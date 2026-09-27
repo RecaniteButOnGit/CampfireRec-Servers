@@ -787,7 +787,12 @@ export async function cloneRoom(
 	const sourceSubRooms = Array.isArray(source.SubRooms) ? (source.SubRooms as SubRoom[]) : []
 	const clonedSubRooms: SubRoom[] = []
 	for (const sub of sourceSubRooms) {
-		clonedSubRooms.push(await insertSubRoom(db, newRoomId, { ...sub, CreatorAccountId: accountId }))
+		clonedSubRooms.push(
+			await insertSubRoom(db, newRoomId, {
+				...withRooms2InitialSave(source, sub, accountId),
+				CreatorAccountId: accountId,
+			})
+		)
 	}
 	cloned.SubRooms = clonedSubRooms
 	// Inherited from the (parsed) source in practice; defaulted here too so a clone is
@@ -1322,6 +1327,60 @@ export interface SaveSubRoomDataInput {
 export type SubRoomDataSave = Record<string, unknown>
 
 /**
+ * The seed data for a Rooms 2.0 subroom that has never been saved. This is the
+ * archived `Empty` subroom from ObbyTemplate, whose ugcr2 scene and real save were
+ * verified against the blob hash. Its binary is bundled by the CDN worker at the
+ * matching DataBlob key; do not replace this with an empty string or a fabricated
+ * protobuf payload.
+ */
+const ROOMS2_EMPTY_SCENE_ID = '5d4e40d8-f289-4295-a6e1-4f907835007d'
+const ROOMS2_EMPTY_DATA_BLOB = 'templates/rooms2/empty-obbytemplate/7xd0rcm7jwv1l2heirlvhi1zh.room'
+const ROOMS2_EMPTY_DATA_BLOB_HASH = 'E7rpId42w2QfuBNkTFpQgLL2gJ72u+6yMAU/DNfweBA='
+const ROOMS2_EMPTY_REFERENCED_ASSET_IDS = [
+	'3bbd34ae-7fff-4bd5-81f7-0645ce297ef9',
+	'84ce9009-5afa-492f-9005-281877ea37e6',
+	'e06c10f5-9ae2-4d75-a79f-93a1e5c43585',
+	'7263f0b2-1d87-4a57-b724-b0665d752cfa',
+	'17d4e1ce-f868-407b-9425-bc43d592cdc3',
+	'f95761d7-1d7d-47db-96b7-ee0dfef4c97f',
+	'e31a99bf-711c-4ad0-997d-eede2b4c2d07',
+]
+
+/** Build a fresh first published save for a save-less Rooms 2.0 clone. */
+function withRooms2InitialSave(room: Room, sub: SubRoom, accountId: number): SubRoom {
+	if (
+		room.UgcVersion !== 2 ||
+		sub.UnitySceneId !== ROOMS2_EMPTY_SCENE_ID ||
+		(sub.CurrentSave !== null && typeof sub.CurrentSave === 'object')
+	) {
+		return sub
+	}
+
+	return {
+		...sub,
+		CurrentSave: {
+			UnitySubAssets: [],
+			ReferencedUnityAssets: [],
+			SubRoomId: sub.SubRoomId,
+			UnityAssetId: null,
+			DataBlob: ROOMS2_EMPTY_DATA_BLOB,
+			DataBlobHash: ROOMS2_EMPTY_DATA_BLOB_HASH,
+			ReferencedUnityAssetIds: [...ROOMS2_EMPTY_REFERENCED_ASSET_IDS],
+			PersistenceVersion: 179,
+			OMVersion: 151,
+			UgcSubVersion: 330,
+			SavedByAccountId: accountId,
+			SavedOnPlatform: 0,
+			SavedOnDeviceClass: 0,
+			Description: '',
+			Tags: [],
+			ModerationState: 0,
+			CreatedAt: new Date().toISOString(),
+		},
+	}
+}
+
+/**
  * The scene-data blob key the client should download for a subroom. Prefers the
  * authoritative `CurrentSave.DataBlob` and falls back to the flat `DataBlob` that
  * subrooms written before `CurrentSave` existed (and the `0001_init.sql` dorm seed)
@@ -1604,10 +1663,15 @@ export async function cloneSubRoom(
 	subRoomId: number,
 	accountId: number
 ): Promise<{ room: Room; subRoom: SubRoom } | null> {
-	const source = await getSubRoom(db, roomId, subRoomId)
+	const sourceRoom = await getRoomById(db, roomId)
+	if (!sourceRoom) return null
+	const source = findSubRoom(sourceRoom, subRoomId)
 	if (!source) return null
 
-	const subRoom = await insertSubRoom(db, roomId, { ...source, CreatorAccountId: accountId })
+	const subRoom = await insertSubRoom(db, roomId, {
+		...withRooms2InitialSave(sourceRoom, source, accountId),
+		CreatorAccountId: accountId,
+	})
 	const room = await getRoomById(db, roomId)
 	if (!room) return null
 	return { room, subRoom }

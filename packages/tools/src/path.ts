@@ -7,8 +7,10 @@ export const getRepoRoot = memoizeOne(() => {
 	const pnpmLock = z
 		.string()
 		.trim()
-		.startsWith('/')
-		.endsWith('/pnpm-lock.yaml')
+		.refine(
+			(candidate) => path.isAbsolute(candidate) && path.basename(candidate) === 'pnpm-lock.yaml',
+			'Expected an absolute path to pnpm-lock.yaml'
+		)
 		.parse(find.up('pnpm-lock.yaml'))
 	return path.dirname(pnpmLock)
 })

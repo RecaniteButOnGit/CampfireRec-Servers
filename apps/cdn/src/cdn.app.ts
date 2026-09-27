@@ -52,20 +52,26 @@ async function serveAsset(c: Context<App>, key: string) {
 	// the whole object — see the 206 branch, which is what turns that back into a 200.
 	// With no `Range` header present this is an ordinary whole-object read.
 	let object
-	try {
-		object = await (c.env as Env).CDN_ASSETS.get(key, {
-			...(ifNoneMatch ? { onlyIf: { etagDoesNotMatch: ifNoneMatch } } : {}),
-			range: c.req.raw.headers,
-		})
-	} catch (e) {
-		// Defensive: R2 documents InvalidRange (10039) for a range it can't satisfy, which
-		// is a 416 rather than the 500 the error handler would otherwise turn it into.
-		// Locally it never fires — workerd resolves an unsatisfiable range to the whole
-		// object instead of throwing — so this covers the service behaving as documented.
-		if (e instanceof Error && e.message.includes('(10039)')) return c.body(null, 416)
-		throw e
+	const bucket = (c.env as Env).CDN_ASSETS
+	if (bucket) {
+		try {
+			object = await bucket.get(key, {
+				...(ifNoneMatch ? { onlyIf: { etagDoesNotMatch: ifNoneMatch } } : {}),
+				range: c.req.raw.headers,
+			})
+		} catch (e) {
+			// Defensive: R2 documents InvalidRange (10039) for a range it can't satisfy, which
+			// is a 416 rather than the 500 the error handler would otherwise turn it into.
+			// Locally it never fires — workerd resolves an unsatisfiable range to the whole
+			// object instead of throwing — so this covers the service behaving as documented.
+			if (e instanceof Error && e.message.includes('(10039)')) return c.body(null, 416)
+			throw e
+		}
 	}
-	if (!object) return c.notFound()
+	if (!object) {
+		if (key === ROOMS2_EMPTY_TEMPLATE_OBJECT_KEY) return serveBundledRooms2EmptyTemplate(c)
+		return c.notFound()
+	}
 
 	const headers = new Headers()
 	object.writeHttpMetadata(headers)
@@ -100,6 +106,77 @@ async function serveAsset(c: Context<App>, key: string) {
  * would pin a stale config for the whole window.
  */
 const CACHE_CONTROL = `public, max-age=${86400 * 30}`
+
+// Railway packages the CDN's static directory with the monolith. The R2 starter save
+// lives there so the seeded database's DataBlob always resolves even when the optional
+// CDN object bucket is not configured. If R2 has this key, its object takes precedence.
+const ROOMS2_EMPTY_TEMPLATE_OBJECT_KEY =
+	'room/templates/rooms2/empty-obbytemplate/7xd0rcm7jwv1l2heirlvhi1zh.room'
+const ROOMS2_EMPTY_TEMPLATE_ASSET_PATH = '/room-templates/rooms2-obby-empty.room'
+
+function resolveBundledRange(
+	raw: string | undefined,
+	size: number
+): { offset: number; length: number } | undefined {
+	if (!raw?.startsWith('bytes=')) return undefined
+	const full = { offset: 0, length: size }
+	const match = /^(\d*)-(\d*)$/.exec(raw.slice('bytes='.length))
+	if (!match || (!match[1] && !match[2])) return full
+
+	if (!match[1]) {
+		const suffix = Number(match[2])
+		if (!Number.isSafeInteger(suffix) || suffix <= 0) return full
+		const length = Math.min(suffix, size)
+		return { offset: size - length, length }
+	}
+
+	const offset = Number(match[1])
+	const requestedEnd = match[2] ? Number(match[2]) : size - 1
+	if (
+		!Number.isSafeInteger(offset) ||
+		!Number.isSafeInteger(requestedEnd) ||
+		offset < 0 ||
+		offset >= size ||
+		requestedEnd < offset
+	) {
+		return full
+	}
+	const end = Math.min(requestedEnd, size - 1)
+	return { offset, length: end - offset + 1 }
+}
+
+async function serveBundledRooms2EmptyTemplate(c: Context<App>): Promise<Response> {
+	const asset = await c.env.ASSETS.fetch(
+		new Request(new URL(ROOMS2_EMPTY_TEMPLATE_ASSET_PATH, c.req.url), c.req.raw)
+	)
+	if (asset.status === 304) {
+		const headers = new Headers(asset.headers)
+		headers.set('content-type', 'application/octet-stream')
+		headers.set('accept-ranges', 'bytes')
+		headers.set('cache-control', CACHE_CONTROL)
+		return new Response(null, { status: 304, headers })
+	}
+	if (!asset.ok) return new Response(null, { status: asset.status })
+
+	const bytes = new Uint8Array(await asset.arrayBuffer())
+	const headers = new Headers(asset.headers)
+	headers.set('content-type', 'application/octet-stream')
+	headers.set('accept-ranges', 'bytes')
+	headers.set('cache-control', CACHE_CONTROL)
+	headers.set('content-length', String(bytes.byteLength))
+	const range = resolveBundledRange(c.req.header('range'), bytes.byteLength)
+	const object = {
+		size: bytes.byteLength,
+		...(range ? { range } : {}),
+	} as Parameters<typeof writeContentRange>[2]
+	if (writeContentRange(headers, c.req.raw.headers, object)) {
+		return new Response(bytes.subarray(range!.offset, range!.offset + range!.length), {
+			status: 206,
+			headers,
+		})
+	}
+	return new Response(bytes, { headers })
+}
 
 /**
  * What may reach the ASSETS binding as a config filename: one path segment, no slashes,

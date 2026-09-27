@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto'
 import { mkdtempSync, rmSync } from 'node:fs'
 import { createServer } from 'node:http'
 import { tmpdir } from 'node:os'
@@ -48,11 +49,20 @@ describe('SQLite D1 adapter and migrations', () => {
   it('applies source migrations once and persists across reopen', async () => {
     const path = join(temp(), 'recflare.sqlite')
     const first = new SQLiteD1(path)
-    expect(migrate(first)).toBe(97)
+    expect(migrate(first)).toBe(98)
     const makerRoom2 = await first.prepare(
-      "SELECT json_extract(data, '$.UnitySceneId') AS scene FROM subroom WHERE room_id = 46"
-    ).first<{ scene: string }>()
+      `SELECT json_extract(s.data, '$.UnitySceneId') AS scene, sv.data AS save
+       FROM subroom s JOIN subroom_save sv ON sv.sub_room_data_save_id = s.current_save_id
+       WHERE s.room_id = 46`
+    ).first<{ scene: string; save: string }>()
     expect(makerRoom2?.scene).toBe('5d4e40d8-f289-4295-a6e1-4f907835007d')
+    expect(JSON.parse(makerRoom2!.save)).toMatchObject({
+      DataBlob: 'templates/rooms2/empty-obbytemplate/7xd0rcm7jwv1l2heirlvhi1zh.room',
+      DataBlobHash: 'E7rpId42w2QfuBNkTFpQgLL2gJ72u+6yMAU/DNfweBA=',
+      PersistenceVersion: 179,
+      OMVersion: 151,
+      UgcSubVersion: 330,
+    })
     first.close()
     const second = new SQLiteD1(path)
     try { expect(migrate(second)).toBe(0); expect(second.ping()).toBe(true) } finally { second.close() }
@@ -123,6 +133,36 @@ describe('S3 R2 adapter and CDN', () => {
       new NodeExecutionContext() as never)
     expect(unsatisfiable.status).toBe(206)
     expect(unsatisfiable.headers.get('content-range')).toBe('bytes 0-9/10')
+  })
+
+  it('serves the bundled Rooms 2.0 base save without an object bucket on Railway', async () => {
+    const assets = new FileAssets(join(import.meta.dirname, '../../cdn/static'))
+    const key = 'templates/rooms2/empty-obbytemplate/7xd0rcm7jwv1l2heirlvhi1zh.room'
+    const runtime = {
+      ASSETS: assets,
+      CDN_ASSETS: undefined,
+      NAME: 'cdn',
+      ENVIRONMENT: 'test',
+      SENTRY_RELEASE: 'test',
+    } as never
+    const context = new NodeExecutionContext() as never
+    const response = await cdnApp.fetch(new Request(`https://cdn.example.test/room/${key}`), runtime, context)
+    expect(response.status).toBe(200)
+    expect(response.headers.get('content-type')).toBe('application/octet-stream')
+    const bytes = Buffer.from(await response.arrayBuffer())
+    expect(bytes.byteLength).toBe(340577)
+    expect(createHash('sha256').update(bytes).digest('base64')).toBe(
+      'E7rpId42w2QfuBNkTFpQgLL2gJ72u+6yMAU/DNfweBA='
+    )
+
+    const range = await cdnApp.fetch(
+      new Request(`https://cdn.example.test/room/${key}`, { headers: { range: 'bytes=10-23' } }),
+      runtime,
+      context
+    )
+    expect(range.status).toBe(206)
+    expect(range.headers.get('content-range')).toBe('bytes 10-23/340577')
+    expect(Buffer.from(await range.arrayBuffer())).toEqual(bytes.subarray(10, 24))
   })
 })
 

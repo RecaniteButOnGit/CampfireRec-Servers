@@ -1137,15 +1137,26 @@ describe('rooms endpoints', () => {
 			RoomId: number
 			Name: string
 			UgcVersion: number
-			SubRooms: Array<{ SubRoomId: number; UnitySceneId: string; CurrentSave: unknown }>
+			SubRooms: Array<{
+				SubRoomId: number
+				UnitySceneId: string
+				CurrentSave: {
+					SubRoomDataSaveId: number
+					SubRoomId: number
+					DataBlob: string
+					DataBlobHash: string
+				} | null
+			}>
 		}>
 		const template = baseRooms.find((room) => room.Name === 'MakerRoom2')
 		expect(template).toMatchObject({ RoomId: 46, UgcVersion: 2 })
 		expect(template?.SubRooms).toHaveLength(1)
-		expect(template?.SubRooms[0].UnitySceneId).toBe(
-			'5d4e40d8-f289-4295-a6e1-4f907835007d'
-		)
-		expect(template?.SubRooms[0].CurrentSave).toBeNull()
+		expect(template?.SubRooms[0].UnitySceneId).toBe('5d4e40d8-f289-4295-a6e1-4f907835007d')
+		expect(template?.SubRooms[0].CurrentSave).toMatchObject({
+			SubRoomId: template?.SubRooms[0].SubRoomId,
+			DataBlob: 'templates/rooms2/empty-obbytemplate/7xd0rcm7jwv1l2heirlvhi1zh.room',
+			DataBlobHash: 'E7rpId42w2QfuBNkTFpQgLL2gJ72u+6yMAU/DNfweBA=',
+		})
 
 		const res = await SELF.fetch(`${ORIGIN}/rooms/46/clone`, {
 			method: 'POST',
@@ -1161,7 +1172,15 @@ describe('rooms endpoints', () => {
 				RoomId: number
 				UgcVersion: number
 				Tags: Array<{ Tag: string; Type: number }>
-				SubRooms: Array<{ SubRoomId: number; UnitySceneId: string; CurrentSave: unknown }>
+				SubRooms: Array<{
+					SubRoomId: number
+					UnitySceneId: string
+					CurrentSave: {
+						SubRoomDataSaveId: number
+						SubRoomId: number
+						DataBlob: string
+					} | null
+				}>
 			}
 		}
 		expect(body.success).toBe(true)
@@ -1170,7 +1189,25 @@ describe('rooms endpoints', () => {
 		expect(body.value.SubRooms).toHaveLength(1)
 		expect(body.value.SubRooms[0].SubRoomId).not.toBe(template?.SubRooms[0].SubRoomId)
 		expect(body.value.SubRooms[0].UnitySceneId).toBe(template?.SubRooms[0].UnitySceneId)
-		expect(body.value.SubRooms[0].CurrentSave).toBeNull()
+		const clonedSubRoom = body.value.SubRooms[0]!
+		expect(clonedSubRoom.CurrentSave).toMatchObject({
+			SubRoomId: clonedSubRoom.SubRoomId,
+			DataBlob: 'templates/rooms2/empty-obbytemplate/7xd0rcm7jwv1l2heirlvhi1zh.room',
+		})
+		expect(clonedSubRoom.CurrentSave!.SubRoomDataSaveId).not.toBe(
+			template?.SubRooms[0].CurrentSave?.SubRoomDataSaveId
+		)
+		const storedCloneSave = await env.DB.prepare(
+			`SELECT s.current_save_id AS saveId, sv.sub_room_id AS savedSubRoomId
+			 FROM subroom s JOIN subroom_save sv ON sv.sub_room_data_save_id = s.current_save_id
+			 WHERE s.sub_room_id = ?1`
+		)
+			.bind(clonedSubRoom.SubRoomId)
+			.first<{ saveId: number; savedSubRoomId: number }>()
+		expect(storedCloneSave).toEqual({
+			saveId: clonedSubRoom.CurrentSave!.SubRoomDataSaveId,
+			savedSubRoomId: clonedSubRoom.SubRoomId,
+		})
 
 		const subClone = await SELF.fetch(
 			`${ORIGIN}/rooms/${body.value.RoomId}/subrooms/${body.value.SubRooms[0].SubRoomId}/clone`,
@@ -1178,15 +1215,55 @@ describe('rooms endpoints', () => {
 		)
 		const subCloneBody = (await subClone.json()) as {
 			success: boolean
-			value: { SubRooms: Array<{ SubRoomId: number; UnitySceneId: string; CurrentSave: unknown }> }
+			value: {
+				SubRooms: Array<{
+					SubRoomId: number
+					UnitySceneId: string
+					Name: string
+					CurrentSave: { SubRoomDataSaveId: number; SubRoomId: number; DataBlob: string } | null
+				}>
+			}
 		}
 		expect(subCloneBody.success).toBe(true)
 		expect(subCloneBody.value.SubRooms).toHaveLength(2)
 		expect(subCloneBody.value.SubRooms[1].SubRoomId).not.toBe(body.value.SubRooms[0].SubRoomId)
-		expect(subCloneBody.value.SubRooms[1].UnitySceneId).toBe(
-			'5d4e40d8-f289-4295-a6e1-4f907835007d'
+		expect(subCloneBody.value.SubRooms[1].UnitySceneId).toBe('5d4e40d8-f289-4295-a6e1-4f907835007d')
+		expect(subCloneBody.value.SubRooms[1]!.CurrentSave).toMatchObject({
+			SubRoomId: subCloneBody.value.SubRooms[1]!.SubRoomId,
+			DataBlob: 'templates/rooms2/empty-obbytemplate/7xd0rcm7jwv1l2heirlvhi1zh.room',
+		})
+
+		// Brand-new Rooms 2.0 subrooms are unsaved by design. Cloning one still needs a
+		// playable starting save, so the clone path fills it from the same verified base.
+		const created = await SELF.fetch(`${ORIGIN}/rooms/${body.value.RoomId}/subrooms`, {
+			method: 'POST',
+			headers: { ...(await bearer('805')), 'Content-Type': 'application/x-www-form-urlencoded' },
+			body: new URLSearchParams({ name: 'UnsavedRooms2' }).toString(),
+		})
+		const createdBody = (await created.json()) as {
+			value: { SubRooms: Array<{ SubRoomId: number; Name: string; CurrentSave: unknown }> }
+		}
+		const unsaved = createdBody.value.SubRooms.find((sub) => sub.Name === 'UnsavedRooms2')!
+		expect(unsaved.CurrentSave).toBeNull()
+		const unsavedClone = await SELF.fetch(
+			`${ORIGIN}/rooms/${body.value.RoomId}/subrooms/${unsaved.SubRoomId}/clone`,
+			{ method: 'POST', headers: await bearer('805') }
 		)
-		expect(subCloneBody.value.SubRooms[1].CurrentSave).toBeNull()
+		const unsavedCloneBody = (await unsavedClone.json()) as {
+			value: {
+				SubRooms: Array<{
+					SubRoomId: number
+					CurrentSave: { SubRoomDataSaveId: number; SubRoomId: number; DataBlob: string } | null
+				}>
+			}
+		}
+		const fallbackSave = unsavedCloneBody.value.SubRooms.find(
+			(sub) => sub.SubRoomId !== unsaved.SubRoomId
+		)!
+		expect(fallbackSave.CurrentSave).toMatchObject({
+			SubRoomId: fallbackSave.SubRoomId,
+			DataBlob: 'templates/rooms2/empty-obbytemplate/7xd0rcm7jwv1l2heirlvhi1zh.room',
+		})
 	})
 
 	it('GET /rooms/recommendations returns a bare array of public rooms (split-test params ignored)', async () => {
