@@ -1327,15 +1327,22 @@ export interface SaveSubRoomDataInput {
 export type SubRoomDataSave = Record<string, unknown>
 
 /**
- * The MakerRoom2 starter save copied from the user's MyLittleMonsters Rooms 2.0
- * snapshot. The save metadata and binary hash were verified against its archive;
- * its Unity scene matches the Rooms 2.0 scene. Its binary is bundled by the CDN
- * service at the matching DataBlob key.
+ * The MakerRoom2 starter save is the user's stripped version of the archived
+ * Empty subroom from ObbyTemplate. It retains the verified Rooms 2.0 scene and
+ * original save metadata; its new binary hash is served by the Railway CDN.
  */
 const ROOMS2_SCENE_ID = '5d4e40d8-f289-4295-a6e1-4f907835007d'
-const ROOMS2_MAKERROOM_DATA_BLOB = 'templates/rooms2/mylittlemonsters/b095j1ikk9vu9j8wl3jwq5eht.room'
-const ROOMS2_MAKERROOM_DATA_BLOB_HASH = 'OcQkZaED9IAXylh7y1B+T1Dxz/Z+wa40vY2jYj+DPLs='
-const ROOMS2_MAKERROOM_UNITY_ASSET_ID = '14fcbddc-7106-4b8e-961c-513bb8379001'
+const ROOMS2_MAKERROOM_DATA_BLOB = 'templates/rooms2/empty-obbytemplate/rooms2-obby-empty-stripped.room'
+const ROOMS2_MAKERROOM_DATA_BLOB_HASH = '4SsRzh8zm+YOp4rGd2NInObD0CLg1q5NWprTcGjathQ='
+const ROOMS2_MAKERROOM_REFERENCED_ASSET_IDS = [
+	'3bbd34ae-7fff-4bd5-81f7-0645ce297ef9',
+	'84ce9009-5afa-492f-9005-281877ea37e6',
+	'e06c10f5-9ae2-4d75-a79f-93a1e5c43585',
+	'7263f0b2-1d87-4a57-b724-b0665d752cfa',
+	'17d4e1ce-f868-407b-9425-bc43d592cdc3',
+	'f95761d7-1d7d-47db-96b7-ee0dfef4c97f',
+	'e31a99bf-711c-4ad0-997d-eede2b4c2d07',
+]
 
 /** Build a fresh first published save for a save-less Rooms 2.0 clone. */
 function withRooms2InitialSave(room: Room, sub: SubRoom, accountId: number): SubRoom {
@@ -1353,13 +1360,13 @@ function withRooms2InitialSave(room: Room, sub: SubRoom, accountId: number): Sub
 			UnitySubAssets: [],
 			ReferencedUnityAssets: [],
 			SubRoomId: sub.SubRoomId,
-			UnityAssetId: ROOMS2_MAKERROOM_UNITY_ASSET_ID,
+			UnityAssetId: null,
 			DataBlob: ROOMS2_MAKERROOM_DATA_BLOB,
 			DataBlobHash: ROOMS2_MAKERROOM_DATA_BLOB_HASH,
-			ReferencedUnityAssetIds: [],
-			PersistenceVersion: 136,
-			OMVersion: 2,
-			UgcSubVersion: 138,
+			ReferencedUnityAssetIds: [...ROOMS2_MAKERROOM_REFERENCED_ASSET_IDS],
+			PersistenceVersion: 179,
+			OMVersion: 151,
+			UgcSubVersion: 330,
 			SavedByAccountId: accountId,
 			SavedOnPlatform: 0,
 			SavedOnDeviceClass: 0,

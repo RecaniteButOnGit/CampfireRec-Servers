@@ -49,7 +49,7 @@ describe('SQLite D1 adapter and migrations', () => {
   it('applies source migrations once and persists across reopen', async () => {
     const path = join(temp(), 'recflare.sqlite')
     const first = new SQLiteD1(path)
-    expect(migrate(first)).toBe(99)
+    expect(migrate(first)).toBe(100)
     const makerRoom2 = await first.prepare(
       `SELECT json_extract(s.data, '$.UnitySceneId') AS scene, sv.data AS save
        FROM subroom s JOIN subroom_save sv ON sv.sub_room_data_save_id = s.current_save_id
@@ -57,12 +57,12 @@ describe('SQLite D1 adapter and migrations', () => {
     ).first<{ scene: string; save: string }>()
     expect(makerRoom2?.scene).toBe('5d4e40d8-f289-4295-a6e1-4f907835007d')
     expect(JSON.parse(makerRoom2!.save)).toMatchObject({
-      UnityAssetId: '14fcbddc-7106-4b8e-961c-513bb8379001',
-      DataBlob: 'templates/rooms2/mylittlemonsters/b095j1ikk9vu9j8wl3jwq5eht.room',
-      DataBlobHash: 'OcQkZaED9IAXylh7y1B+T1Dxz/Z+wa40vY2jYj+DPLs=',
-      PersistenceVersion: 136,
-      OMVersion: 2,
-      UgcSubVersion: 138,
+      UnityAssetId: null,
+      DataBlob: 'templates/rooms2/empty-obbytemplate/rooms2-obby-empty-stripped.room',
+      DataBlobHash: '4SsRzh8zm+YOp4rGd2NInObD0CLg1q5NWprTcGjathQ=',
+      PersistenceVersion: 179,
+      OMVersion: 151,
+      UgcSubVersion: 330,
     })
     first.close()
     const second = new SQLiteD1(path)
@@ -156,6 +156,11 @@ describe('S3 R2 adapter and CDN', () => {
         key: 'templates/rooms2/mylittlemonsters/b095j1ikk9vu9j8wl3jwq5eht.room',
         size: 1957226,
         hash: 'OcQkZaED9IAXylh7y1B+T1Dxz/Z+wa40vY2jYj+DPLs=',
+      },
+      {
+        key: 'templates/rooms2/empty-obbytemplate/rooms2-obby-empty-stripped.room',
+        size: 340149,
+        hash: '4SsRzh8zm+YOp4rGd2NInObD0CLg1q5NWprTcGjathQ=',
       },
     ]
     for (const save of saves) {
