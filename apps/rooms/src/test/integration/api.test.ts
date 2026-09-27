@@ -1132,6 +1132,43 @@ describe('rooms endpoints', () => {
 		expect(body.length).toBeLessThanOrEqual(5)
 	})
 
+	it('MakerRoom2 is an empty Rooms 2.0 base room that can be cloned', async () => {
+		const baseRooms = (await (await SELF.fetch(`${ORIGIN}/rooms/base`)).json()) as Array<{
+			RoomId: number
+			Name: string
+			UgcVersion: number
+			SubRooms: Array<{ SubRoomId: number; UnitySceneId: string; CurrentSave: unknown }>
+		}>
+		const template = baseRooms.find((room) => room.Name === 'MakerRoom2')
+		expect(template).toMatchObject({ RoomId: 46, UgcVersion: 2 })
+		expect(template?.SubRooms).toHaveLength(1)
+		expect(template?.SubRooms[0].CurrentSave).toBeNull()
+
+		const res = await SELF.fetch(`${ORIGIN}/rooms/46/clone`, {
+			method: 'POST',
+			headers: {
+				...(await bearer('805')),
+				'Content-Type': 'application/x-www-form-urlencoded',
+			},
+			body: new URLSearchParams({ name: 'MyRooms2Room' }).toString(),
+		})
+		const body = (await res.json()) as {
+			success: boolean
+			value: {
+				UgcVersion: number
+				Tags: Array<{ Tag: string; Type: number }>
+				SubRooms: Array<{ SubRoomId: number; UnitySceneId: string; CurrentSave: unknown }>
+			}
+		}
+		expect(body.success).toBe(true)
+		expect(body.value.UgcVersion).toBe(2)
+		expect(body.value.Tags).toEqual([{ Tag: 'beta', Type: 1 }])
+		expect(body.value.SubRooms).toHaveLength(1)
+		expect(body.value.SubRooms[0].SubRoomId).not.toBe(template?.SubRooms[0].SubRoomId)
+		expect(body.value.SubRooms[0].UnitySceneId).toBe(template?.SubRooms[0].UnitySceneId)
+		expect(body.value.SubRooms[0].CurrentSave).toBeNull()
+	})
+
 	it('GET /rooms/recommendations returns a bare array of public rooms (split-test params ignored)', async () => {
 		const res = await SELF.fetch(`${ORIGIN}/rooms/recommendations?splitTestId=1&splitTestValue=5`)
 		expect(res.status).toBe(200)
