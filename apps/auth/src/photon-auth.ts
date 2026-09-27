@@ -7,11 +7,31 @@ import type { App } from './context'
 
 const TOKEN_KEYS = ['photonAuthToken', 'authToken', 'token'] as const
 const JWT_SHAPE = /^[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+$/
+const FIELD_NAME = /^[A-Za-z_][A-Za-z0-9_.\[\]-]{0,63}$/
+const MEDIA_TYPE = /^[a-z0-9.+-]+\/[a-z0-9.+-]+$/
 
 type Fields = Record<string, unknown>
+type BodyFormat = 'empty' | 'raw-jwt' | 'form' | 'json-object' | 'unknown'
+type ParsedBody = {
+	fields: Fields
+	rawToken?: string
+	format: BodyFormat
+	bodyLength: number
+	fingerprint?: {
+		containsEquals: boolean
+		containsAmpersand: boolean
+		startsWithBrace: boolean
+		startsWithBracket: boolean
+		jwtDotCount: number
+	}
+}
 
 function safeKeys(keys: Iterable<string>): string[] {
-	return [...keys].map((key) => (key.length <= 64 && !JWT_SHAPE.test(key) ? key : '[redacted]'))
+	return [...keys].map((key) =>
+		FIELD_NAME.test(key) && !JWT_SHAPE.test(key) && !/eyJ[A-Za-z0-9_-]{8,}/.test(key)
+			? key
+			: '[redacted]'
+	)
 }
 
 function fieldsFromParams(params: URLSearchParams): Fields {
@@ -23,31 +43,66 @@ function fieldsFromParams(params: URLSearchParams): Fields {
 	return fields
 }
 
-async function readBody(request: Request): Promise<{ fields: Fields; rawToken?: string }> {
-	if (request.method !== 'POST') return { fields: {} }
-	const contentType = request.headers.get('content-type')?.split(';', 1)[0]?.trim().toLowerCase()
-	const body = new TextDecoder().decode(await request.arrayBuffer())
+function jsonObject(body: string): Fields | null {
+	try {
+		const parsed: unknown = JSON.parse(body)
+		return parsed && typeof parsed === 'object' && !Array.isArray(parsed)
+			? (parsed as Fields)
+			: null
+	} catch {
+		return null
+	}
+}
+
+/** Parse only the supported Photon transports; never search arbitrary values for a JWT. */
+function parsePhotonAuthBody(body: string, contentType: string): ParsedBody {
+	const bodyLength = body.length
+	const empty = { fields: {}, format: 'empty', bodyLength } as const
+	if (!body) return empty
+
 	if (contentType === 'application/json') {
-		try {
-			const parsed: unknown = JSON.parse(body)
-			return {
-				fields:
-					parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? (parsed as Fields) : {},
+		const fields = jsonObject(body)
+		if (fields) return { fields, format: 'json-object', bodyLength }
+	} else if (contentType === 'application/x-www-form-urlencoded') {
+		return { fields: fieldsFromParams(new URLSearchParams(body)), format: 'form', bodyLength }
+	} else {
+		const trimmed = body.trim()
+		if (JWT_SHAPE.test(trimmed))
+			return { fields: {}, rawToken: trimmed, format: 'raw-jwt', bodyLength }
+		if (contentType === '' || contentType === 'text/plain') {
+			// A form is recognized by its parameter names, not by arbitrary values.
+			// In particular, do not turn a JSON body containing '=' into a form key.
+			if (body.includes('=')) {
+				const params = new URLSearchParams(body)
+				if ([...params.keys()].every((key) => FIELD_NAME.test(key))) {
+					return { fields: fieldsFromParams(params), format: 'form', bodyLength }
+				}
 			}
-		} catch {
-			return { fields: {} }
+			const fields = jsonObject(body)
+			if (fields) return { fields, format: 'json-object', bodyLength }
 		}
 	}
-	if (contentType === 'application/x-www-form-urlencoded') {
-		return { fields: fieldsFromParams(new URLSearchParams(body)) }
+
+	return {
+		fields: {},
+		format: 'unknown',
+		bodyLength,
+		fingerprint: {
+			containsEquals: body.includes('='),
+			containsAmpersand: body.includes('&'),
+			startsWithBrace: body.trimStart().startsWith('{'),
+			startsWithBracket: body.trimStart().startsWith('['),
+			jwtDotCount: (body.match(/\./g) ?? []).length,
+		},
 	}
-	if (contentType === 'text/plain') {
-		// Some Photon configurations send form-style parameters as plain text.
-		const params = new URLSearchParams(body)
-		if (TOKEN_KEYS.some((key) => params.has(key))) return { fields: fieldsFromParams(params) }
-	}
-	// An unlabelled/plain raw body is allowed only when the whole body is a JWT.
-	return JWT_SHAPE.test(body) ? { fields: {}, rawToken: body } : { fields: {} }
+}
+
+async function readBody(request: Request): Promise<ParsedBody> {
+	if (request.method !== 'POST') return { fields: {}, format: 'empty', bodyLength: 0 }
+	const contentType =
+		request.headers.get('content-type')?.split(';', 1)[0]?.trim().toLowerCase() ?? ''
+	const body = new TextDecoder().decode(await request.arrayBuffer())
+	return parsePhotonAuthBody(body, contentType)
 }
 
 function findToken(query: Fields, body: Fields, rawToken?: string): string | null {
@@ -69,16 +124,22 @@ const authenticationFailed = { ResultCode: 2, Message: 'Authentication failed.' 
 
 /** Photon Cloud's server-to-server Custom Authentication callback. */
 export async function photonAuthenticate(c: Context<App>): Promise<Response> {
-	let queryKeys: string[] = []
-	let bodyKeys: string[] = []
-	let contentType = ''
 	try {
 		const query = fieldsFromParams(new URL(c.req.url).searchParams)
 		const body = await readBody(c.req.raw)
-		queryKeys = safeKeys(Object.keys(query))
-		bodyKeys = safeKeys(Object.keys(body.fields))
-		contentType = c.req.header('content-type')?.split(';', 1)[0]?.trim().toLowerCase() ?? ''
-		logger.info('Photon auth request', { method: c.req.method, contentType, queryKeys, bodyKeys })
+		const mediaType = c.req.header('content-type')?.split(';', 1)[0]?.trim().toLowerCase() ?? ''
+		logger.info('Photon auth request', {
+			method: c.req.method,
+			contentType:
+				mediaType === '' || (mediaType.length <= 64 && MEDIA_TYPE.test(mediaType))
+					? mediaType
+					: '[invalid]',
+			queryKeys: safeKeys(Object.keys(query)),
+			bodyKeys: safeKeys(Object.keys(body.fields)),
+			bodyLength: body.bodyLength,
+			bodyFormat: body.format,
+			...(body.fingerprint ?? {}),
+		})
 
 		const token = findToken(query, body.fields, body.rawToken)
 		if (!token) {

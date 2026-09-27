@@ -1,11 +1,12 @@
 import { adminSecretsStore, env } from 'cloudflare:test'
 import { exports } from 'cloudflare:workers'
 import { sign } from 'hono/jwt'
-import { beforeAll, describe, expect, test } from 'vitest'
+import { beforeAll, describe, expect, test, vi } from 'vitest'
 
 import '../../auth.app'
 
 import { SCHEMA_DDL } from '@repo/domain'
+import { logger } from '@repo/hono-helpers'
 import { generatePhotonAuthToken, generateToken } from '@repo/jwt'
 
 import type { Env } from '../../context'
@@ -37,7 +38,7 @@ function token(secret = SECRET, audience = AUDIENCE, accountId = ACCOUNT_ID): Pr
 }
 
 async function request(
-	path: string,
+	path: string | Request,
 	init?: RequestInit
 ): Promise<{
 	status: number
@@ -45,7 +46,10 @@ async function request(
 	body: Record<string, unknown>
 	text: string
 }> {
-	const response = await exports.default.fetch(`${ORIGIN}${path}`, init)
+	const response = await exports.default.fetch(
+		typeof path === 'string' ? `${ORIGIN}${path}` : path,
+		init
+	)
 	const text = await response.text()
 	return {
 		status: response.status,
@@ -53,6 +57,14 @@ async function request(
 		body: JSON.parse(text) as Record<string, unknown>,
 		text,
 	}
+}
+
+/** Fetch creates text/plain for string bodies; remove it to model Photon's request. */
+function unlabeledPost(body: string): ReturnType<typeof request> {
+	const raw = new Request(`${ORIGIN}/photon/authenticate`, { method: 'POST', body })
+	raw.headers.delete('content-type')
+	expect(raw.headers.has('content-type')).toBe(false)
+	return request(raw)
 }
 
 function expectPhotonResponse(result: Awaited<ReturnType<typeof request>>, code: number): void {
@@ -123,6 +135,7 @@ describe('Photon Cloud Custom Authentication', () => {
 		for (const [contentType, body] of [
 			['text/plain', `photonAuthToken=${credential}`],
 			['text/plain', credential],
+			['text/plain', JSON.stringify({ photonAuthToken: credential })],
 			['application/octet-stream', credential],
 		] as const) {
 			const result = await request('/photon/authenticate', {
@@ -131,6 +144,109 @@ describe('Photon Cloud Custom Authentication', () => {
 				body,
 			})
 			expectPhotonResponse(result, 1)
+		}
+	})
+
+	test('unlabeled raw JWT body succeeds after cryptographic verification', async () => {
+		const result = await unlabeledPost(`\n${await token()}\n`)
+		expectPhotonResponse(result, 1)
+		expect(result.body.UserId).toBe(String(ACCOUNT_ID))
+	})
+
+	test.each(['photonAuthToken', 'authToken', 'token'])(
+		'unlabeled form body accepts %s with percent encoding',
+		async (name) => {
+			const form = new URLSearchParams({ [name]: await token() }).toString().replaceAll('.', '%2E')
+			const result = await unlabeledPost(form)
+			expectPhotonResponse(result, 1)
+			expect(result.body.UserId).toBe(String(ACCOUNT_ID))
+		}
+	)
+
+	test.each(['photonAuthToken', 'authToken', 'token'])(
+		'unlabeled JSON object accepts %s',
+		async (name) => {
+			const result = await unlabeledPost(JSON.stringify({ [name]: await token() }))
+			expectPhotonResponse(result, 1)
+		}
+	)
+
+	test.each([
+		'hello',
+		'thing=value',
+		'{"foo":"bar"}',
+		'[]',
+		'{"photonAuthToken":{"nested":"value"}}',
+	])('unlabeled body %s has invalid parameters', async (body) => {
+		const result = await unlabeledPost(body)
+		expectPhotonResponse(result, 3)
+	})
+
+	test('unlabeled form with conflicting token names is rejected', async () => {
+		const body = new URLSearchParams({
+			photonAuthToken: await token(),
+			token: await token(SECRET, 'another-photon-app'),
+		}).toString()
+		expectPhotonResponse(await unlabeledPost(body), 3)
+	})
+
+	test('an unlabeled, parsed token with a bad signature is an authentication failure', async () => {
+		const result = await unlabeledPost(`photonAuthToken=${await token('different-test-secret')}`)
+		expectPhotonResponse(result, 2)
+	})
+
+	test('request diagnostics report structure without credential values', async () => {
+		const credential = await token()
+		const info = vi.spyOn(logger, 'info')
+		try {
+			expectPhotonResponse(await unlabeledPost(`photonAuthToken=${credential}&username=Player`), 1)
+			const log = info.mock.calls.find(([message]) => message === 'Photon auth request')
+			expect(log?.[1]).toMatchObject({
+				method: 'POST',
+				contentType: '',
+				bodyKeys: ['photonAuthToken', 'username'],
+				bodyFormat: 'form',
+				bodyLength: expect.any(Number),
+			})
+			expectPhotonResponse(await unlabeledPost(JSON.stringify({ photonAuthToken: credential })), 1)
+			const jsonLog = info.mock.calls
+				.filter(([message]) => message === 'Photon auth request')
+				.at(-1)
+			expect(jsonLog?.[1]).toMatchObject({
+				bodyFormat: 'json-object',
+				bodyKeys: ['photonAuthToken'],
+			})
+			expectPhotonResponse(await unlabeledPost('auth.token=value'), 3)
+			const namedLog = info.mock.calls
+				.filter(([message]) => message === 'Photon auth request')
+				.at(-1)
+			expect(namedLog?.[1]).toMatchObject({ bodyFormat: 'form', bodyKeys: ['auth.token'] })
+			expectPhotonResponse(await unlabeledPost(`${credential}=value`), 3)
+			const logged = JSON.stringify(info.mock.calls)
+			expect(logged).not.toContain(credential)
+			expect(logged).not.toContain(SECRET)
+			expect(logged).not.toContain('eyJ')
+			expect(logged).not.toContain('Player')
+		} finally {
+			info.mockRestore()
+		}
+	})
+
+	test('unknown-body diagnostics contain only a structural fingerprint', async () => {
+		const info = vi.spyOn(logger, 'info')
+		try {
+			expectPhotonResponse(await unlabeledPost('[unknown.secret=value]'), 3)
+			const log = info.mock.calls.find(([message]) => message === 'Photon auth request')
+			expect(log?.[1]).toMatchObject({
+				bodyFormat: 'unknown',
+				bodyKeys: [],
+				containsEquals: true,
+				startsWithBracket: true,
+				jwtDotCount: 1,
+			})
+			expect(JSON.stringify(info.mock.calls)).not.toContain('unknown.secret=value')
+		} finally {
+			info.mockRestore()
 		}
 	})
 
