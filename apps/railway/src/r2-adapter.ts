@@ -63,9 +63,18 @@ export class S3Bucket {
     const head = await this.head(key)
     if (!head) return null
     if (options.onlyIf?.etagDoesNotMatch?.replace(/^"|"$/g, '') === head.etag) return head
-    const range = requestedRange(options.range, head.size)
+    const bytesRequested = options.range instanceof Headers && options.range.get('range')?.startsWith('bytes=')
+    if (bytesRequested && head.size === 0) throw new Error('InvalidRange (10039)')
+    // R2 resolves invalid/multi/unsatisfiable byte ranges to the whole object. The
+    // upstream CDN then answers 206 with an explicit 0..size-1 Content-Range.
+    const range = requestedRange(options.range, head.size) ?? (bytesRequested ? { offset: 0, length: head.size } : undefined)
     const output = await this.client.send(new GetObjectCommand({ Bucket: this.bucket, Key: key,
       ...(range ? { Range: `bytes=${range.offset}-${range.offset + range.length - 1}` } : {}) }))
+    if (range && ((output.ContentLength !== undefined && output.ContentLength !== range.length) ||
+      (output.ContentRange !== undefined && output.ContentRange !== `bytes ${range.offset}-${range.offset + range.length - 1}/${head.size}`) ||
+      (output.$metadata?.httpStatusCode !== undefined && output.$metadata.httpStatusCode !== 206))) {
+      throw new Error('S3 returned an unexpected byte range')
+    }
     const body = webBody(output.Body)
     return { ...head, range, body,
       arrayBuffer: () => new Response(body).arrayBuffer(),
@@ -95,7 +104,10 @@ export class S3Bucket {
   }
 
   async ping(): Promise<boolean> {
-    try { await this.list({ limit: 1 }); return true } catch { return false }
+    try {
+      await this.client.send(new ListObjectsV2Command({ Bucket: this.bucket, MaxKeys: 1 }), { abortSignal: AbortSignal.timeout(2500) })
+      return true
+    } catch { return false }
   }
 
   private isMissing(error: unknown): boolean {

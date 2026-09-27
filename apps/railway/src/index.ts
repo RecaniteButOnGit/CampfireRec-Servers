@@ -4,6 +4,7 @@ import { SQLiteD1 } from './d1-adapter'
 import { buildEnvironment } from './env'
 import { migrate } from './migrate'
 import { createRouter, resolveService } from './router'
+import { startScheduler } from './scheduled'
 
 const port = Number(process.env.PORT || 8080)
 if (!Number.isInteger(port) || port < 1 || port > 65535) throw new Error('PORT must be a valid TCP port')
@@ -12,6 +13,7 @@ console.info(`Applied ${migrate(db)} database migrations`)
 const runtime = buildEnvironment(db)
 const fetch = createRouter(runtime, () => db.ping())
 const server = serve({ fetch, port, hostname: '0.0.0.0' }, info => console.info(`Railway server listening on 0.0.0.0:${info.port}`))
+const scheduler = startScheduler(runtime)
 
 server.on('upgrade', (request, socket, head) => {
   const host = request.headers.host || 'localhost'
@@ -28,6 +30,7 @@ server.on('upgrade', (request, socket, head) => {
 })
 
 const stop = () => {
+  clearInterval(scheduler)
   server.close()
   runtime.hub.websocketServer.close()
   void runtime.redis.close()

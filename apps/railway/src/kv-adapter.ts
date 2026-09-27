@@ -26,7 +26,8 @@ export class RedisKV {
 
   async put(key: string, value: string | ArrayBuffer | ArrayBufferView, options: { expiration?: number; expirationTtl?: number } = {}) {
     const client = await this.ready()
-    const text = typeof value === 'string' ? value : Buffer.from(value instanceof ArrayBuffer ? value : value.buffer).toString()
+    const text = typeof value === 'string' ? value : value instanceof ArrayBuffer
+      ? Buffer.from(value).toString() : Buffer.from(value.buffer, value.byteOffset, value.byteLength).toString()
     const expiry = options.expirationTtl ?? (options.expiration ? options.expiration - Math.floor(Date.now() / 1000) : undefined)
     if (expiry !== undefined && expiry <= 0) { await client.del(this.key(key)); return }
     await client.set(this.key(key), text, expiry === undefined ? undefined : { EX: expiry })

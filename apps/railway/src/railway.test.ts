@@ -114,6 +114,11 @@ describe('S3 R2 adapter and CDN', () => {
     expect(response.headers.get('accept-ranges')).toBe('bytes')
     expect(await response.text()).toBe('cdef')
     expect(requests).toContain('GetObjectCommand:bytes=2-5')
+    const unsatisfiable = await cdnApp.fetch(new Request('https://cdn.example.test/room/x', { headers: { range: 'bytes=1000-1999' } }),
+      { CDN_ASSETS: bucket, NAME: 'cdn', ENVIRONMENT: 'test', SENTRY_RELEASE: 'test' } as never,
+      new NodeExecutionContext() as never)
+    expect(unsatisfiable.status).toBe(206)
+    expect(unsatisfiable.headers.get('content-range')).toBe('bytes 0-9/10')
   })
 })
 
@@ -171,7 +176,7 @@ describe('notification hub and execution context', () => {
     const error = vi.spyOn(console, 'error').mockImplementation(() => {})
     const context = new NodeExecutionContext()
     context.waitUntil(Promise.reject(new Error('failed job')))
-    await context.drain()
+    await expect(context.drain()).rejects.toThrow('waitUntil tasks failed')
     expect(error).toHaveBeenCalled()
     error.mockRestore()
   })
