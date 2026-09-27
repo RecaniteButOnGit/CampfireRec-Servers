@@ -159,8 +159,8 @@ export async function verifySteamTicketSignature(
 	return crypto.subtle.verify(
 		'RSASSA-PKCS1-v1_5',
 		await steamPublicKey(),
-		ticket.signature,
-		buf.subarray(ticket.signedStart, ticket.signedEnd)
+		new Uint8Array(ticket.signature),
+		new Uint8Array(buf.subarray(ticket.signedStart, ticket.signedEnd))
 	)
 }
 

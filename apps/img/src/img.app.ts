@@ -262,7 +262,7 @@ async function finalizeImage(
 	let body: BufferSource = bytes
 	if (transform) {
 		const out = resizeImage(new Uint8Array(bytes), transform)
-		body = out.bytes
+		body = new Uint8Array(out.bytes)
 		// The output is re-encoded (PNG stays PNG, everything else is JPEG), and the
 		// source etag no longer describes the body.
 		headers.set('content-type', out.contentType)

@@ -10,4 +10,14 @@ onlyBuiltDependenciesFile: node_modules/.pnpm-config/@pnpm/trusted-deps/allow.js
 
 onlyBuiltDependencies:
   - core-js-pure
+  - esbuild
+  - sharp
   - unrs-resolver
+  - vue-demi
+  - workerd
+
+allowBuilds:
+  esbuild: true
+  sharp: true
+  vue-demi: true
+  workerd: true

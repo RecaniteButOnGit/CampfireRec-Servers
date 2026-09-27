@@ -5,6 +5,12 @@
 	"sideEffects": false,
 	"type": "module",
 	"scripts": {
+		"start": "pnpm railway:start",
+		"railway:build": "pnpm --filter www exec vite build --config ../railway/vite.config.ts && pnpm --filter railway build",
+		"railway:migrate": "pnpm --filter railway migrate",
+		"railway:start": "pnpm --filter railway start",
+		"railway:cron": "pnpm --filter railway cron",
+		"railway:smoke": "pnpm --filter railway smoke",
 		"check:deps": "runx check --deps",
 		"check:format": "runx check --format",
 		"check:lint:all": "run-oxlint",
