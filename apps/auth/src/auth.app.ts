@@ -476,13 +476,15 @@ const app = new Hono<App>()
 			tags: ['Photon'],
 			summary: 'Photon Cloud Custom Authentication callback',
 			description:
-				'Server-to-server callback for Photon Realtime. Supply the signed photonAuthToken from /player/connection-info as a query parameter; authToken and token are accepted aliases. ResultCode 1 means success, 2 means authentication failed, and 3 means invalid parameters. Expected failures return HTTP 200.',
-			parameters: ['photonAuthToken', 'authToken', 'token'].map((name) => ({
-				name,
-				in: 'query' as const,
-				required: false,
-				schema: { type: 'string' as const },
-			})),
+				'Server-to-server callback for Photon Realtime. Supply the signed photonAuthToken from /player/connection-info as a query parameter; authToken, token, and accessToken are accepted aliases. An optional accountId is checked against the verified JWT subject. ResultCode 1 means success, 2 means authentication failed, and 3 means invalid parameters. Expected failures return HTTP 200.',
+			parameters: ['photonAuthToken', 'authToken', 'token', 'accessToken', 'accountId'].map(
+				(name) => ({
+					name,
+					in: 'query' as const,
+					required: false,
+					schema: { type: 'string' as const },
+				})
+			),
 			responses: {
 				200: json(
 					z.union([
@@ -501,10 +503,18 @@ const app = new Hono<App>()
 			tags: ['Photon'],
 			summary: 'Photon Cloud Custom Authentication callback (POST)',
 			description:
-				'Server-to-server Photon Realtime callback. Accepts photonAuthToken, authToken, or token in the query, JSON, form, or form-style text/plain body. A raw JWT body is also accepted. ResultCode 1 means success, 2 means authentication failed, and 3 means invalid parameters. Expected failures return HTTP 200.',
+				'Server-to-server Photon Realtime callback. The observed 2025 client sends an unlabeled JSON body with accountId and accessToken. accessToken is cryptographically verified; accountId is only checked for consistency with the signed subject, which remains authoritative. photonAuthToken, authToken, and token are accepted aliases in the query, JSON, form, or form-style text/plain body. A raw JWT body is also accepted. ResultCode 1 means success, 2 means authentication failed, and 3 means invalid parameters. Expected failures return HTTP 200.',
 			requestBody: {
 				content: {
-					'application/json': { schema: { type: 'object' } },
+					'application/json': {
+						schema: {
+							type: 'object',
+							properties: {
+								accountId: { type: 'string', description: 'Optional consistency check only' },
+								accessToken: { type: 'string', description: 'Signed Photon auth JWT' },
+							},
+						},
+					},
 					'application/x-www-form-urlencoded': { schema: { type: 'object' } },
 					'text/plain': { schema: { type: 'string' } },
 				},

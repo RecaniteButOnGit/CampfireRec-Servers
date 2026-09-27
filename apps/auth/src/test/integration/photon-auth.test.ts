@@ -37,6 +37,21 @@ function token(secret = SECRET, audience = AUDIENCE, accountId = ACCOUNT_ID): Pr
 	)
 }
 
+function expiredToken(): Promise<string> {
+	return sign(
+		{
+			sub: String(ACCOUNT_ID),
+			'rn.platid': 'test-platform',
+			'rn.plat': '0',
+			'rn.deviceclass': '2',
+			'rn.env': 'prod',
+			exp: Math.floor(Date.now() / 1000) - 60,
+			aud: AUDIENCE,
+		},
+		SECRET
+	)
+}
+
 async function request(
 	path: string | Request,
 	init?: RequestInit
@@ -91,12 +106,15 @@ describe('Photon Cloud Custom Authentication', () => {
 		expect(result.body).toEqual({ ResultCode: 1, UserId: String(ACCOUNT_ID) })
 	})
 
-	test.each(['authToken', 'token'])('GET alias %s accepts the same credential', async (name) => {
-		const result = await request(
-			`/photon/authenticate?${name}=${encodeURIComponent(await token())}`
-		)
-		expectPhotonResponse(result, 1)
-	})
+	test.each(['authToken', 'token', 'accessToken'])(
+		'GET alias %s accepts the same credential',
+		async (name) => {
+			const result = await request(
+				`/photon/authenticate?${name}=${encodeURIComponent(await token())}`
+			)
+			expectPhotonResponse(result, 1)
+		}
+	)
 
 	test('POST JSON and form token transports succeed', async () => {
 		const credential = await token()
@@ -171,6 +189,80 @@ describe('Photon Cloud Custom Authentication', () => {
 		}
 	)
 
+	test('real 2025 unlabeled JSON payload authenticates from accessToken', async () => {
+		const result = await unlabeledPost(
+			JSON.stringify({
+				accountId: String(ACCOUNT_ID),
+				accessToken: await token(),
+			})
+		)
+		expectPhotonResponse(result, 1)
+		expect(result.body).toEqual({ ResultCode: 1, UserId: String(ACCOUNT_ID) })
+	})
+
+	test('accessToken with accountId also works as application/json', async () => {
+		const result = await request('/photon/authenticate', {
+			method: 'POST',
+			headers: { 'Content-Type': 'application/json' },
+			body: JSON.stringify({ accountId: String(ACCOUNT_ID), accessToken: await token() }),
+		})
+		expectPhotonResponse(result, 1)
+		expect(result.body.UserId).toBe(String(ACCOUNT_ID))
+	})
+
+	test('unsigned accountId is optional but must match the verified subject when supplied', async () => {
+		const credential = await token()
+		expectPhotonResponse(await unlabeledPost(JSON.stringify({ accessToken: credential })), 1)
+		for (const suppliedId of ['999', null, { id: ACCOUNT_ID }]) {
+			const result = await unlabeledPost(
+				JSON.stringify({ accountId: suppliedId, accessToken: credential })
+			)
+			expectPhotonResponse(result, 2)
+			expect(result.body).toEqual({ ResultCode: 2, Message: 'Authentication failed.' })
+		}
+		expectPhotonResponse(await unlabeledPost(JSON.stringify({ accountId: String(ACCOUNT_ID) })), 3)
+	})
+
+	test('live accessToken field distinguishes invalid credentials from missing parameters', async () => {
+		for (const credential of [
+			'invalid',
+			await token('different-test-secret'),
+			await token(SECRET, 'another-photon-app'),
+			await expiredToken(),
+		]) {
+			const result = await unlabeledPost(
+				JSON.stringify({
+					accountId: String(ACCOUNT_ID),
+					accessToken: credential,
+				})
+			)
+			expectPhotonResponse(result, 2)
+			expect(result.text).not.toContain(credential)
+		}
+	})
+
+	test('conflicting accessToken and token are rejected, matching values are accepted', async () => {
+		const credential = await token()
+		expectPhotonResponse(
+			await unlabeledPost(
+				JSON.stringify({
+					accessToken: credential,
+					token: await token(SECRET, 'another-photon-app'),
+				})
+			),
+			3
+		)
+		expectPhotonResponse(
+			await unlabeledPost(
+				JSON.stringify({
+					accessToken: credential,
+					token: credential,
+				})
+			),
+			1
+		)
+	})
+
 	test.each([
 		'hello',
 		'thing=value',
@@ -216,6 +308,23 @@ describe('Photon Cloud Custom Authentication', () => {
 				bodyFormat: 'json-object',
 				bodyKeys: ['photonAuthToken'],
 			})
+			expectPhotonResponse(
+				await unlabeledPost(
+					JSON.stringify({
+						accountId: String(ACCOUNT_ID),
+						accessToken: credential,
+					})
+				),
+				1
+			)
+			const liveLog = info.mock.calls
+				.filter(([message]) => message === 'Photon auth request')
+				.at(-1)
+			expect(liveLog?.[1]).toMatchObject({
+				contentType: '',
+				bodyFormat: 'json-object',
+				bodyKeys: ['accountId', 'accessToken'],
+			})
 			expectPhotonResponse(await unlabeledPost('auth.token=value'), 3)
 			const namedLog = info.mock.calls
 				.filter(([message]) => message === 'Photon auth request')
@@ -251,18 +360,7 @@ describe('Photon Cloud Custom Authentication', () => {
 	})
 
 	test('invalid signature, expiration, audience, and missing account are rejected', async () => {
-		const expired = await sign(
-			{
-				sub: String(ACCOUNT_ID),
-				'rn.platid': 'test-platform',
-				'rn.plat': '0',
-				'rn.deviceclass': '2',
-				'rn.env': 'prod',
-				exp: Math.floor(Date.now() / 1000) - 60,
-				aud: AUDIENCE,
-			},
-			SECRET
-		)
+		const expired = await expiredToken()
 		const withoutExpiry = await sign(
 			{
 				sub: String(ACCOUNT_ID),

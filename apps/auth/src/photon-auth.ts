@@ -5,7 +5,7 @@ import { validateAndGetPhotonAccountId } from '@repo/jwt'
 import type { Context } from 'hono'
 import type { App } from './context'
 
-const TOKEN_KEYS = ['photonAuthToken', 'authToken', 'token'] as const
+const TOKEN_KEYS = ['photonAuthToken', 'authToken', 'token', 'accessToken'] as const
 const JWT_SHAPE = /^[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+$/
 const FIELD_NAME = /^[A-Za-z_][A-Za-z0-9_.\[\]-]{0,63}$/
 const MEDIA_TYPE = /^[a-z0-9.+-]+\/[a-z0-9.+-]+$/
@@ -119,6 +119,20 @@ function findToken(query: Fields, body: Fields, rawToken?: string): string | nul
 	return values.every((value) => value === token) ? token : null
 }
 
+/** An unsigned accountId may corroborate the JWT subject, never establish identity. */
+function accountIdMatches(query: Fields, body: Fields, verifiedId: number): boolean {
+	for (const fields of [query, body]) {
+		if (!Object.hasOwn(fields, 'accountId')) continue
+		const supplied = fields.accountId
+		if (
+			(typeof supplied !== 'string' && typeof supplied !== 'number') ||
+			String(supplied) !== String(verifiedId)
+		)
+			return false
+	}
+	return true
+}
+
 const invalidParameters = { ResultCode: 3, Message: 'Invalid authentication parameters.' } as const
 const authenticationFailed = { ResultCode: 2, Message: 'Authentication failed.' } as const
 
@@ -159,6 +173,10 @@ export async function photonAuthenticate(c: Context<App>): Promise<Response> {
 		)
 		if (accountId === null) {
 			logger.info('Photon auth rejected', { category: 'invalid_token' })
+			return c.json(authenticationFailed)
+		}
+		if (!accountIdMatches(query, body.fields, accountId)) {
+			logger.info('Photon auth rejected', { category: 'account_id_mismatch' })
 			return c.json(authenticationFailed)
 		}
 		if (!(await getAccount(c.env.DB, accountId))) {
