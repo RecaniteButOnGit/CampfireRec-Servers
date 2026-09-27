@@ -1793,13 +1793,33 @@ const app = new Hono<App>()
 				logger.info('room create rejected: per-account room limit', { accountId })
 				return roomEnvelope(c, null, `You can only have ${maxRooms} rooms.`)
 			}
+			const sourceRoomId = Number.parseInt(c.req.param('roomId'), 10)
 			const room = await cloneRoom(
 				c.env.DB,
-				Number.parseInt(c.req.param('roomId'), 10),
+				sourceRoomId,
 				name,
 				accountId
 			)
 			if (!room) return roomEnvelope(c, null, "You can't clone this room!")
+			if (room.UgcVersion === 2) {
+				const subRooms = Array.isArray(room.SubRooms)
+					? (room.SubRooms as Array<Record<string, unknown>>)
+					: []
+				logger.info('Rooms 2.0 room cloned', {
+					sourceRoomId,
+					roomId: room.RoomId,
+					ugcVersion: room.UgcVersion,
+					subRooms: subRooms.map((sub) => {
+						const save = sub.CurrentSave as Record<string, unknown> | null | undefined
+						return {
+							subRoomId: sub.SubRoomId,
+							hasCurrentSave: save != null,
+							currentSaveId: save?.SubRoomDataSaveId ?? null,
+							stagedSaveId: sub.StagedSubRoomDataSaveId ?? null,
+						}
+					}),
+				})
+			}
 			return roomEnvelope(c, room)
 		}
 	)
@@ -3962,6 +3982,17 @@ const app = new Hono<App>()
 
 			const result = await cloneSubRoom(c.env.DB, roomId, subRoomId, accountId)
 			if (!result) return roomEnvelope(c, null, 'This subroom does not exist!')
+			if (result.room.UgcVersion === 2) {
+				const save = result.subRoom.CurrentSave as Record<string, unknown> | null | undefined
+				logger.info('Rooms 2.0 subroom cloned', {
+					roomId,
+					sourceSubRoomId: subRoomId,
+					subRoomId: result.subRoom.SubRoomId,
+					hasCurrentSave: save != null,
+					currentSaveId: save?.SubRoomDataSaveId ?? null,
+					stagedSaveId: result.subRoom.StagedSubRoomDataSaveId ?? null,
+				})
+			}
 
 			await pushRoomUpdate(c, accountId, result.room)
 			return roomEnvelope(c, result.room)

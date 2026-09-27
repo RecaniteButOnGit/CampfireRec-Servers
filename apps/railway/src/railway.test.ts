@@ -45,10 +45,14 @@ describe('SQLite D1 adapter and migrations', () => {
     } finally { db.close() }
   })
 
-  it('applies source migrations once and persists across reopen', () => {
+  it('applies source migrations once and persists across reopen', async () => {
     const path = join(temp(), 'recflare.sqlite')
     const first = new SQLiteD1(path)
-    expect(migrate(first)).toBe(95)
+    expect(migrate(first)).toBe(97)
+    const makerRoom2 = await first.prepare(
+      "SELECT json_extract(data, '$.UnitySceneId') AS scene FROM subroom WHERE room_id = 46"
+    ).first<{ scene: string }>()
+    expect(makerRoom2?.scene).toBe('5d4e40d8-f289-4295-a6e1-4f907835007d')
     first.close()
     const second = new SQLiteD1(path)
     try { expect(migrate(second)).toBe(0); expect(second.ping()).toBe(true) } finally { second.close() }

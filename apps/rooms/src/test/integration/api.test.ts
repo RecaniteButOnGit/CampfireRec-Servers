@@ -1132,7 +1132,7 @@ describe('rooms endpoints', () => {
 		expect(body.length).toBeLessThanOrEqual(5)
 	})
 
-	it('MakerRoom2 is an empty Rooms 2.0 base room that can be cloned', async () => {
+	it('MakerRoom2 clones use the Rooms 2.0 scene, including subroom clones', async () => {
 		const baseRooms = (await (await SELF.fetch(`${ORIGIN}/rooms/base`)).json()) as Array<{
 			RoomId: number
 			Name: string
@@ -1142,6 +1142,9 @@ describe('rooms endpoints', () => {
 		const template = baseRooms.find((room) => room.Name === 'MakerRoom2')
 		expect(template).toMatchObject({ RoomId: 46, UgcVersion: 2 })
 		expect(template?.SubRooms).toHaveLength(1)
+		expect(template?.SubRooms[0].UnitySceneId).toBe(
+			'5d4e40d8-f289-4295-a6e1-4f907835007d'
+		)
 		expect(template?.SubRooms[0].CurrentSave).toBeNull()
 
 		const res = await SELF.fetch(`${ORIGIN}/rooms/46/clone`, {
@@ -1155,6 +1158,7 @@ describe('rooms endpoints', () => {
 		const body = (await res.json()) as {
 			success: boolean
 			value: {
+				RoomId: number
 				UgcVersion: number
 				Tags: Array<{ Tag: string; Type: number }>
 				SubRooms: Array<{ SubRoomId: number; UnitySceneId: string; CurrentSave: unknown }>
@@ -1167,6 +1171,22 @@ describe('rooms endpoints', () => {
 		expect(body.value.SubRooms[0].SubRoomId).not.toBe(template?.SubRooms[0].SubRoomId)
 		expect(body.value.SubRooms[0].UnitySceneId).toBe(template?.SubRooms[0].UnitySceneId)
 		expect(body.value.SubRooms[0].CurrentSave).toBeNull()
+
+		const subClone = await SELF.fetch(
+			`${ORIGIN}/rooms/${body.value.RoomId}/subrooms/${body.value.SubRooms[0].SubRoomId}/clone`,
+			{ method: 'POST', headers: await bearer('805') }
+		)
+		const subCloneBody = (await subClone.json()) as {
+			success: boolean
+			value: { SubRooms: Array<{ SubRoomId: number; UnitySceneId: string; CurrentSave: unknown }> }
+		}
+		expect(subCloneBody.success).toBe(true)
+		expect(subCloneBody.value.SubRooms).toHaveLength(2)
+		expect(subCloneBody.value.SubRooms[1].SubRoomId).not.toBe(body.value.SubRooms[0].SubRoomId)
+		expect(subCloneBody.value.SubRooms[1].UnitySceneId).toBe(
+			'5d4e40d8-f289-4295-a6e1-4f907835007d'
+		)
+		expect(subCloneBody.value.SubRooms[1].CurrentSave).toBeNull()
 	})
 
 	it('GET /rooms/recommendations returns a bare array of public rooms (split-test params ignored)', async () => {
