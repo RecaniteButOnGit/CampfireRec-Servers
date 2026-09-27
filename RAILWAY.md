@@ -16,7 +16,7 @@ Use the existing Railway project resources:
 
 The application service must use **one replica** until notification synchronization across replicas is implemented. The hub shares live WebSocket state only within the current Node process. The notification state database is stored beside the main database as `${DATABASE_PATH}.notifications.sqlite`.
 
-The checked-in `railway.json` sets the Railpack build command to `pnpm build` (which runs `pnpm railway:build`), the start command to `pnpm start`, and the health check to `/health`. `railpack.json` selects Node 24, while the root `package.json` selects pnpm 10.14.0. Keep the Railway service root directory at the repository root and set `PORT=8080`. The server binds `0.0.0.0:$PORT`.
+Railpack detects the root `build` and `start` scripts: run `pnpm build` (which runs `pnpm railway:build`) and `pnpm start`. `railpack.json` and `.mise.toml` select Node 24, while the root `package.json` selects pnpm 10.14.0. Keep the Railway service root directory at the repository root, set `PORT=8080`, and configure Railway's health check path as `/health`. The server binds `0.0.0.0:$PORT`.
 
 The start command **automatically applies migrations before opening the HTTP listener**. Railway's pre-deploy phase cannot be relied upon to see the mounted volume, so do not put migrations there. `pnpm railway:migrate` is available for manual use against a volume-mounted environment. Every existing migration is tracked in its service's own `d1_migrations_*` table, and subsequent runs skip applied files. SQLite uses a write transaction while each migration is checked and applied, so concurrent processes do not both apply it.
 
@@ -67,6 +67,8 @@ The related feature follows the upstream behavior when an optional integration i
 ## Domains and routing
 
 Point both `campfire.recanite.net` and `*.campfire.recanite.net` to the same Railway application service. The apex serves the existing `ns` discovery document. A service subdomain dispatches to its Hono app with the path unchanged. The server includes `accounts`, `ai`, `api`, `auth`, `cards`, `cdn`, `chat`, `clubs`, `commerce`, `datacollection`, `discovery`, `econ`, `img`, `leaderboard`, `link`, `lists`, `match`, `moderation`, `notify`, `ns`, `platformnotifications`, `playersettings`, `roomcomments`, `rooms`, `storage`, and `www`.
+
+Create both custom domains in Railway and copy the DNS records shown there into the domain's DNS provider. Railway requires the apex CNAME and verification TXT. The wildcard requires its own CNAME, an `_acme-challenge` CNAME for certificate issuance, and the verification TXT shown for the domain. A CNAME without its TXT can resolve yet still return Railway's `Application not found` fallback.
 
 For local development, a first path segment selects the service and is removed before dispatch: `http://localhost:8080/rooms/api/rooms` reaches `/api/rooms`. `http://localhost:8080/health` checks the runtime.
 
