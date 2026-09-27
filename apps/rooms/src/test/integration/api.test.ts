@@ -1156,8 +1156,8 @@ describe('rooms endpoints', () => {
 		expect(template?.SubRooms[0].CurrentSave).toMatchObject({
 			SubRoomId: template?.SubRooms[0].SubRoomId,
 			UnityAssetId: null,
-			DataBlob: 'templates/rooms2/empty-obbytemplate/rooms2-obby-empty-stripped.room',
-			DataBlobHash: '4SsRzh8zm+YOp4rGd2NInObD0CLg1q5NWprTcGjathQ=',
+			DataBlob: 'templates/rooms2/empty-obbytemplate/rooms2-obby-empty-no-objects.room',
+			DataBlobHash: 'qJFGSCpwxstEyE5VJk4l3ymFm2LViFnercpf1Ma/wxQ=',
 		})
 
 		const res = await SELF.fetch(`${ORIGIN}/rooms/46/clone`, {
@@ -1196,7 +1196,7 @@ describe('rooms endpoints', () => {
 		expect(clonedSubRoom.CurrentSave).toMatchObject({
 			SubRoomId: clonedSubRoom.SubRoomId,
 			UnityAssetId: null,
-			DataBlob: 'templates/rooms2/empty-obbytemplate/rooms2-obby-empty-stripped.room',
+			DataBlob: 'templates/rooms2/empty-obbytemplate/rooms2-obby-empty-no-objects.room',
 		})
 		expect(clonedSubRoom.CurrentSave!.SubRoomDataSaveId).not.toBe(
 			template?.SubRooms[0].CurrentSave?.SubRoomDataSaveId
@@ -1240,7 +1240,7 @@ describe('rooms endpoints', () => {
 		expect(subCloneBody.value.SubRooms[1]!.CurrentSave).toMatchObject({
 			SubRoomId: subCloneBody.value.SubRooms[1]!.SubRoomId,
 			UnityAssetId: null,
-			DataBlob: 'templates/rooms2/empty-obbytemplate/rooms2-obby-empty-stripped.room',
+			DataBlob: 'templates/rooms2/empty-obbytemplate/rooms2-obby-empty-no-objects.room',
 		})
 
 		// Brand-new Rooms 2.0 subrooms are unsaved by design. Cloning one still needs a
@@ -1278,7 +1278,7 @@ describe('rooms endpoints', () => {
 		expect(fallbackSave.CurrentSave).toMatchObject({
 			SubRoomId: fallbackSave.SubRoomId,
 			UnityAssetId: null,
-			DataBlob: 'templates/rooms2/empty-obbytemplate/rooms2-obby-empty-stripped.room',
+			DataBlob: 'templates/rooms2/empty-obbytemplate/rooms2-obby-empty-no-objects.room',
 		})
 	})
 

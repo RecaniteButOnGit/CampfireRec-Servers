@@ -4838,8 +4838,8 @@
 					"ReferencedUnityAssets": [],
 					"SubRoomId": 64,
 					"UnityAssetId": null,
-					"DataBlob": "templates/rooms2/empty-obbytemplate/rooms2-obby-empty-stripped.room",
-					"DataBlobHash": "4SsRzh8zm+YOp4rGd2NInObD0CLg1q5NWprTcGjathQ=",
+					"DataBlob": "templates/rooms2/empty-obbytemplate/rooms2-obby-empty-no-objects.room",
+					"DataBlobHash": "qJFGSCpwxstEyE5VJk4l3ymFm2LViFnercpf1Ma/wxQ=",
 					"ReferencedUnityAssetIds": [
 						"3bbd34ae-7fff-4bd5-81f7-0645ce297ef9",
 						"84ce9009-5afa-492f-9005-281877ea37e6",

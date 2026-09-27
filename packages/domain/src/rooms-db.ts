@@ -1327,13 +1327,13 @@ export interface SaveSubRoomDataInput {
 export type SubRoomDataSave = Record<string, unknown>
 
 /**
- * The MakerRoom2 starter save is the user's stripped version of the archived
+ * The MakerRoom2 starter save is the user's no-objects version of the archived
  * Empty subroom from ObbyTemplate. It retains the verified Rooms 2.0 scene and
- * original save metadata; its new binary hash is served by the Railway CDN.
+ * original save metadata; its binary hash is served by the Railway CDN.
  */
 const ROOMS2_SCENE_ID = '5d4e40d8-f289-4295-a6e1-4f907835007d'
-const ROOMS2_MAKERROOM_DATA_BLOB = 'templates/rooms2/empty-obbytemplate/rooms2-obby-empty-stripped.room'
-const ROOMS2_MAKERROOM_DATA_BLOB_HASH = '4SsRzh8zm+YOp4rGd2NInObD0CLg1q5NWprTcGjathQ='
+const ROOMS2_MAKERROOM_DATA_BLOB = 'templates/rooms2/empty-obbytemplate/rooms2-obby-empty-no-objects.room'
+const ROOMS2_MAKERROOM_DATA_BLOB_HASH = 'qJFGSCpwxstEyE5VJk4l3ymFm2LViFnercpf1Ma/wxQ='
 const ROOMS2_MAKERROOM_REFERENCED_ASSET_IDS = [
 	'3bbd34ae-7fff-4bd5-81f7-0645ce297ef9',
 	'84ce9009-5afa-492f-9005-281877ea37e6',

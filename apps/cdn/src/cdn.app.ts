@@ -119,6 +119,8 @@ const BUNDLED_ROOMS2_TEMPLATE_ASSETS: Record<string, string> = {
 		'/room-templates/rooms2-makerroom-mylittlemonsters.room',
 	'room/templates/rooms2/empty-obbytemplate/rooms2-obby-empty-stripped.room':
 		'/room-templates/rooms2-obby-empty-stripped.room',
+	'room/templates/rooms2/empty-obbytemplate/rooms2-obby-empty-no-objects.room':
+		'/room-templates/rooms2-obby-empty-no-objects.room',
 }
 
 function resolveBundledRange(
