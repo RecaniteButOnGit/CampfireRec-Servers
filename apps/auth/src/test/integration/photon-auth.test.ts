@@ -229,6 +229,7 @@ describe('Photon Cloud Custom Authentication', () => {
 			await token('different-test-secret'),
 			await token(SECRET, 'another-photon-app'),
 			await expiredToken(),
+			await token(SECRET, AUDIENCE, 99999),
 		]) {
 			const result = await unlabeledPost(
 				JSON.stringify({
