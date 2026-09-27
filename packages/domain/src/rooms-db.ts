@@ -1327,30 +1327,21 @@ export interface SaveSubRoomDataInput {
 export type SubRoomDataSave = Record<string, unknown>
 
 /**
- * The seed data for a Rooms 2.0 subroom that has never been saved. This is the
- * archived `Empty` subroom from ObbyTemplate, whose ugcr2 scene and real save were
- * verified against the blob hash. Its binary is bundled by the CDN worker at the
- * matching DataBlob key; do not replace this with an empty string or a fabricated
- * protobuf payload.
+ * The MakerRoom2 starter save copied from the user's MyLittleMonsters Rooms 2.0
+ * snapshot. The save metadata and binary hash were verified against its archive;
+ * its Unity scene matches the Rooms 2.0 scene. Its binary is bundled by the CDN
+ * service at the matching DataBlob key.
  */
-const ROOMS2_EMPTY_SCENE_ID = '5d4e40d8-f289-4295-a6e1-4f907835007d'
-const ROOMS2_EMPTY_DATA_BLOB = 'templates/rooms2/empty-obbytemplate/7xd0rcm7jwv1l2heirlvhi1zh.room'
-const ROOMS2_EMPTY_DATA_BLOB_HASH = 'E7rpId42w2QfuBNkTFpQgLL2gJ72u+6yMAU/DNfweBA='
-const ROOMS2_EMPTY_REFERENCED_ASSET_IDS = [
-	'3bbd34ae-7fff-4bd5-81f7-0645ce297ef9',
-	'84ce9009-5afa-492f-9005-281877ea37e6',
-	'e06c10f5-9ae2-4d75-a79f-93a1e5c43585',
-	'7263f0b2-1d87-4a57-b724-b0665d752cfa',
-	'17d4e1ce-f868-407b-9425-bc43d592cdc3',
-	'f95761d7-1d7d-47db-96b7-ee0dfef4c97f',
-	'e31a99bf-711c-4ad0-997d-eede2b4c2d07',
-]
+const ROOMS2_SCENE_ID = '5d4e40d8-f289-4295-a6e1-4f907835007d'
+const ROOMS2_MAKERROOM_DATA_BLOB = 'templates/rooms2/mylittlemonsters/b095j1ikk9vu9j8wl3jwq5eht.room'
+const ROOMS2_MAKERROOM_DATA_BLOB_HASH = 'OcQkZaED9IAXylh7y1B+T1Dxz/Z+wa40vY2jYj+DPLs='
+const ROOMS2_MAKERROOM_UNITY_ASSET_ID = '14fcbddc-7106-4b8e-961c-513bb8379001'
 
 /** Build a fresh first published save for a save-less Rooms 2.0 clone. */
 function withRooms2InitialSave(room: Room, sub: SubRoom, accountId: number): SubRoom {
 	if (
 		room.UgcVersion !== 2 ||
-		sub.UnitySceneId !== ROOMS2_EMPTY_SCENE_ID ||
+		sub.UnitySceneId !== ROOMS2_SCENE_ID ||
 		(sub.CurrentSave !== null && typeof sub.CurrentSave === 'object')
 	) {
 		return sub
@@ -1362,13 +1353,13 @@ function withRooms2InitialSave(room: Room, sub: SubRoom, accountId: number): Sub
 			UnitySubAssets: [],
 			ReferencedUnityAssets: [],
 			SubRoomId: sub.SubRoomId,
-			UnityAssetId: null,
-			DataBlob: ROOMS2_EMPTY_DATA_BLOB,
-			DataBlobHash: ROOMS2_EMPTY_DATA_BLOB_HASH,
-			ReferencedUnityAssetIds: [...ROOMS2_EMPTY_REFERENCED_ASSET_IDS],
-			PersistenceVersion: 179,
-			OMVersion: 151,
-			UgcSubVersion: 330,
+			UnityAssetId: ROOMS2_MAKERROOM_UNITY_ASSET_ID,
+			DataBlob: ROOMS2_MAKERROOM_DATA_BLOB,
+			DataBlobHash: ROOMS2_MAKERROOM_DATA_BLOB_HASH,
+			ReferencedUnityAssetIds: [],
+			PersistenceVersion: 136,
+			OMVersion: 2,
+			UgcSubVersion: 138,
 			SavedByAccountId: accountId,
 			SavedOnPlatform: 0,
 			SavedOnDeviceClass: 0,

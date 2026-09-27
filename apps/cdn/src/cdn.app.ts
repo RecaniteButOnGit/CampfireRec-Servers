@@ -69,7 +69,8 @@ async function serveAsset(c: Context<App>, key: string) {
 		}
 	}
 	if (!object) {
-		if (key === ROOMS2_EMPTY_TEMPLATE_OBJECT_KEY) return serveBundledRooms2EmptyTemplate(c)
+		const assetPath = BUNDLED_ROOMS2_TEMPLATE_ASSETS[key]
+		if (assetPath) return serveBundledRooms2Template(c, assetPath)
 		return c.notFound()
 	}
 
@@ -107,12 +108,16 @@ async function serveAsset(c: Context<App>, key: string) {
  */
 const CACHE_CONTROL = `public, max-age=${86400 * 30}`
 
-// Railway packages the CDN's static directory with the monolith. The R2 starter save
-// lives there so the seeded database's DataBlob always resolves even when the optional
-// CDN object bucket is not configured. If R2 has this key, its object takes precedence.
-const ROOMS2_EMPTY_TEMPLATE_OBJECT_KEY =
-	'room/templates/rooms2/empty-obbytemplate/7xd0rcm7jwv1l2heirlvhi1zh.room'
-const ROOMS2_EMPTY_TEMPLATE_ASSET_PATH = '/room-templates/rooms2-obby-empty.room'
+// Railway packages these verified Room 2.0 source saves with the CDN service, so their
+// DataBlob keys resolve even when the optional object bucket is not configured. If R2 has
+// either key, its object takes precedence. Keep the old ObbyTemplate save for clones made
+// before MakerRoom2 switched to the MyLittleMonsters source.
+const BUNDLED_ROOMS2_TEMPLATE_ASSETS: Record<string, string> = {
+	'room/templates/rooms2/empty-obbytemplate/7xd0rcm7jwv1l2heirlvhi1zh.room':
+		'/room-templates/rooms2-obby-empty.room',
+	'room/templates/rooms2/mylittlemonsters/b095j1ikk9vu9j8wl3jwq5eht.room':
+		'/room-templates/rooms2-makerroom-mylittlemonsters.room',
+}
 
 function resolveBundledRange(
 	raw: string | undefined,
@@ -145,9 +150,9 @@ function resolveBundledRange(
 	return { offset, length: end - offset + 1 }
 }
 
-async function serveBundledRooms2EmptyTemplate(c: Context<App>): Promise<Response> {
+async function serveBundledRooms2Template(c: Context<App>, assetPath: string): Promise<Response> {
 	const asset = await c.env.ASSETS.fetch(
-		new Request(new URL(ROOMS2_EMPTY_TEMPLATE_ASSET_PATH, c.req.url), c.req.raw)
+		new Request(new URL(assetPath, c.req.url), c.req.raw)
 	)
 	if (asset.status === 304) {
 		const headers = new Headers(asset.headers)

@@ -49,7 +49,7 @@ describe('SQLite D1 adapter and migrations', () => {
   it('applies source migrations once and persists across reopen', async () => {
     const path = join(temp(), 'recflare.sqlite')
     const first = new SQLiteD1(path)
-    expect(migrate(first)).toBe(98)
+    expect(migrate(first)).toBe(99)
     const makerRoom2 = await first.prepare(
       `SELECT json_extract(s.data, '$.UnitySceneId') AS scene, sv.data AS save
        FROM subroom s JOIN subroom_save sv ON sv.sub_room_data_save_id = s.current_save_id
@@ -57,11 +57,12 @@ describe('SQLite D1 adapter and migrations', () => {
     ).first<{ scene: string; save: string }>()
     expect(makerRoom2?.scene).toBe('5d4e40d8-f289-4295-a6e1-4f907835007d')
     expect(JSON.parse(makerRoom2!.save)).toMatchObject({
-      DataBlob: 'templates/rooms2/empty-obbytemplate/7xd0rcm7jwv1l2heirlvhi1zh.room',
-      DataBlobHash: 'E7rpId42w2QfuBNkTFpQgLL2gJ72u+6yMAU/DNfweBA=',
-      PersistenceVersion: 179,
-      OMVersion: 151,
-      UgcSubVersion: 330,
+      UnityAssetId: '14fcbddc-7106-4b8e-961c-513bb8379001',
+      DataBlob: 'templates/rooms2/mylittlemonsters/b095j1ikk9vu9j8wl3jwq5eht.room',
+      DataBlobHash: 'OcQkZaED9IAXylh7y1B+T1Dxz/Z+wa40vY2jYj+DPLs=',
+      PersistenceVersion: 136,
+      OMVersion: 2,
+      UgcSubVersion: 138,
     })
     first.close()
     const second = new SQLiteD1(path)
@@ -135,9 +136,8 @@ describe('S3 R2 adapter and CDN', () => {
     expect(unsatisfiable.headers.get('content-range')).toBe('bytes 0-9/10')
   })
 
-  it('serves the bundled Rooms 2.0 base save without an object bucket on Railway', async () => {
+  it('serves bundled Rooms 2.0 base saves without an object bucket on Railway', async () => {
     const assets = new FileAssets(join(import.meta.dirname, '../../cdn/static'))
-    const key = 'templates/rooms2/empty-obbytemplate/7xd0rcm7jwv1l2heirlvhi1zh.room'
     const runtime = {
       ASSETS: assets,
       CDN_ASSETS: undefined,
@@ -146,23 +146,37 @@ describe('S3 R2 adapter and CDN', () => {
       SENTRY_RELEASE: 'test',
     } as never
     const context = new NodeExecutionContext() as never
-    const response = await cdnApp.fetch(new Request(`https://cdn.example.test/room/${key}`), runtime, context)
-    expect(response.status).toBe(200)
-    expect(response.headers.get('content-type')).toBe('application/octet-stream')
-    const bytes = Buffer.from(await response.arrayBuffer())
-    expect(bytes.byteLength).toBe(340577)
-    expect(createHash('sha256').update(bytes).digest('base64')).toBe(
-      'E7rpId42w2QfuBNkTFpQgLL2gJ72u+6yMAU/DNfweBA='
-    )
+    const saves = [
+      {
+        key: 'templates/rooms2/empty-obbytemplate/7xd0rcm7jwv1l2heirlvhi1zh.room',
+        size: 340577,
+        hash: 'E7rpId42w2QfuBNkTFpQgLL2gJ72u+6yMAU/DNfweBA=',
+      },
+      {
+        key: 'templates/rooms2/mylittlemonsters/b095j1ikk9vu9j8wl3jwq5eht.room',
+        size: 1957226,
+        hash: 'OcQkZaED9IAXylh7y1B+T1Dxz/Z+wa40vY2jYj+DPLs=',
+      },
+    ]
+    for (const save of saves) {
+      const response = await cdnApp.fetch(
+        new Request(`https://cdn.example.test/room/${save.key}`), runtime, context
+      )
+      expect(response.status).toBe(200)
+      expect(response.headers.get('content-type')).toBe('application/octet-stream')
+      const bytes = Buffer.from(await response.arrayBuffer())
+      expect(bytes.byteLength).toBe(save.size)
+      expect(createHash('sha256').update(bytes).digest('base64')).toBe(save.hash)
 
-    const range = await cdnApp.fetch(
-      new Request(`https://cdn.example.test/room/${key}`, { headers: { range: 'bytes=10-23' } }),
-      runtime,
-      context
-    )
-    expect(range.status).toBe(206)
-    expect(range.headers.get('content-range')).toBe('bytes 10-23/340577')
-    expect(Buffer.from(await range.arrayBuffer())).toEqual(bytes.subarray(10, 24))
+      const range = await cdnApp.fetch(
+        new Request(`https://cdn.example.test/room/${save.key}`, { headers: { range: 'bytes=10-23' } }),
+        runtime,
+        context
+      )
+      expect(range.status).toBe(206)
+      expect(range.headers.get('content-range')).toBe(`bytes 10-23/${save.size}`)
+      expect(Buffer.from(await range.arrayBuffer())).toEqual(bytes.subarray(10, 24))
+    }
   })
 })
 

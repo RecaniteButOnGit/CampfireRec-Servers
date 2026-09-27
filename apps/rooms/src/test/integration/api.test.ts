@@ -1143,6 +1143,7 @@ describe('rooms endpoints', () => {
 				CurrentSave: {
 					SubRoomDataSaveId: number
 					SubRoomId: number
+					UnityAssetId: string
 					DataBlob: string
 					DataBlobHash: string
 				} | null
@@ -1154,8 +1155,9 @@ describe('rooms endpoints', () => {
 		expect(template?.SubRooms[0].UnitySceneId).toBe('5d4e40d8-f289-4295-a6e1-4f907835007d')
 		expect(template?.SubRooms[0].CurrentSave).toMatchObject({
 			SubRoomId: template?.SubRooms[0].SubRoomId,
-			DataBlob: 'templates/rooms2/empty-obbytemplate/7xd0rcm7jwv1l2heirlvhi1zh.room',
-			DataBlobHash: 'E7rpId42w2QfuBNkTFpQgLL2gJ72u+6yMAU/DNfweBA=',
+			UnityAssetId: '14fcbddc-7106-4b8e-961c-513bb8379001',
+			DataBlob: 'templates/rooms2/mylittlemonsters/b095j1ikk9vu9j8wl3jwq5eht.room',
+			DataBlobHash: 'OcQkZaED9IAXylh7y1B+T1Dxz/Z+wa40vY2jYj+DPLs=',
 		})
 
 		const res = await SELF.fetch(`${ORIGIN}/rooms/46/clone`, {
@@ -1178,6 +1180,7 @@ describe('rooms endpoints', () => {
 					CurrentSave: {
 						SubRoomDataSaveId: number
 						SubRoomId: number
+						UnityAssetId: string
 						DataBlob: string
 					} | null
 				}>
@@ -1192,7 +1195,8 @@ describe('rooms endpoints', () => {
 		const clonedSubRoom = body.value.SubRooms[0]!
 		expect(clonedSubRoom.CurrentSave).toMatchObject({
 			SubRoomId: clonedSubRoom.SubRoomId,
-			DataBlob: 'templates/rooms2/empty-obbytemplate/7xd0rcm7jwv1l2heirlvhi1zh.room',
+			UnityAssetId: '14fcbddc-7106-4b8e-961c-513bb8379001',
+			DataBlob: 'templates/rooms2/mylittlemonsters/b095j1ikk9vu9j8wl3jwq5eht.room',
 		})
 		expect(clonedSubRoom.CurrentSave!.SubRoomDataSaveId).not.toBe(
 			template?.SubRooms[0].CurrentSave?.SubRoomDataSaveId
@@ -1220,7 +1224,12 @@ describe('rooms endpoints', () => {
 					SubRoomId: number
 					UnitySceneId: string
 					Name: string
-					CurrentSave: { SubRoomDataSaveId: number; SubRoomId: number; DataBlob: string } | null
+					CurrentSave: {
+						SubRoomDataSaveId: number
+						SubRoomId: number
+						UnityAssetId: string
+						DataBlob: string
+					} | null
 				}>
 			}
 		}
@@ -1230,7 +1239,8 @@ describe('rooms endpoints', () => {
 		expect(subCloneBody.value.SubRooms[1].UnitySceneId).toBe('5d4e40d8-f289-4295-a6e1-4f907835007d')
 		expect(subCloneBody.value.SubRooms[1]!.CurrentSave).toMatchObject({
 			SubRoomId: subCloneBody.value.SubRooms[1]!.SubRoomId,
-			DataBlob: 'templates/rooms2/empty-obbytemplate/7xd0rcm7jwv1l2heirlvhi1zh.room',
+			UnityAssetId: '14fcbddc-7106-4b8e-961c-513bb8379001',
+			DataBlob: 'templates/rooms2/mylittlemonsters/b095j1ikk9vu9j8wl3jwq5eht.room',
 		})
 
 		// Brand-new Rooms 2.0 subrooms are unsaved by design. Cloning one still needs a
@@ -1253,7 +1263,12 @@ describe('rooms endpoints', () => {
 			value: {
 				SubRooms: Array<{
 					SubRoomId: number
-					CurrentSave: { SubRoomDataSaveId: number; SubRoomId: number; DataBlob: string } | null
+					CurrentSave: {
+						SubRoomDataSaveId: number
+						SubRoomId: number
+						UnityAssetId: string
+						DataBlob: string
+					} | null
 				}>
 			}
 		}
@@ -1262,7 +1277,8 @@ describe('rooms endpoints', () => {
 		)!
 		expect(fallbackSave.CurrentSave).toMatchObject({
 			SubRoomId: fallbackSave.SubRoomId,
-			DataBlob: 'templates/rooms2/empty-obbytemplate/7xd0rcm7jwv1l2heirlvhi1zh.room',
+			UnityAssetId: '14fcbddc-7106-4b8e-961c-513bb8379001',
+			DataBlob: 'templates/rooms2/mylittlemonsters/b095j1ikk9vu9j8wl3jwq5eht.room',
 		})
 	})
 
