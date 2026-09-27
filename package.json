@@ -6,6 +6,7 @@
 	"type": "module",
 	"engines": { "node": ">=24 <25" },
 	"scripts": {
+		"build": "pnpm railway:build",
 		"start": "node apps/railway/dist/index.js",
 		"railway:build": "pnpm --filter www exec vite build --config ../railway/vite.config.ts && pnpm --filter railway build",
 		"railway:migrate": "node apps/railway/dist/migrate.js",

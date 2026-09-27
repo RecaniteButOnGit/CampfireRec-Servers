@@ -16,7 +16,7 @@ Use the existing Railway project resources:
 
 The application service must use **one replica** until notification synchronization across replicas is implemented. The hub shares live WebSocket state only within the current Node process. The notification state database is stored beside the main database as `${DATABASE_PATH}.notifications.sqlite`.
 
-Configure the service to build with `pnpm railway:build` and start with `pnpm start` (equivalent to `pnpm railway:start`). Railpack should detect Node and pnpm from the root `package.json`; `.node-version` requests Node 24. Set the port to `8080`. The server binds `0.0.0.0:$PORT`.
+The checked-in `railway.json` sets the Railpack build command to `pnpm build` (which runs `pnpm railway:build`), the start command to `pnpm start`, and the health check to `/health`. `railpack.json` selects Node 24, while the root `package.json` selects pnpm 10.14.0. Keep the Railway service root directory at the repository root and set `PORT=8080`. The server binds `0.0.0.0:$PORT`.
 
 The start command **automatically applies migrations before opening the HTTP listener**. Railway's pre-deploy phase cannot be relied upon to see the mounted volume, so do not put migrations there. `pnpm railway:migrate` is available for manual use against a volume-mounted environment. Every existing migration is tracked in its service's own `d1_migrations_*` table, and subsequent runs skip applied files. SQLite uses a write transaction while each migration is checked and applied, so concurrent processes do not both apply it.
 
@@ -44,6 +44,7 @@ Required for a complete production service:
 | `IMG_S3_REGION` | `${{recflare-img.REGION}}` |
 
 Only `JWT_SECRET` is required to start a local server. Unconfigured Redis and buckets report `false` from `/health` and dependent routes are unavailable. `/health` returns 200 while SQLite is healthy and 503 if SQLite is unhealthy; the JSON includes `database`, `redis`, `cdn`, and `img` status without credentials.
+For local runs without `DATABASE_PATH`, SQLite defaults to `./data/recflare.sqlite` relative to the process working directory. Set `DATABASE_PATH=/data/recflare.sqlite` in Railway so data survives deployments.
 
 Recommended service-discovery override: `SUBDOMAINS={"moderation":"api"}`. This advertises the functional API reporting routes in place of the upstream moderation stub.
 
