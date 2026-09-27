@@ -7,26 +7,34 @@
   "FeaturedRoomGroup": {
     "FeaturedRoomGroupId": 2,
     "Name": "Featured Rooms",
-    "Rooms": [
-    ]
+    "Rooms": []
   },
   "CurrentAnnouncement": {
-    "Message": "Server powered by RecFlare",
-    "MoreInfoUrl": "https://recflare.net"
+    "Message": "Join the Campfire Rec Discord!",
+    "MoreInfoUrl": "https://discord.gg/4HM5tnqcyV"
   },
-  "InstagramImages": [
-    {
-      "ImageName": "test.jpg",
-      "ImageUrl": "https://github.com/djdevin/recflare"
-    }
-  ],
+  "InstagramImages": [],
   "Videos": [
     {
-      "BlobName": "something.mp4",
-      "Title": "test",
-      "Description": "test description",
-      "ThumbnailBlobName": "something.jpg",
-      "SourceUrl": "https://www.youtube.com"
+      "BlobName": "nEVIlrGqn_4.mp4",
+      "Title": "Video 1",
+      "Description": "",
+      "ThumbnailBlobName": "nEVIlrGqn_4.jpg",
+      "SourceUrl": "https://www.youtube.com/watch?v=nEVIlrGqn_4"
+    },
+    {
+      "BlobName": "MORrNaEaz3o.mp4",
+      "Title": "Video 2",
+      "Description": "",
+      "ThumbnailBlobName": "MORrNaEaz3o.jpg",
+      "SourceUrl": "https://www.youtube.com/watch?v=MORrNaEaz3o"
+    },
+    {
+      "BlobName": "mcX-SQ2IS7M.mp4",
+      "Title": "Video 3",
+      "Description": "",
+      "ThumbnailBlobName": "mcX-SQ2IS7M.jpg",
+      "SourceUrl": "https://www.youtube.com/watch?v=mcX-SQ2IS7M"
     }
   ]
 }
