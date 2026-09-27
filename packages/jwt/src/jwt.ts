@@ -185,9 +185,8 @@ export interface PhotonAuthClaims {
  * the connecting player to the realtime server and nothing else, so none of the
  * scopes or roles from {@link generateToken} belong on it.
  *
- * Signed with the same shared `JWT_SECRET` as every other token here. A real Photon
- * Cloud application would verify this against a secret configured in its dashboard;
- * self-hosted, nothing verifies it yet — so treat it as identifying, not authorizing.
+ * Signed with the same shared `JWT_SECRET` as every other token here. The auth
+ * worker verifies it for Photon Cloud's Custom Authentication callback.
  * `rn.env` is `prod` because that's what the client is built against, regardless of
  * which environment this worker is running in.
  */
@@ -208,6 +207,37 @@ export async function generatePhotonAuthToken(
 		},
 		secret
 	)
+}
+
+/** Verify the exact credential minted by {@link generatePhotonAuthToken}. */
+export async function validateAndGetPhotonAccountId(
+	token: string,
+	secret: string,
+	audience: string
+): Promise<number | null> {
+	if (!audience) return null
+	try {
+		// Hono checks the HS256 signature and exp/nbf. Require exp as well: an
+		// otherwise valid JWT with no expiration must not be a Photon credential.
+		const payload = await verify(token, secret, 'HS256')
+		if (
+			typeof payload.sub !== 'string' ||
+			!/^[1-9]\d*$/.test(payload.sub) ||
+			typeof payload.exp !== 'number' ||
+			!Number.isFinite(payload.exp) ||
+			payload.exp <= Math.floor(Date.now() / 1000) ||
+			payload.aud !== audience ||
+			typeof payload['rn.platid'] !== 'string' ||
+			typeof payload['rn.plat'] !== 'string' ||
+			typeof payload['rn.deviceclass'] !== 'string' ||
+			payload['rn.env'] !== 'prod'
+		)
+			return null
+		const id = Number(payload.sub)
+		return Number.isSafeInteger(id) ? id : null
+	} catch {
+		return null
+	}
 }
 
 export async function generateToken(

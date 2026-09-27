@@ -12,6 +12,8 @@ export type Env = SharedHonoEnv & {
 	// signed here verify in all of them. Provisioned via `wrangler secrets-store`;
 	// the store id is spliced into wrangler.jsonc at deploy time (RECFLARE_SECRETS_STORE).
 	JWT_SECRET: SecretsStoreSecret
+	/** Realtime app id used as the audience of Photon Custom Authentication tokens. */
+	PHOTON_REALTIME_APP_ID?: string
 	// The Meta (Oculus) app secret, from the app's page in the Meta developer dashboard.
 	// Bound from the same Secrets Store as JWT_SECRET; resolve it with `.get()`. Used
 	// only to authenticate US to Meta's graph API when validating a login nonce (see

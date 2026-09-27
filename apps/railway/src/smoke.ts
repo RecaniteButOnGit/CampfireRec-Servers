@@ -44,6 +44,10 @@ try {
     const response = await route(`${service}.example.test`, service === 'rooms' ? '/' : '/openapi.json')
     if (response.status !== 200) throw new Error(`${service} service failed: ${response.status}`)
   }
+  const photon = await route('auth.example.test', '/photon/authenticate')
+  if (photon.status !== 200 || (JSON.parse(photon.body) as { ResultCode: number }).ResultCode !== 3) {
+    throw new Error('Photon auth no-token response failed')
+  }
   console.info('Railway smoke test passed')
 } finally {
   child.kill('SIGTERM')

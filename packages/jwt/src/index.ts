@@ -5,6 +5,7 @@ export {
 	validateAndGetVersion,
 	generateToken,
 	generatePhotonAuthToken,
+	validateAndGetPhotonAccountId,
 	TOKEN_TTL_SECONDS,
 } from './jwt'
 export type { PhotonAuthClaims } from './jwt'

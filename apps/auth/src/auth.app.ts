@@ -53,6 +53,7 @@ import {
 	TokenRequest,
 	TokenResponse,
 } from './openapi'
+import { photonAuthenticate } from './photon-auth'
 import {
 	countAccountsForPlatformIdentity,
 	getLinksForPlatformId,
@@ -466,6 +467,60 @@ const app = new Hono<App>()
 
 	.onError(withOnError())
 	.notFound(withNotFound())
+
+	// Photon Cloud calls this URL while the client is connecting to Realtime.
+	// Both verbs return Photon's own result schema, including expected failures.
+	.get(
+		'/photon/authenticate',
+		describeRoute({
+			tags: ['Photon'],
+			summary: 'Photon Cloud Custom Authentication callback',
+			description:
+				'Server-to-server callback for Photon Realtime. Supply the signed photonAuthToken from /player/connection-info as a query parameter; authToken and token are accepted aliases. ResultCode 1 means success, 2 means authentication failed, and 3 means invalid parameters. Expected failures return HTTP 200.',
+			parameters: ['photonAuthToken', 'authToken', 'token'].map((name) => ({
+				name,
+				in: 'query' as const,
+				required: false,
+				schema: { type: 'string' as const },
+			})),
+			responses: {
+				200: json(
+					z.union([
+						z.object({ ResultCode: z.literal(1), UserId: z.string() }),
+						z.object({ ResultCode: z.union([z.literal(2), z.literal(3)]), Message: z.string() }),
+					]),
+					'Photon authentication result'
+				),
+			},
+		}),
+		photonAuthenticate
+	)
+	.post(
+		'/photon/authenticate',
+		describeRoute({
+			tags: ['Photon'],
+			summary: 'Photon Cloud Custom Authentication callback (POST)',
+			description:
+				'Server-to-server Photon Realtime callback. Accepts photonAuthToken, authToken, or token in the query, JSON, form, or form-style text/plain body. A raw JWT body is also accepted. ResultCode 1 means success, 2 means authentication failed, and 3 means invalid parameters. Expected failures return HTTP 200.',
+			requestBody: {
+				content: {
+					'application/json': { schema: { type: 'object' } },
+					'application/x-www-form-urlencoded': { schema: { type: 'object' } },
+					'text/plain': { schema: { type: 'string' } },
+				},
+			},
+			responses: {
+				200: json(
+					z.union([
+						z.object({ ResultCode: z.literal(1), UserId: z.string() }),
+						z.object({ ResultCode: z.union([z.literal(2), z.literal(3)]), Message: z.string() }),
+					]),
+					'Photon authentication result'
+				),
+			},
+		}),
+		photonAuthenticate
+	)
 
 	// EAC challenge — a fresh GUID, JSON-quoted, served as plain text.
 	.get(

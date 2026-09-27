@@ -64,6 +64,8 @@ Optional integration and policy variables (exact names accepted by the runtime):
 
 The related feature follows the upstream behavior when an optional integration is absent. In particular, web signup remains Turnstile-gated, Meta nonce login needs the Meta secret, Discord benefits need their credentials, and image signing uses the existing optional configuration.
 
+For Photon Realtime, configure the Photon Dashboard Custom Authentication URL as `https://auth.<DOMAIN>/photon/authenticate` (for this deployment, `https://auth.campfire.recanite.net/photon/authenticate`). The auth app verifies the token minted by `/player/connection-info` using `JWT_SECRET` and `PHOTON_REALTIME_APP_ID`. A plain GET without a token returns HTTP 200 with Photon `ResultCode: 3`; this is a safe route smoke test.
+
 ## Domains and routing
 
 Point both `campfire.recanite.net` and `*.campfire.recanite.net` to the same Railway application service. The apex serves the existing `ns` discovery document. A service subdomain dispatches to its Hono app with the path unchanged. The server includes `accounts`, `ai`, `api`, `auth`, `cards`, `cdn`, `chat`, `clubs`, `commerce`, `datacollection`, `discovery`, `econ`, `img`, `leaderboard`, `link`, `lists`, `match`, `moderation`, `notify`, `ns`, `platformnotifications`, `playersettings`, `roomcomments`, `rooms`, `storage`, and `www`.

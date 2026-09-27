@@ -1557,6 +1557,7 @@ describe('auth worker routes', () => {
 			'GET /cachedlogin/forplatformid/{platform}/{id}',
 			'GET /eac/challenge',
 			'GET /oculus/nonce',
+			'GET /photon/authenticate',
 			'GET /privileges/me/restrictions',
 			'GET /role/developer',
 			'GET /role/developer/{id}',
@@ -1566,6 +1567,7 @@ describe('auth worker routes', () => {
 			'POST /cachedlogin/forplatformid/{platform}/{id}',
 			'POST /cachedlogin/forplatformids',
 			'POST /connect/token',
+			'POST /photon/authenticate',
 		])
 
 		// Every operation carries a summary — a path present but undescribed is not
