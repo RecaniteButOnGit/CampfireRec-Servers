@@ -476,7 +476,7 @@ const app = new Hono<App>()
 			tags: ['Photon'],
 			summary: 'Photon Cloud Custom Authentication callback',
 			description:
-				'Server-to-server callback for Photon Realtime. Supply the signed photonAuthToken from /player/connection-info as a query parameter; authToken, token, and accessToken are accepted aliases. An optional accountId is checked against the verified JWT subject. ResultCode 1 means success, 2 means authentication failed, and 3 means invalid parameters. Expected failures return HTTP 200.',
+				'Server-to-server callback for Photon Realtime. Supply a signed Photon token from /player/connection-info or a normal RecNet access token as a query parameter; photonAuthToken, authToken, token, and accessToken are accepted names. Each credential type is verified against its own claims. An optional accountId is checked against the verified JWT subject. ResultCode 1 means success, 2 means authentication failed, and 3 means invalid parameters. Expected failures return HTTP 200.',
 			parameters: ['photonAuthToken', 'authToken', 'token', 'accessToken', 'accountId'].map(
 				(name) => ({
 					name,
@@ -503,7 +503,7 @@ const app = new Hono<App>()
 			tags: ['Photon'],
 			summary: 'Photon Cloud Custom Authentication callback (POST)',
 			description:
-				'Server-to-server Photon Realtime callback. The observed 2025 client sends an unlabeled JSON body with accountId and accessToken. accessToken is cryptographically verified; accountId is only checked for consistency with the signed subject, which remains authoritative. photonAuthToken, authToken, and token are accepted aliases in the query, JSON, form, or form-style text/plain body. A raw JWT body is also accepted. ResultCode 1 means success, 2 means authentication failed, and 3 means invalid parameters. Expected failures return HTTP 200.',
+				'Server-to-server Photon Realtime callback. The observed 2025 client sends an unlabeled JSON body with accountId and accessToken. The credential must verify as either a Photon-specific JWT or a normal RecNet OAuth access token; accountId is only checked for consistency with the signed subject, which remains authoritative. photonAuthToken, authToken, and token are accepted aliases in the query, JSON, form, or form-style text/plain body. A raw JWT body is also accepted. ResultCode 1 means success, 2 means authentication failed, and 3 means invalid parameters. Expected failures return HTTP 200.',
 			requestBody: {
 				content: {
 					'application/json': {
@@ -511,7 +511,7 @@ const app = new Hono<App>()
 							type: 'object',
 							properties: {
 								accountId: { type: 'string', description: 'Optional consistency check only' },
-								accessToken: { type: 'string', description: 'Signed Photon auth JWT' },
+								accessToken: { type: 'string', description: 'Signed Photon or RecNet access JWT' },
 							},
 						},
 					},

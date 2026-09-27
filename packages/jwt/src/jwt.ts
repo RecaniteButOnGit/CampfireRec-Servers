@@ -18,6 +18,9 @@ import { GAME_VERSION } from '@repo/domain'
 // last a day so the client doesn't have to refresh it.
 export const TOKEN_TTL_SECONDS = 86400
 
+/** The issuer and audience stamped onto RecNet access tokens by {@link generateToken}. */
+const RECNET_AUTH_URL = 'https://auth.recflare.net'
+
 /**
  * Validate an HS256 token and return its `sub` (account id) claim, or `null` when
  * the token is malformed, has a bad signature, or is expired/not-yet-valid.
@@ -240,6 +243,61 @@ export async function validateAndGetPhotonAccountId(
 	}
 }
 
+/**
+ * Classify a bare JWT as the RecNet OAuth access token minted by {@link generateToken}.
+ * This is stricter than the legacy request bearer helper: Photon can accept either
+ * supported credential type only after its own format has been verified. The
+ * request-based RecNet helpers retain their existing behavior.
+ */
+export async function validateAndGetRecNetAccessTokenAccountId(
+	token: string,
+	secret: string
+): Promise<number | null> {
+	try {
+		const payload = await verify(token, secret, 'HS256') // signature, exp and nbf
+		const now = Math.floor(Date.now() / 1000)
+		const roles = payload.role
+		const scopes = payload.scope
+		if (
+			payload.iss !== RECNET_AUTH_URL ||
+			payload.aud !== RECNET_AUTH_URL ||
+			typeof payload.sub !== 'string' ||
+			!/^[1-9]\d*$/.test(payload.sub) ||
+			typeof payload.exp !== 'number' ||
+			!Number.isFinite(payload.exp) ||
+			payload.exp <= now ||
+			typeof payload.nbf !== 'number' ||
+			!Number.isFinite(payload.nbf) ||
+			payload.nbf > now ||
+			typeof payload.iat !== 'number' ||
+			!Number.isFinite(payload.iat) ||
+			typeof payload.auth_time !== 'number' ||
+			!Number.isFinite(payload.auth_time) ||
+			payload.amr !== 'cached_login' ||
+			payload.client_id !== 'recroom' ||
+			payload.idp !== 'local' ||
+			typeof payload.platform !== 'number' ||
+			!Number.isSafeInteger(payload.platform) ||
+			payload['rn.plat'] !== payload.platform ||
+			typeof payload.platform_id !== 'string' ||
+			typeof payload['rn.ver'] !== 'string' ||
+			!Array.isArray(roles) ||
+			!roles.includes('gameClient') ||
+			!roles.every((role: unknown) => typeof role === 'string') ||
+			!Array.isArray(scopes) ||
+			!TOKEN_SCOPES.every((scope) => scopes.includes(scope)) ||
+			!scopes.every((scope: unknown) => typeof scope === 'string') ||
+			typeof payload.jti !== 'string' ||
+			payload.jti === ''
+		)
+			return null
+		const id = Number(payload.sub)
+		return Number.isSafeInteger(id) ? id : null
+	} catch {
+		return null
+	}
+}
+
 export async function generateToken(
 	accountId: string,
 	platformId: string,
@@ -255,8 +313,8 @@ export async function generateToken(
 	// authorize itself; a token with only `sub` is rejected before login finishes.
 	return sign(
 		{
-			iss: 'https://auth.recflare.net',
-			aud: 'https://auth.recflare.net',
+			iss: RECNET_AUTH_URL,
+			aud: RECNET_AUTH_URL,
 			nbf: now,
 			iat: now,
 			exp: now + TOKEN_TTL_SECONDS,

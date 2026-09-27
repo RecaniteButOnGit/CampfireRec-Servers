@@ -1,6 +1,6 @@
 import { getAccount } from '@repo/domain'
 import { logger } from '@repo/hono-helpers'
-import { validateAndGetPhotonAccountId } from '@repo/jwt'
+import { validateAndGetPhotonAccountId, validateAndGetRecNetAccessTokenAccountId } from '@repo/jwt'
 
 import type { Context } from 'hono'
 import type { App } from './context'
@@ -166,24 +166,27 @@ export async function photonAuthenticate(c: Context<App>): Promise<Response> {
 			logger.error('Photon auth missing Realtime app ID')
 			return c.json(authenticationFailed)
 		}
-		const accountId = await validateAndGetPhotonAccountId(
-			token,
-			await c.env.JWT_SECRET.get(),
-			audience
-		)
+		const secret = await c.env.JWT_SECRET.get()
+		let accountId = await validateAndGetPhotonAccountId(token, secret, audience)
+		let credentialType: 'photon' | 'recnet' | 'unknown' = 'photon'
 		if (accountId === null) {
-			logger.info('Photon auth rejected', { category: 'invalid_token' })
+			accountId = await validateAndGetRecNetAccessTokenAccountId(token, secret)
+			credentialType = accountId === null ? 'unknown' : 'recnet'
+		}
+		logger.info('Photon auth credential classified', { credentialType })
+		if (accountId === null) {
+			logger.info('Photon auth rejected', { category: 'unsupported_credential' })
 			return c.json(authenticationFailed)
 		}
 		if (!accountIdMatches(query, body.fields, accountId)) {
-			logger.info('Photon auth rejected', { category: 'account_id_mismatch' })
+			logger.info('Photon auth rejected', { category: 'account_mismatch' })
 			return c.json(authenticationFailed)
 		}
 		if (!(await getAccount(c.env.DB, accountId))) {
 			logger.info('Photon auth rejected', { category: 'unknown_account' })
 			return c.json(authenticationFailed)
 		}
-		logger.info('Photon auth accepted', { accountId })
+		logger.info('Photon auth accepted', { accountId, credentialType })
 		return c.json({ ResultCode: 1, UserId: String(accountId) })
 	} catch (error) {
 		// An infrastructure failure is still a valid Photon response, while the

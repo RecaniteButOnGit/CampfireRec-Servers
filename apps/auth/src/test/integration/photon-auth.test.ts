@@ -1,6 +1,6 @@
 import { adminSecretsStore, env } from 'cloudflare:test'
 import { exports } from 'cloudflare:workers'
-import { sign } from 'hono/jwt'
+import { sign, verify } from 'hono/jwt'
 import { beforeAll, describe, expect, test, vi } from 'vitest'
 
 import '../../auth.app'
@@ -200,6 +200,110 @@ describe('Photon Cloud Custom Authentication', () => {
 		expect(result.body).toEqual({ ResultCode: 1, UserId: String(ACCOUNT_ID) })
 	})
 
+	test('classifies signed Photon and RecNet credentials without logging their values', async () => {
+		for (const [credential, credentialType] of [
+			[await token(), 'photon'],
+			[await generateToken(String(ACCOUNT_ID), 'test-platform', 0, SECRET), 'recnet'],
+		] as const) {
+			const info = vi.spyOn(logger, 'info')
+			try {
+				const result = await unlabeledPost(
+					JSON.stringify({
+						accountId: String(ACCOUNT_ID),
+						accessToken: credential,
+					})
+				)
+				expectPhotonResponse(result, 1)
+				expect(result.body).toEqual({ ResultCode: 1, UserId: String(ACCOUNT_ID) })
+				expect(
+					info.mock.calls.find(([message]) => message === 'Photon auth credential classified')?.[1]
+				).toEqual({ credentialType })
+				expect(
+					info.mock.calls.find(([message]) => message === 'Photon auth accepted')?.[1]
+				).toEqual({ accountId: ACCOUNT_ID, credentialType })
+				expect(JSON.stringify(info.mock.calls)).not.toContain(credential)
+				expect(JSON.stringify(info.mock.calls)).not.toContain(SECRET)
+			} finally {
+				info.mockRestore()
+			}
+		}
+	})
+
+	test('a signed RecNet access token authenticates without an unsigned accountId', async () => {
+		const accessToken = await generateToken(String(ACCOUNT_ID), 'test-platform', 0, SECRET)
+		const result = await unlabeledPost(JSON.stringify({ accessToken }))
+		expectPhotonResponse(result, 1)
+		expect(result.body.UserId).toBe(String(ACCOUNT_ID))
+	})
+
+	test('RecNet tokens with a bad signature, expiration, issuer, audience, or claims fail', async () => {
+		const valid = await generateToken(String(ACCOUNT_ID), 'test-platform', 0, SECRET)
+		const claims = await verify(valid, SECRET, 'HS256')
+		const now = Math.floor(Date.now() / 1000)
+		for (const credential of [
+			await generateToken(String(ACCOUNT_ID), 'test-platform', 0, 'different-test-secret'),
+			await sign({ ...claims, exp: now - 60 }, SECRET),
+			await sign({ ...claims, nbf: now + 3600 }, SECRET),
+			await sign({ ...claims, iss: 'https://other.example' }, SECRET),
+			await sign({ ...claims, aud: 'https://other.example' }, SECRET),
+			await sign({ ...claims, role: [] }, SECRET),
+			await sign({ ...claims, scope: [] }, SECRET),
+		]) {
+			const result = await unlabeledPost(
+				JSON.stringify({
+					accountId: String(ACCOUNT_ID),
+					accessToken: credential,
+				})
+			)
+			expectPhotonResponse(result, 2)
+			expect(result.body).toEqual({ ResultCode: 2, Message: 'Authentication failed.' })
+			expect(result.text).not.toContain(credential)
+		}
+	})
+
+	test('unsupported credentials are classified without leaking the JWT', async () => {
+		const credential = await token('different-test-secret')
+		const info = vi.spyOn(logger, 'info')
+		try {
+			expectPhotonResponse(await unlabeledPost(JSON.stringify({ accessToken: credential })), 2)
+			expect(
+				info.mock.calls.find(([message]) => message === 'Photon auth credential classified')?.[1]
+			).toEqual({ credentialType: 'unknown' })
+			expect(info.mock.calls.find(([message]) => message === 'Photon auth rejected')?.[1]).toEqual({
+				category: 'unsupported_credential',
+			})
+			expect(JSON.stringify(info.mock.calls)).not.toContain(credential)
+		} finally {
+			info.mockRestore()
+		}
+	})
+
+	test('RecNet account mismatch and unknown account are rejected after verification', async () => {
+		const credential = await generateToken(String(ACCOUNT_ID), 'test-platform', 0, SECRET)
+		const info = vi.spyOn(logger, 'info')
+		try {
+			expectPhotonResponse(
+				await unlabeledPost(
+					JSON.stringify({
+						accountId: '999',
+						accessToken: credential,
+					})
+				),
+				2
+			)
+			expect(info.mock.calls.find(([message]) => message === 'Photon auth rejected')?.[1]).toEqual({
+				category: 'account_mismatch',
+			})
+		} finally {
+			info.mockRestore()
+		}
+		const unknown = await generateToken('99999', 'test-platform', 0, SECRET)
+		expectPhotonResponse(
+			await unlabeledPost(JSON.stringify({ accountId: '99999', accessToken: unknown })),
+			2
+		)
+	})
+
 	test('accessToken with accountId also works as application/json', async () => {
 		const result = await request('/photon/authenticate', {
 			method: 'POST',
@@ -379,7 +483,6 @@ describe('Photon Cloud Custom Authentication', () => {
 			withoutExpiry,
 			await token(SECRET, 'another-photon-app'),
 			await token(SECRET, AUDIENCE, 99999),
-			await generateToken(String(ACCOUNT_ID), 'test-platform', 0, SECRET),
 		]) {
 			const result = await request(
 				`/photon/authenticate?photonAuthToken=${encodeURIComponent(credential)}`
