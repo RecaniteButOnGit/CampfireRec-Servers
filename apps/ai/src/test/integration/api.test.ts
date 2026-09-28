@@ -1,7 +1,7 @@
 import { adminSecretsStore, env, SELF } from 'cloudflare:test'
-import { beforeAll, describe, expect, it } from 'vitest'
+import { afterEach, beforeAll, describe, expect, it, vi } from 'vitest'
 
-import '../../ai.app'
+import aiApp from '../../ai.app'
 
 import type { Env } from '../../context'
 
@@ -239,47 +239,149 @@ describe('GET /makerai/user/balances', () => {
 })
 
 describe('POST /realtime-session/create', () => {
-	// The one call whose real answer is a working credential, so the one that can't be
-	// served statically. Note `error_id` is an empty string, not a code, and `value` null.
-	it('refuses to open a session', async () => {
-		const res = await SELF.fetch(`${ORIGIN}/realtime-session/create`, {
-			method: 'POST',
-			headers: { ...(await bearer()), 'Content-Type': 'application/json' },
-			body: JSON.stringify({ AIType: 'Roomie' }),
-		})
-		expect(res.status).toBe(200)
-		expect(await res.json()).toEqual({
-			success: false,
-			error: 'Realtime AI sessions are not available on this server',
-			error_id: '',
-			value: null,
-		})
+	const OPENAIKEY = 'sk-test-server-secret'
+	const failure = (error: string) => ({ success: false, error, error_id: '', value: null })
+	const success = {
+		success: true,
+		error: null,
+		error_id: null,
+		value: { SessionId: 'sess_test', ClientSecret: 'ek_test' },
+	}
+
+	async function create(
+		body: string | null = JSON.stringify({ AIType: 'Roomie' }),
+		options: { key?: string; model?: string; authorized?: boolean; authorization?: string } = {}
+	) {
+		const headers = {
+			'Content-Type': 'application/json',
+			...(options.authorized === false
+				? {}
+				: options.authorization
+					? { Authorization: options.authorization }
+					: await bearer()),
+		}
+		return aiApp.fetch(
+			new Request(`${ORIGIN}/realtime-session/create`, {
+				method: 'POST',
+				headers,
+				body: body ?? undefined,
+			}),
+			{
+				...env,
+				OPENAIKEY: options.key === undefined ? undefined : { get: async () => options.key },
+				OPENAI_REALTIME_MODEL: options.model,
+			} as never,
+			{} as never
+		)
+	}
+
+	afterEach(() => vi.restoreAllMocks())
+
+	it('401s on missing or invalid bearer tokens without contacting OpenAI', async () => {
+		const outbound = vi.spyOn(globalThis, 'fetch')
+		for (const options of [
+			{ key: OPENAIKEY, authorized: false },
+			{ key: OPENAIKEY, authorization: 'Bearer not-a-real-token' },
+		]) {
+			const res = await create(undefined, options)
+			expect(res.status).toBe(401)
+			expect(await res.text()).toBe('')
+		}
+		expect(outbound).not.toHaveBeenCalled()
 	})
 
-	// The body is never read, so a missing or malformed one must not 500 — the answer is
-	// the same refusal either way.
+	it('returns an HTTP 200 failure when OPENAIKEY is missing', async () => {
+		const outbound = vi.spyOn(globalThis, 'fetch')
+		const res = await create()
+		expect(res.status).toBe(200)
+		expect(await res.json()).toEqual(failure('Realtime AI is not configured on this server'))
+		expect(outbound).not.toHaveBeenCalled()
+	})
+
+	it('creates a GA client secret using the permanent key and default model', async () => {
+		const log = vi.spyOn(console, 'log').mockImplementation(() => {})
+		const info = vi.spyOn(console, 'info').mockImplementation(() => {})
+		const warn = vi.spyOn(console, 'warn').mockImplementation(() => {})
+		const error = vi.spyOn(console, 'error').mockImplementation(() => {})
+		const outbound = vi.spyOn(globalThis, 'fetch').mockResolvedValue(
+			Response.json({
+				value: 'ek_test',
+				expires_at: 1234567890,
+				session: { id: 'sess_test', type: 'realtime' },
+			})
+		)
+		const res = await create(JSON.stringify({ AIType: 'Roomie', Extra: true }), { key: OPENAIKEY })
+		expect(res.status).toBe(200)
+		expect(await res.json()).toEqual(success)
+		expect(outbound).toHaveBeenCalledTimes(1)
+		const [url, init] = outbound.mock.calls[0]
+		expect(url).toBe('https://api.openai.com/v1/realtime/client_secrets')
+		expect(init?.method).toBe('POST')
+		expect(init?.headers).toMatchObject({
+			Authorization: `Bearer ${OPENAIKEY}`,
+			'Content-Type': 'application/json',
+		})
+		expect(
+			(init?.headers as Record<string, string> | undefined)?.['OpenAI-Safety-Identifier']
+		).toMatch(/^[a-f0-9]{64}$/)
+		expect(JSON.parse(init?.body as string)).toEqual({
+			session: { type: 'realtime', model: 'gpt-realtime-2.1-mini' },
+		})
+		expect(init?.signal).toBeDefined()
+		expect(
+			JSON.stringify([log.mock.calls, info.mock.calls, warn.mock.calls, error.mock.calls])
+		).not.toMatch(/sk-test-server-secret|ek_test/)
+	})
+
+	it('uses the configured model and accepts a missing or malformed body', async () => {
+		const outbound = vi.spyOn(globalThis, 'fetch').mockImplementation(async () =>
+			Response.json({
+				value: 'ek_test',
+				session: { id: 'sess_test' },
+			})
+		)
+		for (const body of [null, 'not json']) {
+			const res = await create(body, { key: OPENAIKEY, model: 'gpt-realtime-custom' })
+			expect(await res.json()).toEqual(success)
+		}
+		expect(outbound).toHaveBeenCalledTimes(2)
+		for (const [, init] of outbound.mock.calls) {
+			expect(JSON.parse(init?.body as string)).toEqual({
+				session: { type: 'realtime', model: 'gpt-realtime-custom' },
+			})
+		}
+	})
+
+	it('returns a safe failure envelope on an OpenAI error without logging secrets', async () => {
+		const log = vi.spyOn(console, 'log').mockImplementation(() => {})
+		const info = vi.spyOn(console, 'info').mockImplementation(() => {})
+		const warn = vi.spyOn(console, 'warn').mockImplementation(() => {})
+		const error = vi.spyOn(console, 'error').mockImplementation(() => {})
+		vi.spyOn(globalThis, 'fetch').mockResolvedValue(
+			new Response(JSON.stringify({ error: { message: `bad ${OPENAIKEY} ek_should-not-log` } }), {
+				status: 429,
+				headers: { 'x-request-id': 'req_test' },
+			})
+		)
+		const res = await create(undefined, { key: OPENAIKEY })
+		expect(res.status).toBe(200)
+		expect(await res.json()).toEqual(failure('Failed to create realtime AI session'))
+		expect(
+			JSON.stringify([log.mock.calls, info.mock.calls, warn.mock.calls, error.mock.calls])
+		).not.toMatch(/sk-test-server-secret|ek_should-not-log/)
+		expect(JSON.stringify(warn.mock.calls)).toContain('req_test')
+		expect(JSON.stringify(warn.mock.calls)).toContain('429')
+	})
+
 	it.each([
-		['no body', undefined],
-		['an empty body', '{}'],
-		['a malformed body', 'not json'],
-	])('refuses with %s', async (_label, body) => {
-		const res = await SELF.fetch(`${ORIGIN}/realtime-session/create`, {
-			method: 'POST',
-			headers: { ...(await bearer()), 'Content-Type': 'application/json' },
-			body,
-		})
+		{ value: '', session: { id: 'sess_test' } },
+		{ value: 'ek_test', session: {} },
+		{ value: 'ek_test', session: { id: 42 } },
+	])('rejects a malformed OpenAI success response: %j', async (payload) => {
+		vi.spyOn(globalThis, 'fetch').mockResolvedValue(Response.json(payload))
+		const res = await create(undefined, { key: OPENAIKEY })
 		expect(res.status).toBe(200)
-		expect((await res.json()) as { success: boolean }).toMatchObject({ success: false })
-	})
-
-	it('401s without a bearer token', async () => {
-		const res = await SELF.fetch(`${ORIGIN}/realtime-session/create`, {
-			method: 'POST',
-			headers: { 'Content-Type': 'application/json' },
-			body: JSON.stringify({ AIType: 'Roomie' }),
-		})
-		expect(res.status).toBe(401)
-		expect(await res.text()).toBe('')
+		expect(await res.json()).toEqual(failure('OpenAI returned an invalid realtime session'))
 	})
 })
 
@@ -310,6 +412,10 @@ describe('GET /openapi.json', () => {
 			'GET /roomieai/user/facts',
 			'POST /realtime-session/create',
 		])
+		const realtimeSpec = JSON.stringify(spec.paths['/realtime-session/create'].post)
+		expect(realtimeSpec).toContain('SessionId')
+		expect(realtimeSpec).toContain('ClientSecret')
+		expect(realtimeSpec).toContain('401')
 
 		for (const ops of Object.values(spec.paths)) {
 			for (const op of Object.values(ops)) expect(op.summary).toBeTruthy()

@@ -4,15 +4,13 @@ AI worker served on the `ai` subdomain (`ai.recflare.net`). The client checks he
 offering any of its AI features — Game AI in a room, the Roomie assistant, and Maker AI's
 usage meter.
 
-No model runs behind this worker, so every answer is static. They are not all refusals,
-though, because the features fail at different points:
+The worker serves access and budget checks and mints Roomie session credentials. The
+checks are mostly static because they do not meter usage:
 
 - **Game AI** is a **server-side** feature this server cannot provide, so both of its reads
   refuse and the client hides it.
-- **Roomie** runs on the **client** and only asks this service what it may spend, so the
-  budget reads grant everything. The refusal lands instead on
-  `POST /realtime-session/create` — the one call whose real answer is a working credential
-  rather than a description of one.
+- **Roomie** runs on the **client**. Its budget reads grant everything. Session creation
+  asks OpenAI for a short-lived client secret when `OPENAIKEY` is configured.
 - **Maker AI** meters model usage in dollars. Nothing here bills, so every figure is zero.
 
 - `GET /` — service status `{ "service": "ai", "status": "ok" }`. No auth.
@@ -113,27 +111,29 @@ though, because the features fail at different points:
   The time bucket is `Empty` at `DateTime.MinValue`, this server selling no timed access
   for it to hold. Flat body, no envelope.
 
-- `POST /realtime-session/create` — `[Authorize]`. Posted when the player actually pulls
-  out an assistant. Live, this mints a short-lived credential (`{ SessionId, ClientSecret }`
-  in `value`) that the **client** then uses to talk to the model provider directly.
-  Refused:
+- `POST /realtime-session/create` — `[Authorize]`. Posted when the player uses Roomie.
+  The server calls OpenAI's GA `POST /v1/realtime/client_secrets` endpoint and returns
+  only the session id and short-lived client secret:
 
   ```json
   {
-    "success": false,
-    "error": "Realtime AI sessions are not available on this server",
-    "error_id": "",
-    "value": null
+    "success": true,
+    "error": null,
+    "error_id": null,
+    "value": { "SessionId": "sess_...", "ClientSecret": "ek_..." }
   }
   ```
 
-  This is the one endpoint here whose real answer is a working key rather than a
-  description of one, so there is nothing static to serve — which is why the budget reads
-  above grant everything and the stop lands here instead: the client offers the feature,
-  and the session it opens is what fails. Note `error_id` is an **empty string**, not a
-  code — the reference server sends no id for this refusal. The posted body (`AIType`) is
-  ignored; the answer is the same either way, and a missing or malformed body still gets
-  the refusal rather than a 500.
+  `OPENAIKEY` stays server-side and is never returned. The default model is
+  `gpt-realtime-2.1-mini`; set `OPENAI_REALTIME_MODEL` to override it. Both variables are
+  optional for backend startup, but session creation needs `OPENAIKEY`. A missing key,
+  OpenAI failure, or invalid response returns HTTP 200 with `success: false`, a safe
+  `error`, `error_id: ""`, and `value: null`. The posted `AIType` is optional; extra fields
+  and malformed bodies do not prevent session creation.
+
+  Minting a GA client secret does not establish whether the July 2025 Rec Room client can
+  connect with it. After deployment, inspect `Player.log` for the client's attempted
+  Realtime endpoint, protocol headers, and any connection error.
 
 The worker exists so the client gets a definite answer on the host its endpoints document
 already names (`AI` → `ai`, see `apps/ns`), instead of a failed request to a host with

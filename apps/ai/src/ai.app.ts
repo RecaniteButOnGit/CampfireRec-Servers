@@ -18,7 +18,7 @@ import {
 	MakerAiAccessResponse,
 	MakerAiBalances,
 	RealtimeSessionCreateBody,
-	RealtimeSessionDenied,
+	RealtimeSessionCreateResponse,
 	RoomieAiAccess,
 	RoomieUserFacts,
 	UNAUTHORIZED_RESPONSE,
@@ -29,14 +29,12 @@ import type { App } from './context'
 
 /**
  * AI Worker. Serves the access checks and budget reads the client makes before offering
- * its AI features. Nothing here runs a model, so every answer is static — but not
- * uniformly a refusal, because the features fail differently:
+ * its AI features. Roomie session creation also mints short-lived OpenAI credentials:
  *
  * - Game AI is a SERVER-side feature. This server cannot provide it, so both its reads are
  *   refused and the client hides the feature.
- * - Roomie runs on the CLIENT and only asks this service what it may spend, so the budget
- *   reads are granted in full. The session that would actually reach a model
- *   (`/realtime-session/create`) is where it stops.
+ * - Roomie runs on the CLIENT. Budget reads are granted in full and session creation
+ *   hands it an ephemeral credential when the server has an OpenAI key.
  * - Maker AI meters model usage in dollars. Nothing here bills, so every figure is zero.
  */
 
@@ -46,6 +44,9 @@ import type { App } from './context'
  * and lands as a negative number, i.e. no energy at all.
  */
 const INT32_MAX = 2_147_483_647
+const DEFAULT_REALTIME_MODEL = 'gpt-realtime-2.1-mini'
+const OPENAI_CLIENT_SECRETS_URL = 'https://api.openai.com/v1/realtime/client_secrets'
+const OPENAI_TIMEOUT_MS = 10_000
 
 /**
  * The reason both Game AI reads refuse with. `AI.RoomDoesNotSupportGameAI` is the id the
@@ -70,6 +71,20 @@ async function authedId(c: Context<App>): Promise<number | null> {
 /** Results.Unauthorized() equivalent — 401 with empty body. */
 function unauthorized(c: Context<App>) {
 	return c.body(null, 401)
+}
+
+function realtimeFailure(c: Context<App>, error: string) {
+	return c.json({ success: false, error, error_id: '', value: null })
+}
+
+function nonEmptyString(value: unknown): value is string {
+	return typeof value === 'string' && value.trim().length > 0
+}
+
+async function safetyIdentifier(accountId: number): Promise<string> {
+	const data = new TextEncoder().encode(`campfirerec-roomie:${accountId}`)
+	const digest = await crypto.subtle.digest('SHA-256', data)
+	return Array.from(new Uint8Array(digest), (byte) => byte.toString(16).padStart(2, '0')).join('')
 }
 
 const app = new Hono<App>()
@@ -326,8 +341,7 @@ const app = new Hono<App>()
 		}
 	)
 
-	// Opening a live voice session with an assistant — the one call here that would reach a
-	// real model, and so the one that cannot be answered statically. Refused.
+	// Mint an ephemeral OpenAI credential for the client-side Roomie realtime connection.
 	.post(
 		'/realtime-session/create',
 		describeRoute({
@@ -338,21 +352,18 @@ const app = new Hono<App>()
 				'lived credential the CLIENT then uses to talk to the model provider directly, and',
 				'answers with `{ SessionId, ClientSecret }` in `value`.',
 				'',
-				'Refused here. This is the one endpoint on the worker whose answer is a working key',
-				'rather than a description of one, so there is nothing static to serve — which is why',
-				'the budget reads above grant everything and the refusal lands at this point instead:',
-				'the client offers the feature, and the session it opens is what fails.',
+				'The permanent OpenAI key stays server-side. Only a short-lived client secret and',
+				'session id are returned. Session creation requires an optional OPENAIKEY binding.',
 				'',
-				'The refusal is still a 200 with `success: false`, and `error_id` is an EMPTY STRING',
-				'rather than a code — the reference server sends no id for this one. `value` is null.',
+				'Failures are 200s with `success: false`, an empty `error_id`, and null `value`.',
 			].join(' '),
 			security: AUTHED,
 			requestBody: jsonBody(
 				RealtimeSessionCreateBody,
-				'Which assistant is being opened. Read for the log only — the answer is the same either way.'
+				'Which assistant is being opened. Optional; extra fields are ignored.'
 			),
 			responses: {
-				200: json(RealtimeSessionDenied, 'Always a refusal — no session is created'),
+				200: json(RealtimeSessionCreateResponse, 'Session credentials or a failure envelope'),
 				401: UNAUTHORIZED_RESPONSE,
 			},
 		}),
@@ -360,12 +371,77 @@ const app = new Hono<App>()
 			const id = await authedId(c)
 			if (id === null) return unauthorized(c)
 
-			return c.json({
-				success: false,
-				error: 'Realtime AI sessions are not available on this server',
-				error_id: '',
-				value: null,
-			})
+			const body: unknown = await c.req.json().catch(() => null)
+			const aiTypeValue =
+				body && typeof body === 'object' && !Array.isArray(body)
+					? (body as Record<string, unknown>).AIType
+					: undefined
+			const aiType =
+				typeof aiTypeValue === 'string' && /^[\w-]{1,64}$/.test(aiTypeValue)
+					? aiTypeValue
+					: undefined
+			const model = c.env.OPENAI_REALTIME_MODEL?.trim() || DEFAULT_REALTIME_MODEL
+			const logContext = { accountId: id, aiType, model }
+
+			try {
+				const key = await c.env.OPENAIKEY?.get()
+				if (!nonEmptyString(key)) {
+					console.warn('Roomie realtime session not configured', logContext)
+					return realtimeFailure(c, 'Realtime AI is not configured on this server')
+				}
+
+				const response = await fetch(OPENAI_CLIENT_SECRETS_URL, {
+					method: 'POST',
+					headers: {
+						Authorization: `Bearer ${key}`,
+						'Content-Type': 'application/json',
+						'OpenAI-Safety-Identifier': await safetyIdentifier(id),
+					},
+					body: JSON.stringify({ session: { type: 'realtime', model } }),
+					signal: AbortSignal.timeout(OPENAI_TIMEOUT_MS),
+				})
+				const requestId = response.headers.get('x-request-id')
+				const diagnostics = { ...logContext, status: response.status, requestId }
+				if (!response.ok) {
+					console.warn('OpenAI realtime session creation failed', diagnostics)
+					return realtimeFailure(c, 'Failed to create realtime AI session')
+				}
+
+				const payload: unknown = await response.json().catch(() => null)
+				const session =
+					payload && typeof payload === 'object' && !Array.isArray(payload)
+						? (payload as Record<string, unknown>).session
+						: null
+				const sessionId =
+					session && typeof session === 'object' && !Array.isArray(session)
+						? (session as Record<string, unknown>).id
+						: null
+				const clientSecret =
+					payload && typeof payload === 'object' && !Array.isArray(payload)
+						? (payload as Record<string, unknown>).value
+						: null
+				if (!nonEmptyString(sessionId) || !nonEmptyString(clientSecret)) {
+					console.warn('OpenAI returned an invalid realtime session', diagnostics)
+					return realtimeFailure(c, 'OpenAI returned an invalid realtime session')
+				}
+
+				const expiresAt = (payload as Record<string, unknown>).expires_at
+				console.info('Roomie realtime session created', {
+					...diagnostics,
+					sessionId: /^sess_[A-Za-z0-9_-]{1,128}$/.test(sessionId) ? sessionId : undefined,
+					expiresAt:
+						typeof expiresAt === 'number' && Number.isFinite(expiresAt) ? expiresAt : undefined,
+				})
+				return c.json({
+					success: true,
+					error: null,
+					error_id: null,
+					value: { SessionId: sessionId, ClientSecret: clientSecret },
+				})
+			} catch {
+				console.warn('OpenAI realtime session request failed', logContext)
+				return realtimeFailure(c, 'Failed to create realtime AI session')
+			}
 		}
 	)
 
@@ -385,14 +461,12 @@ app.get(
 						'backend. The client checks here before offering any of its AI features: Game AI in a',
 						'room, the Roomie assistant, and Maker AI’s usage meter.',
 						'',
-						'No model runs behind this worker, so every answer is static — but they are not all',
-						'refusals, because the features fail at different points. Game AI is a server-side',
-						'feature this server cannot provide, so both its reads refuse. Roomie and Maker AI',
-						'only ask what the caller may SPEND, which nothing here meters, so those reads are',
-						'granted in full; the refusal lands instead on `POST /realtime-session/create`, the',
-						'one call whose real answer is a working credential rather than a description of one.',
+						'Game AI is a server-side feature this server cannot provide, so both its reads',
+						'refuse. Roomie and Maker AI budget reads are granted in full because nothing here',
+						'meters usage. `POST /realtime-session/create` mints short-lived OpenAI credentials',
+						'for Roomie when OPENAIKEY is configured.',
 						'',
-						'The refusals are 200s carrying `success: false`, which is the shape the client',
+						'Failures are 200s carrying `success: false`, which is the shape the client',
 						'branches on — the worker exists so the client gets a definite answer on the host its',
 						'endpoints document names, instead of a failed request.',
 					].join('\n'),

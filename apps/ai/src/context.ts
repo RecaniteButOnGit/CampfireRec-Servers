@@ -8,6 +8,10 @@ export type Env = SharedHonoEnv & {
 	 * `auth` verify here.
 	 */
 	JWT_SECRET: SecretsStoreSecret
+	/** Optional server-side OpenAI key used only when creating Roomie sessions. */
+	OPENAIKEY?: SecretsStoreSecret
+	/** Realtime model for newly minted Roomie sessions. */
+	OPENAI_REALTIME_MODEL?: string
 }
 
 /** Variables can be extended */

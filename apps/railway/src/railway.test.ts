@@ -191,6 +191,26 @@ describe('S3 R2 adapter and CDN', () => {
 })
 
 describe('routing, health and compatibility', () => {
+  it('passes optional OpenAI settings to the AI worker without requiring a key at startup', async () => {
+    const prior = { ...process.env }
+    process.env.JWT_SECRET = 'test-secret'
+    delete process.env.OPENAIKEY
+    delete process.env.OPENAI_REALTIME_MODEL
+    const db = new SQLiteD1(join(temp(), 'ai-env.sqlite'))
+    try {
+      const withoutKey = buildEnvironment(db)
+      expect(withoutKey.base.OPENAIKEY).toBeUndefined()
+      withoutKey.hub.db.close()
+
+      process.env.OPENAIKEY = 'sk-test-railway'
+      process.env.OPENAI_REALTIME_MODEL = 'gpt-realtime-custom'
+      const configured = buildEnvironment(db)
+      expect(await configured.base.OPENAIKEY?.get()).toBe('sk-test-railway')
+      expect(configured.base.OPENAI_REALTIME_MODEL).toBe('gpt-realtime-custom')
+      configured.hub.db.close()
+    } finally { db.close(); process.env = prior }
+  })
+
   it('routes a production hostname without changing the path', () => {
     const request = new Request('https://rooms.example.test/api/rooms')
     const result = resolveService(request, 'example.test', '{}')!

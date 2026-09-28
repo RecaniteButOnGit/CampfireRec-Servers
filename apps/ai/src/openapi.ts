@@ -152,17 +152,29 @@ export const RealtimeSessionCreateBody = z.object({
 		.describe('Which assistant the client is opening a session for, e.g. `Roomie`'),
 })
 
-/**
- * The realtime-session refusal. `{ success, error, error_id, value }` — note `error_id` is
- * an empty string rather than a machine-readable code, and `value` (which would carry the
- * session id and its client secret) is null.
- */
+/** A minted Roomie session: only the session id and short-lived client secret go to Rec Room. */
+export const RealtimeSessionCreated = z.object({
+	success: z.literal(true),
+	error: z.null(),
+	error_id: z.null(),
+	value: z.object({
+		SessionId: z.string().min(1).describe('OpenAI Realtime session id'),
+		ClientSecret: z.string().min(1).describe('Short-lived OpenAI client secret'),
+	}),
+})
+
+/** A session-creation failure is an HTTP 200 with an empty error id and null value. */
 export const RealtimeSessionDenied = z.object({
 	success: z.literal(false),
 	error: z.string().describe('The message shown to the player'),
-	error_id: z.string().describe('Empty — the reference server sends no code for this refusal'),
-	value: z.null().describe('The session credentials. Null: no session is created'),
+	error_id: z.literal('').describe('Empty — the reference server sends no code for this failure'),
+	value: z.null().describe('No session credentials were created'),
 })
+
+export const RealtimeSessionCreateResponse = z.union([
+	RealtimeSessionCreated,
+	RealtimeSessionDenied,
+])
 
 /**
  * What Roomie knows about the caller: a prose profile it is primed with, and the discrete
