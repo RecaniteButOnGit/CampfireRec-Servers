@@ -81,6 +81,12 @@ function nonEmptyString(value: unknown): value is string {
 	return typeof value === 'string' && value.trim().length > 0
 }
 
+function safeDiagnostic(value: unknown, pattern: RegExp): string | undefined {
+	return typeof value === 'string' && pattern.test(value) && !/(?:sk|ek)[-_]/.test(value)
+		? value
+		: undefined
+}
+
 async function safetyIdentifier(accountId: number): Promise<string> {
 	const data = new TextEncoder().encode(`campfirerec-roomie:${accountId}`)
 	const digest = await crypto.subtle.digest('SHA-256', data)
@@ -376,12 +382,13 @@ const app = new Hono<App>()
 				body && typeof body === 'object' && !Array.isArray(body)
 					? (body as Record<string, unknown>).AIType
 					: undefined
-			const aiType =
-				typeof aiTypeValue === 'string' && /^[\w-]{1,64}$/.test(aiTypeValue)
-					? aiTypeValue
-					: undefined
+			const aiType = safeDiagnostic(aiTypeValue, /^[\w-]{1,64}$/)
 			const model = c.env.OPENAI_REALTIME_MODEL?.trim() || DEFAULT_REALTIME_MODEL
-			const logContext = { accountId: id, aiType, model }
+			const logContext = {
+				accountId: id,
+				aiType,
+				model: safeDiagnostic(model, /^[A-Za-z0-9_.-]{1,128}$/),
+			}
 
 			try {
 				const key = await c.env.OPENAIKEY?.get()
@@ -400,7 +407,10 @@ const app = new Hono<App>()
 					body: JSON.stringify({ session: { type: 'realtime', model } }),
 					signal: AbortSignal.timeout(OPENAI_TIMEOUT_MS),
 				})
-				const requestId = response.headers.get('x-request-id')
+				const requestId = safeDiagnostic(
+					response.headers.get('x-request-id'),
+					/^req_[A-Za-z0-9_-]{1,128}$/
+				)
 				const diagnostics = { ...logContext, status: response.status, requestId }
 				if (!response.ok) {
 					console.warn('OpenAI realtime session creation failed', diagnostics)
@@ -428,7 +438,7 @@ const app = new Hono<App>()
 				const expiresAt = (payload as Record<string, unknown>).expires_at
 				console.info('Roomie realtime session created', {
 					...diagnostics,
-					sessionId: /^sess_[A-Za-z0-9_-]{1,128}$/.test(sessionId) ? sessionId : undefined,
+					sessionId: safeDiagnostic(sessionId, /^sess_[A-Za-z0-9_-]{1,128}$/),
 					expiresAt:
 						typeof expiresAt === 'number' && Number.isFinite(expiresAt) ? expiresAt : undefined,
 				})
