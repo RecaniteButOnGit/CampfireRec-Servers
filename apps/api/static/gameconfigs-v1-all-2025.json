@@ -4614,7 +4614,7 @@
 	},
 	{
 		"Key": "RoomieAI.System.Enabled",
-		"Value": "False",
+		"Value": "true",
 		"ActiveExperiments": null,
 		"StartTime": null,
 		"EndTime": null
