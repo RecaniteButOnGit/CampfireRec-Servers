@@ -22,7 +22,9 @@ export interface RoomArchive {
 
 const MAX_ZIP_BYTES = 256 * 1024 * 1024
 const MAX_ENTRY_BYTES = 64 * 1024 * 1024
-const MAX_EXTRACTED_BYTES = 128 * 1024 * 1024
+// CV2 `.htr.binpb` recordings can make the selected import payload much larger than
+// ordinary room scenes. Keep the filtered payload bounded while allowing large rooms.
+const MAX_EXTRACTED_BYTES = 384 * 1024 * 1024
 const text = new TextDecoder()
 const EXPORTED_AUDIO_ENTRY =
 	/(?:^|\/)(?:CV2Audio\/Node_SampleAudio_|AudioSampler\/PVHolotar_|Holotar\/PVHolotar_)([a-z0-9]{16,64}\.htr)\.binpb$/i

@@ -3367,7 +3367,7 @@ function RoomImport({ navigate }: { navigate: Navigate }) {
 	const [name, setName] = useState('')
 	const [loading, setLoading] = useState(false)
 	const [fileError, setFileError] = useState('')
-	const [forceVersionOne, setForceVersionOne] = useState(true)
+	const [forceVersionOne, setForceVersionOne] = useState(false)
 	const [useOriginalScenes, setUseOriginalScenes] = useState(false)
 	const [progress, setProgress] = useState('')
 	const [created, setCreated] = useState<{ RoomId: number; Name: string } | null>(null)
@@ -3460,12 +3460,14 @@ function RoomImport({ navigate }: { navigate: Navigate }) {
 							setCreated(null)
 							setFileError('')
 							setUseOriginalScenes(false)
+							setForceVersionOne(false)
 							if (!picked) return
 							setLoading(true)
 							void readRoomArchive(picked)
 								.then((read) => {
 									setArchive(read)
 									setName(String(read.details.Name))
+									setUseOriginalScenes(read.subRooms.some((sub) => sub.originalFile))
 								})
 								.catch((err) => setFileError(err instanceof Error ? err.message : String(err)))
 								.finally(() => setLoading(false))
