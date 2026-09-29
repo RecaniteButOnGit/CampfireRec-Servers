@@ -29,14 +29,14 @@
 	},
 	{
 		"Key": "Door.Creative.Title",
-		"Value": "New",
+		"Value": "NEW",
 		"ActiveExperiments": null,
 		"StartTime": null,
 		"EndTime": null
 	},
 	{
 		"Key": "Door.Featured.Query",
-		"Value": "^Blood Flower | ^MonsterDuneWars  | ^scp3008-Rework ",
+		"Value": "^Blood Flower | ^MonsterDuneWars  | ^TheFogIsComingRR ",
 		"ActiveExperiments": null,
 		"StartTime": null,
 		"EndTime": null
@@ -64,7 +64,7 @@
 	},
 	{
 		"Key": "Door.Shooters.Query",
-		"Value": "^Blade_Ball | ^BloodFlower  | ^MonsterDuneWars | ^scp-3008-Rework | ^UltimateNaturalDisasterSurvival ",
+		"Value": "^Blade_BaIl | ^BloodFlower  | ^MonsterDuneWars | ^scp3008 | ^UltimateNaturalDisasterSurvival | ^TheFogIsComingRR ",
 		"ActiveExperiments": null,
 		"StartTime": null,
 		"EndTime": null
