@@ -246,8 +246,8 @@ function isRoomBlobFile(filename: string): boolean {
 
 /**
  * The file that actually gets stored for a picked scene file. A scene taken from a newer
- * build can't be parsed by the build this server runs as it stands, so when the owner asks
- * for it the file is downgraded first (see `room-converter.ts`); otherwise it passes
+ * build may need conversion before the 2025 client can read it, so when the owner asks
+ * for it the file is converted first (see `room-converter.ts`); otherwise it passes
  * through untouched.
  *
  * Done here in the browser, before either request, because the upload goes straight to

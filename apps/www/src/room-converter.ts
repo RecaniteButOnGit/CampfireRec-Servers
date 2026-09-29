@@ -1,11 +1,11 @@
 /**
- * Downgrade a newer Rec Room scene file (`.binpb`) into one the build this server runs can
- * parse. A port of `recroom_downgrader.py` v4, producing the same bytes it does.
+ * Convert a newer Rec Room scene file (`.binpb`) for the 2025 Campfire Rec client.
+ * Based on `recroom_downgrader.py` v4, with the persistence version capped at 141.
  *
  * A scene is a protobuf message with no schema available, so everything here works on the
  * wire format — field numbers and wire types — and never on meaning. Four patches:
  *
- *   1. fn30, the minimum version the file asks for → 123 (first top-level occurrence).
+ *   1. fn30, the scene's persistence version → at most 141 (first top-level occurrence).
  *   2. fn100 = 0xFFFFFFFFFFFFFFFF, stripped from each object blob (top-level fn2).
  *   3. fn14.fn5, stripped from each object's fn14 sub-message.
  *   4. fn28, the circuit layer, removed WHEREVER it occurs in the message tree. Done at the
@@ -24,7 +24,10 @@
  */
 
 const FN100_SENTINEL = 0xffff_ffff_ffff_ffffn
-const TARGET_VERSION = 123
+// The 2025 Campfire Rec client reads PersistedRoomVersion 141. A scene already at or
+// below it must retain its own version: forcing BloodFlower's 141 down to 123 makes
+// that client reject it as V123TextScreenScrollAdded despite supporting version 141.
+const TARGET_VERSION = 141
 const CIRCUIT_FIELD = 28
 
 const WT_VARINT = 0
@@ -334,8 +337,9 @@ function processObjectBlob(blob: Uint8Array, stats: DowngradeStats): Uint8Array 
 }
 
 /**
- * Set the first top-level fn30 varint to the target version. The walk stops at the first
- * thing it can't read, so an fn30 behind a malformed field is left as it was.
+ * Cap the first top-level fn30 varint at the target version. Keep older versions as
+ * they are. The walk stops at the first thing it can't read, so an fn30 behind a
+ * malformed field is left as it was.
  */
 function patchFn30(data: Uint8Array<ArrayBuffer>, stats: DowngradeStats): Uint8Array<ArrayBuffer> {
 	let pos = 0
@@ -346,7 +350,8 @@ function patchFn30(data: Uint8Array<ArrayBuffer>, stats: DowngradeStats): Uint8A
 			if (fn === 30 && wt === WT_VARINT) {
 				const [value, fieldEnd] = readVarint(data, valuePos)
 				stats.originalVersion = value
-				stats.versionPatched = value !== TARGET_VERSION
+				if (value <= TARGET_VERSION) return data
+				stats.versionPatched = true
 				return concat([
 					data.subarray(0, pos),
 					encodeVarint(30 * 8 + WT_VARINT),
