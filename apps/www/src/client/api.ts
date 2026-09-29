@@ -109,6 +109,21 @@ export function isDeveloper(): boolean {
 	return tokenRoles().includes('developer')
 }
 
+/** Cosmetic gate for account 2's exclusive avatar importer; the server verifies the token. */
+export function isAvatarImporter(): boolean {
+	const payload = token?.split('.')[1]
+	if (!payload) return false
+	try {
+		const b64 = payload.replace(/-/g, '+').replace(/_/g, '/')
+		const claims = JSON.parse(atob(b64.padEnd(b64.length + ((4 - (b64.length % 4)) % 4), '='))) as {
+			sub?: unknown
+		}
+		return claims.sub === '2'
+	} catch {
+		return false
+	}
+}
+
 /**
  * An OAuth machine code (`invalid_grant`, `server_error`) rather than a sentence — a
  * lower_snake_case word with no spaces. A worker that speaks OAuth puts one of these in

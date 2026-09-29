@@ -6,6 +6,7 @@ import {
 	SELF,
 	waitOnExecutionContext,
 } from 'cloudflare:test'
+import { zipSync } from 'fflate'
 import { beforeAll, expect, it } from 'vitest'
 
 import {
@@ -16,6 +17,7 @@ import {
 import { AUDIT_LOG_SCHEMA_DDL } from '@repo/domain/src/audit-db'
 import { PlatformType } from '@repo/domain/src/enums'
 import { getPendingGifts, RECEIVED_GIFT_SCHEMA_DDL } from '@repo/domain/src/gifts-db'
+import { OUTFIT_SCHEMA_DDL } from '@repo/domain/src/outfits-db'
 import {
 	PRESENCE_SCHEMA_DDL,
 	PRESENCE_TTL_SECONDS,
@@ -69,6 +71,7 @@ import { DISCORD_INVITE, ISSUES_URL, PRIVACY_EMAIL } from '../../links'
 import { turnstileKeys } from '../../turnstile'
 import { postAuthForm, readAuthError } from '../../upstream'
 import { scheduled } from '../../www.app'
+import { avatarDataFixture } from '../avatar-fixture'
 
 import type { Env } from '../../context'
 import type { MemberRead } from '../../discord-roles'
@@ -113,6 +116,7 @@ beforeAll(async () => {
 	for (const stmt of PRESENCE_SCHEMA_DDL) await env.DB.prepare(stmt).run()
 	// `account` likewise: owned by `auth`, read and (for the benefits claim) written here.
 	for (const stmt of ACCOUNT_SCHEMA_DDL) await env.DB.prepare(stmt).run()
+	for (const stmt of OUTFIT_SCHEMA_DDL) await env.DB.prepare(stmt).run()
 	// And `platform_account`, where a claimed Discord identity is linked.
 	for (const stmt of PLATFORM_SCHEMA_DDL) await env.DB.prepare(stmt).run()
 	// `report` and `warning` are owned (and migrated) by `api`; www serves the staff panel
@@ -723,6 +727,67 @@ async function staffPost(
 /** POST a JSON body to a developer-only staff endpoint (the gifts) as a developer. */
 const devPost = (path: string, accountId: number, body: unknown) =>
 	staffPost(path, accountId, body, ['developer'])
+
+it('imports an avatar only for account 2 and saves each import in the next free outfit slot', async () => {
+	const path = '/api/avatar-import/players/9850'
+	await env.DB.prepare('INSERT OR IGNORE INTO account (data) VALUES (?1)')
+		.bind(
+			JSON.stringify({ accountId: 9850, username: 'AvatarTarget', displayName: 'AvatarTarget' })
+		)
+		.run()
+	await env.DB.prepare('INSERT INTO outfit (account_id, set_id, avatar) VALUES (9850, 1, ?1)')
+		.bind(JSON.stringify({ Slot: 1, Name: 'Existing outfit' }))
+		.run()
+	const upload = (file: File) => {
+		const form = new FormData()
+		form.set('file', file)
+		return form
+	}
+	const direct = new File([new Uint8Array(avatarDataFixture)], 'AvatarData.binpb')
+	expect(
+		(await SELF.fetch(`https://example.com${path}`, { method: 'POST', body: upload(direct) }))
+			.status
+	).toBe(401)
+	expect(
+		(
+			await SELF.fetch(`https://example.com${path}`, {
+				method: 'POST',
+				headers: { authorization: `Bearer ${await tokenFor(3, ['developer'])}` },
+				body: upload(direct),
+			})
+		).status
+	).toBe(403)
+	const headers = { authorization: `Bearer ${await tokenFor(2)}` }
+	let response = await SELF.fetch(`https://example.com${path}`, {
+		method: 'POST',
+		headers,
+		body: upload(direct),
+	})
+	expect(response.status).toBe(200)
+	expect(await response.json()).toEqual({ playerId: 9850, savedSlot: 2 })
+	const zip = new File(
+		[new Uint8Array(zipSync({ 'Export/AvatarData.binpb': avatarDataFixture }))],
+		'avatar.zip'
+	)
+	response = await SELF.fetch(`https://example.com${path}`, {
+		method: 'POST',
+		headers,
+		body: upload(zip),
+	})
+	expect(response.status).toBe(200)
+	expect(await response.json()).toEqual({ playerId: 9850, savedSlot: 3 })
+	const rows = await env.DB.prepare(
+		'SELECT set_id, avatar FROM outfit WHERE account_id = 9850 ORDER BY set_id'
+	).all<{ set_id: number; avatar: string }>()
+	expect(rows.results.map((row) => row.set_id)).toEqual([0, 1, 2, 3])
+	expect(JSON.parse(rows.results[1]!.avatar).Name).toBe('Existing outfit')
+	expect(JSON.parse(rows.results[0]!.avatar).LegacyData.SelectionsV1).toContain('03020100')
+	expect(JSON.parse(rows.results[2]!.avatar).OutfitSelections).toContain('03020100')
+	const stored = await env.DB.prepare('SELECT avatar FROM account WHERE account_id = 9850').first<{
+		avatar: string
+	}>()
+	expect(JSON.parse(stored!.avatar).OutfitSelections).toContain('03020100')
+})
 
 // Two refusals, not one. A 401 is an expired session — the SPA drops the token and sends
 // the player to sign in — while a 403 is a signed-in player who simply isn't staff, and

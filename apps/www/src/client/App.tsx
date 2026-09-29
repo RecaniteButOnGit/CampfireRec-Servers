@@ -26,6 +26,7 @@ import {
 	call,
 	hasToken,
 	isAdmin,
+	isAvatarImporter,
 	isDeveloper,
 	setHosts,
 	setToken,
@@ -1259,8 +1260,58 @@ function PlayerPage({
 
 			{/* Staff only, and cosmetic: hidden for everyone else, but every endpoint behind it
 			    is gated by `requireStaff`. */}
+			{isAvatarImporter() && (
+				<AvatarImport accountId={account.accountId} username={account.username} />
+			)}
 			{isAdmin() && <StaffPlayerActions account={account} navigate={navigate} />}
 		</main>
+	)
+}
+
+/** The owner can apply an exported avatar to any profile, including their own. */
+function AvatarImport({ accountId, username }: { accountId: number; username: string }) {
+	const [file, setFile] = useState<File | null>(null)
+	const { pending, error, done, run } = useAction()
+	return (
+		<section className="card">
+			<h2>Import avatar</h2>
+			<p className="muted">
+				Upload AvatarData.binpb or a ZIP containing it. This changes @{username}&apos;s worn avatar
+				and saves a copy in their next free outfit slot.
+			</p>
+			<form
+				className="blob-upload"
+				onSubmit={(event) => {
+					event.preventDefault()
+					if (!file) return
+					void run(async () => {
+						const form = new FormData()
+						form.set('file', file)
+						const result = await call<{ savedSlot: number }>(
+							`/api/avatar-import/players/${accountId}`,
+							{ authed: true, multipart: form }
+						)
+						setFile(null)
+						return `Imported avatar for @${username} and saved it in outfit slot ${result.savedSlot}.`
+					})
+				}}
+			>
+				<label>
+					Avatar export
+					<input
+						type="file"
+						accept=".binpb,.zip"
+						key={file ? 'selected' : 'empty'}
+						onChange={(event) => setFile(event.target.files?.[0] ?? null)}
+					/>
+				</label>
+				<button type="submit" disabled={!file || pending}>
+					{pending ? 'Importing…' : 'Import avatar'}
+				</button>
+				{error && <p className="error">{error}</p>}
+				{done && <p className="ok">{done}</p>}
+			</form>
+		</section>
 	)
 }
 
@@ -3285,6 +3336,17 @@ function Dashboard({
 						render: () => <RoomImport navigate={navigate} />,
 					},
 					{ id: 'tokens', label: 'Token drop', render: () => <TokenDropForm /> },
+				]
+			: []),
+		...(account.accountId === 2
+			? [
+					{
+						id: 'avatar-import',
+						label: 'Import avatar',
+						render: () => (
+							<AvatarImport accountId={account.accountId} username={account.username} />
+						),
+					},
 				]
 			: []),
 	]

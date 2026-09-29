@@ -21,6 +21,7 @@ import {
 	linkPlatformIdentity,
 } from '../../auth/src/platform-db'
 import { authUnreachable } from './auth-messages'
+import { importAvatarHandler } from './avatar-import-handler'
 import {
 	AUTHORIZE_URL,
 	discordConfig,
@@ -496,6 +497,8 @@ const app = new Hono<App>()
 	.post('/api/staff/online/gift-tokens', requireDeveloper, giftOnlineTokensHandler)
 	.post('/api/staff/players/:id/username-changes', addUsernameChangeHandler)
 	.post('/api/staff/players/:id/clear-password', clearPasswordHandler)
+	// Exclusive to the verified session for account 2; accepts a protobuf file or ZIP.
+	.post('/api/avatar-import/players/:id', importAvatarHandler)
 
 	// ---- Privacy policy -----------------------------------------------------
 	// Server-rendered rather than a SPA route so the page has real text without
