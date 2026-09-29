@@ -98,14 +98,14 @@ it('imports an export as a private room owned by account 2, without unsupported 
 		CreatorAccountId: 2,
 		Accessibility: 0,
 		ImageName: imageName,
-		PersistenceVersion: 227,
+		PersistenceVersion: 141,
 		Roles: [{ AccountId: 2, Role: 255 }],
 		SubRooms: [{ Name: 'OldUpdate', CreatorAccountId: 2 }],
 	})
 	const sub = (result.value.SubRooms as Room[])[0]!
 	expect(sub.CurrentSave).toMatchObject({
 		DataBlob: dataBlob,
-		PersistenceVersion: 227,
+		PersistenceVersion: 141,
 		OMVersion: 0,
 		UgcSubVersion: 0,
 	})

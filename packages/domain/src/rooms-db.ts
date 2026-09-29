@@ -810,8 +810,8 @@ export interface ImportedSubRoom {
 	converted: boolean
 }
 
-/** The 20250718.01 client's observed `MaxPersistenceVersion` for a published room save. */
-const IMPORT_PERSISTENCE_VERSION_2025 = 227
+/** The 2025 Campfire Rec client's room-save persistence version. */
+const IMPORT_PERSISTENCE_VERSION_2025 = 141
 
 function importedSavePersistenceVersion(sub: ImportedSubRoom): number {
 	if (sub.converted) return IMPORT_PERSISTENCE_VERSION_2025
