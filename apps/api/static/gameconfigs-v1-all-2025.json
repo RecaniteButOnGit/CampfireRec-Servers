@@ -22,14 +22,14 @@
 	},
 	{
 		"Key": "Door.Creative.Query",
-		"Value": "^Blood Flower",
+		"Value": "#new",
 		"ActiveExperiments": null,
 		"StartTime": null,
 		"EndTime": null
 	},
 	{
 		"Key": "Door.Creative.Title",
-		"Value": "Blood Flower",
+		"Value": "New",
 		"ActiveExperiments": null,
 		"StartTime": null,
 		"EndTime": null
@@ -43,7 +43,7 @@
 	},
 	{
 		"Key": "Door.Featured.Title",
-		"Value": "Featured",
+		"Value": "FEATURED",
 		"ActiveExperiments": null,
 		"StartTime": null,
 		"EndTime": null
@@ -71,7 +71,7 @@
 	},
 	{
 		"Key": "Door.Shooters.Title",
-		"Value": "Imported",
+		"Value": "IMPORTED",
 		"ActiveExperiments": null,
 		"StartTime": null,
 		"EndTime": null

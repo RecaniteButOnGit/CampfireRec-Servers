@@ -36,6 +36,73 @@ declare module 'cloudflare:test' {
 
 const ORIGIN = 'https://example.com'
 
+it('imports an export as a private room owned by account 2, without unsupported fields', async () => {
+	const name = `ZipImport${Date.now()}`
+	const imageName = `2026-09-28/${crypto.randomUUID()}`
+	const dataBlob = `2026-09-28/${crypto.randomUUID()}`
+	await env.CDN_ASSETS.put(`image/${imageName}`, new Uint8Array([1, 2, 3]))
+	await env.CDN_ASSETS.put(`room/${dataBlob}`, new Uint8Array([4, 5, 6]))
+	const body = {
+		details: {
+			Name: name,
+			Description: 'Imported room',
+			CreatorAccountId: 999,
+			BoostCount: 100,
+			CurrentSnapshotId: 'old-snapshot',
+			Stats: { VisitCount: 9999 },
+			Roles: [{ AccountId: 999, Role: 255 }],
+			Tags: [{ Tag: 'horror', Type: 0 }],
+		},
+		imageName,
+		subRooms: [
+			{
+				details: { Name: 'OldUpdate', UnitySceneId: 'a75f7547-79eb-47c6-8986-6767abcb4f92' },
+				save: { PersistenceVersion: 153 },
+				dataBlob,
+				dataBlobHash: 'hash',
+				converted: true,
+			},
+		],
+	}
+	const unauthenticated = await SELF.fetch(`${ORIGIN}/rooms/import`, {
+		method: 'POST',
+		body: JSON.stringify(body),
+	})
+	expect(unauthenticated.status).toBe(401)
+	const forbidden = await SELF.fetch(`${ORIGIN}/rooms/import`, {
+		method: 'POST',
+		headers: await bearer('999'),
+		body: JSON.stringify(body),
+	})
+	expect(forbidden.status).toBe(403)
+	const imported = await SELF.fetch(`${ORIGIN}/rooms/import`, {
+		method: 'POST',
+		headers: { ...(await bearer('999', ['developer'])), 'content-type': 'application/json' },
+		body: JSON.stringify(body),
+	})
+	expect(imported.status).toBe(200)
+	const result = (await imported.json()) as { success: boolean; value: Room }
+	expect(result.success).toBe(true)
+	expect(result.value).toMatchObject({
+		Name: name,
+		CreatorAccountId: 2,
+		Accessibility: 0,
+		ImageName: imageName,
+		Roles: [{ AccountId: 2, Role: 255 }],
+		SubRooms: [{ Name: 'OldUpdate', CreatorAccountId: 2 }],
+	})
+	const sub = (result.value.SubRooms as Room[])[0]!
+	expect(sub.CurrentSave).toMatchObject({ DataBlob: dataBlob, PersistenceVersion: 123 })
+	const stored = await env.DB.prepare('SELECT data FROM room WHERE room_id = ?1')
+		.bind(result.value.RoomId)
+		.first<{ data: string }>()
+	expect(stored).not.toBeNull()
+	const saved = JSON.parse(stored!.data) as Room
+	expect(saved).not.toHaveProperty('BoostCount')
+	expect(saved).not.toHaveProperty('CurrentSnapshotId')
+	expect(saved.Stats).toMatchObject({ VisitCount: 0 })
+})
+
 // Mint a token the way the `auth` worker does, signing with the shared test key seeded into the JWT_SECRET store.
 const TEST_SECRET = 'test-signing-key'
 function b64url(input: ArrayBuffer | string): string {
