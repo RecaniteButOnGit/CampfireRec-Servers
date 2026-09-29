@@ -22,21 +22,21 @@
 	},
 	{
 		"Key": "Door.Creative.Query",
-		"Value": "^RunTheBlock",
+		"Value": "^Blood Flower",
 		"ActiveExperiments": null,
 		"StartTime": null,
 		"EndTime": null
 	},
 	{
 		"Key": "Door.Creative.Title",
-		"Value": "RunTheBlock",
+		"Value": "Blood Flower",
 		"ActiveExperiments": null,
 		"StartTime": null,
 		"EndTime": null
 	},
 	{
 		"Key": "Door.Featured.Query",
-		"Value": "#featured",
+		"Value": "^Blood Flower | ^MonsterDuneWars  | ^scp3008-Rework ",
 		"ActiveExperiments": null,
 		"StartTime": null,
 		"EndTime": null
@@ -64,14 +64,14 @@
 	},
 	{
 		"Key": "Door.Shooters.Query",
-		"Value": "^PlayerChase | ^DrillSim2  | ^Extreme-Dropper | ^FleeTheRisingLava | ^BrokenGuns | ^ZombieCitySim.2 ",
+		"Value": "^Blade_Ball | ^BloodFlower  | ^MonsterDuneWars | ^scp-3008-Rework | ^UltimateNaturalDisasterSurvival ",
 		"ActiveExperiments": null,
 		"StartTime": null,
 		"EndTime": null
 	},
 	{
 		"Key": "Door.Shooters.Title",
-		"Value": "State of the Art",
+		"Value": "Imported",
 		"ActiveExperiments": null,
 		"StartTime": null,
 		"EndTime": null

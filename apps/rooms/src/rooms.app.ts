@@ -46,6 +46,7 @@ import {
 	getSubRoomSaves,
 	getTrendingRooms,
 	getVisitedRooms,
+	importRoom,
 	inviteRoomRole,
 	isPlayerBannedFromRoom,
 	isRoomOwner,
@@ -106,6 +107,7 @@ import {
 	FORBIDDEN_RESPONSE,
 	form,
 	ImageRequest,
+	ImportRoomRequest,
 	InteractionDto,
 	intQuery,
 	InviteRoleRequest,
@@ -938,6 +940,63 @@ const app = new Hono<App>()
 			responses: { 200: json(ServiceStatus, 'Always `{ service: "rooms", status: "ok" }`') },
 		}),
 		(c) => c.json({ service: 'rooms', status: 'ok' })
+	)
+
+	// Complete a browser-side ZIP import after its image and scene blobs have been uploaded.
+	// The source archive is untrusted: the domain helper copies supported fields only and
+	// always creates a private room with owner account 2 and fresh ids.
+	.post(
+		'/rooms/import',
+		describeRoute({
+			tags: ['Room settings'],
+			summary: 'Import an exported room ZIP',
+			description:
+				'Developer-only. The website extracts a ZIP and uploads its image and supported subroom scenes first. This endpoint validates those keys, strips unsupported metadata, assigns new ids and account 2 as owner, and creates the room private.',
+			security: AUTHED,
+			requestBody: jsonBody(ImportRoomRequest, 'Export metadata and uploaded object keys'),
+			responses: {
+				200: json(RoomEnvelope, 'The imported room'),
+				400: { description: 'Invalid export or missing uploaded objects' },
+				401: UNAUTHORIZED_RESPONSE,
+				403: { description: 'Developer role required' },
+			},
+		}),
+		async (c) => {
+			const accountId = await authedAccountId(c)
+			if (accountId === null) return unauthorized(c)
+			const roles = await validateAndGetRoles(c.req.raw, await c.env.JWT_SECRET.get())
+			if (!roles?.includes('developer')) return c.json({ error: 'Developer role required' }, 403)
+			const raw = await c.req.json().catch(() => null)
+			const parsed = ImportRoomRequest.safeParse(raw)
+			if (!parsed.success) return c.json({ error: 'Invalid room import metadata' }, 400)
+			const { details, imageName, subRooms } = parsed.data
+			const name = typeof details.Name === 'string' ? details.Name.trim() : ''
+			if (!name || roomNameRejection(name, 'room name')) {
+				return c.json({ error: roomNameRejection(name, 'room name') ?? 'Room name is required' }, 400)
+			}
+			if (await getRoomByName(c.env.DB, name)) {
+				return c.json({ error: 'A room with that name already exists' }, 400)
+			}
+			if (subRooms.length === 0 || subRooms.length > 16) {
+				return c.json({ error: 'Import one to sixteen subrooms with scene data' }, 400)
+			}
+			const key = (value: string) => /^[0-9]{4}-[0-9]{2}-[0-9]{2}\/[a-f0-9-]{36}$/.test(value)
+			if (!key(imageName) || !(await c.env.CDN_ASSETS.head(`image/${imageName}`))) {
+				return c.json({ error: 'Room image was not uploaded' }, 400)
+			}
+			for (const sub of subRooms) {
+				const subName = typeof sub.details.Name === 'string' ? sub.details.Name : ''
+				if (!subName || roomNameRejection(subName, 'subroom name')) {
+					return c.json({ error: 'Invalid subroom name' }, 400)
+				}
+				if (!key(sub.dataBlob) || !(await c.env.CDN_ASSETS.head(`room/${sub.dataBlob}`))) {
+					return c.json({ error: `Scene data for ${subName} was not uploaded` }, 400)
+				}
+			}
+			const room = await importRoom(c.env.DB, { ...details, Name: name }, imageName, subRooms)
+			await pushRoomUpdate(c, 2, room)
+			return roomEnvelope(c, room)
+		}
 	)
 
 	// Room lookup by `id` (first match wins) or `name`. 400s when neither is

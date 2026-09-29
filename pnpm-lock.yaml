@@ -1307,6 +1307,9 @@ importers:
       '@scalar/api-reference':
         specifier: 1.67.0
         version: 1.67.0(tailwindcss@4.3.3)(typescript@6.0.3)(zod@4.5.4)
+      fflate:
+        specifier: 0.8.2
+        version: 0.8.2
       hono:
         specifier: 4.13.5
         version: 4.13.5
@@ -3928,6 +3931,9 @@ packages:
     peerDependenciesMeta:
       picomatch:
         optional: true
+
+  fflate@0.8.2:
+    resolution: {integrity: sha512-cPJU47OaAoCbg0pBvzsgpTPhmhqI5eJjh/JIu8tPj5q+T7iLvW/JAYUqmE7KOB4R1ZyEhzBaIQpQpardBF5z8A==}
 
   flatted@3.4.4:
     resolution: {integrity: sha512-5+ybhBZANEJxaH3X5evAFatUxLfEHSr7n6kYJ+1Qd0mUqr4eu9gIf6GDbWHf8RJijHrjjO8G+la14SlL2SeS1Q==}
@@ -7389,6 +7395,8 @@ snapshots:
   fdir@6.5.0(picomatch@4.0.4):
     optionalDependencies:
       picomatch: 4.0.4
+
+  fflate@0.8.2: {}
 
   flatted@3.4.4: {}
 

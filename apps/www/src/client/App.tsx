@@ -13,6 +13,7 @@ import {
 	SOURCE_REPO,
 } from '../links'
 import { downgradeRoom, needsDowngrade } from '../room-converter'
+import { readRoomArchive } from '../room-archive'
 // The session token, the worker hostnames and the `call` every request goes through —
 // see api.ts for why they're a module of their own rather than defined here.
 import {
@@ -32,6 +33,7 @@ import { StatsPage } from './Stats'
 
 import type { ReactNode } from 'react'
 import type { Hosts } from './api'
+import type { RoomArchive } from '../room-archive'
 
 /**
  * Site config from `www`. `signupEnabled` is false when the operator has no Turnstile
@@ -3247,7 +3249,10 @@ function Dashboard({
 			: []),
 		// Narrower than the two above: the drop mints tokens, and www's route is developer-only.
 		...(isDeveloper()
-			? [{ id: 'tokens', label: 'Token drop', render: () => <TokenDropForm /> }]
+			? [
+					{ id: 'room-import', label: 'Import room', render: () => <RoomImport navigate={navigate} /> },
+					{ id: 'tokens', label: 'Token drop', render: () => <TokenDropForm /> },
+				]
 			: []),
 	]
 	const [active, setActive] = useState(sections[0].id)
@@ -3330,6 +3335,133 @@ function MyRooms({ navigate }: { navigate: Navigate }) {
 					))}
 				</ul>
 			)}
+		</section>
+	)
+}
+
+/** Import a Rec Room export ZIP. The server owns the final field allowlist and owner id. */
+function RoomImport({ navigate }: { navigate: Navigate }) {
+	const [archive, setArchive] = useState<RoomArchive | null>(null)
+	const [name, setName] = useState('')
+	const [loading, setLoading] = useState(false)
+	const [fileError, setFileError] = useState('')
+	const [downgrade, setDowngrade] = useState(true)
+	const [progress, setProgress] = useState('')
+	const [created, setCreated] = useState<{ RoomId: number; Name: string } | null>(null)
+	const { pending, error, run } = useAction()
+
+	return (
+		<section className="card">
+			<h2>Import room</h2>
+			<p className="muted">
+				Import a room export ZIP. The room starts private, with account #2 as its owner.
+				Only subrooms with scene data in the ZIP are imported.
+			</p>
+			<form
+				className="blob-upload"
+				onSubmit={(event) => {
+					event.preventDefault()
+					if (!archive) return
+					void run(async () => {
+						setCreated(null)
+						setProgress('Uploading room image…')
+						const imageName = await uploadToStorage(archive.image, FILE_TYPE_IMAGE)
+						const subRooms = []
+						for (const [index, sub] of archive.subRooms.entries()) {
+							setProgress(`Uploading subroom ${index + 1} of ${archive.subRooms.length}…`)
+							const converted = downgrade && needsDowngrade(sub.file.name)
+							const prepared = await prepareRoomBlob(sub.file, converted)
+							const [dataBlob, dataBlobHash] = await Promise.all([
+								uploadRoomBlob(prepared),
+								blobHash(prepared),
+							])
+							subRooms.push({
+								details: sub.details,
+								save: sub.save,
+								dataBlob,
+								dataBlobHash,
+								converted,
+							})
+						}
+						setProgress('Creating room…')
+						const response = await call<{
+							success?: boolean
+							error?: string
+							value?: { RoomId: number; Name: string }
+						}>(`${where().rooms}/rooms/import`, {
+							method: 'POST',
+							authed: true,
+							json: { details: { ...archive.details, Name: name.trim() }, imageName, subRooms },
+						})
+						if (response.success !== true || !response.value) {
+							throw new Error(response.error || 'The rooms worker refused the import.')
+						}
+						setCreated(response.value)
+						setProgress('')
+						return `Imported ^${response.value.Name} as room #${response.value.RoomId}.`
+					})
+				}}
+			>
+				<label>
+					Room export ZIP
+					<input
+						type="file"
+						accept=".zip,application/zip"
+						disabled={loading || pending}
+						onChange={(event) => {
+							const picked = event.target.files?.[0]
+							setArchive(null)
+							setCreated(null)
+							setFileError('')
+							if (!picked) return
+							setLoading(true)
+							void readRoomArchive(picked)
+								.then((read) => {
+									setArchive(read)
+									setName(String(read.details.Name))
+								})
+								.catch((err) => setFileError(err instanceof Error ? err.message : String(err)))
+								.finally(() => setLoading(false))
+						}}
+					/>
+				</label>
+				{loading && <p className="muted">Reading ZIP…</p>}
+				{fileError && <p className="error">{fileError}</p>}
+				{archive && (
+					<>
+						<label>
+							Room name
+							<input value={name} onChange={(event) => setName(event.target.value)} required />
+						</label>
+						<p className="muted">
+							{archive.subRooms.length} subroom{archive.subRooms.length === 1 ? '' : 's'} with scene
+							data. {archive.skippedSubRooms} listed subroom
+							{archive.skippedSubRooms === 1 ? '' : 's'} without files will be skipped.
+						</p>
+						<label className="check">
+							<input
+								type="checkbox"
+								checked={downgrade}
+								onChange={(event) => setDowngrade(event.target.checked)}
+							/>
+							Downgrade .binpb scenes for this game build (removes circuits)
+						</label>
+						{progress && <p className="muted">{progress}</p>}
+						{error && <p className="error">{error}</p>}
+						{created && (
+							<p className="ok">
+								Imported ^{created.Name} as room #{created.RoomId}.{' '}
+								<Link to={`/rooms/${created.RoomId}`} navigate={navigate}>
+									View room
+								</Link>
+							</p>
+						)}
+						<button type="submit" disabled={pending || !name.trim()}>
+							{pending ? 'Importing…' : 'Import room'}
+						</button>
+					</>
+				)}
+			</form>
 		</section>
 	)
 }

@@ -801,6 +801,147 @@ export async function cloneRoom(
 	return cloned
 }
 
+/** One extracted scene in a room export. The archive's original ids are never reused. */
+export interface ImportedSubRoom {
+	details: Record<string, unknown>
+	save: Record<string, unknown>
+	dataBlob: string
+	dataBlobHash: string
+	converted: boolean
+}
+
+/**
+ * Create a private room from an export. Only fields understood by this server are copied;
+ * engagement, moderation, boosts, snapshots, roles, and source ids are discarded.
+ * The caller validates the upload keys and name before calling this helper.
+ */
+export async function importRoom(
+	db: D1Database,
+	details: Room,
+	imageName: string,
+	subRooms: ImportedSubRoom[]
+): Promise<Room> {
+	const ownerId = 2
+	const now = new Date().toISOString()
+	const number = (value: unknown, fallback: number) =>
+		typeof value === 'number' && Number.isFinite(value) ? value : fallback
+	const flag = (value: unknown, fallback: boolean) =>
+		typeof value === 'boolean' ? value : fallback
+	const string = (value: unknown, fallback: string) =>
+		typeof value === 'string' ? value : fallback
+	const row = await db.prepare('SELECT MAX(room_id) AS maxId FROM room').first<{ maxId: number | null }>()
+	const roomId = (row?.maxId ?? 0) + 1
+	const name = string(details.Name, '')
+	const room: Room = {
+		RoomId: roomId,
+		Name: name,
+		FriendlyName: string(details.FriendlyName, name),
+		Description: string(details.Description, ''),
+		ImageName: imageName,
+		WarningMask: number(details.WarningMask, 0),
+		CustomWarning: typeof details.CustomWarning === 'string' ? details.CustomWarning : null,
+		CreatorAccountId: ownerId,
+		State: 0,
+		Accessibility: Accessibility.Private,
+		PublishState: 0,
+		SupportsLevelVoting: flag(details.SupportsLevelVoting, false),
+		IsRRO: false,
+		IsRecRoomApproved: false,
+		ExcludeFromLists: false,
+		ExcludeFromSearch: false,
+		SupportsScreens: flag(details.SupportsScreens, true),
+		SupportsWalkVR: flag(details.SupportsWalkVR, true),
+		SupportsTeleportVR: flag(details.SupportsTeleportVR, true),
+		SupportsVRLow: flag(details.SupportsVRLow, true),
+		SupportsQuest2: flag(details.SupportsQuest2, true),
+		SupportsMobile: flag(details.SupportsMobile, true),
+		SupportsJuniors: flag(details.SupportsJuniors, false),
+		MinLevel: number(details.MinLevel, 0),
+		AgeRating: number(details.AgeRating, 2),
+		CreatedAt: now,
+		PublishedAt: now,
+		BecameRRStudioRoomAt: null,
+		Stats: { ...ZERO_STATS },
+		RankingContext: null,
+		IsDorm: false,
+		IsPlacePlay: false,
+		MaxPlayerCalculationMode: number(details.MaxPlayerCalculationMode, 0),
+		MaxPlayers: number(details.MaxPlayers, 20),
+		CloningAllowed: false,
+		DisableMicAutoMute: flag(details.DisableMicAutoMute, false),
+		DisableRoomComments: flag(details.DisableRoomComments, false),
+		EncryptVoiceChat: flag(details.EncryptVoiceChat, false),
+		ToxmodEnabled: true,
+		LoadScreenLocked: false,
+		UgcVersion: number(details.UgcVersion, 1),
+		PersistenceVersion: subRooms.some((sub) => sub.converted)
+			? 123
+			: number(details.PersistenceVersion, 0),
+		UgcSubVersion: null,
+		MinUgcSubVersion: null,
+		AutoLocalizeRoom: false,
+		LocalizationContext: { TargetLocale: null, Scope: null, LocalizedFields: [] },
+		IsDeveloperOwned: false,
+		RankedEntityId: '',
+		Roles: [{ AccountId: ownerId, Role: Role.Creator, LastChangedByAccountId: null, InvitedRole: Role.None }],
+		IsJuniorCreated: false,
+		PromoImages: [],
+		PromoExternalContent: [],
+		LoadScreens: [],
+		RestrictedCircuitsAllowListNames: [],
+	}
+	const tags = Array.isArray(details.Tags) ? details.Tags : []
+	const supportedTags: RoomTag[] = tags
+		.filter((tag): tag is Record<string, unknown> => !!tag && typeof tag === 'object')
+		.filter((tag) => typeof tag.Tag === 'string' && (tag.Type === 0 || tag.Type === 1))
+		.map((tag) => ({
+			Tag: tag.Tag as string,
+			Type: tag.Type as number,
+			...(tag.IsPrimaryGenre === true ? { IsPrimaryGenre: true } : {}),
+		}))
+	await db.prepare('INSERT INTO room (data) VALUES (?1)').bind(serializeRoom(room)).run()
+	try {
+		if (supportedTags.length > 0) await setRoomTags(db, roomId, supportedTags)
+		for (const entry of subRooms) {
+			const source = entry.details
+			const sourceSave = entry.save
+			await insertSubRoom(db, roomId, {
+				RoomId: roomId,
+				CreatorAccountId: ownerId,
+				UnitySceneId: string(source.UnitySceneId, DEFAULT_SUBROOM_SCENE),
+				Name: string(source.Name, 'Main'),
+				LastModeratedSaveModerationState: 0,
+				IsSandbox: flag(source.IsSandbox, true),
+				MaxPlayers: number(source.MaxPlayers, number(details.MaxPlayers, 20)),
+				Accessibility: Accessibility.Private,
+				DefaultMatchmakingPolicy: number(source.DefaultMatchmakingPolicy, 0),
+				ShouldAutoStageSaves: true,
+				CurrentSave: {
+					UnitySubAssets: [],
+					ReferencedUnityAssets: [],
+					DataBlob: entry.dataBlob,
+					DataBlobHash: entry.dataBlobHash,
+					ReferencedUnityAssetIds: [],
+					PersistenceVersion: entry.converted ? 123 : number(sourceSave.PersistenceVersion, 0),
+					OMVersion: number(sourceSave.OMVersion, 0),
+					UgcSubVersion: entry.converted ? 123 : number(sourceSave.UgcSubVersion, 0),
+					SavedByAccountId: ownerId,
+					SavedOnPlatform: 0,
+					SavedOnDeviceClass: 0,
+					Description: '',
+					Tags: [],
+					ModerationState: 0,
+					CreatedAt: now,
+				},
+			})
+		}
+		return (await getRoomById(db, roomId))!
+	} catch (error) {
+		await deleteRoom(db, roomId)
+		throw error
+	}
+}
+
 /** Set a room's Description in place (the caller is responsible for the owner check). */
 export async function setRoomDescription(
 	db: D1Database,

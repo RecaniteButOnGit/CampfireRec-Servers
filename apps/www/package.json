@@ -20,6 +20,7 @@
 		"@repo/hono-helpers": "workspace:*",
 		"@repo/jwt": "workspace:*",
 		"@scalar/api-reference": "1.67.0",
+		"fflate": "0.8.2",
 		"hono": "4.13.5",
 		"react": "19.2.7",
 		"react-dom": "19.2.7",

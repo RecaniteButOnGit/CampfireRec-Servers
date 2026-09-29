@@ -47,6 +47,21 @@ export function jsonBody(schema: z.ZodType, description: string): OpenAPIV3_1.Re
 /** Bearer-JWT security requirement, for the auth-gated routes. */
 export const AUTHED = [{ bearerAuth: [] }]
 
+/** Metadata and uploaded object keys produced by the website's room ZIP importer. */
+export const ImportRoomRequest = z.object({
+	details: z.record(z.string(), z.unknown()),
+	imageName: z.string(),
+	subRooms: z.array(
+		z.object({
+			details: z.record(z.string(), z.unknown()),
+			save: z.record(z.string(), z.unknown()),
+			dataBlob: z.string(),
+			dataBlobHash: z.string(),
+			converted: z.boolean(),
+		})
+	),
+})
+
 /**
  * The 401 the auth-gated routes return. Most answer `{ error: 'Unauthorized' }`; the
  * subroom writes answer an empty body (see UNAUTHORIZED_EMPTY / UNAUTHORIZED_ENVELOPE).
