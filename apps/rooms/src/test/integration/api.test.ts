@@ -144,7 +144,7 @@ it('uses the imported saves rather than skipped subrooms for the room version', 
 			imageName,
 			subRooms: [
 				{
-					details: { Name: 'OldUpdate' },
+					details: { Name: 'new-map-aka-lighter-got-bored' },
 					save: { PersistenceVersion: 153, UgcSubVersion: 153 },
 					dataBlob,
 					dataBlobHash: 'hash',
@@ -160,6 +160,7 @@ it('uses the imported saves rather than skipped subrooms for the room version', 
 		PersistenceVersion: 153,
 		UgcSubVersion: 153,
 	})
+	expect((result.value.SubRooms as Room[])[0]?.Name).toBe('new-map-aka-lighter-got-bored')
 })
 
 // Mint a token the way the `auth` worker does, signing with the shared test key seeded into the JWT_SECRET store.
@@ -5742,10 +5743,10 @@ describe('rooms endpoints', () => {
 	})
 })
 
-// Room and subroom names take letters, digits and underscores, at most 32 (see
-// `roomNameRejection` in @repo/domain — usernames are held to the narrower rule, with no
-// underscore). All four routes that take a player-supplied name enforce it, and each
-// keeps its OWN refusal shape: the create
+// Room names take letters, digits and underscores; subroom names also take dots and
+// dashes found in exported room names. Both are at most 32 characters. All four
+// routes that take a player-supplied name enforce their rule, and each keeps its
+// OWN refusal shape: the create
 // paths answer the lowercase `{ success, error, value }` envelope, the two settings
 // routes answer `{ Success, ErrorId, Error }` with the same `Rooms.InvalidName` id they
 // already used for an empty name. The client keys off those, so the rule had to fit the
@@ -5755,6 +5756,7 @@ describe('rooms endpoints', () => {
 // which this rule would reject. That's why the check lives in the handlers.
 describe('room name validation', () => {
 	const bad = ['My Room', 'punct!', 'a'.repeat(33)]
+	const badRoom = [...bad, 'new-map']
 
 	const post = async (path: string, fields: Record<string, string>, sub: string) =>
 		SELF.fetch(`${ORIGIN}${path}`, {
@@ -5771,7 +5773,7 @@ describe('room name validation', () => {
 		})
 
 	it('refuses a bad name when a player clones a room into existence', async () => {
-		for (const name of bad) {
+		for (const name of badRoom) {
 			const res = await post('/rooms/2/clone', { name }, '1')
 			const body = (await res.json()) as { success: boolean; error: string; value: unknown }
 			expect(body.success, name).toBe(false)
@@ -5781,7 +5783,7 @@ describe('room name validation', () => {
 	})
 
 	it('refuses a bad name on rename, with the id the client already handles', async () => {
-		for (const name of bad) {
+		for (const name of badRoom) {
 			const res = await put('/rooms/2/name', { name }, '1')
 			const body = (await res.json()) as { Success: boolean; ErrorId: string; Error: string }
 			expect(body.Success, name).toBe(false)
@@ -5799,7 +5801,9 @@ describe('room name validation', () => {
 			const created = await post('/rooms/2/subrooms', { name }, '1')
 			const env1 = (await created.json()) as { success: boolean; error: string }
 			expect(env1.success, name).toBe(false)
-			expect(env1.error).toMatch(/letters, numbers and underscores|at most 32 characters/)
+			expect(env1.error).toMatch(
+				/letters, numbers, underscores, dots and dashes|at most 32 characters/
+			)
 
 			const modified = await put(
 				'/rooms/2/subrooms/2/modify',
@@ -5812,8 +5816,8 @@ describe('room name validation', () => {
 		}
 	})
 
-	it('accepts a 32-character name, and an underscore where a space is refused', async () => {
-		for (const name of ['a'.repeat(32), 'Laser_Tag']) {
+	it('accepts exported subroom names with dots and dashes', async () => {
+		for (const name of ['a'.repeat(32), 'Laser_Tag', 'new-map-aka-lighter-got-bored', '2.0']) {
 			const res = await post('/rooms/2/subrooms', { name }, '1')
 			const body = (await res.json()) as {
 				success: boolean

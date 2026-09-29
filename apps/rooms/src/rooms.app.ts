@@ -70,6 +70,7 @@ import {
 	setRoomName,
 	setRoomRole,
 	setSubRoomPermissions,
+	subRoomNameRejection,
 	toggleCheer,
 	toggleFavorite,
 	transferRoomOwnership,
@@ -989,9 +990,9 @@ const app = new Hono<App>()
 			}
 			for (const sub of subRooms) {
 				const subName = typeof sub.details.Name === 'string' ? sub.details.Name : ''
-				if (!subName || roomNameRejection(subName, 'subroom name')) {
-					return c.json({ error: 'Invalid subroom name' }, 400)
-				}
+				if (!subName) return c.json({ error: 'Subroom name is required' }, 400)
+				const badSubName = subRoomNameRejection(subName)
+				if (badSubName) return c.json({ error: badSubName }, 400)
 				if (typeof sub.save.UnityAssetId === 'string') {
 					return c.json({ error: 'RRS subrooms are not supported yet' }, 400)
 				}
@@ -3777,7 +3778,7 @@ const app = new Hono<App>()
 					Error: 'You must enter a name for your room!',
 				})
 			}
-			const badName = roomNameRejection(name, 'subroom name')
+			const badName = subRoomNameRejection(name)
 			if (badName !== null) {
 				return roomResult(c, { Success: false, ErrorId: 'Rooms.InvalidName', Error: badName })
 			}
@@ -4170,7 +4171,7 @@ const app = new Hono<App>()
 			const body = (await c.req.parseBody().catch(() => ({}))) as Record<string, unknown>
 			const name = typeof body.name === 'string' ? body.name.trim() : ''
 			if (name === '') return roomEnvelope(c, null, 'You must enter a name for your subroom!')
-			const badName = roomNameRejection(name, 'subroom name')
+			const badName = subRoomNameRejection(name)
 			if (badName !== null) return roomEnvelope(c, null, badName)
 
 			const result = await createSubRoom(c.env.DB, roomId, accountId, name)

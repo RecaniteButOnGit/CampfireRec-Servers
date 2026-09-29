@@ -142,6 +142,23 @@ export function roomNameRejection(value: string, label: string): string | null {
 }
 
 /**
+ * Subroom names in room exports can contain dots and dashes (for example `2.0` and
+ * `new-map`). Keep room identifiers on their narrower rule while accepting these
+ * client-created subroom names.
+ */
+const SUBROOM_NAME_PATTERN = /^(?=.*[A-Za-z0-9])[A-Za-z0-9_.-]+$/
+
+export function subRoomNameRejection(value: string): string | null {
+	if (value.length > MAX_ROOM_NAME_LENGTH) {
+		return `Your subroom name can be at most ${MAX_ROOM_NAME_LENGTH} characters.`
+	}
+	if (!SUBROOM_NAME_PATTERN.test(value)) {
+		return 'Your subroom name can only contain letters, numbers, underscores, dots and dashes.'
+	}
+	return null
+}
+
+/**
  * Letters, digits, spaces, dashes and colons — the title charset. Wider than
  * `NAME_PATTERN` because an invention is a thing with a name ("Grappling Hook v2",
  * "Speed-Boost Pad"), not an identifier someone types into a sign-in box. Still no
