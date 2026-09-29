@@ -9,7 +9,7 @@ import {
 	withNotFound,
 	withOnError,
 } from '@repo/hono-helpers'
-import { validateAndGetAccountId } from '@repo/jwt'
+import { validateAndGetAccountId, validateAndGetRoles } from '@repo/jwt'
 
 import {
 	AUTHED,
@@ -197,6 +197,76 @@ const app = new Hono<App>()
 			if (explicitName) return c.json({ filename: explicitName })
 
 			return c.json({ error: 'missing filename or valid upload data' }, 400)
+		}
+	)
+
+	// Room exports carry CV2 Sample Audio and Audio Sampler blobs as `.htr.binpb`.
+	// The scene still references the original `<blob>.htr` name, so a generated
+	// upload name would leave the sample unavailable. Only developers importing
+	// rooms may write that exact name under the generic `data/` CDN prefix.
+	.post(
+		'/upload/imported-audio',
+		describeRoute({
+			tags: ['Upload'],
+			summary: 'Upload sample audio from a room export',
+			description:
+				'Stores the exported protobuf bytes under data/<BlobName>, preserving the name referenced by the room scene. Developer-only.',
+			security: AUTHED,
+			requestBody: {
+				description: 'BlobName and the exported .htr.binpb file',
+				content: {
+					'multipart/form-data': {
+						schema: {
+							type: 'object',
+							required: ['BlobName', 'File'],
+							properties: {
+								BlobName: { type: 'string', example: '8s9mgoy07z9cn3btawtolp294.htr' },
+								File: { type: 'string', format: 'binary' },
+							},
+						},
+					},
+				},
+			},
+			responses: {
+				200: json(UploadResponse, 'The stored audio blob name'),
+				400: json(ErrorResponse, 'Invalid name or missing file'),
+				401: UNAUTHORIZED_RESPONSE,
+				403: json(ErrorResponse, 'Developer role required'),
+				409: json(ErrorResponse, 'An existing audio blob has different bytes'),
+				413: json(ErrorResponse, 'File exceeds the upload limit'),
+			},
+		}),
+		async (c) => {
+			const secret = await c.env.JWT_SECRET.get()
+			const id = await validateAndGetAccountId(c.req.raw, secret)
+			if (id === null) return c.body(null, 401)
+			const roles = await validateAndGetRoles(c.req.raw, secret)
+			if (!roles?.includes('developer')) return c.json({ error: 'Developer role required' }, 403)
+			const body = await c.req.parseBody().catch(() => ({}))
+			const blobName = textField(body, 'blobname')
+			const file = Object.values(body).find((value): value is File => value instanceof File)
+			if (!blobName || !/^[a-z0-9]{16,64}\.htr$/.test(blobName) || !file) {
+				return c.json({ error: 'Valid BlobName and audio file are required' }, 400)
+			}
+			const limit = maxUploadBytes(c.env.MAX_UPLOAD_BYTES)
+			if (file.size > limit) {
+				return c.json({ error: `file exceeds the ${limit}-byte upload limit` }, 413)
+			}
+			const bytes = new Uint8Array(await file.arrayBuffer())
+			const key = `data/${blobName}`
+			const existing = await c.env.CDN_ASSETS.get(key)
+			if (existing) {
+				const prior = new Uint8Array(await existing.arrayBuffer())
+				if (prior.length !== bytes.length || prior.some((byte, i) => byte !== bytes[i])) {
+					return c.json({ error: 'Audio blob name already has different data' }, 409)
+				}
+				return c.json({ filename: blobName })
+			}
+			await c.env.CDN_ASSETS.put(key, bytes, {
+				httpMetadata: { contentType: 'application/octet-stream' },
+				sha256: await crypto.subtle.digest('SHA-256', bytes),
+			})
+			return c.json({ filename: blobName })
 		}
 	)
 

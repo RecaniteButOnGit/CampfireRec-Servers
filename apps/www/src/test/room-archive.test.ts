@@ -23,6 +23,14 @@ it('reads a room export and skips listed subrooms without scene files', async ()
 			JSON.stringify({ Name: 'RRSUpdate', CurrentSave: { UnityAssetId: 'rrs-asset' } })
 		),
 		'BloodFlower/SubRoom_456_RRSUpdate/persisted_room_data.binpb': new Uint8Array([8, 2]),
+		'BloodFlower/SubRoom_123_OldUpdate/CV2Audio/Node_SampleAudio_8s9mgoy07z9cn3btawtolp294.htr.binpb':
+			new Uint8Array([3, 4, 5]),
+		'BloodFlower/SubRoom_456_RRSUpdate/CV2Audio/Node_SampleAudio_8s9mgoy07z9cn3btawtolp294.htr.binpb':
+			new Uint8Array([3, 4, 5]),
+		'BloodFlower/SubRoom_123_OldUpdate/CV2Audio/Node_SampleAudio_8s9mgoy07z9cn3btawtolp294.htr.wav':
+			new Uint8Array([6, 7]),
+		'BloodFlower/SubRoom_123_OldUpdate/AudioSampler/PVHolotar_d6wmvlq0dfm4xs0h33320g14z.htr.binpb':
+			new Uint8Array([7, 8]),
 		'BloodFlower/Inventions/Invention_1/Scene.glb': new Uint8Array([1, 2, 3]),
 	})
 	const archive = await readRoomArchive(new File([new Uint8Array(zip)], 'BloodFlower.zip'))
@@ -36,4 +44,10 @@ it('reads a room export and skips listed subrooms without scene files', async ()
 		new Uint8Array([0xf0, 0x01, 83])
 	)
 	expect(archive.skippedSubRooms).toBe(1)
+	expect(archive.audio).toHaveLength(2)
+	expect(archive.audio[0]?.blobName).toBe('8s9mgoy07z9cn3btawtolp294.htr')
+	expect(new Uint8Array(await archive.audio[0]!.file.arrayBuffer())).toEqual(
+		new Uint8Array([3, 4, 5])
+	)
+	expect(archive.audio[1]?.blobName).toBe('d6wmvlq0dfm4xs0h33320g14z.htr')
 })

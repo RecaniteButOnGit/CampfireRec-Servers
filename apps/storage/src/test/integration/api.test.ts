@@ -25,10 +25,10 @@ function b64url(input: ArrayBuffer | string): string {
 	return btoa(binary).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '')
 }
 
-async function bearer(sub = '42'): Promise<Record<string, string>> {
+async function bearer(sub = '42', roles?: string[]): Promise<Record<string, string>> {
 	const now = Math.floor(Date.now() / 1000)
 	const signingInput = `${b64url(JSON.stringify({ alg: 'HS256', typ: 'JWT' }))}.${b64url(
-		JSON.stringify({ sub, exp: now + 3600 })
+		JSON.stringify({ sub, exp: now + 3600, ...(roles && { role: roles }) })
 	)}`
 	const key = await crypto.subtle.importKey(
 		'raw',
@@ -46,6 +46,13 @@ function uploadForm(fileType: string, bytes: Uint8Array): FormData {
 	const form = new FormData()
 	form.set('FileType', fileType)
 	form.set('File', new File([bytes], 'file.bin', { type: 'application/octet-stream' }))
+	return form
+}
+
+function cv2AudioForm(blobName: string, bytes: Uint8Array): FormData {
+	const form = new FormData()
+	form.set('BlobName', blobName)
+	form.set('File', new File([bytes], 'sample.htr.binpb'))
 	return form
 }
 
@@ -178,6 +185,61 @@ it('POST /upload 400s when there is neither a file nor a name', async () => {
 	expect(res.status).toBe(400)
 })
 
+it('uploads sample audio under its scene blob name for developers only', async () => {
+	const blobName = '8s9mgoy07z9cn3btawtolp294.htr'
+	const bytes = new Uint8Array([8, 1, 18, 2, 3, 4])
+	const url = `${ORIGIN}/upload/imported-audio`
+	expect(
+		(await SELF.fetch(url, { method: 'POST', body: cv2AudioForm(blobName, bytes) })).status
+	).toBe(401)
+	expect(
+		(
+			await SELF.fetch(url, {
+				method: 'POST',
+				headers: await bearer(),
+				body: cv2AudioForm(blobName, bytes),
+			})
+		).status
+	).toBe(403)
+	const headers = await bearer('42', ['developer'])
+	expect(
+		(
+			await SELF.fetch(url, {
+				method: 'POST',
+				headers,
+				body: cv2AudioForm('../other.htr', bytes),
+			})
+		).status
+	).toBe(400)
+	const uploaded = await SELF.fetch(url, {
+		method: 'POST',
+		headers,
+		body: cv2AudioForm(blobName, bytes),
+	})
+	expect(uploaded.status).toBe(200)
+	expect((await uploaded.json()) as { filename: string }).toEqual({ filename: blobName })
+	const stored = await env.CDN_ASSETS.get(`data/${blobName}`)
+	expect(new Uint8Array(await stored!.arrayBuffer())).toEqual(bytes)
+	expect(
+		(
+			await SELF.fetch(url, {
+				method: 'POST',
+				headers,
+				body: cv2AudioForm(blobName, bytes),
+			})
+		).status
+	).toBe(200)
+	expect(
+		(
+			await SELF.fetch(url, {
+				method: 'POST',
+				headers,
+				body: cv2AudioForm(blobName, new Uint8Array([9])),
+			})
+		).status
+	).toBe(409)
+})
+
 it('answers the CORS preflight the website’s upload needs', async () => {
 	// The room management page uploads a subroom's scene blob straight from the browser.
 	// The bearer token makes that a preflighted request, so a missing OPTIONS handler
@@ -215,7 +277,7 @@ it('GET /openapi.json documents every route', async () => {
 			Object.keys(ops).map((method) => `${method.toUpperCase()} ${path}`)
 		)
 	)
-	expect([...documented].sort()).toEqual(['GET /', 'POST /upload'])
+	expect([...documented].sort()).toEqual(['GET /', 'POST /upload', 'POST /upload/imported-audio'])
 
 	// Every operation carries a summary — a path present but undescribed is not
 	// documentation.

@@ -7,10 +7,16 @@ export interface ArchiveSubRoom {
 	originalFile?: File
 }
 
+export interface ArchiveAudio {
+	blobName: string
+	file: File
+}
+
 export interface RoomArchive {
 	details: Record<string, unknown>
 	image: File
 	subRooms: ArchiveSubRoom[]
+	audio: ArchiveAudio[]
 	skippedSubRooms: number
 }
 
@@ -18,6 +24,8 @@ const MAX_ZIP_BYTES = 256 * 1024 * 1024
 const MAX_ENTRY_BYTES = 64 * 1024 * 1024
 const MAX_EXTRACTED_BYTES = 128 * 1024 * 1024
 const text = new TextDecoder()
+const EXPORTED_AUDIO_ENTRY =
+	/(?:^|\/)(?:CV2Audio\/Node_SampleAudio_|AudioSampler\/PVHolotar_|Holotar\/PVHolotar_)([a-z0-9]{16,64}\.htr)\.binpb$/i
 
 function jsonObject(bytes: Uint8Array, label: string): Record<string, unknown> {
 	try {
@@ -31,7 +39,7 @@ function jsonObject(bytes: Uint8Array, label: string): Record<string, unknown> {
 	throw new Error(`${label} is not valid room metadata.`)
 }
 
-/** Read only the files the importer uses; large GLBs, inventions and auxiliary assets stay compressed. */
+/** Read importable metadata and blobs; large GLBs and WAV previews stay compressed. */
 export async function readRoomArchive(file: File): Promise<RoomArchive> {
 	if (!file.name.toLowerCase().endsWith('.zip')) throw new Error('Choose a .zip room export.')
 	if (file.size > MAX_ZIP_BYTES) throw new Error('This ZIP is too large to import in the browser.')
@@ -43,7 +51,7 @@ export async function readRoomArchive(file: File): Promise<RoomArchive> {
 				const wanted =
 					/(?:^|\/)(?:RoomDetails\.json|RoomImage\.(?:jpe?g|png)|Subroom\.json|persisted_room_data\.(?:original\.binpb|binpb|room))$/i.test(
 						name
-					)
+					) || EXPORTED_AUDIO_ENTRY.test(name)
 				if (!wanted) return false
 				if (originalSize > MAX_ENTRY_BYTES) throw new Error(`Archive entry is too large: ${name}`)
 				extractedBytes += originalSize
@@ -74,6 +82,28 @@ export async function readRoomArchive(file: File): Promise<RoomArchive> {
 	const image = new File([new Uint8Array(imageBytes)], imagePath.split('/').pop()!, {
 		type: imageType,
 	})
+	// The scene stores each sample's original `.htr` blob name. WAV files in the
+	// export are decoded previews; the `.binpb` bytes are what the client fetches.
+	const audioByName = new Map<string, Uint8Array>()
+	for (const [path, bytes] of entries) {
+		if (!path.startsWith(root)) continue
+		const match = EXPORTED_AUDIO_ENTRY.exec(path)
+		if (!match) continue
+		const blobName = match[1]!.toLowerCase()
+		const previous = audioByName.get(blobName)
+		if (
+			previous &&
+			(previous.length !== bytes.length || previous.some((byte, i) => byte !== bytes[i]))
+		)
+			throw new Error(`Archive has conflicting sample audio for ${blobName}.`)
+		audioByName.set(blobName, bytes)
+	}
+	const audio: ArchiveAudio[] = [...audioByName].map(([blobName, bytes]) => ({
+		blobName,
+		file: new File([new Uint8Array(bytes)], `${blobName}.binpb`, {
+			type: 'application/octet-stream',
+		}),
+	}))
 	const subRooms: ArchiveSubRoom[] = []
 	for (const [path, bytes] of entries) {
 		if (!path.startsWith(root) || !/\/Subroom\.json$/i.test(path)) continue
@@ -115,5 +145,5 @@ export async function readRoomArchive(file: File): Promise<RoomArchive> {
 	}
 	if (subRooms.length === 0) throw new Error('The ZIP has no subroom with scene data to import.')
 	const listed = Array.isArray(details.SubRooms) ? details.SubRooms.length : subRooms.length
-	return { details, image, subRooms, skippedSubRooms: Math.max(0, listed - subRooms.length) }
+	return { details, image, subRooms, audio, skippedSubRooms: Math.max(0, listed - subRooms.length) }
 }

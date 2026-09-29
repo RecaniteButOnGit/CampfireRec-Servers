@@ -31,7 +31,7 @@ import { ModerationPage } from './Moderation'
 import { StatsPage } from './Stats'
 
 import type { ReactNode } from 'react'
-import type { RoomArchive } from '../room-archive'
+import type { ArchiveAudio, RoomArchive } from '../room-archive'
 import type { Hosts } from './api'
 
 /**
@@ -264,6 +264,23 @@ async function uploadToStorage(file: File, fileType: string): Promise<string> {
 	})
 	if (!filename) throw new Error('The storage worker accepted the file but returned no name.')
 	return filename
+}
+
+/** Exported audio must keep the blob names already embedded in the scene. */
+async function uploadImportedAudio(audio: ArchiveAudio): Promise<void> {
+	const form = new FormData()
+	form.set('BlobName', audio.blobName)
+	form.set('File', audio.file)
+	const { filename } = await call<{ filename?: string }>(
+		`${where().storage}/upload/imported-audio`,
+		{
+			method: 'POST',
+			multipart: form,
+			authed: true,
+		}
+	)
+	if (filename !== audio.blobName)
+		throw new Error(`Could not upload sample audio ${audio.blobName}.`)
 }
 
 /**
@@ -3409,6 +3426,10 @@ function RoomImport({ navigate }: { navigate: Navigate }) {
 								converted,
 							})
 						}
+						for (const [index, audio] of archive.audio.entries()) {
+							setProgress(`Uploading sample audio ${index + 1} of ${archive.audio.length}…`)
+							await uploadImportedAudio(audio)
+						}
 						setProgress('Creating room…')
 						const response = await call<{
 							success?: boolean
@@ -3462,7 +3483,9 @@ function RoomImport({ navigate }: { navigate: Navigate }) {
 						<p className="muted">
 							{archive.subRooms.length} subroom{archive.subRooms.length === 1 ? '' : 's'} with scene
 							data. {archive.skippedSubRooms} listed subroom
-							{archive.skippedSubRooms === 1 ? '' : 's'} without files will be skipped.
+							{archive.skippedSubRooms === 1 ? '' : 's'} without supported scene data will be
+							skipped. {archive.audio.length} sample audio file
+							{archive.audio.length === 1 ? '' : 's'} will be uploaded.
 						</p>
 						{archive.subRooms.some((sub) => sub.originalFile) && (
 							<label className="check">

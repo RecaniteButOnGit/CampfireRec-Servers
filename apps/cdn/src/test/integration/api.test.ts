@@ -266,6 +266,14 @@ describe('cdn endpoints', () => {
 		expect(new Uint8Array(await res.arrayBuffer())).toEqual(new Uint8Array([4, 5, 6]))
 	})
 
+	test('GET /data/:id serves an imported sample by its bare .htr name', async () => {
+		const name = '8s9mgoy07z9cn3btawtolp294.htr'
+		await env.CDN_ASSETS.put(`data/${name}`, new Uint8Array([8, 1, 18, 2]))
+		const res = await exports.default.fetch(`${ORIGIN}/data/${name}`)
+		expect(res.status).toBe(200)
+		expect(new Uint8Array(await res.arrayBuffer())).toEqual(new Uint8Array([8, 1, 18, 2]))
+	})
+
 	test('GET /data/:id 404s when the blob is absent', async () => {
 		const res = await exports.default.fetch(`${ORIGIN}/data/missing`)
 		expect(res.status).toBe(404)
