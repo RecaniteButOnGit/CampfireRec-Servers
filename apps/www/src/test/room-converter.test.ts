@@ -1,6 +1,6 @@
 import { expect, it } from 'vitest'
 
-import { forceRoomVersionOne, isBinpbScene, roomVersion } from '../room-converter'
+import { forceRoomVersion, forceRoomVersionOne, isBinpbScene, roomVersion } from '../room-converter'
 
 function varint(value: bigint): number[] {
 	const out: number[] = []
@@ -53,6 +53,13 @@ it('changes every top-level version when the field occurs twice', () => {
 		...len(2, num(30, 222)),
 		...num(30, 1),
 	])
+})
+
+it('writes Rooms 2.0 client version 141 as a varint without changing other fields', () => {
+	const input = Uint8Array.from([...num(1, 38), ...num(30, 1), ...num(31, 7)])
+	const output = forceRoomVersion(input, 141)
+	expect(roomVersion(output)).toBe(141)
+	expect([...output]).toEqual([...num(1, 38), ...num(30, 141), ...num(31, 7)])
 })
 
 it('leaves a scene already at version 1 unchanged', () => {

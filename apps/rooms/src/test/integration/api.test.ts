@@ -163,6 +163,44 @@ it('uses the imported saves rather than skipped subrooms for the room version', 
 	expect((result.value.SubRooms as Room[])[0]?.Name).toBe('new-map-aka-lighter-got-bored')
 })
 
+it('imports a converted Rooms 2.0 save at version 141 in all save metadata', async () => {
+	const name = `ZipRooms2${crypto.randomUUID().slice(0, 8)}`
+	const imageName = `2026-09-28/${crypto.randomUUID()}`
+	const dataBlob = `2026-09-28/${crypto.randomUUID()}`
+	await env.CDN_ASSETS.put(`image/${imageName}`, new Uint8Array([1]))
+	await env.CDN_ASSETS.put(`room/${dataBlob}`, new Uint8Array([2]))
+	const response = await SELF.fetch(`${ORIGIN}/rooms/import`, {
+		method: 'POST',
+		headers: { ...(await bearer('999', ['developer'])), 'content-type': 'application/json' },
+		body: JSON.stringify({
+			details: { Name: name },
+			imageName,
+			subRooms: [
+				{
+					details: { Name: 'Home' },
+					save: { PersistenceVersion: 141, OMVersion: 141, UgcSubVersion: 141 },
+					dataBlob,
+					dataBlobHash: 'hash',
+					converted: true,
+					convertedVersion: 141,
+				},
+			],
+		}),
+	})
+	expect(response.status).toBe(200)
+	const result = (await response.json()) as { value: Room }
+	expect(result.value.PersistenceVersion).toBe(141)
+	expect((result.value.SubRooms as Room[])[0]?.CurrentSave).toMatchObject({
+		PersistenceVersion: 141,
+		OMVersion: 141,
+		UgcSubVersion: 141,
+	})
+	await SELF.fetch(`${ORIGIN}/rooms/${result.value.RoomId}`, {
+		method: 'DELETE',
+		headers: await bearer('999', ['developer']),
+	})
+})
+
 // Mint a token the way the `auth` worker does, signing with the shared test key seeded into the JWT_SECRET store.
 const TEST_SECRET = 'test-signing-key'
 function b64url(input: ArrayBuffer | string): string {

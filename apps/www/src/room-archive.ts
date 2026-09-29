@@ -1,4 +1,4 @@
-import { unzipSync } from 'fflate'
+import { Unzip, UnzipInflate, UnzipPassThrough } from 'fflate'
 
 export interface ArchiveSubRoom {
 	details: Record<string, unknown>
@@ -20,7 +20,7 @@ export interface RoomArchive {
 	skippedSubRooms: number
 }
 
-const MAX_ZIP_BYTES = 256 * 1024 * 1024
+const MAX_ZIP_BYTES = 2 * 1024 * 1024 * 1024
 const MAX_ENTRY_BYTES = 64 * 1024 * 1024
 // CV2 `.htr.binpb` recordings can make the selected import payload much larger than
 // ordinary room scenes. Keep the filtered payload bounded while allowing large rooms.
@@ -28,6 +28,89 @@ const MAX_EXTRACTED_BYTES = 384 * 1024 * 1024
 const text = new TextDecoder()
 const EXPORTED_AUDIO_ENTRY =
 	/(?:^|\/)(?:CV2Audio\/Node_SampleAudio_|AudioSampler\/PVHolotar_|Holotar\/PVHolotar_)([a-z0-9]{16,64}\.htr)\.binpb$/i
+
+function selectedEntry(name: string): boolean {
+	return (
+		/(?:^|\/)(?:RoomDetails\.json|RoomImage\.(?:jpe?g|png)|Subroom\.json|persisted_room_data\.(?:original\.binpb|binpb|room))$/i.test(
+			name
+		) || EXPORTED_AUDIO_ENTRY.test(name)
+	)
+}
+
+function asError(error: unknown): Error {
+	return error instanceof Error ? error : new Error(String(error))
+}
+
+function joinChunks(chunks: Uint8Array[], size: number): Uint8Array {
+	const output = new Uint8Array(size)
+	let offset = 0
+	for (const chunk of chunks) {
+		output.set(chunk, offset)
+		offset += chunk.length
+	}
+	return output
+}
+
+/** Stream only importer-relevant entries so multi-gigabyte exports don't fill browser RAM. */
+async function extractSelectedEntries(file: File): Promise<Record<string, Uint8Array>> {
+	const files: Record<string, Uint8Array> = {}
+	let extractedBytes = 0
+	let streamError: Error | undefined
+	const unzipper = new Unzip()
+	unzipper.register(UnzipPassThrough)
+	unzipper.register(UnzipInflate)
+	unzipper.onfile = (entry) => {
+		if (!selectedEntry(entry.name)) return
+		if (entry.originalSize !== undefined && entry.originalSize > MAX_ENTRY_BYTES) {
+			streamError = new Error(`Archive entry is too large: ${entry.name}`)
+			return
+		}
+		const chunks: Uint8Array[] = []
+		let entryBytes = 0
+		entry.ondata = (error, chunk, final) => {
+			if (error) {
+				streamError = asError(error)
+				return
+			}
+			if (chunk) {
+				entryBytes += chunk.length
+				extractedBytes += chunk.length
+				if (entryBytes > MAX_ENTRY_BYTES) {
+					streamError = new Error(`Archive entry is too large: ${entry.name}`)
+					return
+				}
+				if (extractedBytes > MAX_EXTRACTED_BYTES) {
+					streamError = new Error('The extracted room is too large.')
+					return
+				}
+				chunks.push(chunk)
+			}
+			if (final && !streamError) files[entry.name] = joinChunks(chunks, entryBytes)
+		}
+		try {
+			entry.start()
+		} catch (error) {
+			streamError = asError(error)
+		}
+	}
+
+	const reader = file.stream().getReader()
+	try {
+		while (true) {
+			const { done, value } = await reader.read()
+			unzipper.push(value ?? new Uint8Array(0), done)
+			if (streamError) throw streamError
+			if (done) break
+		}
+		return files
+	} catch (error) {
+		await reader.cancel().catch(() => undefined)
+		if (error instanceof Error && /too large/i.test(error.message)) throw error
+		throw new Error('Could not read this ZIP as a room export.')
+	} finally {
+		reader.releaseLock()
+	}
+}
 
 function jsonObject(bytes: Uint8Array, label: string): Record<string, unknown> {
 	try {
@@ -44,28 +127,8 @@ function jsonObject(bytes: Uint8Array, label: string): Record<string, unknown> {
 /** Read importable metadata and blobs; large GLBs and WAV previews stay compressed. */
 export async function readRoomArchive(file: File): Promise<RoomArchive> {
 	if (!file.name.toLowerCase().endsWith('.zip')) throw new Error('Choose a .zip room export.')
-	if (file.size > MAX_ZIP_BYTES) throw new Error('This ZIP is too large to import in the browser.')
-	let extractedBytes = 0
-	let files: Record<string, Uint8Array>
-	try {
-		files = unzipSync(new Uint8Array(await file.arrayBuffer()), {
-			filter: ({ name, originalSize }) => {
-				const wanted =
-					/(?:^|\/)(?:RoomDetails\.json|RoomImage\.(?:jpe?g|png)|Subroom\.json|persisted_room_data\.(?:original\.binpb|binpb|room))$/i.test(
-						name
-					) || EXPORTED_AUDIO_ENTRY.test(name)
-				if (!wanted) return false
-				if (originalSize > MAX_ENTRY_BYTES) throw new Error(`Archive entry is too large: ${name}`)
-				extractedBytes += originalSize
-				if (extractedBytes > MAX_EXTRACTED_BYTES)
-					throw new Error('The extracted room is too large.')
-				return true
-			},
-		})
-	} catch (error) {
-		if (error instanceof Error && /too large/i.test(error.message)) throw error
-		throw new Error('Could not read this ZIP as a room export.')
-	}
+	if (file.size > MAX_ZIP_BYTES) throw new Error('This ZIP is too large to import (maximum 2 GiB).')
+	const files = await extractSelectedEntries(file)
 	const entries = Object.entries(files)
 	const detailFiles = entries.filter(([name]) => /(?:^|\/)RoomDetails\.json$/i.test(name))
 	if (detailFiles.length !== 1) throw new Error('The ZIP must contain one RoomDetails.json.')

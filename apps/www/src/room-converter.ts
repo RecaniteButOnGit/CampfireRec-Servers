@@ -6,11 +6,22 @@
  * cannot make content from a newer game build compatible with an older client.
  */
 
-const TARGET_VERSION = 1
-
 /** The file extension for scene data exported from a newer Rec Room build. */
 export function isBinpbScene(filename: string): boolean {
 	return filename.toLowerCase().endsWith('.binpb')
+}
+
+function encodeVarint(value: number): Uint8Array {
+	if (!Number.isSafeInteger(value) || value < 0) {
+		throw new Error('Scene version must be a non-negative integer.')
+	}
+	const bytes: number[] = []
+	do {
+		const remainder = value % 128
+		value = Math.floor(value / 128)
+		bytes.push(remainder | (value > 0 ? 0x80 : 0))
+	} while (value > 0)
+	return Uint8Array.from(bytes)
 }
 
 function readVarint(data: Uint8Array, start: number): [number, number] {
@@ -82,16 +93,16 @@ export function roomVersion(data: Uint8Array): number | undefined {
 	return version
 }
 
-/** Change only top-level field 30 to version 1, retaining all other scene bytes. */
-export function forceRoomVersionOne(data: Uint8Array): Uint8Array<ArrayBuffer> {
+/** Change only top-level field 30, retaining all other scene bytes. */
+export function forceRoomVersion(data: Uint8Array, targetVersion: number): Uint8Array<ArrayBuffer> {
 	const source = Uint8Array.from(data)
 	const parts: Uint8Array[] = []
 	let copiedThrough = 0
 	let changed = false
 
 	const foundVersion = visitRoomVersions(source, (version, valuePos, fieldEnd) => {
-		if (version !== TARGET_VERSION) {
-			parts.push(source.subarray(copiedThrough, valuePos), Uint8Array.of(TARGET_VERSION))
+		if (version !== targetVersion) {
+			parts.push(source.subarray(copiedThrough, valuePos), encodeVarint(targetVersion))
 			copiedThrough = fieldEnd
 			changed = true
 		}
@@ -108,4 +119,9 @@ export function forceRoomVersionOne(data: Uint8Array): Uint8Array<ArrayBuffer> {
 		offset += part.length
 	}
 	return output
+}
+
+/** Change only top-level field 30 to version 1, retaining all other scene bytes. */
+export function forceRoomVersionOne(data: Uint8Array): Uint8Array<ArrayBuffer> {
+	return forceRoomVersion(data, 1)
 }

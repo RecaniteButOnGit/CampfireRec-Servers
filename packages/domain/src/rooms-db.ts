@@ -808,13 +808,14 @@ export interface ImportedSubRoom {
 	dataBlob: string
 	dataBlobHash: string
 	converted: boolean
+	convertedVersion?: number
 }
 
-/** The experimental persistence version written into converted ZIP scene files. */
+/** The legacy persistence version used when an imported scene is converted. */
 const IMPORT_CONVERTED_PERSISTENCE_VERSION = 1
 
 function importedSavePersistenceVersion(sub: ImportedSubRoom): number {
-	if (sub.converted) return IMPORT_CONVERTED_PERSISTENCE_VERSION
+	if (sub.converted) return sub.convertedVersion ?? IMPORT_CONVERTED_PERSISTENCE_VERSION
 	const sourceVersion = sub.save.PersistenceVersion
 	return typeof sourceVersion === 'number' && Number.isFinite(sourceVersion) ? sourceVersion : 0
 }
@@ -942,8 +943,16 @@ export async function importRoom(
 					DataBlobHash: entry.dataBlobHash,
 					ReferencedUnityAssetIds: [],
 					PersistenceVersion: importedSavePersistenceVersion(entry),
-					OMVersion: entry.converted ? 0 : number(sourceSave.OMVersion, 0),
-					UgcSubVersion: entry.converted ? 0 : number(sourceSave.UgcSubVersion, 0),
+					OMVersion: entry.converted
+						? entry.convertedVersion === 141
+							? 141
+							: 0
+						: number(sourceSave.OMVersion, 0),
+					UgcSubVersion: entry.converted
+						? entry.convertedVersion === 141
+							? 141
+							: 0
+						: number(sourceSave.UgcSubVersion, 0),
 					SavedByAccountId: ownerId,
 					SavedOnPlatform: 0,
 					SavedOnDeviceClass: 0,

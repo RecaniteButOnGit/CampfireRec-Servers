@@ -12,7 +12,7 @@ import {
 	SOURCE_REPO,
 } from '../links'
 import { readRoomArchive } from '../room-archive'
-import { forceRoomVersionOne, isBinpbScene, roomVersion } from '../room-converter'
+import { forceRoomVersion, isBinpbScene, roomVersion } from '../room-converter'
 // The session token, the worker hostnames and the `call` every request goes through —
 // see api.ts for why they're a module of their own rather than defined here.
 import {
@@ -233,17 +233,20 @@ function isRoomBlobFile(filename: string): boolean {
 }
 
 /**
- * The file that actually gets stored for a picked scene file. With the version-one
- * option enabled, only the scene's top-level persistence version is changed; all
- * circuit and object bytes pass through unchanged.
+ * The file that actually gets stored for a picked scene file. Only the scene's
+ * top-level persistence version is changed; all circuit and object bytes pass through.
  *
  * Done here in the browser, before either request, because the upload goes straight to
  * `storage` and the save's `Hash` has to describe the bytes that were stored — so both
  * the upload and `blobHash` must be given this file, not the one that was picked.
  */
-async function prepareRoomBlob(file: File, forceVersionOne: boolean): Promise<File> {
-	if (!forceVersionOne) return file
-	const data = forceRoomVersionOne(new Uint8Array(await file.arrayBuffer()))
+async function prepareRoomBlob(
+	file: File,
+	changeVersion: boolean,
+	targetVersion = 1
+): Promise<File> {
+	if (!changeVersion) return file
+	const data = forceRoomVersion(new Uint8Array(await file.arrayBuffer()), targetVersion)
 	return new File([data], file.name, { type: 'application/octet-stream' })
 }
 
@@ -3367,7 +3370,6 @@ function RoomImport({ navigate }: { navigate: Navigate }) {
 	const [name, setName] = useState('')
 	const [loading, setLoading] = useState(false)
 	const [fileError, setFileError] = useState('')
-	const [forceVersionOne, setForceVersionOne] = useState(false)
 	const [useOriginalScenes, setUseOriginalScenes] = useState(false)
 	const [progress, setProgress] = useState('')
 	const [created, setCreated] = useState<{ RoomId: number; Name: string } | null>(null)
@@ -3392,28 +3394,44 @@ function RoomImport({ navigate }: { navigate: Navigate }) {
 								const originalFile = useOriginalScenes ? sub.originalFile : undefined
 								const file = originalFile ?? sub.file
 								let save = sub.save
-								if (originalFile) {
+								const rooms2 = typeof save.OMVersion === 'number' && save.OMVersion > 0
+								const converted = isBinpbScene(file.name) && (!originalFile || rooms2)
+								const convertedVersion = rooms2 ? 141 : 1
+								if (originalFile && !rooms2) {
 									const version = roomVersion(new Uint8Array(await originalFile.arrayBuffer()))
-									if (version === undefined)
+									if (version === undefined) {
 										throw new Error(
 											`Original scene for ${String(sub.details.Name)} has no version.`
 										)
+									}
 									save = { ...save, PersistenceVersion: version }
+								}
+								if (converted) {
+									save = {
+										...save,
+										PersistenceVersion: convertedVersion,
+										OMVersion: rooms2 ? convertedVersion : 0,
+										UgcSubVersion: rooms2 ? convertedVersion : 0,
+									}
 								}
 								return {
 									sub,
 									file,
 									save,
-									converted: !originalFile && forceVersionOne && isBinpbScene(file.name),
+									converted,
+									convertedVersion: converted ? convertedVersion : undefined,
 								}
 							})
 						)
 						setProgress('Uploading room image…')
 						const imageName = await uploadToStorage(archive.image, FILE_TYPE_IMAGE)
 						const subRooms = []
-						for (const [index, { sub, file, save, converted }] of selectedSubRooms.entries()) {
+						for (const [
+							index,
+							{ sub, file, save, converted, convertedVersion },
+						] of selectedSubRooms.entries()) {
 							setProgress(`Uploading subroom ${index + 1} of ${archive.subRooms.length}…`)
-							const prepared = await prepareRoomBlob(file, converted)
+							const prepared = await prepareRoomBlob(file, converted, convertedVersion)
 							const [dataBlob, dataBlobHash] = await Promise.all([
 								uploadRoomBlob(prepared),
 								blobHash(prepared),
@@ -3424,6 +3442,7 @@ function RoomImport({ navigate }: { navigate: Navigate }) {
 								dataBlob,
 								dataBlobHash,
 								converted,
+								...(convertedVersion === undefined ? {} : { convertedVersion }),
 							})
 						}
 						for (const [index, audio] of archive.audio.entries()) {
@@ -3460,7 +3479,6 @@ function RoomImport({ navigate }: { navigate: Navigate }) {
 							setCreated(null)
 							setFileError('')
 							setUseOriginalScenes(false)
-							setForceVersionOne(false)
 							if (!picked) return
 							setLoading(true)
 							void readRoomArchive(picked)
@@ -3499,18 +3517,15 @@ function RoomImport({ navigate }: { navigate: Navigate }) {
 								Use original scene files before export migration, where available
 							</label>
 						)}
-						<label className="check">
-							<input
-								type="checkbox"
-								checked={forceVersionOne}
-								onChange={(event) => setForceVersionOne(event.target.checked)}
-							/>
-							Force migrated .binpb scene version 1 (keeps circuits)
-						</label>
+						<p className="muted">
+							Imported legacy scenes are set to version 1; Rooms 2.0 scenes (OMVersion above 0) are
+							set to version 141. Only the top-level scene version and matching save metadata are
+							adjusted; circuit and object data stay intact.
+						</p>
 						{useOriginalScenes && (
 							<p className="muted">
-								Original scenes keep their embedded version; the version 1 option applies only where
-								no original is available.
+								Original scene files are used when available. Rooms 2.0 originals receive the same
+								version 141 normalization as their save metadata.
 							</p>
 						)}
 						{progress && <p className="muted">{progress}</p>}
