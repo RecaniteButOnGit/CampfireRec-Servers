@@ -17,8 +17,8 @@ export type Env = SharedHonoEnv & {
 	// push RoomUpdate notifications when a room is mutated.
 	RECFLARE_NOTIFICATIONS_HUB: DurableObjectNamespace<NotificationsHub>
 	// Shared `recflare-cdn` R2 bucket (the `cdn`/`storage` workers own it). Room
-	// images/files live here under the `room/` key prefix; bound so deleting a room
-	// can remove its image object.
+	// Scene files live under `room/`, while room images live under `image/`;
+	// bound so deleting a room can remove its image object.
 	CDN_ASSETS: R2Bucket
 	// How many rooms one account may create (optional). Unset falls back to
 	// DEFAULT_MAX_ROOMS_PER_ACCOUNT in rooms.app.ts; 0 lifts the cap. Typed

@@ -75,6 +75,15 @@ it('imports an export as a private room owned by account 2, without unsupported 
 		body: JSON.stringify(body),
 	})
 	expect(forbidden.status).toBe(403)
+	const unsupported = await SELF.fetch(`${ORIGIN}/rooms/import`, {
+		method: 'POST',
+		headers: { ...(await bearer('999', ['developer'])), 'content-type': 'application/json' },
+		body: JSON.stringify({
+			...body,
+			subRooms: [{ ...body.subRooms[0], save: { UnityAssetId: 'rrs-asset' } }],
+		}),
+	})
+	expect(unsupported.status).toBe(400)
 	const imported = await SELF.fetch(`${ORIGIN}/rooms/import`, {
 		method: 'POST',
 		headers: { ...(await bearer('999', ['developer'])), 'content-type': 'application/json' },
@@ -1878,7 +1887,7 @@ describe('rooms endpoints', () => {
 				})
 			)
 			.run()
-		await env.CDN_ASSETS.put(`room/${ImageName}`, new Uint8Array([1, 2, 3]))
+		await env.CDN_ASSETS.put(`image/${ImageName}`, new Uint8Array([1, 2, 3]))
 		await env.DB.prepare(
 			'INSERT INTO interaction (player_id, room_id, cheered, favorited) VALUES (7, 9500, 1, 1)'
 		).run()
@@ -1902,7 +1911,7 @@ describe('rooms endpoints', () => {
 		// Owner → Success:true; the room, its interactions, and the CDN image are gone.
 		expect(await bodyOf(await del('1'))).toMatchObject({ Success: true })
 		expect(await roomExists()).toBe(false)
-		expect(await env.CDN_ASSETS.get(`room/${ImageName}`)).toBeNull()
+		expect(await env.CDN_ASSETS.get(`image/${ImageName}`)).toBeNull()
 		const interactions = await env.DB.prepare(
 			'SELECT COUNT(*) AS n FROM interaction WHERE room_id = 9500'
 		).first<{ n: number }>()
@@ -5645,6 +5654,7 @@ describe('rooms endpoints', () => {
 			'GET /roomserver/rooms/createdby/me',
 			'GET /showcase/{playerId}',
 			'POST /rooms/bulk',
+			'POST /rooms/import',
 			'POST /rooms/{roomId}/bans',
 			'POST /rooms/{roomId}/clone',
 			'POST /rooms/{roomId}/leaderboards/{leaderboardId}',

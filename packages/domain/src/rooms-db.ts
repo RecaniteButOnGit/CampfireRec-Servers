@@ -829,13 +829,15 @@ export async function importRoom(
 		typeof value === 'boolean' ? value : fallback
 	const string = (value: unknown, fallback: string) =>
 		typeof value === 'string' ? value : fallback
-	const row = await db.prepare('SELECT MAX(room_id) AS maxId FROM room').first<{ maxId: number | null }>()
+	const row = await db
+		.prepare('SELECT MAX(room_id) AS maxId FROM room')
+		.first<{ maxId: number | null }>()
 	const roomId = (row?.maxId ?? 0) + 1
 	const name = string(details.Name, '')
 	const room: Room = {
 		RoomId: roomId,
 		Name: name,
-		FriendlyName: string(details.FriendlyName, name),
+		FriendlyName: name,
 		Description: string(details.Description, ''),
 		ImageName: imageName,
 		WarningMask: number(details.WarningMask, 0),
@@ -883,7 +885,14 @@ export async function importRoom(
 		LocalizationContext: { TargetLocale: null, Scope: null, LocalizedFields: [] },
 		IsDeveloperOwned: false,
 		RankedEntityId: '',
-		Roles: [{ AccountId: ownerId, Role: Role.Creator, LastChangedByAccountId: null, InvitedRole: Role.None }],
+		Roles: [
+			{
+				AccountId: ownerId,
+				Role: Role.Creator,
+				LastChangedByAccountId: null,
+				InvitedRole: Role.None,
+			},
+		],
 		IsJuniorCreated: false,
 		PromoImages: [],
 		PromoExternalContent: [],
@@ -1473,7 +1482,8 @@ export type SubRoomDataSave = Record<string, unknown>
  * original save metadata; its binary hash is served by the Railway CDN.
  */
 const ROOMS2_SCENE_ID = '5d4e40d8-f289-4295-a6e1-4f907835007d'
-const ROOMS2_MAKERROOM_DATA_BLOB = 'templates/rooms2/empty-obbytemplate/rooms2-obby-empty-no-objects.room'
+const ROOMS2_MAKERROOM_DATA_BLOB =
+	'templates/rooms2/empty-obbytemplate/rooms2-obby-empty-no-objects.room'
 const ROOMS2_MAKERROOM_DATA_BLOB_HASH = 'qJFGSCpwxstEyE5VJk4l3ymFm2LViFnercpf1Ma/wxQ='
 const ROOMS2_MAKERROOM_REFERENCED_ASSET_IDS = [
 	'3bbd34ae-7fff-4bd5-81f7-0645ce297ef9',

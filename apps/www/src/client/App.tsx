@@ -12,8 +12,8 @@ import {
 	QUEST_DOWNLOAD_URL,
 	SOURCE_REPO,
 } from '../links'
-import { downgradeRoom, needsDowngrade } from '../room-converter'
 import { readRoomArchive } from '../room-archive'
+import { downgradeRoom, needsDowngrade } from '../room-converter'
 // The session token, the worker hostnames and the `call` every request goes through —
 // see api.ts for why they're a module of their own rather than defined here.
 import {
@@ -32,8 +32,8 @@ import { ModerationPage } from './Moderation'
 import { StatsPage } from './Stats'
 
 import type { ReactNode } from 'react'
-import type { Hosts } from './api'
 import type { RoomArchive } from '../room-archive'
+import type { Hosts } from './api'
 
 /**
  * Site config from `www`. `signupEnabled` is false when the operator has no Turnstile
@@ -3250,7 +3250,11 @@ function Dashboard({
 		// Narrower than the two above: the drop mints tokens, and www's route is developer-only.
 		...(isDeveloper()
 			? [
-					{ id: 'room-import', label: 'Import room', render: () => <RoomImport navigate={navigate} /> },
+					{
+						id: 'room-import',
+						label: 'Import room',
+						render: () => <RoomImport navigate={navigate} />,
+					},
 					{ id: 'tokens', label: 'Token drop', render: () => <TokenDropForm /> },
 				]
 			: []),
@@ -3354,8 +3358,8 @@ function RoomImport({ navigate }: { navigate: Navigate }) {
 		<section className="card">
 			<h2>Import room</h2>
 			<p className="muted">
-				Import a room export ZIP. The room starts private, with account #2 as its owner.
-				Only subrooms with scene data in the ZIP are imported.
+				Import a room export ZIP. The room starts private, with account #2 as its owner. Only
+				subrooms with scene data in the ZIP are imported.
 			</p>
 			<form
 				className="blob-upload"
@@ -3397,9 +3401,8 @@ function RoomImport({ navigate }: { navigate: Navigate }) {
 							throw new Error(response.error || 'The rooms worker refused the import.')
 						}
 						setCreated(response.value)
-						setProgress('')
 						return `Imported ^${response.value.Name} as room #${response.value.RoomId}.`
-					})
+					}).finally(() => setProgress(''))
 				}}
 			>
 				<label>
@@ -3456,7 +3459,7 @@ function RoomImport({ navigate }: { navigate: Navigate }) {
 								</Link>
 							</p>
 						)}
-						<button type="submit" disabled={pending || !name.trim()}>
+						<button type="submit" disabled={pending || !name.trim() || created !== null}>
 							{pending ? 'Importing…' : 'Import room'}
 						</button>
 					</>

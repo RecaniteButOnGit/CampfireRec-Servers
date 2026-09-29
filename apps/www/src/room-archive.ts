@@ -39,11 +39,15 @@ export async function readRoomArchive(file: File): Promise<RoomArchive> {
 	try {
 		files = unzipSync(new Uint8Array(await file.arrayBuffer()), {
 			filter: ({ name, originalSize }) => {
-				const wanted = /(?:^|\/)(?:RoomDetails\.json|RoomImage\.(?:jpe?g|png)|Subroom\.json|persisted_room_data\.(?:binpb|room))$/i.test(name)
+				const wanted =
+					/(?:^|\/)(?:RoomDetails\.json|RoomImage\.(?:jpe?g|png)|Subroom\.json|persisted_room_data\.(?:binpb|room))$/i.test(
+						name
+					)
 				if (!wanted) return false
 				if (originalSize > MAX_ENTRY_BYTES) throw new Error(`Archive entry is too large: ${name}`)
 				extractedBytes += originalSize
-				if (extractedBytes > MAX_EXTRACTED_BYTES) throw new Error('The extracted room is too large.')
+				if (extractedBytes > MAX_EXTRACTED_BYTES)
+					throw new Error('The extracted room is too large.')
 				return true
 			},
 		})
@@ -58,14 +62,17 @@ export async function readRoomArchive(file: File): Promise<RoomArchive> {
 	const root = detailsPath.slice(0, -'RoomDetails.json'.length)
 	const details = jsonObject(detailsBytes, 'RoomDetails.json')
 	const name = details.Name
-	if (typeof name !== 'string' || !name.trim()) throw new Error('RoomDetails.json has no room name.')
+	if (typeof name !== 'string' || !name.trim())
+		throw new Error('RoomDetails.json has no room name.')
 	const imageEntry = entries.find(
 		([path]) => path.startsWith(root) && /^RoomImage\.(?:jpe?g|png)$/i.test(path.slice(root.length))
 	)
 	if (!imageEntry) throw new Error('The ZIP has no RoomImage.jpg or RoomImage.png.')
 	const [imagePath, imageBytes] = imageEntry
 	const imageType = /\.png$/i.test(imagePath) ? 'image/png' : 'image/jpeg'
-	const image = new File([new Uint8Array(imageBytes)], imagePath.split('/').pop()!, { type: imageType })
+	const image = new File([new Uint8Array(imageBytes)], imagePath.split('/').pop()!, {
+		type: imageType,
+	})
 	const subRooms: ArchiveSubRoom[] = []
 	for (const [path, bytes] of entries) {
 		if (!path.startsWith(root) || !/\/Subroom\.json$/i.test(path)) continue
@@ -80,6 +87,8 @@ export async function readRoomArchive(file: File): Promise<RoomArchive> {
 		const subDetails = jsonObject(bytes, 'Subroom.json')
 		const save = subDetails.CurrentSave
 		if (!save || typeof save !== 'object' || Array.isArray(save)) continue
+		// A UnityAssetId marks an RRS-backed save. The current game build cannot load it.
+		if (typeof (save as Record<string, unknown>).UnityAssetId === 'string') continue
 		const [scenePath, sceneBytes] = sceneEntry
 		subRooms.push({
 			details: subDetails,

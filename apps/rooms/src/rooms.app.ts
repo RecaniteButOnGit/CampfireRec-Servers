@@ -972,7 +972,10 @@ const app = new Hono<App>()
 			const { details, imageName, subRooms } = parsed.data
 			const name = typeof details.Name === 'string' ? details.Name.trim() : ''
 			if (!name || roomNameRejection(name, 'room name')) {
-				return c.json({ error: roomNameRejection(name, 'room name') ?? 'Room name is required' }, 400)
+				return c.json(
+					{ error: roomNameRejection(name, 'room name') ?? 'Room name is required' },
+					400
+				)
 			}
 			if (await getRoomByName(c.env.DB, name)) {
 				return c.json({ error: 'A room with that name already exists' }, 400)
@@ -988,6 +991,9 @@ const app = new Hono<App>()
 				const subName = typeof sub.details.Name === 'string' ? sub.details.Name : ''
 				if (!subName || roomNameRejection(subName, 'subroom name')) {
 					return c.json({ error: 'Invalid subroom name' }, 400)
+				}
+				if (typeof sub.save.UnityAssetId === 'string') {
+					return c.json({ error: 'RRS subrooms are not supported yet' }, 400)
 				}
 				if (!key(sub.dataBlob) || !(await c.env.CDN_ASSETS.head(`room/${sub.dataBlob}`))) {
 					return c.json({ error: `Scene data for ${subName} was not uploaded` }, 400)
@@ -1853,12 +1859,7 @@ const app = new Hono<App>()
 				return roomEnvelope(c, null, `You can only have ${maxRooms} rooms.`)
 			}
 			const sourceRoomId = Number.parseInt(c.req.param('roomId'), 10)
-			const room = await cloneRoom(
-				c.env.DB,
-				sourceRoomId,
-				name,
-				accountId
-			)
+			const room = await cloneRoom(c.env.DB, sourceRoomId, name, accountId)
 			if (!room) return roomEnvelope(c, null, "You can't clone this room!")
 			if (room.UgcVersion === 2) {
 				const subRooms = Array.isArray(room.SubRooms)
@@ -2224,13 +2225,12 @@ const app = new Hono<App>()
 
 			await deleteRoom(c.env.DB, roomId)
 
-			// Remove the room image from the CDN bucket. The stored ImageName is the
-			// un-prefixed key the `cdn` worker serves back under `room/` (see storage
-			// upload + the `GET /room/:dataBlob` route), so the object key is `room/<name>`.
+			// Room images uploaded through storage (including ZIP imports) are served
+			// by img from the `image/` prefix, separate from room scene data.
 			// R2 deletes are idempotent, so a canonical/static or already-gone image is fine.
 			const imageName = typeof room.ImageName === 'string' ? room.ImageName : ''
 			if (imageName !== '') {
-				await c.env.CDN_ASSETS.delete(`room/${imageName}`)
+				await c.env.CDN_ASSETS.delete(`image/${imageName}`)
 			}
 
 			// A takedown — staff deleting a room that isn't theirs — goes in the audit log; an

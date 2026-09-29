@@ -20,8 +20,8 @@
 		}
 	],
 	// Shared `recflare-cdn` R2 bucket (also bound by the `cdn`/`storage` workers).
-	// Room images/files live here under `room/`; bound so deleting a room removes its
-	// image object. bucket_name is a literal, so nothing is spliced at deploy time.
+	// Scene files live under `room/` and images under `image/`; bound so deleting a room
+	// removes its image object. bucket_name is a literal, so nothing is spliced at deploy time.
 	"r2_buckets": [
 		{
 			"binding": "CDN_ASSETS",
