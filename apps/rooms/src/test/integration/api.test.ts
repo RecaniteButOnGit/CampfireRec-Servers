@@ -163,7 +163,7 @@ it('uses the imported saves rather than skipped subrooms for the room version', 
 	expect((result.value.SubRooms as Room[])[0]?.Name).toBe('new-map-aka-lighter-got-bored')
 })
 
-it('imports a converted Rooms 2.0 save at version 141 in all save metadata', async () => {
+it('imports a converted Rooms 2.0 save at version 120 in all save metadata', async () => {
 	const name = `ZipRooms2${crypto.randomUUID().slice(0, 8)}`
 	const imageName = `2026-09-28/${crypto.randomUUID()}`
 	const dataBlob = `2026-09-28/${crypto.randomUUID()}`
@@ -178,22 +178,22 @@ it('imports a converted Rooms 2.0 save at version 141 in all save metadata', asy
 			subRooms: [
 				{
 					details: { Name: 'Home' },
-					save: { PersistenceVersion: 141, OMVersion: 141, UgcSubVersion: 141 },
+					save: { PersistenceVersion: 120, OMVersion: 120, UgcSubVersion: 120 },
 					dataBlob,
 					dataBlobHash: 'hash',
 					converted: true,
-					convertedVersion: 141,
+					convertedVersion: 120,
 				},
 			],
 		}),
 	})
 	expect(response.status).toBe(200)
 	const result = (await response.json()) as { value: Room }
-	expect(result.value.PersistenceVersion).toBe(141)
+	expect(result.value.PersistenceVersion).toBe(120)
 	expect((result.value.SubRooms as Room[])[0]?.CurrentSave).toMatchObject({
-		PersistenceVersion: 141,
-		OMVersion: 141,
-		UgcSubVersion: 141,
+		PersistenceVersion: 120,
+		OMVersion: 120,
+		UgcSubVersion: 120,
 	})
 	await SELF.fetch(`${ORIGIN}/rooms/${result.value.RoomId}`, {
 		method: 'DELETE',

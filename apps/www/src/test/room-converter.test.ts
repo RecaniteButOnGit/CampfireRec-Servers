@@ -55,11 +55,11 @@ it('changes every top-level version when the field occurs twice', () => {
 	])
 })
 
-it('writes Rooms 2.0 client version 141 as a varint without changing other fields', () => {
+it('writes Rooms 2.0 client version 120 as a varint without changing other fields', () => {
 	const input = Uint8Array.from([...num(1, 38), ...num(30, 1), ...num(31, 7)])
-	const output = forceRoomVersion(input, 141)
-	expect(roomVersion(output)).toBe(141)
-	expect([...output]).toEqual([...num(1, 38), ...num(30, 141), ...num(31, 7)])
+	const output = forceRoomVersion(input, 120)
+	expect(roomVersion(output)).toBe(120)
+	expect([...output]).toEqual([...num(1, 38), ...num(30, 120), ...num(31, 7)])
 })
 
 it('leaves a scene already at version 1 unchanged', () => {

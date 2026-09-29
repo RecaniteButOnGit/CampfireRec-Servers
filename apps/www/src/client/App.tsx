@@ -3396,7 +3396,7 @@ function RoomImport({ navigate }: { navigate: Navigate }) {
 								let save = sub.save
 								const rooms2 = typeof save.OMVersion === 'number' && save.OMVersion > 0
 								const converted = isBinpbScene(file.name) && (!originalFile || rooms2)
-								const convertedVersion = rooms2 ? 141 : 1
+								const convertedVersion = rooms2 ? 120 : 1
 								if (originalFile && !rooms2) {
 									const version = roomVersion(new Uint8Array(await originalFile.arrayBuffer()))
 									if (version === undefined) {
@@ -3519,13 +3519,13 @@ function RoomImport({ navigate }: { navigate: Navigate }) {
 						)}
 						<p className="muted">
 							Imported legacy scenes are set to version 1; Rooms 2.0 scenes (OMVersion above 0) are
-							set to version 141. Only the top-level scene version and matching save metadata are
+							set to version 120. Only the top-level scene version and matching save metadata are
 							adjusted; circuit and object data stay intact.
 						</p>
 						{useOriginalScenes && (
 							<p className="muted">
 								Original scene files are used when available. Rooms 2.0 originals receive the same
-								version 141 normalization as their save metadata.
+								version 120 normalization as their save metadata.
 							</p>
 						)}
 						{progress && <p className="muted">{progress}</p>}

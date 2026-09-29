@@ -944,13 +944,13 @@ export async function importRoom(
 					ReferencedUnityAssetIds: [],
 					PersistenceVersion: importedSavePersistenceVersion(entry),
 					OMVersion: entry.converted
-						? entry.convertedVersion === 141
-							? 141
+						? entry.convertedVersion === 120
+							? 120
 							: 0
 						: number(sourceSave.OMVersion, 0),
 					UgcSubVersion: entry.converted
-						? entry.convertedVersion === 141
-							? 141
+						? entry.convertedVersion === 120
+							? 120
 							: 0
 						: number(sourceSave.UgcSubVersion, 0),
 					SavedByAccountId: ownerId,
