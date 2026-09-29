@@ -934,7 +934,7 @@ const fetchRoomPhotos = (roomId: number): Promise<PublicPhoto[]> =>
 	)
 
 /**
- * Delete a room outright — the staff takedown. `rooms` lets the owner or a developer /
+ * Delete a room outright. `rooms` lets the owner or a developer /
  * moderator through and refuses everyone else; it answers a refusal as a 200 carrying
  * `Success: false` (the game's envelope), so the check is on the body, not the status.
  */
@@ -2055,7 +2055,7 @@ function RoomPage({
 	// The signed-in player's own rooms, or null while unknown. Decides which view this is:
 	// a room in this list gets the owner's editable page, anything else the public one.
 	const [mine, setMine] = useState<OwnedRoom[] | null>(null)
-	// Set by the staff takedown. The room is gone by then, so the page says so rather than
+	// Set after deletion. The room is gone by then, so the page says so rather than
 	// re-fetching and answering with the "private or missing" line, which would be a lie.
 	const [takenDown, setTakenDown] = useState<string | null>(null)
 	const [error, setError] = useState('')
@@ -2134,16 +2134,20 @@ function RoomPage({
 						)
 					}
 				/>
+				{owned.CreatorAccountId === accountId && (
+					<RoomDeleteControl room={owned} onDeleted={() => setTakenDown(owned.Name)} />
+				)}
 			</main>
 		)
 	}
 
-	// Unlisted rooms are reachable by link, which is what a URL is. Everything else that
-	// isn't Public is somebody's private space, and gets the same sentence a missing room
-	// does: which of the two it is answers a question a stranger has no business asking.
+	// Unlisted rooms are reachable by link, and staff can see private rooms to manage or
+	// delete imports assigned to account 2. Other private rooms stay hidden from visitors.
 	const visible =
 		room !== null &&
-		(room.Accessibility === Accessibility.Public || room.Accessibility === Accessibility.Unlisted)
+		(room.Accessibility === Accessibility.Public ||
+			room.Accessibility === Accessibility.Unlisted ||
+			isAdmin())
 
 	return (
 		<main className="shell wide">
@@ -2255,19 +2259,13 @@ function PublicRoomView({
 			{isAdmin() && (
 				<>
 					{isDeveloper() && <StaffRoomTokens room={room} />}
-					<StaffTakedown room={room} onTakenDown={onTakenDown} />
+					<RoomDeleteControl room={room} onDeleted={onTakenDown} />
 				</>
 			)}
 		</>
 	)
 }
 
-/**
- * The staff takedown, at the foot of a public room's page: the room is already on screen,
- * so there's nothing to look up and nothing to confirm but the deletion itself. Two
- * steps — a plain card, then the same accent-bordered confirm the ban form uses — since
- * this is the one thing on the site that can't be undone.
- */
 /**
  * Pay everyone standing in the room, across every instance of it, from the room's own page.
  * The audience is read when the button is pressed, so it is whoever is in there at that
@@ -2338,7 +2336,8 @@ function StaffRoomTokens({ room }: { room: OwnedRoom }) {
 	)
 }
 
-function StaffTakedown({ room, onTakenDown }: { room: OwnedRoom; onTakenDown: () => void }) {
+/** One confirmed delete action for an owner or staff member. */
+function RoomDeleteControl({ room, onDeleted }: { room: OwnedRoom; onDeleted: () => void }) {
 	const [confirming, setConfirming] = useState(false)
 	const { pending, error, run } = useAction()
 
@@ -2350,7 +2349,7 @@ function StaffTakedown({ room, onTakenDown }: { room: OwnedRoom; onTakenDown: ()
 					Deleting a room removes it for everyone: the room, its subrooms and their saves, and its
 					picture. Photos players took in it stay on their profiles.
 				</p>
-				<button type="submit" onClick={() => setConfirming(true)}>
+				<button type="button" onClick={() => setConfirming(true)}>
 					Delete room
 				</button>
 			</section>
@@ -2366,7 +2365,7 @@ function StaffTakedown({ room, onTakenDown }: { room: OwnedRoom; onTakenDown: ()
 					e.preventDefault()
 					void run(async () => {
 						await deleteRoom(room.RoomId)
-						onTakenDown()
+						onDeleted()
 						return ''
 					})
 				}}
@@ -3447,7 +3446,7 @@ function RoomImport({ navigate }: { navigate: Navigate }) {
 								checked={downgrade}
 								onChange={(event) => setDowngrade(event.target.checked)}
 							/>
-							Downgrade .binpb scenes for this game build (removes circuits)
+							Convert .binpb scenes for the 2025 client (removes circuits)
 						</label>
 						{progress && <p className="muted">{progress}</p>}
 						{error && <p className="error">{error}</p>}

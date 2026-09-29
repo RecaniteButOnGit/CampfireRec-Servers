@@ -50,6 +50,7 @@ it('imports an export as a private room owned by account 2, without unsupported 
 			BoostCount: 100,
 			CurrentSnapshotId: 'old-snapshot',
 			Stats: { VisitCount: 9999 },
+			PersistenceVersion: 246,
 			Roles: [{ AccountId: 999, Role: 255 }],
 			Tags: [{ Tag: 'horror', Type: 0 }],
 		},
@@ -57,7 +58,7 @@ it('imports an export as a private room owned by account 2, without unsupported 
 		subRooms: [
 			{
 				details: { Name: 'OldUpdate', UnitySceneId: 'a75f7547-79eb-47c6-8986-6767abcb4f92' },
-				save: { PersistenceVersion: 153 },
+				save: { PersistenceVersion: 153, OMVersion: 99, UgcSubVersion: 153 },
 				dataBlob,
 				dataBlobHash: 'hash',
 				converted: true,
@@ -97,11 +98,17 @@ it('imports an export as a private room owned by account 2, without unsupported 
 		CreatorAccountId: 2,
 		Accessibility: 0,
 		ImageName: imageName,
+		PersistenceVersion: 227,
 		Roles: [{ AccountId: 2, Role: 255 }],
 		SubRooms: [{ Name: 'OldUpdate', CreatorAccountId: 2 }],
 	})
 	const sub = (result.value.SubRooms as Room[])[0]!
-	expect(sub.CurrentSave).toMatchObject({ DataBlob: dataBlob, PersistenceVersion: 123 })
+	expect(sub.CurrentSave).toMatchObject({
+		DataBlob: dataBlob,
+		PersistenceVersion: 227,
+		OMVersion: 0,
+		UgcSubVersion: 0,
+	})
 	const stored = await env.DB.prepare('SELECT data FROM room WHERE room_id = ?1')
 		.bind(result.value.RoomId)
 		.first<{ data: string }>()
@@ -110,6 +117,49 @@ it('imports an export as a private room owned by account 2, without unsupported 
 	expect(saved).not.toHaveProperty('BoostCount')
 	expect(saved).not.toHaveProperty('CurrentSnapshotId')
 	expect(saved.Stats).toMatchObject({ VisitCount: 0 })
+	const deleted = await SELF.fetch(`${ORIGIN}/rooms/${result.value.RoomId}`, {
+		method: 'DELETE',
+		headers: await bearer('999', ['developer']),
+	})
+	expect((await deleted.json()) as { Success: boolean }).toMatchObject({ Success: true })
+	expect(
+		await env.DB.prepare('SELECT data FROM room WHERE room_id = ?1')
+			.bind(result.value.RoomId)
+			.first()
+	).toBeNull()
+	expect(await env.CDN_ASSETS.get(`image/${imageName}`)).toBeNull()
+})
+
+it('uses the imported saves rather than skipped subrooms for the room version', async () => {
+	const name = `ZipVersion${crypto.randomUUID().slice(0, 8)}`
+	const imageName = `2026-09-28/${crypto.randomUUID()}`
+	const dataBlob = `2026-09-28/${crypto.randomUUID()}`
+	await env.CDN_ASSETS.put(`image/${imageName}`, new Uint8Array([1]))
+	await env.CDN_ASSETS.put(`room/${dataBlob}`, new Uint8Array([2]))
+	const response = await SELF.fetch(`${ORIGIN}/rooms/import`, {
+		method: 'POST',
+		headers: { ...(await bearer('999', ['developer'])), 'content-type': 'application/json' },
+		body: JSON.stringify({
+			details: { Name: name, PersistenceVersion: 246 },
+			imageName,
+			subRooms: [
+				{
+					details: { Name: 'OldUpdate' },
+					save: { PersistenceVersion: 153, UgcSubVersion: 153 },
+					dataBlob,
+					dataBlobHash: 'hash',
+					converted: false,
+				},
+			],
+		}),
+	})
+	expect(response.status).toBe(200)
+	const result = (await response.json()) as { value: Room }
+	expect(result.value.PersistenceVersion).toBe(153)
+	expect((result.value.SubRooms as Room[])[0]?.CurrentSave).toMatchObject({
+		PersistenceVersion: 153,
+		UgcSubVersion: 153,
+	})
 })
 
 // Mint a token the way the `auth` worker does, signing with the shared test key seeded into the JWT_SECRET store.

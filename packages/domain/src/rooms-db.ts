@@ -810,6 +810,15 @@ export interface ImportedSubRoom {
 	converted: boolean
 }
 
+/** The 20250718.01 client's observed `MaxPersistenceVersion` for a published room save. */
+const IMPORT_PERSISTENCE_VERSION_2025 = 227
+
+function importedSavePersistenceVersion(sub: ImportedSubRoom): number {
+	if (sub.converted) return IMPORT_PERSISTENCE_VERSION_2025
+	const sourceVersion = sub.save.PersistenceVersion
+	return typeof sourceVersion === 'number' && Number.isFinite(sourceVersion) ? sourceVersion : 0
+}
+
 /**
  * Create a private room from an export. Only fields understood by this server are copied;
  * engagement, moderation, boosts, snapshots, roles, and source ids are discarded.
@@ -876,9 +885,10 @@ export async function importRoom(
 		ToxmodEnabled: true,
 		LoadScreenLocked: false,
 		UgcVersion: number(details.UgcVersion, 1),
-		PersistenceVersion: subRooms.some((sub) => sub.converted)
-			? 123
-			: number(details.PersistenceVersion, 0),
+		// The export's room-level version can describe subrooms we skipped (such as RRS).
+		// Report the newest save we actually imported, using the 2025 client version for
+		// scenes that the website converted for this build.
+		PersistenceVersion: Math.max(...subRooms.map(importedSavePersistenceVersion)),
 		UgcSubVersion: null,
 		MinUgcSubVersion: null,
 		AutoLocalizeRoom: false,
@@ -931,9 +941,9 @@ export async function importRoom(
 					DataBlob: entry.dataBlob,
 					DataBlobHash: entry.dataBlobHash,
 					ReferencedUnityAssetIds: [],
-					PersistenceVersion: entry.converted ? 123 : number(sourceSave.PersistenceVersion, 0),
-					OMVersion: number(sourceSave.OMVersion, 0),
-					UgcSubVersion: entry.converted ? 123 : number(sourceSave.UgcSubVersion, 0),
+					PersistenceVersion: importedSavePersistenceVersion(entry),
+					OMVersion: entry.converted ? 0 : number(sourceSave.OMVersion, 0),
+					UgcSubVersion: entry.converted ? 0 : number(sourceSave.UgcSubVersion, 0),
 					SavedByAccountId: ownerId,
 					SavedOnPlatform: 0,
 					SavedOnDeviceClass: 0,
