@@ -1,9 +1,8 @@
+import { JULY_2025_ROOM_IMPORT_VERSIONS } from '@repo/domain/src/room-import-versions'
+
 /**
- * Patch the top-level persistence version of an imported Rec Room scene.
- *
- * Scene files are protobuf messages. We walk only their top-level wire fields and copy
- * everything else as-is, including object data and circuits. A version label alone
- * cannot make content from a newer game build compatible with an older client.
+ * Patch only the scene's protobuf version fields. Object and circuit payloads stay intact.
+ * A version label alone cannot make newer content compatible with an older client.
  */
 
 /** The file extension for scene data exported from a newer Rec Room build. */
@@ -50,12 +49,17 @@ function checkedEnd(data: Uint8Array, end: number): number {
 	return end
 }
 
-function visitRoomVersions(
+function visitFields(
 	data: Uint8Array,
-	visit: (version: number, valuePos: number, fieldEnd: number) => void
-): boolean {
+	visit: (
+		fieldNumber: number,
+		wireType: number,
+		valuePos: number,
+		fieldEnd: number,
+		payloadPos?: number
+	) => void
+): void {
 	let pos = 0
-	let foundVersion = false
 	while (pos < data.length) {
 		const [tag, valuePos] = readVarint(data, pos)
 		const fieldNumber = Math.floor(tag / 8)
@@ -63,55 +67,34 @@ function visitRoomVersions(
 		if (fieldNumber === 0) throw new Error('Scene has an invalid protobuf field.')
 
 		if (wireType === 0) {
-			const fieldEnd = skipVarint(data, valuePos)
-			if (fieldNumber === 30) {
-				const [version] = readVarint(data, valuePos)
-				visit(version, valuePos, fieldEnd)
-				foundVersion = true
-			}
-			pos = fieldEnd
+			pos = skipVarint(data, valuePos)
+			visit(fieldNumber, wireType, valuePos, pos)
 		} else if (wireType === 1) {
 			pos = checkedEnd(data, valuePos + 8)
+			visit(fieldNumber, wireType, valuePos, pos)
 		} else if (wireType === 2) {
 			const [length, payloadPos] = readVarint(data, valuePos)
 			pos = checkedEnd(data, payloadPos + length)
+			visit(fieldNumber, wireType, valuePos, pos, payloadPos)
 		} else if (wireType === 5) {
 			pos = checkedEnd(data, valuePos + 4)
+			visit(fieldNumber, wireType, valuePos, pos)
 		} else {
 			throw new Error('Scene has an unsupported protobuf wire type.')
 		}
 	}
-	return foundVersion
 }
 
 /** Read the embedded scene version; a legacy scene may have no version field. */
 export function roomVersion(data: Uint8Array): number | undefined {
 	let version: number | undefined
-	visitRoomVersions(data, (value) => {
-		version = value
+	visitFields(data, (fieldNumber, wireType, valuePos) => {
+		if (fieldNumber === 30 && wireType === 0) [version] = readVarint(data, valuePos)
 	})
 	return version
 }
 
-/** Change only top-level field 30, retaining all other scene bytes. */
-export function forceRoomVersion(data: Uint8Array, targetVersion: number): Uint8Array<ArrayBuffer> {
-	const source = Uint8Array.from(data)
-	const parts: Uint8Array[] = []
-	let copiedThrough = 0
-	let changed = false
-
-	const foundVersion = visitRoomVersions(source, (version, valuePos, fieldEnd) => {
-		if (version !== targetVersion) {
-			parts.push(source.subarray(copiedThrough, valuePos), encodeVarint(targetVersion))
-			copiedThrough = fieldEnd
-			changed = true
-		}
-	})
-
-	if (!foundVersion) throw new Error('Scene data has no persistence version (field 30).')
-	if (!changed) return source
-
-	parts.push(source.subarray(copiedThrough))
+function joinParts(parts: Uint8Array[]): Uint8Array<ArrayBuffer> {
 	const output = new Uint8Array(parts.reduce((size, part) => size + part.length, 0))
 	let offset = 0
 	for (const part of parts) {
@@ -119,6 +102,70 @@ export function forceRoomVersion(data: Uint8Array, targetVersion: number): Uint8
 		offset += part.length
 	}
 	return output
+}
+
+/** Change only top-level varints of one field, retaining every other byte. */
+function rewriteVarints(
+	data: Uint8Array,
+	field: number,
+	replacement: (value: number) => number,
+	required = false
+): Uint8Array<ArrayBuffer> {
+	const source = Uint8Array.from(data)
+	const parts: Uint8Array[] = []
+	let copiedThrough = 0
+	let changed = false
+	let found = false
+
+	visitFields(source, (fieldNumber, wireType, valuePos, fieldEnd) => {
+		if (fieldNumber !== field || wireType !== 0) return
+		found = true
+		const [value] = readVarint(source, valuePos)
+		const target = replacement(value)
+		if (value !== target) {
+			parts.push(source.subarray(copiedThrough, valuePos), encodeVarint(target))
+			copiedThrough = fieldEnd
+			changed = true
+		}
+	})
+
+	if (required && !found) throw new Error('Scene data has no persistence version (field 30).')
+	if (!changed) return source
+
+	parts.push(source.subarray(copiedThrough))
+	return joinParts(parts)
+}
+
+/** Change only top-level field 30, retaining all other scene bytes. */
+export function forceRoomVersion(data: Uint8Array, targetVersion: number): Uint8Array<ArrayBuffer> {
+	return rewriteVarints(data, 30, () => targetVersion, true)
+}
+
+/** Cap the nested Circuits V2 serialization version without discarding circuit data. */
+export function capRoomCircuitVersion(
+	data: Uint8Array,
+	maxVersion = JULY_2025_ROOM_IMPORT_VERSIONS.circuitsV2
+): Uint8Array<ArrayBuffer> {
+	const source = Uint8Array.from(data)
+	const parts: Uint8Array[] = []
+	let copiedThrough = 0
+	visitFields(source, (fieldNumber, wireType, valuePos, fieldEnd, payloadPos) => {
+		if (fieldNumber !== 28 || wireType !== 2 || payloadPos === undefined) return
+		const payload = source.subarray(payloadPos, fieldEnd)
+		let version: number | undefined
+		visitFields(payload, (nestedField, nestedWireType, nestedValuePos) => {
+			if (nestedField === 1 && nestedWireType === 0) {
+				version = readVarint(payload, nestedValuePos)[0]
+			}
+		})
+		if (version === undefined || version <= maxVersion) return
+		const patched = rewriteVarints(payload, 1, (value) => Math.min(value, maxVersion))
+		parts.push(source.subarray(copiedThrough, valuePos), encodeVarint(patched.length), patched)
+		copiedThrough = fieldEnd
+	})
+	if (parts.length === 0) return source
+	parts.push(source.subarray(copiedThrough))
+	return joinParts(parts)
 }
 
 /** Change only top-level field 30 to version 1, retaining all other scene bytes. */

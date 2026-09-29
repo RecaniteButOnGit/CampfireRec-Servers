@@ -58,10 +58,9 @@ it('imports an export as a private room owned by account 2, without unsupported 
 		subRooms: [
 			{
 				details: { Name: 'OldUpdate', UnitySceneId: 'a75f7547-79eb-47c6-8986-6767abcb4f92' },
-				save: { PersistenceVersion: 153, OMVersion: 99, UgcSubVersion: 153 },
+				save: { PersistenceVersion: 241, OMVersion: 0, UgcSubVersion: 0 },
 				dataBlob,
 				dataBlobHash: 'hash',
-				converted: true,
 			},
 		],
 	}
@@ -98,14 +97,14 @@ it('imports an export as a private room owned by account 2, without unsupported 
 		CreatorAccountId: 2,
 		Accessibility: 0,
 		ImageName: imageName,
-		PersistenceVersion: 1,
+		PersistenceVersion: 227,
 		Roles: [{ AccountId: 2, Role: 255 }],
 		SubRooms: [{ Name: 'OldUpdate', CreatorAccountId: 2 }],
 	})
 	const sub = (result.value.SubRooms as Room[])[0]!
 	expect(sub.CurrentSave).toMatchObject({
 		DataBlob: dataBlob,
-		PersistenceVersion: 1,
+		PersistenceVersion: 227,
 		OMVersion: 0,
 		UgcSubVersion: 0,
 	})
@@ -148,7 +147,6 @@ it('uses the imported saves rather than skipped subrooms for the room version', 
 					save: { PersistenceVersion: 153, UgcSubVersion: 153 },
 					dataBlob,
 					dataBlobHash: 'hash',
-					converted: false,
 				},
 			],
 		}),
@@ -163,7 +161,7 @@ it('uses the imported saves rather than skipped subrooms for the room version', 
 	expect((result.value.SubRooms as Room[])[0]?.Name).toBe('new-map-aka-lighter-got-bored')
 })
 
-it('imports a converted Rooms 2.0 save at version 120 in all save metadata', async () => {
+it('keeps the separate Rooms 2.0 version values from the export', async () => {
 	const name = `ZipRooms2${crypto.randomUUID().slice(0, 8)}`
 	const imageName = `2026-09-28/${crypto.randomUUID()}`
 	const dataBlob = `2026-09-28/${crypto.randomUUID()}`
@@ -178,22 +176,20 @@ it('imports a converted Rooms 2.0 save at version 120 in all save metadata', asy
 			subRooms: [
 				{
 					details: { Name: 'Home' },
-					save: { PersistenceVersion: 120, OMVersion: 120, UgcSubVersion: 120 },
+					save: { PersistenceVersion: 143, OMVersion: 2, UgcSubVersion: 145 },
 					dataBlob,
 					dataBlobHash: 'hash',
-					converted: true,
-					convertedVersion: 120,
 				},
 			],
 		}),
 	})
 	expect(response.status).toBe(200)
 	const result = (await response.json()) as { value: Room }
-	expect(result.value.PersistenceVersion).toBe(120)
+	expect(result.value.PersistenceVersion).toBe(143)
 	expect((result.value.SubRooms as Room[])[0]?.CurrentSave).toMatchObject({
-		PersistenceVersion: 120,
-		OMVersion: 120,
-		UgcSubVersion: 120,
+		PersistenceVersion: 143,
+		OMVersion: 2,
+		UgcSubVersion: 145,
 	})
 	await SELF.fetch(`${ORIGIN}/rooms/${result.value.RoomId}`, {
 		method: 'DELETE',

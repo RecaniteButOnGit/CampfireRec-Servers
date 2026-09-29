@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 
 import { Accessibility } from '@repo/domain/src/enums'
+import { JULY_2025_ROOM_IMPORT_VERSIONS } from '@repo/domain/src/room-import-versions'
 
 import { NotificationType } from '../../../notify/src/notification-types'
 import { authFailure, authUnreachable } from '../auth-messages'
@@ -12,7 +13,12 @@ import {
 	SOURCE_REPO,
 } from '../links'
 import { readRoomArchive } from '../room-archive'
-import { forceRoomVersion, isBinpbScene, roomVersion } from '../room-converter'
+import {
+	capRoomCircuitVersion,
+	forceRoomVersion,
+	isBinpbScene,
+	roomVersion,
+} from '../room-converter'
 // The session token, the worker hostnames and the `call` every request goes through —
 // see api.ts for why they're a module of their own rather than defined here.
 import {
@@ -233,8 +239,8 @@ function isRoomBlobFile(filename: string): boolean {
 }
 
 /**
- * The file that actually gets stored for a picked scene file. Only the scene's
- * top-level persistence version is changed; all circuit and object bytes pass through.
+ * The file that actually gets stored for a picked scene file. Imported ZIP scenes may
+ * adjust both the top-level and Circuits V2 version fields; all payload bytes pass through.
  *
  * Done here in the browser, before either request, because the upload goes straight to
  * `storage` and the save's `Hash` has to describe the bytes that were stored — so both
@@ -243,10 +249,12 @@ function isRoomBlobFile(filename: string): boolean {
 async function prepareRoomBlob(
 	file: File,
 	changeVersion: boolean,
-	targetVersion = 1
+	targetVersion = 1,
+	capCircuitVersion = false
 ): Promise<File> {
 	if (!changeVersion) return file
-	const data = forceRoomVersion(new Uint8Array(await file.arrayBuffer()), targetVersion)
+	let data = forceRoomVersion(new Uint8Array(await file.arrayBuffer()), targetVersion)
+	if (capCircuitVersion) data = capRoomCircuitVersion(data)
 	return new File([data], file.name, { type: 'application/octet-stream' })
 }
 
@@ -3395,31 +3403,38 @@ function RoomImport({ navigate }: { navigate: Navigate }) {
 								const file = originalFile ?? sub.file
 								let save = sub.save
 								const rooms2 = typeof save.OMVersion === 'number' && save.OMVersion > 0
-								const converted = isBinpbScene(file.name) && (!originalFile || rooms2)
-								const convertedVersion = rooms2 ? 120 : 1
-								if (originalFile && !rooms2) {
-									const version = roomVersion(new Uint8Array(await originalFile.arrayBuffer()))
-									if (version === undefined) {
-										throw new Error(
-											`Original scene for ${String(sub.details.Name)} has no version.`
-										)
-									}
-									save = { ...save, PersistenceVersion: version }
-								}
+								const converted = isBinpbScene(file.name)
+								let sceneVersion: number | undefined
 								if (converted) {
-									save = {
-										...save,
-										PersistenceVersion: convertedVersion,
-										OMVersion: rooms2 ? convertedVersion : 0,
-										UgcSubVersion: rooms2 ? convertedVersion : 0,
+									sceneVersion = roomVersion(new Uint8Array(await file.arrayBuffer()))
+									if (sceneVersion === undefined) {
+										throw new Error(`Scene for ${String(sub.details.Name)} has no version.`)
 									}
+								}
+								const sourcePersistenceVersion =
+									typeof save.PersistenceVersion === 'number' ? save.PersistenceVersion : 0
+								const persistenceVersion =
+									originalFile && !rooms2 && sceneVersion !== undefined
+										? sceneVersion
+										: sourcePersistenceVersion
+								save = {
+									...save,
+									PersistenceVersion: Math.min(
+										persistenceVersion,
+										JULY_2025_ROOM_IMPORT_VERSIONS.savePersistence
+									),
+									OMVersion: rooms2 ? save.OMVersion : 0,
+									UgcSubVersion: rooms2 ? save.UgcSubVersion : 0,
 								}
 								return {
 									sub,
 									file,
 									save,
 									converted,
-									convertedVersion: converted ? convertedVersion : undefined,
+									sceneVersion:
+										sceneVersion === undefined
+											? undefined
+											: Math.min(sceneVersion, JULY_2025_ROOM_IMPORT_VERSIONS.scene),
 								}
 							})
 						)
@@ -3428,10 +3443,10 @@ function RoomImport({ navigate }: { navigate: Navigate }) {
 						const subRooms = []
 						for (const [
 							index,
-							{ sub, file, save, converted, convertedVersion },
+							{ sub, file, save, converted, sceneVersion },
 						] of selectedSubRooms.entries()) {
 							setProgress(`Uploading subroom ${index + 1} of ${archive.subRooms.length}…`)
-							const prepared = await prepareRoomBlob(file, converted, convertedVersion)
+							const prepared = await prepareRoomBlob(file, converted, sceneVersion, converted)
 							const [dataBlob, dataBlobHash] = await Promise.all([
 								uploadRoomBlob(prepared),
 								blobHash(prepared),
@@ -3441,8 +3456,6 @@ function RoomImport({ navigate }: { navigate: Navigate }) {
 								save,
 								dataBlob,
 								dataBlobHash,
-								converted,
-								...(convertedVersion === undefined ? {} : { convertedVersion }),
 							})
 						}
 						for (const [index, audio] of archive.audio.entries()) {
@@ -3518,14 +3531,16 @@ function RoomImport({ navigate }: { navigate: Navigate }) {
 							</label>
 						)}
 						<p className="muted">
-							Imported legacy scenes are set to version 1; Rooms 2.0 scenes (OMVersion above 0) are
-							set to version 120. Only the top-level scene version and matching save metadata are
-							adjusted; circuit and object data stay intact.
+							Scenes above version {JULY_2025_ROOM_IMPORT_VERSIONS.scene} are capped at that client
+							version; Circuits V2 versions above {JULY_2025_ROOM_IMPORT_VERSIONS.circuitsV2} are
+							capped separately. Save metadata keeps the export's Rooms 2.0 versions and caps
+							persistence at {JULY_2025_ROOM_IMPORT_VERSIONS.savePersistence}. Circuit and object
+							data stay intact.
 						</p>
 						{useOriginalScenes && (
 							<p className="muted">
-								Original scene files are used when available. Rooms 2.0 originals receive the same
-								version 120 normalization as their save metadata.
+								Original scene files are used when available. Their embedded versions are only
+								capped if they exceed the July 18 client values.
 							</p>
 						)}
 						{progress && <p className="muted">{progress}</p>}

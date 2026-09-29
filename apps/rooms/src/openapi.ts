@@ -57,8 +57,6 @@ export const ImportRoomRequest = z.object({
 			save: z.record(z.string(), z.unknown()),
 			dataBlob: z.string(),
 			dataBlobHash: z.string(),
-			converted: z.boolean(),
-			convertedVersion: z.union([z.literal(1), z.literal(120)]).optional(),
 		})
 	),
 })

@@ -20,6 +20,7 @@
 import { bindPlaceholders, chunkForBinds, MAX_BOUND_PARAMS } from './d1-binds'
 import { Accessibility, Role } from './enums'
 import { countPlayersByRoom } from './presence-db'
+import { JULY_2025_ROOM_IMPORT_VERSIONS } from './room-import-versions'
 
 /** Schema DDL (mirror of the head migration schema, sans the seed INSERT). */
 export const ROOM_SCHEMA_DDL: string[] = [
@@ -807,17 +808,13 @@ export interface ImportedSubRoom {
 	save: Record<string, unknown>
 	dataBlob: string
 	dataBlobHash: string
-	converted: boolean
-	convertedVersion?: number
 }
 
-/** The legacy persistence version used when an imported scene is converted. */
-const IMPORT_CONVERTED_PERSISTENCE_VERSION = 1
-
 function importedSavePersistenceVersion(sub: ImportedSubRoom): number {
-	if (sub.converted) return sub.convertedVersion ?? IMPORT_CONVERTED_PERSISTENCE_VERSION
 	const sourceVersion = sub.save.PersistenceVersion
-	return typeof sourceVersion === 'number' && Number.isFinite(sourceVersion) ? sourceVersion : 0
+	return typeof sourceVersion === 'number' && Number.isFinite(sourceVersion)
+		? Math.min(sourceVersion, JULY_2025_ROOM_IMPORT_VERSIONS.savePersistence)
+		: 0
 }
 
 /**
@@ -887,8 +884,8 @@ export async function importRoom(
 		LoadScreenLocked: false,
 		UgcVersion: number(details.UgcVersion, 1),
 		// The export's room-level version can describe subrooms we skipped (such as RRS).
-		// Report the newest save we actually imported, using the version written into
-		// scenes that the website converted.
+		// Report the newest save we actually imported, capped to the client-supported
+		// save-metadata version. This value is separate from the embedded scene version.
 		PersistenceVersion: Math.max(...subRooms.map(importedSavePersistenceVersion)),
 		UgcSubVersion: null,
 		MinUgcSubVersion: null,
@@ -943,16 +940,8 @@ export async function importRoom(
 					DataBlobHash: entry.dataBlobHash,
 					ReferencedUnityAssetIds: [],
 					PersistenceVersion: importedSavePersistenceVersion(entry),
-					OMVersion: entry.converted
-						? entry.convertedVersion === 120
-							? 120
-							: 0
-						: number(sourceSave.OMVersion, 0),
-					UgcSubVersion: entry.converted
-						? entry.convertedVersion === 120
-							? 120
-							: 0
-						: number(sourceSave.UgcSubVersion, 0),
+					OMVersion: number(sourceSave.OMVersion, 0),
+					UgcSubVersion: number(sourceSave.UgcSubVersion, 0),
 					SavedByAccountId: ownerId,
 					SavedOnPlatform: 0,
 					SavedOnDeviceClass: 0,

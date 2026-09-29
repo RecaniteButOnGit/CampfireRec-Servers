@@ -1,6 +1,12 @@
 import { expect, it } from 'vitest'
 
-import { forceRoomVersion, forceRoomVersionOne, isBinpbScene, roomVersion } from '../room-converter'
+import {
+	capRoomCircuitVersion,
+	forceRoomVersion,
+	forceRoomVersionOne,
+	isBinpbScene,
+	roomVersion,
+} from '../room-converter'
 
 function varint(value: bigint): number[] {
 	const out: number[] = []
@@ -55,11 +61,28 @@ it('changes every top-level version when the field occurs twice', () => {
 	])
 })
 
-it('writes Rooms 2.0 client version 120 as a varint without changing other fields', () => {
+it('writes a chosen scene version as a varint without changing other fields', () => {
 	const input = Uint8Array.from([...num(1, 38), ...num(30, 1), ...num(31, 7)])
-	const output = forceRoomVersion(input, 120)
-	expect(roomVersion(output)).toBe(120)
-	expect([...output]).toEqual([...num(1, 38), ...num(30, 120), ...num(31, 7)])
+	const output = forceRoomVersion(input, 141)
+	expect(roomVersion(output)).toBe(141)
+	expect([...output]).toEqual([...num(1, 38), ...num(30, 141), ...num(31, 7)])
+})
+
+it('caps only the nested Circuits V2 version and keeps its graph and object bytes', () => {
+	const graph = len(2, text('circuit graph'))
+	const objects = len(29, text('object model'))
+	const input = Uint8Array.from([
+		...num(30, 141),
+		...len(28, [...num(1, 300), ...graph]),
+		...objects,
+	])
+	const output = capRoomCircuitVersion(input)
+	expect([...output]).toEqual([...num(30, 141), ...len(28, [...num(1, 104), ...graph]), ...objects])
+})
+
+it('leaves an older Circuits V2 version unchanged', () => {
+	const input = Uint8Array.from([...num(30, 83), ...len(28, [...num(1, 70), ...len(2, [1, 2])])])
+	expect(capRoomCircuitVersion(input)).toEqual(input)
 })
 
 it('leaves a scene already at version 1 unchanged', () => {
