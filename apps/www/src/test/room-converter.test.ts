@@ -66,7 +66,7 @@ it('applies all four patches', () => {
 			...len(7, len(8, num(1, 1))),
 		]),
 		...len(9, num(1, 1)),
-		...num(30, 141),
+		...num(30, 1),
 	])
 	expect(stats).toMatchObject({
 		schemaVersion: 9,
@@ -84,26 +84,24 @@ it('applies all four patches', () => {
 it('keeps an fn100 that is not the sentinel, and only patches the first fn30', () => {
 	const input = [...len(2, num(100, 5)), ...num(30, 123), ...num(30, 200)]
 	const { bytes, stats } = run(input)
+	expect(bytes).toEqual([...len(2, num(100, 5)), ...num(30, 1), ...num(30, 200)])
+	expect(stats).toMatchObject({ fn100Removed: 0, objectsModified: 0, versionPatched: true })
+})
+
+it('leaves a scene already at version 1 unchanged', () => {
+	const input = [...num(1, 9), ...num(30, 1)]
+	const { bytes, stats } = run(input)
 	expect(bytes).toEqual(input)
-	expect(stats).toMatchObject({ fn100Removed: 0, objectsModified: 0, versionPatched: false })
+	expect(stats).toMatchObject({ originalVersion: 1, versionPatched: false })
 })
 
-it('preserves scene versions already supported by the 2025 client', () => {
-	for (const version of [123, 140, 141]) {
-		const input = [...num(1, 9), ...num(30, version)]
-		const { bytes, stats } = run(input)
-		expect(bytes).toEqual(input)
-		expect(stats).toMatchObject({ originalVersion: version, versionPatched: false })
-	}
-})
-
-it('keeps version 141 while removing newer circuit data', () => {
+it('sets version 1 while removing newer circuit data', () => {
 	const circuit = len(28, text('unsupported circuit data'))
 	const { bytes, stats } = run([...num(1, 38), ...circuit, ...num(30, 141)])
-	expect(bytes).toEqual([...num(1, 38), ...num(30, 141)])
+	expect(bytes).toEqual([...num(1, 38), ...num(30, 1)])
 	expect(stats).toMatchObject({
 		originalVersion: 141,
-		versionPatched: false,
+		versionPatched: true,
 		circuitFieldsRemoved: 1,
 	})
 })

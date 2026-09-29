@@ -810,11 +810,11 @@ export interface ImportedSubRoom {
 	converted: boolean
 }
 
-/** The 2025 Campfire Rec client's room-save persistence version. */
-const IMPORT_PERSISTENCE_VERSION_2025 = 141
+/** The experimental persistence version written into converted ZIP scene files. */
+const IMPORT_CONVERTED_PERSISTENCE_VERSION = 1
 
 function importedSavePersistenceVersion(sub: ImportedSubRoom): number {
-	if (sub.converted) return IMPORT_PERSISTENCE_VERSION_2025
+	if (sub.converted) return IMPORT_CONVERTED_PERSISTENCE_VERSION
 	const sourceVersion = sub.save.PersistenceVersion
 	return typeof sourceVersion === 'number' && Number.isFinite(sourceVersion) ? sourceVersion : 0
 }
@@ -886,8 +886,8 @@ export async function importRoom(
 		LoadScreenLocked: false,
 		UgcVersion: number(details.UgcVersion, 1),
 		// The export's room-level version can describe subrooms we skipped (such as RRS).
-		// Report the newest save we actually imported, using the 2025 client version for
-		// scenes that the website converted for this build.
+		// Report the newest save we actually imported, using the version written into
+		// scenes that the website converted.
 		PersistenceVersion: Math.max(...subRooms.map(importedSavePersistenceVersion)),
 		UgcSubVersion: null,
 		MinUgcSubVersion: null,

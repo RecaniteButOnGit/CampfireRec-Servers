@@ -2703,7 +2703,7 @@ function BlobUpload({
 					disabled={file === null}
 					onChange={(e) => setDowngrade(e.target.checked)}
 				/>
-				Downgrade room for compatibility
+				Force scene version 1 (experimental; removes circuits)
 			</label>
 			{error && <p className="error">{error}</p>}
 			{done && <p className="ok">{done}</p>}
@@ -3446,7 +3446,7 @@ function RoomImport({ navigate }: { navigate: Navigate }) {
 								checked={downgrade}
 								onChange={(event) => setDowngrade(event.target.checked)}
 							/>
-							Convert .binpb scenes for the 2025 client (removes circuits)
+							Convert .binpb scenes (force version 1; removes circuits)
 						</label>
 						{progress && <p className="muted">{progress}</p>}
 						{error && <p className="error">{error}</p>}
