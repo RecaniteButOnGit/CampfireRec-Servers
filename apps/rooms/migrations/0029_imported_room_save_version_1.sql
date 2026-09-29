@@ -1,7 +1,7 @@
 -- Converted ZIP scenes now carry persistence version 1. Match the room and its
--- initial published save metadata to that version for imports made by the website.
--- Restrict this to the importer's room shape and a sole, still-current first save so
--- a room edited in game after import keeps the version recorded by that later save.
+-- published save metadata to that version for imports made by the website.
+-- Restrict this to the importer's room shape and the current published save. Older
+-- save history keeps the version recorded when it was written.
 -- Scene blobs live in R2 and are not changed here; existing imports need a fresh
 -- scene upload or re-import to replace their previously converted bytes.
 UPDATE room
@@ -15,11 +15,6 @@ SET data = json_set(
           AND json_extract(saved.data, '$.UgcSubVersion') = 0
           AND json_extract(saved.data, '$.OMVersion') = 0
           AND json_extract(saved.data, '$.SavedByAccountId') = 2
-          AND NOT EXISTS (
-            SELECT 1 FROM subroom_save history
-            WHERE history.sub_room_id = sub.sub_room_id
-              AND history.sub_room_data_save_id <> sub.current_save_id
-          )
         THEN 1
         ELSE COALESCE(json_extract(saved.data, '$.PersistenceVersion'), 0)
       END
@@ -42,11 +37,6 @@ WHERE creator_account_id = 2
       AND json_extract(saved.data, '$.UgcSubVersion') = 0
       AND json_extract(saved.data, '$.OMVersion') = 0
       AND json_extract(saved.data, '$.SavedByAccountId') = 2
-      AND NOT EXISTS (
-        SELECT 1 FROM subroom_save history
-        WHERE history.sub_room_id = sub.sub_room_id
-          AND history.sub_room_data_save_id <> sub.current_save_id
-      )
   );
 
 UPDATE subroom_save
@@ -64,9 +54,4 @@ WHERE json_extract(data, '$.PersistenceVersion') = 141
       AND json_extract(r.data, '$.IsDorm') = 0
       AND json_extract(r.data, '$.CloningAllowed') = 0
       AND json_extract(r.data, '$.CreatedAt') >= '2026-09-28'
-      AND NOT EXISTS (
-        SELECT 1 FROM subroom_save history
-        WHERE history.sub_room_id = sub.sub_room_id
-          AND history.sub_room_data_save_id <> sub.current_save_id
-      )
   );

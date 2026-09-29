@@ -1,7 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 
 import { Accessibility } from '@repo/domain/src/enums'
-import { GAME_VERSION } from '@repo/domain/src/presence-db'
 
 import { NotificationType } from '../../../notify/src/notification-types'
 import { authFailure, authUnreachable } from '../auth-messages'
@@ -13,7 +12,7 @@ import {
 	SOURCE_REPO,
 } from '../links'
 import { readRoomArchive } from '../room-archive'
-import { downgradeRoom, needsDowngrade } from '../room-converter'
+import { forceRoomVersionOne, isBinpbScene } from '../room-converter'
 // The session token, the worker hostnames and the `call` every request goes through —
 // see api.ts for why they're a module of their own rather than defined here.
 import {
@@ -209,17 +208,6 @@ const FILE_TYPE_ROOM_SAVE = '1'
 const FILE_TYPE_IMAGE = '3'
 
 /**
- * The game build this server targets, as `YYYY-MM-DD` — read from the same `GAME_VERSION`
- * the auth token and presence carry rather than written out again here, so upgrading the
- * client moves this line with it instead of leaving a stale date on the upload form.
- *
- * It's shown because a scene blob is only loadable by the build that wrote it (or older
- * ones that understand it): a save taken out of a room built on a later version can fail
- * outright, and nothing between here and the game says why.
- */
-const CLIENT_BUILD_DATE = `${GAME_VERSION.slice(0, 4)}-${GAME_VERSION.slice(4, 6)}-${GAME_VERSION.slice(6, 8)}`
-
-/**
  * Upload a scene blob to `storage` and return the key it was stored under — the
  * `<date>/<uuid>` name every `DataBlob` field holds.
  *
@@ -245,18 +233,17 @@ function isRoomBlobFile(filename: string): boolean {
 }
 
 /**
- * The file that actually gets stored for a picked scene file. A scene taken from a newer
- * build may need conversion before the 2025 client can read it, so when the owner asks
- * for it the file is converted first (see `room-converter.ts`); otherwise it passes
- * through untouched.
+ * The file that actually gets stored for a picked scene file. With the version-one
+ * option enabled, only the scene's top-level persistence version is changed; all
+ * circuit and object bytes pass through unchanged.
  *
  * Done here in the browser, before either request, because the upload goes straight to
  * `storage` and the save's `Hash` has to describe the bytes that were stored — so both
  * the upload and `blobHash` must be given this file, not the one that was picked.
  */
-async function prepareRoomBlob(file: File, downgrade: boolean): Promise<File> {
-	if (!downgrade) return file
-	const { data } = downgradeRoom(new Uint8Array(await file.arrayBuffer()))
+async function prepareRoomBlob(file: File, forceVersionOne: boolean): Promise<File> {
+	if (!forceVersionOne) return file
+	const data = forceRoomVersionOne(new Uint8Array(await file.arrayBuffer()))
 	return new File([data], file.name, { type: 'application/octet-stream' })
 }
 
@@ -367,7 +354,13 @@ async function blobHash(file: File): Promise<string> {
 async function saveSubRoomBlob(
 	roomId: number,
 	subRoomId: number,
-	input: { filename: string; hash: string; description: string; autoPublish: boolean }
+	input: {
+		filename: string
+		hash: string
+		description: string
+		autoPublish: boolean
+		persistenceVersion?: number
+	}
 ): Promise<OwnedRoom> {
 	const res = await call<{
 		success?: boolean
@@ -380,6 +373,9 @@ async function saveSubRoomBlob(
 			SubRoomData: { Filename: input.filename, Hash: input.hash },
 			Description: input.description,
 			AutoPublish: input.autoPublish,
+			...(input.persistenceVersion === undefined
+				? {}
+				: { PersistenceVersion: input.persistenceVersion }),
 		},
 	})
 	if (res.success !== true) {
@@ -2605,10 +2601,9 @@ function BlobUpload({
 	const [file, setFile] = useState<File | null>(null)
 	const [description, setDescription] = useState('')
 	const [publish, setPublish] = useState(true)
-	// Whether to convert the file for this build before storing it. Picking a file sets it
-	// from the extension — on for a `.binpb`, off for a `.room` — and the owner can overrule
-	// that either way: a `.binpb` that already loads shouldn't lose its circuits for nothing.
-	const [downgrade, setDowngrade] = useState(false)
+	// Default on for a `.binpb`, off for a `.room`; the owner may override it. This
+	// changes only the scene version and leaves circuits and objects intact.
+	const [forceVersionOne, setForceVersionOne] = useState(false)
 	const [fileError, setFileError] = useState('')
 	// The file input is uncontrolled — React can't set its value — so clearing the picked
 	// file after a save takes a handle on the element itself.
@@ -2622,7 +2617,7 @@ function BlobUpload({
 				e.preventDefault()
 				if (!file) return
 				void run(async () => {
-					const blob = await prepareRoomBlob(file, downgrade)
+					const blob = await prepareRoomBlob(file, forceVersionOne)
 					const [filename, hash] = await Promise.all([uploadRoomBlob(blob), blobHash(blob)])
 					onRoomChange(
 						await saveSubRoomBlob(roomId, subRoomId, {
@@ -2630,13 +2625,14 @@ function BlobUpload({
 							hash,
 							description: description.trim(),
 							autoPublish: publish,
+							persistenceVersion: forceVersionOne ? 1 : undefined,
 						})
 					)
 					setFile(null)
-					setDowngrade(false)
+					setForceVersionOne(false)
 					setDescription('')
 					if (input.current) input.current.value = ''
-					const uploaded = downgrade ? 'Converted for this build, uploaded' : 'Uploaded'
+					const uploaded = forceVersionOne ? 'Version set to 1, uploaded' : 'Uploaded'
 					return publish
 						? `${uploaded} and published — players load this scene now.`
 						: `${uploaded} and staged. Publish it in game to make it live.`
@@ -2651,11 +2647,9 @@ function BlobUpload({
 				<span className="badge beta">Beta</span>
 			</p>
 			<p className="muted blob-upload-caveat">
-				New and lightly tested. Nothing here checks the file — the server stores whatever it is and
-				the game finds out on load. This server runs the {CLIENT_BUILD_DATE} build, so scene data
-				from a room built on anything newer may not load at all. Converting a file for this build
-				before it is stored gets around that, but removes its circuits. Download the save above and
-				keep it before replacing it.
+				New and lightly tested. Nothing here checks whether the game can load the file. Forcing
+				version 1 changes only its version field and may still leave unsupported content. Download
+				the save above and keep it before replacing it.
 			</p>
 			<label className="blob-upload-file">
 				Scene data file
@@ -2670,13 +2664,13 @@ function BlobUpload({
 						if (picked && !isRoomBlobFile(picked.name)) {
 							setFileError('Pick a .room or .binpb file.')
 							setFile(null)
-							setDowngrade(false)
+							setForceVersionOne(false)
 							e.target.value = ''
 							return
 						}
 						setFileError('')
 						setFile(picked)
-						setDowngrade(picked !== null && needsDowngrade(picked.name))
+						setForceVersionOne(picked !== null && isBinpbScene(picked.name))
 					}}
 					required
 				/>
@@ -2699,11 +2693,11 @@ function BlobUpload({
 			<label className="check">
 				<input
 					type="checkbox"
-					checked={downgrade}
+					checked={forceVersionOne}
 					disabled={file === null}
-					onChange={(e) => setDowngrade(e.target.checked)}
+					onChange={(e) => setForceVersionOne(e.target.checked)}
 				/>
-				Force scene version 1 (experimental; removes circuits)
+				Force scene version 1 (keeps circuits)
 			</label>
 			{error && <p className="error">{error}</p>}
 			{done && <p className="ok">{done}</p>}
@@ -3348,7 +3342,7 @@ function RoomImport({ navigate }: { navigate: Navigate }) {
 	const [name, setName] = useState('')
 	const [loading, setLoading] = useState(false)
 	const [fileError, setFileError] = useState('')
-	const [downgrade, setDowngrade] = useState(true)
+	const [forceVersionOne, setForceVersionOne] = useState(true)
 	const [progress, setProgress] = useState('')
 	const [created, setCreated] = useState<{ RoomId: number; Name: string } | null>(null)
 	const { pending, error, run } = useAction()
@@ -3372,7 +3366,7 @@ function RoomImport({ navigate }: { navigate: Navigate }) {
 						const subRooms = []
 						for (const [index, sub] of archive.subRooms.entries()) {
 							setProgress(`Uploading subroom ${index + 1} of ${archive.subRooms.length}…`)
-							const converted = downgrade && needsDowngrade(sub.file.name)
+							const converted = forceVersionOne && isBinpbScene(sub.file.name)
 							const prepared = await prepareRoomBlob(sub.file, converted)
 							const [dataBlob, dataBlobHash] = await Promise.all([
 								uploadRoomBlob(prepared),
@@ -3443,10 +3437,10 @@ function RoomImport({ navigate }: { navigate: Navigate }) {
 						<label className="check">
 							<input
 								type="checkbox"
-								checked={downgrade}
-								onChange={(event) => setDowngrade(event.target.checked)}
+								checked={forceVersionOne}
+								onChange={(event) => setForceVersionOne(event.target.checked)}
 							/>
-							Convert .binpb scenes (force version 1; removes circuits)
+							Force .binpb scene version 1 (keeps circuits)
 						</label>
 						{progress && <p className="muted">{progress}</p>}
 						{error && <p className="error">{error}</p>}
