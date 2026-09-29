@@ -4,6 +4,7 @@ export interface ArchiveSubRoom {
 	details: Record<string, unknown>
 	save: Record<string, unknown>
 	file: File
+	originalFile?: File
 }
 
 export interface RoomArchive {
@@ -40,7 +41,7 @@ export async function readRoomArchive(file: File): Promise<RoomArchive> {
 		files = unzipSync(new Uint8Array(await file.arrayBuffer()), {
 			filter: ({ name, originalSize }) => {
 				const wanted =
-					/(?:^|\/)(?:RoomDetails\.json|RoomImage\.(?:jpe?g|png)|Subroom\.json|persisted_room_data\.(?:binpb|room))$/i.test(
+					/(?:^|\/)(?:RoomDetails\.json|RoomImage\.(?:jpe?g|png)|Subroom\.json|persisted_room_data\.(?:original\.binpb|binpb|room))$/i.test(
 						name
 					)
 				if (!wanted) return false
@@ -83,19 +84,33 @@ export async function readRoomArchive(file: File): Promise<RoomArchive> {
 				scenePath.startsWith(dir) &&
 				/^persisted_room_data\.(?:binpb|room)$/i.test(scenePath.slice(dir.length))
 		)
-		if (!sceneEntry) continue
+		const originalEntry = entries.find(
+			([scenePath]) =>
+				scenePath.startsWith(dir) &&
+				/^persisted_room_data\.original\.binpb$/i.test(scenePath.slice(dir.length))
+		)
+		if (!sceneEntry && !originalEntry) continue
 		const subDetails = jsonObject(bytes, 'Subroom.json')
 		const save = subDetails.CurrentSave
 		if (!save || typeof save !== 'object' || Array.isArray(save)) continue
 		// A UnityAssetId marks an RRS-backed save. The current game build cannot load it.
 		if (typeof (save as Record<string, unknown>).UnityAssetId === 'string') continue
-		const [scenePath, sceneBytes] = sceneEntry
+		const [scenePath, sceneBytes] = sceneEntry ?? originalEntry!
 		subRooms.push({
 			details: subDetails,
 			save: save as Record<string, unknown>,
 			file: new File([new Uint8Array(sceneBytes)], scenePath.split('/').pop()!, {
 				type: 'application/octet-stream',
 			}),
+			...(originalEntry
+				? {
+						originalFile: new File(
+							[new Uint8Array(originalEntry[1])],
+							originalEntry[0].split('/').pop()!,
+							{ type: 'application/octet-stream' }
+						),
+					}
+				: {}),
 		})
 	}
 	if (subRooms.length === 0) throw new Error('The ZIP has no subroom with scene data to import.')

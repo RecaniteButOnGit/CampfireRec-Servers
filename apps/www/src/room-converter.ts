@@ -39,44 +39,63 @@ function checkedEnd(data: Uint8Array, end: number): number {
 	return end
 }
 
-/** Change only top-level field 30 to version 1, retaining all other scene bytes. */
-export function forceRoomVersionOne(data: Uint8Array): Uint8Array<ArrayBuffer> {
-	const source = Uint8Array.from(data)
-	const parts: Uint8Array[] = []
+function visitRoomVersions(
+	data: Uint8Array,
+	visit: (version: number, valuePos: number, fieldEnd: number) => void
+): boolean {
 	let pos = 0
-	let copiedThrough = 0
 	let foundVersion = false
-	let changed = false
-
-	while (pos < source.length) {
-		const [tag, valuePos] = readVarint(source, pos)
+	while (pos < data.length) {
+		const [tag, valuePos] = readVarint(data, pos)
 		const fieldNumber = Math.floor(tag / 8)
 		const wireType = tag % 8
 		if (fieldNumber === 0) throw new Error('Scene has an invalid protobuf field.')
 
 		if (wireType === 0) {
-			const fieldEnd = skipVarint(source, valuePos)
+			const fieldEnd = skipVarint(data, valuePos)
 			if (fieldNumber === 30) {
-				const [version] = readVarint(source, valuePos)
+				const [version] = readVarint(data, valuePos)
+				visit(version, valuePos, fieldEnd)
 				foundVersion = true
-				if (version !== TARGET_VERSION) {
-					parts.push(source.subarray(copiedThrough, valuePos), Uint8Array.of(TARGET_VERSION))
-					copiedThrough = fieldEnd
-					changed = true
-				}
 			}
 			pos = fieldEnd
 		} else if (wireType === 1) {
-			pos = checkedEnd(source, valuePos + 8)
+			pos = checkedEnd(data, valuePos + 8)
 		} else if (wireType === 2) {
-			const [length, payloadPos] = readVarint(source, valuePos)
-			pos = checkedEnd(source, payloadPos + length)
+			const [length, payloadPos] = readVarint(data, valuePos)
+			pos = checkedEnd(data, payloadPos + length)
 		} else if (wireType === 5) {
-			pos = checkedEnd(source, valuePos + 4)
+			pos = checkedEnd(data, valuePos + 4)
 		} else {
 			throw new Error('Scene has an unsupported protobuf wire type.')
 		}
 	}
+	return foundVersion
+}
+
+/** Read the embedded scene version; a legacy scene may have no version field. */
+export function roomVersion(data: Uint8Array): number | undefined {
+	let version: number | undefined
+	visitRoomVersions(data, (value) => {
+		version = value
+	})
+	return version
+}
+
+/** Change only top-level field 30 to version 1, retaining all other scene bytes. */
+export function forceRoomVersionOne(data: Uint8Array): Uint8Array<ArrayBuffer> {
+	const source = Uint8Array.from(data)
+	const parts: Uint8Array[] = []
+	let copiedThrough = 0
+	let changed = false
+
+	const foundVersion = visitRoomVersions(source, (version, valuePos, fieldEnd) => {
+		if (version !== TARGET_VERSION) {
+			parts.push(source.subarray(copiedThrough, valuePos), Uint8Array.of(TARGET_VERSION))
+			copiedThrough = fieldEnd
+			changed = true
+		}
+	})
 
 	if (!foundVersion) throw new Error('Scene data has no persistence version (field 30).')
 	if (!changed) return source

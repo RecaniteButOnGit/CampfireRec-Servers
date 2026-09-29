@@ -12,7 +12,7 @@ import {
 	SOURCE_REPO,
 } from '../links'
 import { readRoomArchive } from '../room-archive'
-import { forceRoomVersionOne, isBinpbScene } from '../room-converter'
+import { forceRoomVersionOne, isBinpbScene, roomVersion } from '../room-converter'
 // The session token, the worker hostnames and the `call` every request goes through —
 // see api.ts for why they're a module of their own rather than defined here.
 import {
@@ -2601,8 +2601,8 @@ function BlobUpload({
 	const [file, setFile] = useState<File | null>(null)
 	const [description, setDescription] = useState('')
 	const [publish, setPublish] = useState(true)
-	// Default on for a `.binpb`, off for a `.room`; the owner may override it. This
-	// changes only the scene version and leaves circuits and objects intact.
+	// Default on for a migrated `.binpb`, off for a raw `.original.binpb` or
+	// `.room`; the owner may override it. Circuits and objects remain intact.
 	const [forceVersionOne, setForceVersionOne] = useState(false)
 	const [fileError, setFileError] = useState('')
 	// The file input is uncontrolled — React can't set its value — so clearing the picked
@@ -2618,6 +2618,9 @@ function BlobUpload({
 				if (!file) return
 				void run(async () => {
 					const blob = await prepareRoomBlob(file, forceVersionOne)
+					const persistenceVersion = forceVersionOne
+						? 1
+						: roomVersion(new Uint8Array(await blob.arrayBuffer()))
 					const [filename, hash] = await Promise.all([uploadRoomBlob(blob), blobHash(blob)])
 					onRoomChange(
 						await saveSubRoomBlob(roomId, subRoomId, {
@@ -2625,7 +2628,7 @@ function BlobUpload({
 							hash,
 							description: description.trim(),
 							autoPublish: publish,
-							persistenceVersion: forceVersionOne ? 1 : undefined,
+							persistenceVersion,
 						})
 					)
 					setFile(null)
@@ -2648,8 +2651,9 @@ function BlobUpload({
 			</p>
 			<p className="muted blob-upload-caveat">
 				New and lightly tested. Nothing here checks whether the game can load the file. Forcing
-				version 1 changes only its version field and may still leave unsupported content. Download
-				the save above and keep it before replacing it.
+				version 1 changes only its version field and may still leave unsupported content. With that
+				option off, the save records the file's embedded version. Download the save above and keep
+				it before replacing it.
 			</p>
 			<label className="blob-upload-file">
 				Scene data file
@@ -2670,7 +2674,11 @@ function BlobUpload({
 						}
 						setFileError('')
 						setFile(picked)
-						setForceVersionOne(picked !== null && isBinpbScene(picked.name))
+						setForceVersionOne(
+							picked !== null &&
+								isBinpbScene(picked.name) &&
+								!/\.original\.binpb$/i.test(picked.name)
+						)
 					}}
 					required
 				/>
@@ -3343,6 +3351,7 @@ function RoomImport({ navigate }: { navigate: Navigate }) {
 	const [loading, setLoading] = useState(false)
 	const [fileError, setFileError] = useState('')
 	const [forceVersionOne, setForceVersionOne] = useState(true)
+	const [useOriginalScenes, setUseOriginalScenes] = useState(false)
 	const [progress, setProgress] = useState('')
 	const [created, setCreated] = useState<{ RoomId: number; Name: string } | null>(null)
 	const { pending, error, run } = useAction()
@@ -3361,20 +3370,40 @@ function RoomImport({ navigate }: { navigate: Navigate }) {
 					if (!archive) return
 					void run(async () => {
 						setCreated(null)
+						const selectedSubRooms = await Promise.all(
+							archive.subRooms.map(async (sub) => {
+								const originalFile = useOriginalScenes ? sub.originalFile : undefined
+								const file = originalFile ?? sub.file
+								let save = sub.save
+								if (originalFile) {
+									const version = roomVersion(new Uint8Array(await originalFile.arrayBuffer()))
+									if (version === undefined)
+										throw new Error(
+											`Original scene for ${String(sub.details.Name)} has no version.`
+										)
+									save = { ...save, PersistenceVersion: version }
+								}
+								return {
+									sub,
+									file,
+									save,
+									converted: !originalFile && forceVersionOne && isBinpbScene(file.name),
+								}
+							})
+						)
 						setProgress('Uploading room image…')
 						const imageName = await uploadToStorage(archive.image, FILE_TYPE_IMAGE)
 						const subRooms = []
-						for (const [index, sub] of archive.subRooms.entries()) {
+						for (const [index, { sub, file, save, converted }] of selectedSubRooms.entries()) {
 							setProgress(`Uploading subroom ${index + 1} of ${archive.subRooms.length}…`)
-							const converted = forceVersionOne && isBinpbScene(sub.file.name)
-							const prepared = await prepareRoomBlob(sub.file, converted)
+							const prepared = await prepareRoomBlob(file, converted)
 							const [dataBlob, dataBlobHash] = await Promise.all([
 								uploadRoomBlob(prepared),
 								blobHash(prepared),
 							])
 							subRooms.push({
 								details: sub.details,
-								save: sub.save,
+								save,
 								dataBlob,
 								dataBlobHash,
 								converted,
@@ -3409,6 +3438,7 @@ function RoomImport({ navigate }: { navigate: Navigate }) {
 							setArchive(null)
 							setCreated(null)
 							setFileError('')
+							setUseOriginalScenes(false)
 							if (!picked) return
 							setLoading(true)
 							void readRoomArchive(picked)
@@ -3434,14 +3464,30 @@ function RoomImport({ navigate }: { navigate: Navigate }) {
 							data. {archive.skippedSubRooms} listed subroom
 							{archive.skippedSubRooms === 1 ? '' : 's'} without files will be skipped.
 						</p>
+						{archive.subRooms.some((sub) => sub.originalFile) && (
+							<label className="check">
+								<input
+									type="checkbox"
+									checked={useOriginalScenes}
+									onChange={(event) => setUseOriginalScenes(event.target.checked)}
+								/>
+								Use original scene files before export migration, where available
+							</label>
+						)}
 						<label className="check">
 							<input
 								type="checkbox"
 								checked={forceVersionOne}
 								onChange={(event) => setForceVersionOne(event.target.checked)}
 							/>
-							Force .binpb scene version 1 (keeps circuits)
+							Force migrated .binpb scene version 1 (keeps circuits)
 						</label>
+						{useOriginalScenes && (
+							<p className="muted">
+								Original scenes keep their embedded version; the version 1 option applies only where
+								no original is available.
+							</p>
+						)}
 						{progress && <p className="muted">{progress}</p>}
 						{error && <p className="error">{error}</p>}
 						{created && (

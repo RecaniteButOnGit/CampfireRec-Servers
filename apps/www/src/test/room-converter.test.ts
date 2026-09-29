@@ -1,6 +1,6 @@
 import { expect, it } from 'vitest'
 
-import { forceRoomVersionOne, isBinpbScene } from '../room-converter'
+import { forceRoomVersionOne, isBinpbScene, roomVersion } from '../room-converter'
 
 function varint(value: bigint): number[] {
 	const out: number[] = []
@@ -47,6 +47,7 @@ it('changes only the version and retains circuits and object data', () => {
 
 it('changes every top-level version when the field occurs twice', () => {
 	const input = [...num(30, 141), ...len(2, num(30, 222)), ...num(30, 123)]
+	expect(roomVersion(Uint8Array.from(input))).toBe(123)
 	expect([...forceRoomVersionOne(Uint8Array.from(input))]).toEqual([
 		...num(30, 1),
 		...len(2, num(30, 222)),
@@ -60,6 +61,7 @@ it('leaves a scene already at version 1 unchanged', () => {
 })
 
 it('rejects a scene without a top-level persistence version', () => {
+	expect(roomVersion(Uint8Array.from(len(2, num(30, 141))))).toBeUndefined()
 	expect(() => forceRoomVersionOne(Uint8Array.from(len(2, num(30, 141))))).toThrow(
 		'Scene data has no persistence version'
 	)
