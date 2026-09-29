@@ -6,7 +6,7 @@ import {
 	waitOnExecutionContext,
 } from 'cloudflare:test'
 import { exports } from 'cloudflare:workers'
-import { beforeAll, describe, expect, test } from 'vitest'
+import { beforeAll, describe, expect, test, vi } from 'vitest'
 
 import {
 	countPlayersInInstance,
@@ -31,7 +31,7 @@ import {
 	SCHEMA_DDL as REPORTS_SCHEMA_DDL,
 } from '../../../../api/src/reports-db'
 import { PLATFORM_SCHEMA_DDL } from '../../../../auth/src/platform-db'
-import { scheduled } from '../../match.app'
+import { app, scheduled } from '../../match.app'
 
 import type { Env } from '../../context'
 
@@ -1191,11 +1191,39 @@ describe('public endpoints', () => {
 		expect(res.status).toBe(200)
 	})
 
-	test('POST /roominstance/:id/reportjoinresult returns 200', async () => {
-		const res = await exports.default.fetch(`${ORIGIN}/roominstance/5/reportjoinresult`, {
-			method: 'POST',
+	test('POST /roominstance/:id/reportjoinresult logs the complete payload and returns 200', async () => {
+		const payload = JSON.stringify({
+			Result: 8702,
+			Error: 'Did not receive Room Authority initialization',
+			Details: { received: 6, expected: 7 },
 		})
-		expect(res.status).toBe(200)
+		const logs: unknown[] = []
+		const consoleLog = vi.spyOn(console, 'log').mockImplementation((entry: unknown) => {
+			logs.push(entry)
+		})
+		try {
+			const res = await app.request(
+				`${ORIGIN}/roominstance/5/reportjoinresult`,
+				{ method: 'POST', headers: { 'content-type': 'application/json' }, body: payload },
+				env
+			)
+			expect(res.status).toBe(200)
+			const report = logs.find(
+				(entry): entry is { message: string } =>
+					typeof entry === 'object' &&
+					entry !== null &&
+					'message' in entry &&
+					typeof entry.message === 'string' &&
+					entry.message.includes('room instance join result')
+			)
+			expect(report).toBeDefined()
+			expect(JSON.parse(report!.message)).toEqual([
+				'room instance join result',
+				{ roomInstanceId: '5', contentType: 'application/json', payload },
+			])
+		} finally {
+			consoleLog.mockRestore()
+		}
 	})
 })
 

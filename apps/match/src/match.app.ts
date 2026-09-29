@@ -3109,12 +3109,20 @@ const app = new Hono<App>()
 		'/roominstance/:id/reportjoinresult',
 		describeRoute({
 			tags: ['Room instance'],
-			summary: 'Report join result (no-op ack)',
-			description: 'The client reports how a join went; accepted and ignored.',
+			summary: 'Report join result',
+			description:
+				'Logs the complete raw request body, instance id, and content type, then acknowledges the client.',
 			parameters: [{ name: 'id', in: 'path', required: true, schema: { type: 'string' } }],
 			responses: { 200: EMPTY_OK },
 		}),
-		(c) => c.body(null, 200)
+		async (c) => {
+			logger.info('room instance join result', {
+				roomInstanceId: c.req.param('id'),
+				contentType: c.req.header('content-type') ?? null,
+				payload: await c.req.text(),
+			})
+			return c.body(null, 200)
+		}
 	)
 
 	// The instance's in-progress flag, flipped when a session starts (e.g. a game round

@@ -25,7 +25,7 @@ instances and presence all live in the shared `recflare` D1 database.
 | POST   | `/goto/none`                         |      | Go to the dorm                                        |
 | PUT    | `/player/photonregionpings`          |      | Region ping report (no-op ack)                        |
 | PUT    | `/player/gameserverregionpings`      |      | Region ping report (no-op ack)                        |
-| POST   | `/roominstance/:id/reportjoinresult` |      | Report join result (no-op ack)                        |
+| POST   | `/roominstance/:id/reportjoinresult` |      | Log the complete join-result request body, then ack   |
 | PUT    | `/roominstance/:id/inprogress`       | ✓    | Set the instance's in-progress flag                   |
 | GET    | `/room/:roomId/instances`            | ✓    | A room's live instances (owner/co-owner only)         |
 | GET    | `/rooms/requiring/developer`         |      | Rooms requiring a developer → `[]`                    |
