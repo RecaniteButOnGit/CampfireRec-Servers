@@ -60,9 +60,12 @@ async function extractSelectedEntries(file: File): Promise<Record<string, Uint8A
 	unzipper.register(UnzipPassThrough)
 	unzipper.register(UnzipInflate)
 	unzipper.onfile = (entry) => {
-		if (!selectedEntry(entry.name)) return
+		// Some Windows exporters write backslash separators in ZIP paths. Normalize
+		// before matching subroom files and deriving roots.
+		const name = entry.name.replaceAll('\\', '/')
+		if (!selectedEntry(name)) return
 		if (entry.originalSize !== undefined && entry.originalSize > MAX_ENTRY_BYTES) {
-			streamError = new Error(`Archive entry is too large: ${entry.name}`)
+			streamError = new Error(`Archive entry is too large: ${name}`)
 			return
 		}
 		const chunks: Uint8Array[] = []
@@ -76,7 +79,7 @@ async function extractSelectedEntries(file: File): Promise<Record<string, Uint8A
 				entryBytes += chunk.length
 				extractedBytes += chunk.length
 				if (entryBytes > MAX_ENTRY_BYTES) {
-					streamError = new Error(`Archive entry is too large: ${entry.name}`)
+					streamError = new Error(`Archive entry is too large: ${name}`)
 					return
 				}
 				if (extractedBytes > MAX_EXTRACTED_BYTES) {
@@ -85,7 +88,7 @@ async function extractSelectedEntries(file: File): Promise<Record<string, Uint8A
 				}
 				chunks.push(chunk)
 			}
-			if (final && !streamError) files[entry.name] = joinChunks(chunks, entryBytes)
+			if (final && !streamError) files[name] = joinChunks(chunks, entryBytes)
 		}
 		try {
 			entry.start()
