@@ -179,7 +179,9 @@ export function convertAvatarData(data: Uint8Array): {
 	const hair = nested(source, 10)
 	const beard = nested(source, 11)
 	const hat = nested(source, 8)
-	const hairColor = guid(hair, 2)?.encoded ?? guid(hair, 1)?.encoded ?? ''
+	// The flat outfit field is the primary hair color. Keep it aligned with the
+	// primaryColorId we write into FaceFeatures below.
+	const hairColor = guid(hair, 1)?.encoded ?? guid(hair, 2)?.encoded ?? ''
 	const faceFeatures = {
 		// FaceFeatures has its own serializer version. AvatarData.avatar_version is
 		// a protobuf schema version and must never be used here.

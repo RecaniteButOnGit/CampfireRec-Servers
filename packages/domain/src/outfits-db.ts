@@ -91,7 +91,11 @@ function sanitizeImportedOutfit(outfit: Outfit, legacy: Record<string, unknown>)
 	if (typeof legacyData.FaceFeatures === 'string') {
 		try {
 			const features = object(JSON.parse(legacyData.FaceFeatures))
-			if (features) legacyData.FaceFeatures = JSON.stringify({ ...features, ver: 6 })
+			if (features) {
+				legacyData.FaceFeatures = JSON.stringify({ ...features, ver: 6 })
+				if (typeof features.hairPrimaryColorId === 'string' && features.hairPrimaryColorId)
+					legacyData.HairColor = features.hairPrimaryColorId
+			}
 		} catch {
 			// Keep the original value; the game client will report malformed features.
 		}
