@@ -782,7 +782,8 @@ it('imports an avatar only for account 2 and saves each import in the next free 
 	expect(rows.results.map((row) => row.set_id)).toEqual([0, 1, 2, 3])
 	expect(JSON.parse(rows.results[1]!.avatar).Name).toBe('Existing outfit')
 	expect(JSON.parse(rows.results[0]!.avatar).LegacyData.SelectionsV1).toContain('03020100')
-	expect(JSON.parse(rows.results[2]!.avatar).OutfitSelections).toContain('03020100')
+	expect(JSON.parse(rows.results[2]!.avatar).LegacyData.SelectionsV1).toContain('03020100')
+	expect(JSON.parse(rows.results[2]!.avatar).CustomizationSettings).toBeNull()
 	const stored = await env.DB.prepare('SELECT avatar FROM account WHERE account_id = 9850').first<{
 		avatar: string
 	}>()

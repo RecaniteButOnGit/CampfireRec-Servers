@@ -12,6 +12,7 @@ import {
 	inventionTagRejection,
 	MAX_BULK_OUTFIT_ACCOUNTS,
 	setOutfit,
+	toNewClientOutfit,
 } from '@repo/domain'
 
 import {
@@ -1005,7 +1006,7 @@ export const avatarRoutes = new Hono<App>({ strict: false })
 			if (id === null) return unauthorized(c)
 
 			const outfit = await getOutfit(c.env.DB, id, CURRENT_OUTFIT_SLOT)
-			if (outfit !== null) return c.json(outfit)
+			if (outfit !== null) return c.json(toNewClientOutfit(outfit))
 
 			return c.json({
 				FaceFeatures: '',
@@ -1120,7 +1121,8 @@ export const avatarRoutes = new Hono<App>({ strict: false })
 
 			const outfits = await getOutfitsByAccounts(c.env.DB, accountIds, CURRENT_OUTFIT_SLOT)
 			const OutfitsByAccountId: Record<string, unknown> = {}
-			for (const [accountId, outfit] of outfits) OutfitsByAccountId[String(accountId)] = outfit
+			for (const [accountId, outfit] of outfits)
+				OutfitsByAccountId[String(accountId)] = toNewClientOutfit(outfit)
 			return c.json({ OutfitsByAccountId })
 		}
 	)
@@ -1164,7 +1166,7 @@ export const avatarRoutes = new Hono<App>({ strict: false })
 		async (c) => {
 			const id = await authedId(c)
 			if (id === null) return unauthorized(c)
-			return c.json(await getOutfits(c.env.DB, id))
+			return c.json((await getOutfits(c.env.DB, id)).map(toNewClientOutfit))
 		}
 	)
 

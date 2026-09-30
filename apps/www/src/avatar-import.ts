@@ -178,7 +178,9 @@ export function convertAvatarData(data: Uint8Array): {
 	const hat = nested(source, 8)
 	const hairColor = guid(hair, 2)?.encoded ?? guid(hair, 1)?.encoded ?? ''
 	const faceFeatures = {
-		ver: integer(source, 1),
+		// FaceFeatures has its own serializer version. AvatarData.avatar_version is
+		// a protobuf schema version and must never be used here.
+		ver: 6,
 		eyeId: eyes.Id,
 		eyePos: eyes.PositionOffset,
 		eyeScl: eyes.ScaleOffset,
@@ -250,6 +252,7 @@ export function convertAvatarData(data: Uint8Array): {
 		]),
 		bodyPaint: guid(source, 16)?.encoded ?? '',
 		auraId: integer(nested(source, 17), 1),
+		baseAvatarType: '',
 	}
 	const selectionV1 = selections
 		.map((selection) =>
@@ -276,42 +279,6 @@ export function convertAvatarData(data: Uint8Array): {
 			.map((selection) => selection.UgcOutfitData.CustomAvatarItemId)
 			.filter(Boolean),
 	}
-	const customization = {
-		AvatarVersion: integer(source, 1),
-		AvatarBodyType: integer(source, 12),
-		OutfitSelections: selections,
-		SkinColor: skinColor,
-		BodyShapeId: bodyShape,
-		HideEars: faceFeatures.hideEars,
-		UseHelmetHair: faceFeatures.useHelmetHair,
-		UseHatAnchorParams: faceFeatures.useHatAnchorParams,
-		HatAnchorParams: faceFeatures.hatAnchorParams,
-		HairData: {
-			PrimaryColorId: faceFeatures.hairPrimaryColorId,
-			SecondaryColorId: faceFeatures.hairSecondaryColorId,
-			PatternTextureId: faceFeatures.hairPatternId,
-		},
-		BeardData: {
-			PrimaryColorId: faceFeatures.beardColorId,
-			SecondaryColorId: faceFeatures.beardSecondaryColorId,
-			PatternTextureId: faceFeatures.beardPatternId,
-		},
-		FaceCustomizationSettings: {
-			EyeSettings: eyes,
-			EyeBrowsSettings: brows,
-			MouthSettings: mouth,
-			NoseSettings: nose,
-			FaceShapeId: guid(face, 4)?.encoded ?? '',
-			HeadScale: float(face, 6),
-			ModernBeanHeadScale: float(face, 7),
-		},
-		BodyPropertyData: faceFeatures.bodyPropertyData,
-		FacePropertyData: faceFeatures.facePropertyData,
-		NosePropertyData: faceFeatures.nosePropertyData,
-		BodyPaint: faceFeatures.bodyPaint,
-		AuraId: faceFeatures.auraId,
-	}
-	const saved: Outfit = { ...avatar, Slot: 1, Name: 'Imported avatar', PreviewImageName: '' }
 	const worn: Outfit = {
 		DataVersion: 2,
 		LegacyData: {
@@ -321,13 +288,17 @@ export function convertAvatarData(data: Uint8Array): {
 			SkinColor: skinColor,
 			HairColor: hairColor,
 		},
-		CustomizationSettings: JSON.stringify(customization),
+		// The 2025 client parses this document as a newer, GUID-typed schema. The
+		// protobuf export is newer and has different field names and GUID encoding.
+		// A null value tells the client to load the complete LegacyData instead.
+		CustomizationSettings: null,
 		Selections: [],
 		Slot: 0,
 		Name: null,
 		Accessibility: 1,
 		ThumbnailFileName: null,
 	}
+	const saved: Outfit = { ...worn, Slot: 1, Name: 'Imported avatar' }
 	return { avatar, worn, saved }
 }
 

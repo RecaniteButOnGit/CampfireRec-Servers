@@ -12,10 +12,13 @@ it('converts AvatarData selections into worn and saved client payloads', () => {
 		BodyPart: 1,
 	})
 	expect(avatar.SkinColor).toBe('AAECAwQFBgcICQoLDA0ODw')
-	expect(JSON.parse(avatar.FaceFeatures as string).ver).toBe(10)
+	expect(JSON.parse(avatar.FaceFeatures as string).ver).toBe(6)
 	expect(worn.Slot).toBe(0)
 	expect((worn.LegacyData as Record<string, unknown>).SelectionsV1).toBe(avatar.OutfitSelections)
-	expect(saved.OutfitSelections).toBe(avatar.OutfitSelections)
+	expect(worn.CustomizationSettings).toBeNull()
+	expect(saved.Slot).toBe(1)
+	expect(saved.LegacyData).toEqual(worn.LegacyData)
+	expect(saved.Name).toBe('Imported avatar')
 })
 
 it('reads the named file directly or from a nested ZIP entry', async () => {

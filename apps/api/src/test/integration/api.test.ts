@@ -1968,6 +1968,49 @@ describe('public endpoints', () => {
 		expect(await saved('4343')).toEqual([])
 	})
 
+	test('new outfit reads adapt a legacy saved slot for the 2025 client', async () => {
+		const legacy = {
+			Slot: 2,
+			Name: 'Imported avatar',
+			PreviewImageName: '',
+			OutfitSelections: '193a3bf9-abc0-4d78-8d63-92046908b1c5,,0',
+			OutfitSelectionsV2: '{"selections":[]}',
+			FaceFeatures: '{"ver":6}',
+			SkinColor: 'Dc6StLFk60u5iUTrb3_C3w',
+			HairColor: 'UAT0OaWEkUG-mWDIyiX1Kg',
+		}
+		await env.DB.prepare('INSERT INTO outfit (account_id, set_id, avatar) VALUES (?1, 2, ?2)')
+			.bind(4244, JSON.stringify(legacy))
+			.run()
+		const response = await exports.default.fetch(`${ORIGIN}/outfits/me/saved`, {
+			headers: await bearer('4244'),
+		})
+		expect(response.status).toBe(200)
+		expect(await response.json()).toEqual([
+			{
+				DataVersion: 2,
+				LegacyData: {
+					SelectionsV1: legacy.OutfitSelections,
+					SelectionsV2: legacy.OutfitSelectionsV2,
+					FaceFeatures: legacy.FaceFeatures,
+					SkinColor: legacy.SkinColor,
+					HairColor: legacy.HairColor,
+				},
+				CustomizationSettings: null,
+				Selections: [],
+				Slot: 2,
+				Name: 'Imported avatar',
+				Accessibility: 1,
+				ThumbnailFileName: null,
+			},
+		])
+		// The older API still serves its original payload.
+		const row = await env.DB.prepare(
+			'SELECT avatar FROM outfit WHERE account_id = 4244 AND set_id = 2'
+		).first<{ avatar: string }>()
+		expect(JSON.parse(row!.avatar)).toEqual(legacy)
+	})
+
 	test('POST /outfits/bulk serves each account’s worn outfit, keyed by id', async () => {
 		const bulk = async (body: unknown, sub?: string) =>
 			exports.default.fetch(`${ORIGIN}/outfits/bulk`, {

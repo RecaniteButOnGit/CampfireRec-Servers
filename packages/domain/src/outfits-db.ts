@@ -15,9 +15,9 @@
  * row shape live in one place.
  *
  * Note the two write paths store DIFFERENT payload shapes into the same column: econ's
- * saved-outfit slots hold the old flat PascalCase outfit, while `/outfits/me` holds the
- * newer `{ DataVersion, LegacyData, CustomizationSettings, … }` envelope. Each endpoint
- * serves back what it stored, so don't add a projection that assumes either one.
+ * saved-outfit slots can hold the old flat PascalCase outfit, while `/outfits/me` holds
+ * the newer `{ DataVersion, LegacyData, CustomizationSettings, … }` envelope. Econ
+ * serves its rows verbatim; the newer API adapts old rows at read time.
  */
 
 /** Schema DDL (mirror of apps/econ/migrations/0002_outfit.sql) — also builds the table in tests. */
@@ -42,6 +42,33 @@ export interface Outfit extends Record<string, unknown> {
 
 /** The slot the newer client wears — what `/outfits/me` reads and writes. */
 export const CURRENT_OUTFIT_SLOT = 0
+
+/** The 2025 client requires LegacyData even when an outfit was saved by the older API. */
+export function toNewClientOutfit(outfit: Outfit): Outfit {
+	if (outfit.LegacyData && typeof outfit.LegacyData === 'object') return outfit
+	return {
+		DataVersion: 2,
+		LegacyData: {
+			SelectionsV1: typeof outfit.OutfitSelections === 'string' ? outfit.OutfitSelections : '',
+			SelectionsV2:
+				typeof outfit.OutfitSelectionsV2 === 'string' ? outfit.OutfitSelectionsV2 : null,
+			FaceFeatures: typeof outfit.FaceFeatures === 'string' ? outfit.FaceFeatures : null,
+			SkinColor: typeof outfit.SkinColor === 'string' ? outfit.SkinColor : null,
+			HairColor: typeof outfit.HairColor === 'string' ? outfit.HairColor : null,
+		},
+		CustomizationSettings: null,
+		Selections: [],
+		Slot: outfit.Slot,
+		Name: typeof outfit.Name === 'string' ? outfit.Name : null,
+		Accessibility: typeof outfit.Accessibility === 'number' ? outfit.Accessibility : 1,
+		ThumbnailFileName:
+			typeof outfit.ThumbnailFileName === 'string'
+				? outfit.ThumbnailFileName
+				: typeof outfit.PreviewImageName === 'string' && outfit.PreviewImageName
+					? outfit.PreviewImageName
+					: null,
+	}
+}
 
 /** Every outfit a player has saved, ordered by slot. */
 export async function getOutfits(db: D1Database, accountId: number): Promise<Outfit[]> {
