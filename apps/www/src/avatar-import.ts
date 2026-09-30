@@ -145,7 +145,10 @@ export function convertAvatarData(data: Uint8Array): {
 		const prefab = guid(item, 1)
 		if (!prefab) throw new Error('AvatarData.binpb has a selection without an item.')
 		const material = guid(item, 2)
-		const custom = guid(item, 3)
+		// AvatarData may reference UGC custom items, but the export does not include
+		// their server records or asset bundles. Sending those ids makes the client
+		// request missing custom items and reject the selection. Preserve the base
+		// avatar item and its material while leaving the unavailable UGC id unset.
 		const color = nested(item, 4)
 		const bodyPart = integer(selection, 1)
 		return {
@@ -159,7 +162,7 @@ export function convertAvatarData(data: Uint8Array): {
 					b: float(color, 3),
 					a: float(color, 4),
 				},
-				CustomAvatarItemId: custom?.uuid ?? '',
+				CustomAvatarItemId: '',
 			},
 		}
 	})
