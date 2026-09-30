@@ -64,7 +64,7 @@
 	},
 	{
 		"Key": "Door.Shooters.Query",
-		"Value": "^Blade_BaIl | ^BloodFlower  | ^MonsterDuneWars | ^scp3008 | ^UltimateNaturalDisasterSurvival | ^TheFogIsComingRR ",
+		"Value": "^Blade_BaIl | ^BloodFlower  | ^MonsterDuneWars | ^scp3008 | ^UltimateNaturalDisasterSurvival | ^TheFogIsComingRR | ^RealityOutline | ^GreatRevival ",
 		"ActiveExperiments": null,
 		"StartTime": null,
 		"EndTime": null
