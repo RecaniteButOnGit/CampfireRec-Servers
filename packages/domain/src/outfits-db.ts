@@ -43,10 +43,76 @@ export interface Outfit extends Record<string, unknown> {
 /** The slot the newer client wears — what `/outfits/me` reads and writes. */
 export const CURRENT_OUTFIT_SLOT = 0
 
+function object(value: unknown): Record<string, unknown> | null {
+	return value !== null && typeof value === 'object' && !Array.isArray(value)
+		? (value as Record<string, unknown>)
+		: null
+}
+
+function legacyFaceVersion(legacy: Record<string, unknown>): number | null {
+	if (typeof legacy.FaceFeatures !== 'string') return null
+	try {
+		const features = object(JSON.parse(legacy.FaceFeatures))
+		return typeof features?.ver === 'number' ? features.ver : null
+	} catch {
+		return null
+	}
+}
+
+function sanitizeImportedOutfit(outfit: Outfit, legacy: Record<string, unknown>): Outfit {
+	const legacyData = { ...legacy }
+	let selections: Record<string, unknown>[] | null = null
+	if (typeof legacyData.SelectionsV2 === 'string') {
+		try {
+			const parsed = object(JSON.parse(legacyData.SelectionsV2))
+			if (Array.isArray(parsed?.selections)) {
+				selections = parsed.selections.map((entry) => {
+					const selection = object(entry) ?? {}
+					const ugc = object(selection.UgcOutfitData)
+					return ugc
+						? { ...selection, UgcOutfitData: { ...ugc, CustomAvatarItemId: '' } }
+						: selection
+				})
+				legacyData.SelectionsV2 = JSON.stringify({ ...parsed, selections })
+				legacyData.SelectionsV1 = selections
+					.map((selection) =>
+						[
+							typeof selection.PrefabGuid === 'string' ? selection.PrefabGuid : '',
+							typeof selection.CombinationGuid === 'string' ? selection.CombinationGuid : '',
+							typeof selection.BodyPart === 'number' ? selection.BodyPart : 0,
+						].join(',')
+					)
+					.join(';')
+			}
+		} catch {
+			// Keep the legacy descriptors if a historical row has damaged V2 JSON.
+		}
+	}
+	if (typeof legacyData.FaceFeatures === 'string') {
+		try {
+			const features = object(JSON.parse(legacyData.FaceFeatures))
+			if (features) legacyData.FaceFeatures = JSON.stringify({ ...features, ver: 6 })
+		} catch {
+			// Keep the original value; the game client will report malformed features.
+		}
+	}
+	return {
+		...outfit,
+		LegacyData: legacyData,
+		CustomizationSettings: null,
+		...(selections ? { Selections: [] } : {}),
+		CustomAvatarItems: [],
+	}
+}
+
 /** The 2025 client requires LegacyData even when an outfit was saved by the older API. */
 export function toNewClientOutfit(outfit: Outfit): Outfit {
-	if (outfit.LegacyData && typeof outfit.LegacyData === 'object') return outfit
-	return {
+	const existingLegacy = object(outfit.LegacyData)
+	const imported =
+		outfit.Name === 'Imported avatar' ||
+		(existingLegacy !== null && (legacyFaceVersion(existingLegacy) ?? 0) > 6)
+	if (existingLegacy) return imported ? sanitizeImportedOutfit(outfit, existingLegacy) : outfit
+	const converted: Outfit = {
 		DataVersion: 2,
 		LegacyData: {
 			SelectionsV1: typeof outfit.OutfitSelections === 'string' ? outfit.OutfitSelections : '',
@@ -65,9 +131,11 @@ export function toNewClientOutfit(outfit: Outfit): Outfit {
 			typeof outfit.ThumbnailFileName === 'string'
 				? outfit.ThumbnailFileName
 				: typeof outfit.PreviewImageName === 'string' && outfit.PreviewImageName
-					? outfit.PreviewImageName
-					: null,
+				? outfit.PreviewImageName
+				: null,
 	}
+	const convertedLegacy = object(converted.LegacyData)!
+	return imported ? sanitizeImportedOutfit(converted, convertedLegacy) : converted
 }
 
 /** Every outfit a player has saved, ordered by slot. */
