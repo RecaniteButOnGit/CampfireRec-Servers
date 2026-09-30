@@ -1276,8 +1276,7 @@ function AvatarImport({ accountId, username }: { accountId: number; username: st
 		<section className="card">
 			<h2>Import avatar</h2>
 			<p className="muted">
-				Upload AvatarData.binpb or a ZIP containing it. This changes @{username}&apos;s worn avatar
-				and saves a copy in their next free outfit slot.
+				Upload AvatarData.binpb or a ZIP containing it. This replaces @{username}&apos;s avatar data.
 			</p>
 			<form
 				className="blob-upload"
@@ -1287,12 +1286,12 @@ function AvatarImport({ accountId, username }: { accountId: number; username: st
 					void run(async () => {
 						const form = new FormData()
 						form.set('file', file)
-						const result = await call<{ savedSlot: number }>(
+						await call<{ playerId: number }>(
 							`/api/avatar-import/players/${accountId}`,
 							{ authed: true, multipart: form }
 						)
 						setFile(null)
-						return `Imported avatar for @${username} and saved it in outfit slot ${result.savedSlot}.`
+						return `Imported avatar data for @${username}.`
 					})
 				}}
 			>

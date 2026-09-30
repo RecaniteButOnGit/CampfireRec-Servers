@@ -1,7 +1,5 @@
 import { Unzip, UnzipInflate, UnzipPassThrough } from 'fflate'
 
-import type { Outfit } from '@repo/domain/src/outfits-db'
-
 const MAX_UPLOAD_BYTES = 8 * 1024 * 1024
 const MAX_AVATAR_BYTES = 1024 * 1024
 
@@ -128,12 +126,8 @@ function properties(message: Message, names: string[]): Record<string, number> {
 	return Object.fromEntries(names.map((name, index) => [name, float(message, index + 1)]))
 }
 
-/** Convert an exported AvatarData proto to the two avatar formats our clients read. */
-export function convertAvatarData(data: Uint8Array): {
-	avatar: Record<string, unknown>
-	worn: Outfit
-	saved: Outfit
-} {
+/** Convert an exported AvatarData proto to the account's flat avatar payload. */
+export function convertAvatarData(data: Uint8Array): { avatar: Record<string, unknown> } {
 	if (data.length === 0 || data.length > MAX_AVATAR_BYTES)
 		throw new Error('AvatarData.binpb is empty or too large.')
 	const source = decode(data)
@@ -284,27 +278,7 @@ export function convertAvatarData(data: Uint8Array): {
 			.map((selection) => selection.UgcOutfitData.CustomAvatarItemId)
 			.filter(Boolean),
 	}
-	const worn: Outfit = {
-		DataVersion: 2,
-		LegacyData: {
-			SelectionsV1: selectionV1,
-			SelectionsV2: selectionV2,
-			FaceFeatures: faceJson,
-			SkinColor: skinColor,
-			HairColor: hairColor,
-		},
-		// The 2025 client parses this document as a newer, GUID-typed schema. The
-		// protobuf export is newer and has different field names and GUID encoding.
-		// A null value tells the client to load the complete LegacyData instead.
-		CustomizationSettings: null,
-		Selections: [],
-		Slot: 0,
-		Name: null,
-		Accessibility: 1,
-		ThumbnailFileName: null,
-	}
-	const saved: Outfit = { ...worn, Slot: 1, Name: 'Imported avatar' }
-	return { avatar, worn, saved }
+	return { avatar }
 }
 
 /** Accept the named file directly or find exactly one such file anywhere in a ZIP. */

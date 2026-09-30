@@ -36,45 +36,15 @@ export async function importAvatarHandler(c: Context<App>) {
 		return c.json({ error: error instanceof Error ? error.message : 'Invalid avatar upload.' }, 400)
 	}
 
-	// Slot 0 is what the newer client wears. Positive slots are wardrobe saves. An
-	// INSERT without an update arm makes concurrent imports retry rather than overwrite.
-	let savedSlot: number | undefined
-	for (let attempt = 0; attempt < 5; attempt++) {
-		const { results } = await c.env.DB.prepare(
-			'SELECT set_id FROM outfit WHERE account_id = ?1 AND set_id > 0 ORDER BY set_id'
-		)
-			.bind(playerId)
-			.all<{ set_id: number }>()
-		const occupied = new Set(results.map((row) => row.set_id))
-		let slot = 1
-		while (occupied.has(slot)) slot++
-		try {
-			await c.env.DB.batch([
-				c.env.DB.prepare(
-					'INSERT INTO outfit (account_id, set_id, avatar) VALUES (?1, ?2, ?3)'
-				).bind(playerId, slot, JSON.stringify({ ...avatar.saved, Slot: slot })),
-				c.env.DB.prepare('UPDATE account SET avatar = ?2 WHERE account_id = ?1').bind(
-					playerId,
-					JSON.stringify(avatar.avatar)
-				),
-				c.env.DB.prepare(
-					'INSERT INTO outfit (account_id, set_id, avatar) VALUES (?1, 0, ?2) ON CONFLICT (account_id, set_id) DO UPDATE SET avatar = ?2'
-				).bind(playerId, JSON.stringify(avatar.worn)),
-			])
-			savedSlot = slot
-			break
-		} catch (error) {
-			if (!/unique|constraint|primary key/i.test(String(error))) throw error
-		}
-	}
-	if (savedSlot === undefined)
-		return c.json({ error: 'Could not find a free outfit slot. Please try again.' }, 409)
+	await c.env.DB.prepare('UPDATE account SET avatar = ?2 WHERE account_id = ?1')
+		.bind(playerId, JSON.stringify(avatar.avatar))
+		.run()
 
 	try {
 		await writeAuditLog(c.env.DB, {
 			playerId: actorId,
 			action: 'import_avatar',
-			data: { playerId, savedSlot },
+			data: { playerId },
 		})
 	} catch (error) {
 		logger.error('could not audit avatar import', {
@@ -83,5 +53,5 @@ export async function importAvatarHandler(c: Context<App>) {
 			error: error instanceof Error ? error.message : String(error),
 		})
 	}
-	return c.json({ playerId, savedSlot })
+	return c.json({ playerId })
 }

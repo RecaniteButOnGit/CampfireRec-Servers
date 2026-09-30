@@ -728,7 +728,7 @@ async function staffPost(
 const devPost = (path: string, accountId: number, body: unknown) =>
 	staffPost(path, accountId, body, ['developer'])
 
-it('imports an avatar only for account 2 and saves each import in the next free outfit slot', async () => {
+it('imports avatar data only for account 2 without changing outfit slots', async () => {
 	const path = '/api/avatar-import/players/9850'
 	await env.DB.prepare('INSERT OR IGNORE INTO account (data) VALUES (?1)')
 		.bind(
@@ -764,7 +764,7 @@ it('imports an avatar only for account 2 and saves each import in the next free 
 		body: upload(direct),
 	})
 	expect(response.status).toBe(200)
-	expect(await response.json()).toEqual({ playerId: 9850, savedSlot: 2 })
+	expect(await response.json()).toEqual({ playerId: 9850 })
 	const zip = new File(
 		[new Uint8Array(zipSync({ 'Export/AvatarData.binpb': avatarDataFixture }))],
 		'avatar.zip'
@@ -775,19 +775,19 @@ it('imports an avatar only for account 2 and saves each import in the next free 
 		body: upload(zip),
 	})
 	expect(response.status).toBe(200)
-	expect(await response.json()).toEqual({ playerId: 9850, savedSlot: 3 })
+	expect(await response.json()).toEqual({ playerId: 9850 })
 	const rows = await env.DB.prepare(
 		'SELECT set_id, avatar FROM outfit WHERE account_id = 9850 ORDER BY set_id'
 	).all<{ set_id: number; avatar: string }>()
-	expect(rows.results.map((row) => row.set_id)).toEqual([0, 1, 2, 3])
-	expect(JSON.parse(rows.results[1]!.avatar).Name).toBe('Existing outfit')
-	expect(JSON.parse(rows.results[0]!.avatar).LegacyData.SelectionsV1).toContain('03020100')
-	expect(JSON.parse(rows.results[2]!.avatar).LegacyData.SelectionsV1).toContain('03020100')
-	expect(JSON.parse(rows.results[2]!.avatar).CustomizationSettings).toBeNull()
+	expect(rows.results.map((row) => row.set_id)).toEqual([1])
+	expect(JSON.parse(rows.results[0]!.avatar)).toEqual({ Slot: 1, Name: 'Existing outfit' })
 	const stored = await env.DB.prepare('SELECT avatar FROM account WHERE account_id = 9850').first<{
 		avatar: string
 	}>()
-	expect(JSON.parse(stored!.avatar).OutfitSelections).toContain('03020100')
+	const storedAvatar = JSON.parse(stored!.avatar)
+	expect(storedAvatar.OutfitSelections).toContain('03020100')
+	expect(storedAvatar).not.toHaveProperty('LegacyData')
+	expect(storedAvatar).not.toHaveProperty('Slot')
 })
 
 // Two refusals, not one. A 401 is an expired session — the SPA drops the token and sends
