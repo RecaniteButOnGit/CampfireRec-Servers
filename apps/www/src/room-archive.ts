@@ -18,6 +18,7 @@ export interface RoomArchive {
 	subRooms: ArchiveSubRoom[]
 	audio: ArchiveAudio[]
 	skippedSubRooms: number
+	strippedRrsSubRooms: number
 }
 
 const MAX_ZIP_BYTES = 2 * 1024 * 1024 * 1024
@@ -173,6 +174,7 @@ export async function readRoomArchive(file: File): Promise<RoomArchive> {
 		}),
 	}))
 	const subRooms: ArchiveSubRoom[] = []
+	let strippedRrsSubRooms = 0
 	for (const [path, bytes] of entries) {
 		if (!path.startsWith(root) || !/\/Subroom\.json$/i.test(path)) continue
 		const dir = path.slice(0, -'Subroom.json'.length)
@@ -191,12 +193,25 @@ export async function readRoomArchive(file: File): Promise<RoomArchive> {
 		const subDetails = jsonObject(bytes, 'Subroom.json')
 		const save = subDetails.CurrentSave
 		if (!save || typeof save !== 'object' || Array.isArray(save)) continue
-		// A UnityAssetId marks an RRS-backed save. The current game build cannot load it.
-		if (typeof (save as Record<string, unknown>).UnityAssetId === 'string') continue
+		const importSave = { ...(save as Record<string, unknown>) }
+		const hasRrsAssets =
+			typeof importSave.UnityAssetId === 'string' ||
+			['UnitySubAssets', 'ReferencedUnityAssets', 'ReferencedUnityAssetIds'].some((field) => {
+				const assets = importSave[field]
+				return Array.isArray(assets) && assets.length > 0
+			})
+		if (hasRrsAssets) strippedRrsSubRooms++
+		// The import service does not host RRS bundles. Remove their identifiers and lists,
+		// while keeping the ordinary persisted room data in the subroom save.
+		delete importSave.UnityAssetId
+		delete importSave.UnitySubAssets
+		delete importSave.ReferencedUnityAssets
+		delete importSave.ReferencedUnityAssetIds
+		const importDetails = { ...subDetails, CurrentSave: importSave }
 		const [scenePath, sceneBytes] = sceneEntry ?? originalEntry!
 		subRooms.push({
-			details: subDetails,
-			save: save as Record<string, unknown>,
+			details: importDetails,
+			save: importSave,
 			file: new File([new Uint8Array(sceneBytes)], scenePath.split('/').pop()!, {
 				type: 'application/octet-stream',
 			}),
@@ -213,5 +228,12 @@ export async function readRoomArchive(file: File): Promise<RoomArchive> {
 	}
 	if (subRooms.length === 0) throw new Error('The ZIP has no subroom with scene data to import.')
 	const listed = Array.isArray(details.SubRooms) ? details.SubRooms.length : subRooms.length
-	return { details, image, subRooms, audio, skippedSubRooms: Math.max(0, listed - subRooms.length) }
+	return {
+		details,
+		image,
+		subRooms,
+		audio,
+		skippedSubRooms: Math.max(0, listed - subRooms.length),
+		strippedRrsSubRooms,
+	}
 }

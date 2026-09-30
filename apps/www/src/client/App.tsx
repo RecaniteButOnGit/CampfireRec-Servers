@@ -3581,6 +3581,13 @@ function RoomImport({ navigate }: { navigate: Navigate }) {
 							skipped. {archive.audio.length} sample audio file
 							{archive.audio.length === 1 ? '' : 's'} will be uploaded.
 						</p>
+						{archive.strippedRrsSubRooms > 0 && (
+							<p className="muted">
+								RRS asset references will be removed from {archive.strippedRrsSubRooms} subroom
+								{archive.strippedRrsSubRooms === 1 ? '' : 's'}. Saved room data for these subrooms
+								will still be imported.
+							</p>
+						)}
 						{archive.subRooms.some((sub) => sub.originalFile) && (
 							<label className="check">
 								<input
