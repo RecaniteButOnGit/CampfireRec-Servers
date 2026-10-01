@@ -161,7 +161,13 @@ const app = new Hono<App>()
 			}
 			if (type.startsWith('AIRequest')) {
 				c.header('Cache-Control', 'no-store')
-				const sections = await handleAIRequest(type, c.env)
+				// A raw '?' inside a CV2 prompt moves the rest of the page source name into
+				// the URL query, including the token suffix. Rejoin it before parsing.
+				const query = new URL(c.req.url).search
+				const queryText = query && !type.includes(']8254TOKEN')
+					? new URLSearchParams(`value=${query.slice(1).replaceAll('&', '%26').replaceAll('+', '%2B')}`).get('value')
+					: null
+				const sections = await handleAIRequest(queryText === null ? type : `${type}?${queryText}`, c.env)
 				return sections ? c.json(sections) : c.body(null, 401)
 			}
 			const res = await fetchPageSource(c, type)

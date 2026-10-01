@@ -38,7 +38,8 @@ unauthenticated and every client gets the same layout.
 is a page source name. URL-encode the **entire name** before appending it to
 `/sections/pagesource/`, especially when the prompt contains `#`, `?`, `/`, `%`, or Unicode.
 An unencoded `#` is a URL fragment and never reaches the server, so parsing cannot recover
-it. JSON-escaped field values are preferred; the handler also accepts literal quotes,
+it. The handler can rejoin a request split by an unencoded `?`, but URL encoding remains
+the reliable format. JSON-escaped field values are preferred; the handler also accepts literal quotes,
 backslashes, brackets, and newlines when the field boundaries remain clear. Keep the
 token JSON-quoted.
 

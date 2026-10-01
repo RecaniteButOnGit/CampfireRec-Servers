@@ -12,9 +12,9 @@ function command(fields = FIELDS, token = TOKEN) {
 	return `AIRequest[${fields}]8254TOKEN${JSON.stringify(token)}`
 }
 
-function request(value: string, options: { token?: string; key?: string } = {}) {
+function request(value: string, options: { token?: string; key?: string; encoded?: boolean } = {}) {
 	return app.fetch(
-		new Request(`https://discovery.example.com/sections/pagesource/${encodeURIComponent(value)}`),
+		new Request(`https://discovery.example.com/sections/pagesource/${options.encoded === false ? value : encodeURIComponent(value)}`),
 		{
 			...env,
 			NAME: 'discovery',
@@ -76,6 +76,19 @@ describe('CV2 AIRequest page source', () => {
 		expect(await res.json()).toMatchObject([{ id: 'Accepted' }])
 		const [, init] = outbound.mock.calls[0]
 		expect(JSON.parse(init?.body as string)).toMatchObject({ input: prompt, instructions: systemPrompt })
+	})
+
+	it('recovers an unencoded question mark that moved the token into the URL query', async () => {
+		const systemPrompt = 'Answer? Use "quotes" & 100%$ + C:\\Games [x].'
+		const outbound = vi.spyOn(globalThis, 'fetch').mockResolvedValue(Response.json({
+			output: [{ type: 'message', content: [{ type: 'output_text', text: 'Accepted' }] }],
+		}))
+		const res = await request(command(`Prompt:"What? Explain it",SystemPrompt:"${systemPrompt}",Reasoning:"none"`), { encoded: false })
+		expect(res.status).toBe(200)
+		expect(await res.json()).toMatchObject([{ id: 'Accepted' }])
+		const [, init] = outbound.mock.calls[0]
+		expect(JSON.parse(init?.body as string).input).toBe('What? Explain it')
+		expect(JSON.parse(init?.body as string).instructions).toBe(systemPrompt)
 	})
 
 	it('accepts literal CV2 quotes, backslashes, newlines and brackets in a field', async () => {
