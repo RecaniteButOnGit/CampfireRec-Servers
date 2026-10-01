@@ -237,6 +237,15 @@ describe('routing, health and compatibility', () => {
       expect(await response.json()).toMatchObject({ ok: true, database: true, redis: false, cdn: false, img: false })
       const discovery = await route(new Request('https://example.test/'))
       expect((await discovery.json() as Record<string, string>).Auth).toBe('https://auth.example.test')
+      const log = vi.spyOn(console, 'info').mockImplementation(() => {})
+      try {
+        const probe = await route(new Request('https://discovery.example.test/sections/pagesource/Mayyybeeee'))
+        expect(probe.status).toBe(404)
+        expect(log).toHaveBeenCalledWith('[discovery/pagesource] Mayyybeeee')
+        const nested = await route(new Request('https://discovery.example.test/sections/pagesource/hello%20world/again'))
+        expect(nested.status).toBe(404)
+        expect(log).toHaveBeenCalledWith('[discovery/pagesource] hello%20world/again')
+      } finally { log.mockRestore() }
       runtime.hub.db.close()
     } finally { db.close(); process.env = prior }
   })

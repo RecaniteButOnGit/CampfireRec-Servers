@@ -23,7 +23,7 @@ apex/`ns` host and isn't listed within it. Each implemented worker has its own
 | Service               | Subdomain               | Worker                  | Notes                                                                 |
 | --------------------- | ----------------------- | ----------------------- | --------------------------------------------------------------------- |
 | Accounts              | `accounts`              | `accounts`              | Player accounts & profile reads/writes (D1)                           |
-| AI                    | `ai`                    | `ai`                    | Game AI access check (always refuses — no model runs here)            |
+| AI                    | `ai`                    | `ai`                    | Game AI access for two named rooms; no model runs here                |
 | API                   | `api`                   | `api`                   | Core Game API — config, social, avatar, rooms, image uploads (D1, R2) |
 | Auth                  | `auth`                  | `auth`                  | OAuth token issuance (`/connect/token`); (D1)                         |
 | BugReporting          | `bugreporting`          | —                       | Not yet implemented                                                   |

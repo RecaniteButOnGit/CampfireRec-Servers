@@ -568,14 +568,14 @@
 	},
 	{
 		"Key": "UGC.CircuitsV2.Limit.Chips",
-		"Value": "7500",
+		"Value": "20000",
 		"ActiveExperiments": null,
 		"StartTime": null,
 		"EndTime": null
 	},
 	{
 		"Key": "UGC.CircuitsV2.Limit.CloudValues",
-		"Value": "100",
+		"Value": "250",
 		"ActiveExperiments": null,
 		"StartTime": null,
 		"EndTime": null
@@ -2045,7 +2045,7 @@
 	},
 	{
 		"Key": "UGC.LimitsV2.UI.Triangles.Enabled",
-		"Value": "false",
+		"Value": "true",
 		"ActiveExperiments": null,
 		"StartTime": null,
 		"EndTime": null

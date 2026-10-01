@@ -92,14 +92,19 @@ export const RoomieAiAccess = z.object({
 })
 
 /**
- * The refusal every Game AI read answers with. It is a 200 carrying `success: false`, not
- * an HTTP error — the client branches on the body, and an error status would surface as a
- * failed request rather than the "not available here" state it is meant to show.
+ * A denied Game AI room check. The client branches on `success` in the HTTP 200 body.
  */
 export const GameAiAccessDenied = z.object({
 	success: z.literal(false),
 	error_id: z.string().describe('Machine-readable reason, e.g. `AI.RoomDoesNotSupportGameAI`'),
 	error: z.string().describe('The message shown to the player'),
+})
+
+/** A successful room eligibility check has no `value` payload. */
+export const GameAiAccessGranted = z.object({
+	success: z.literal(true),
+	error_id: z.null(),
+	error: z.null(),
 })
 
 /**
@@ -110,6 +115,14 @@ export const GameAiAccessDenied = z.object({
  */
 export const GameAiSpendSummaryDenied = GameAiAccessDenied.extend({
 	value: z.null().describe('The spend summary. Null — there is no Game AI spend to report'),
+})
+
+/**
+ * Empty unmetered summary. The available protocol evidence establishes the envelope
+ * and `value` slot, but contains no successful Game AI summary fields to reproduce.
+ */
+export const GameAiSpendSummaryGranted = GameAiAccessGranted.extend({
+	value: z.object({}).describe('No Game AI spend is metered by this server'),
 })
 
 /**

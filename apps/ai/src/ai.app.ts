@@ -2,6 +2,7 @@ import { Hono } from 'hono'
 import { describeRoute, openAPIRouteHandler } from 'hono-openapi'
 import { useWorkersLogger } from 'workers-tagged-logger'
 
+import { getRoomById } from '@repo/domain'
 import { withCleanSpec, withNotFound, withOnError } from '@repo/hono-helpers'
 import { validateAndGetAccountId } from '@repo/jwt'
 
@@ -9,7 +10,9 @@ import {
 	AUTHED,
 	boolQuery,
 	GameAiAccessDenied,
+	GameAiAccessGranted,
 	GameAiSpendSummaryDenied,
+	GameAiSpendSummaryGranted,
 	HealthResponse,
 	idParam,
 	intQuery,
@@ -31,8 +34,8 @@ import type { App } from './context'
  * AI Worker. Serves the access checks and budget reads the client makes before offering
  * its AI features. Roomie session creation also mints short-lived OpenAI credentials:
  *
- * - Game AI is a SERVER-side feature. This server cannot provide it, so both its reads are
- *   refused and the client hides the feature.
+ * - Game AI room reads are granted for two named test rooms. Model execution is not
+ *   implemented here.
  * - Roomie runs on the CLIENT. Budget reads are granted in full and session creation
  *   hands it an ephemeral credential when the server has an OpenAI key.
  * - Maker AI meters model usage in dollars. Nothing here bills, so every figure is zero.
@@ -49,15 +52,31 @@ const OPENAI_CLIENT_SECRETS_URL = 'https://api.openai.com/v1/realtime/client_sec
 const OPENAI_TIMEOUT_MS = 10_000
 
 /**
- * The reason both Game AI reads refuse with. `AI.RoomDoesNotSupportGameAI` is the id the
- * client renders a message for; the room it names makes no difference, there being no Game
- * AI backend behind any of them.
+ * The denial returned for rooms outside the Game AI allowlist.
  */
 const GAME_AI_UNSUPPORTED = {
 	success: false,
 	error_id: 'AI.RoomDoesNotSupportGameAI',
 	error: 'This room does not support Rec Room Game AI',
 } as const
+
+const GAME_AI_GRANTED = { success: true, error_id: null, error: null } as const
+
+/** Resolve the canonical room Name through the shared room domain helper. */
+async function roomSupportsGameAi(db: D1Database, rawRoomId: string | undefined) {
+	const roomId = rawRoomId && /^\d+$/.test(rawRoomId) ? Number(rawRoomId) : null
+	if (roomId === null || !Number.isSafeInteger(roomId) || roomId <= 0) {
+		return { roomId: null, roomName: null, allowed: false }
+	}
+
+	const room = await getRoomById(db, roomId)
+	const roomName = typeof room?.Name === 'string' ? room.Name : null
+	return {
+		roomId,
+		roomName,
+		allowed: roomName === 'GameAI' || roomName === 'GameAIRooms2',
+	}
+}
 
 /**
  * Resolve the account id from a Bearer token (the route is auth-gated).
@@ -119,28 +138,23 @@ const app = new Hono<App>()
 		(c) => c.json({ service: 'ai', status: 'ok' })
 	)
 
-	// Whether the caller may use Game AI in a room. Always refused: no Game AI backend
-	// exists here, so the honest answer for every room is that it doesn't support it.
+	// Whether the caller may use Game AI in one of the two named test rooms.
 	.get(
 		'/gameai/user/access',
 		describeRoute({
 			tags: ['Game AI', '2025'],
 			summary: 'May the caller use Game AI here?',
-			description: [
-				'Asked before the client offers any Game AI feature in a room. This server hosts no',
-				'Game AI, so it always refuses — with a 200 carrying `success: false`, NOT an HTTP',
-				'error: the client branches on the body, and an error status would read as a failed',
-				'request rather than the “not available here” state this is. `AI.RoomDoesNotSupportGameAI`',
-				'is the reason the client renders.',
-				'',
-				'`roomId` is accepted and ignored — the answer is the same for every room, and the',
-				'refusal is per-room by nature, so the client asks again for the next one. The token',
-				'is still validated first, as the reference does.',
-			].join(' '),
+			description:
+				'Grants access only when the requested room’s canonical Name is exactly GameAI or ' +
+				'GameAIRooms2. Other, missing, or malformed room ids get a 200 denial body. ' +
+				'The bearer token is validated before room lookup.',
 			security: AUTHED,
-			parameters: [intQuery('roomId', 'The room the client is asking about. Ignored.')],
+			parameters: [intQuery('roomId', 'The room the client is asking about.')],
 			responses: {
-				200: json(GameAiAccessDenied, 'Always a refusal'),
+				200: json(
+					GameAiAccessGranted.or(GameAiAccessDenied),
+					'Access granted for the two named rooms, denied elsewhere'
+				),
 				401: UNAUTHORIZED_RESPONSE,
 			},
 		}),
@@ -148,31 +162,28 @@ const app = new Hono<App>()
 			const id = await authedId(c)
 			if (id === null) return unauthorized(c)
 
-			return c.json(GAME_AI_UNSUPPORTED)
+			const check = await roomSupportsGameAi(c.env.DB, c.req.query('roomId'))
+			console.info('Game AI access check', { accountId: id, ...check })
+			return c.json(check.allowed ? GAME_AI_GRANTED : GAME_AI_UNSUPPORTED)
 		}
 	)
 
-	// What a room has spent on Game AI. Refused for the same reason as the access check
-	// above, but note the body differs: this one carries an explicit `value: null`.
+	// What an eligible room has spent on Game AI. Usage is currently unmetered.
 	.get(
 		'/gameai/room/:roomId{[0-9]+}/spendsummary',
 		describeRoute({
 			tags: ['Game AI', '2025'],
 			summary: 'A room’s Game AI spend summary',
-			description: [
-				'What a room has spent of its Game AI budget. Refused with the same 200-plus-',
-				'`success: false` body as the access check, since a room that cannot use Game AI has',
-				'no spend to summarise.',
-				'',
-				'The body is NOT identical to the access check’s: it carries `value: null` where that',
-				'one omits the key entirely. The access check answers a yes/no and has nothing to',
-				'carry; this endpoint’s payload slot exists and is empty. Reproduced as the reference',
-				'server sends it — don’t unify the two.',
-			].join(' '),
+			description:
+				'Returns an empty unmetered summary for GameAI and GameAIRooms2. Other rooms get ' +
+				'the existing 200 denial with `value: null`.',
 			security: AUTHED,
-			parameters: [idParam('roomId', 'The room being asked about. Ignored.')],
+			parameters: [idParam('roomId', 'The room being asked about.')],
 			responses: {
-				200: json(GameAiSpendSummaryDenied, 'Always a refusal'),
+				200: json(
+					GameAiSpendSummaryGranted.or(GameAiSpendSummaryDenied),
+					'Empty unmetered summary for an eligible room, denial elsewhere'
+				),
 				401: UNAUTHORIZED_RESPONSE,
 			},
 		}),
@@ -180,7 +191,10 @@ const app = new Hono<App>()
 			const id = await authedId(c)
 			if (id === null) return unauthorized(c)
 
-			return c.json({ ...GAME_AI_UNSUPPORTED, value: null })
+			const check = await roomSupportsGameAi(c.env.DB, c.req.param('roomId'))
+			return c.json(
+				check.allowed ? { ...GAME_AI_GRANTED, value: {} } : { ...GAME_AI_UNSUPPORTED, value: null }
+			)
 		}
 	)
 
@@ -471,8 +485,8 @@ app.get(
 						'backend. The client checks here before offering any of its AI features: Game AI in a',
 						'room, the Roomie assistant, and Maker AI’s usage meter.',
 						'',
-						'Game AI is a server-side feature this server cannot provide, so both its reads',
-						'refuse. Roomie and Maker AI budget reads are granted in full because nothing here',
+						'Game AI access is granted in the two named test rooms; model execution is not',
+						'implemented. Roomie and Maker AI budget reads are granted in full because nothing here',
 						'meters usage. `POST /realtime-session/create` mints short-lived OpenAI credentials',
 						'for Roomie when OPENAIKEY is configured.',
 						'',

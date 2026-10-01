@@ -7,15 +7,22 @@ usage meter.
 The worker serves access and budget checks and mints Roomie session credentials. The
 checks are mostly static because they do not meter usage:
 
-- **Game AI** is a **server-side** feature this server cannot provide, so both of its reads
-  refuse and the client hides it.
+- **Game AI** access is enabled only in rooms named exactly `GameAI` or `GameAIRooms2`.
+  This worker does not run Game AI models or meter their usage.
 - **Roomie** runs on the **client**. Its budget reads grant everything. Session creation
   asks OpenAI for a short-lived client secret when `OPENAIKEY` is configured.
 - **Maker AI** meters model usage in dollars. Nothing here bills, so every figure is zero.
 
 - `GET /` — service status `{ "service": "ai", "status": "ok" }`. No auth.
-- `GET /gameai/user/access?roomId=<id>` — `[Authorize]`. Whether the caller may use Game AI
-  in a room. Always refused:
+- `GET /gameai/user/access?roomId=<id>` — `[Authorize]`. Resolves the room by ID from the
+  shared rooms database. If its canonical `Name` is exactly `GameAI` or `GameAIRooms2`,
+  returns:
+
+  ```json
+  { "success": true, "error_id": null, "error": null }
+  ```
+
+  Every other, missing, or malformed room ID returns:
 
   ```json
   {
@@ -25,16 +32,17 @@ checks are mostly static because they do not meter usage:
   }
   ```
 
-  No model runs behind this worker, so every room gets that answer. Two things about it
-  are deliberate: **it is a 200, not a 4xx** (the client branches on `success` in the body;
-  an error status would surface as a failed request rather than the "not available here"
-  state this is), and **`roomId` is ignored** while the token is still validated first, as
-  the reference server does — so an unauthenticated caller gets a 401 rather than the
-  refusal.
+  Both answers use HTTP 200 because the client branches on `success`. The bearer token is
+  validated first; missing or invalid tokens still get an empty-body 401.
 
-- `GET /gameai/room/<roomId>/spendsummary` — `[Authorize]`. What a room has spent of its
-  Game AI budget. Refused for the same reason, but **the body is not identical** to the
-  access check's:
+- `GET /gameai/room/<roomId>/spendsummary` — `[Authorize]`. Uses the same room eligibility
+  check. The two eligible rooms get an unmetered empty summary:
+
+  ```json
+  { "success": true, "error_id": null, "error": null, "value": {} }
+  ```
+
+  Other rooms retain the denied response:
 
   ```json
   {
@@ -45,9 +53,9 @@ checks are mostly static because they do not meter usage:
   }
   ```
 
-  It carries `value: null` where the access check omits the key entirely — that one answers
-  a yes/no and has nothing to carry, while this endpoint's payload slot exists and is
-  simply empty. Reproduced as the reference server sends it; don't unify the two.
+  The available 2025 protocol evidence contains only a denied spend-summary example, so
+  the successful `value` DTO has not been verified against a client capture. The empty
+  object adds no speculative spend fields and needs a real client test.
 
 - `GET /roomieai/user/access` — `[Authorize]`. Roomie AI's energy budget, granted in full:
 

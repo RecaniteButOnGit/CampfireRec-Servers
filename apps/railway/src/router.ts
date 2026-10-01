@@ -70,6 +70,11 @@ export function createRouter(runtime: RailwayEnvironment, databasePing: () => bo
     }
     const resolved = resolveService(request, runtime.base.DOMAIN, runtime.base.SUBDOMAINS)
     if (!resolved) return Response.json({ error: 'unknown_service' }, { status: 404 })
+    if (resolved.name === 'discovery') {
+      const pathname = new URL(resolved.request.url).pathname
+      const prefix = '/sections/pagesource/'
+      if (pathname.startsWith(prefix)) console.info(`[discovery/pagesource] ${pathname.slice(prefix.length)}`)
+    }
     const app = services[resolved.name]
     const env = { ...runtime.base, NAME: resolved.name, ASSETS: runtime.assets[resolved.name] }
     return app.fetch(resolved.request, env as never, new NodeExecutionContext() as never)

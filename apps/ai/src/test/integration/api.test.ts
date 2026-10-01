@@ -1,6 +1,8 @@
 import { adminSecretsStore, env, SELF } from 'cloudflare:test'
 import { afterEach, beforeAll, describe, expect, it, vi } from 'vitest'
 
+import { ROOM_SCHEMA_DDL, seedRoomWithSubRooms, SUBROOM_SCHEMA_DDL } from '@repo/domain'
+
 import aiApp from '../../ai.app'
 
 import type { Env } from '../../context'
@@ -14,6 +16,16 @@ const ORIGIN = 'https://example.com'
 beforeAll(async () => {
 	// Seed the shared JWT signing key into the local Secrets Store so .get() resolves.
 	await adminSecretsStore(env.JWT_SECRET).create('test-signing-key')
+	for (const stmt of ROOM_SCHEMA_DDL) await env.DB.prepare(stmt).run()
+	for (const stmt of SUBROOM_SCHEMA_DDL) await env.DB.prepare(stmt).run()
+	for (const room of [
+		{ RoomId: 1001, Name: 'GameAI' },
+		{ RoomId: 1002, Name: 'GameAIRooms2' },
+		{ RoomId: 1003, Name: 'UnrelatedRoom' },
+		{ RoomId: 1004, Name: 'gameai' },
+	]) {
+		await seedRoomWithSubRooms(env.DB, room)
+	}
 })
 
 // Mint a token the way the `auth` worker does, signing with the shared test key seeded
@@ -48,6 +60,7 @@ const REFUSAL = {
 	error_id: 'AI.RoomDoesNotSupportGameAI',
 	error: 'This room does not support Rec Room Game AI',
 }
+const GAME_AI_GRANTED = { success: true, error_id: null, error: null }
 
 describe('ai endpoints', () => {
 	it('GET / reports service status', async () => {
@@ -58,28 +71,35 @@ describe('ai endpoints', () => {
 })
 
 describe('GET /gameai/user/access', () => {
-	// A refusal, not an HTTP error: the client branches on the body, so a 4xx here would
-	// read as a failed request rather than "Game AI isn't available in this room".
-	it('refuses with a 200 body', async () => {
-		const res = await SELF.fetch(`${ORIGIN}/gameai/user/access?roomId=1234`, {
+	it.each([
+		[1001, 'GameAI'],
+		[1002, 'GameAIRooms2'],
+	])('grants room %i named %s', async (roomId) => {
+		const res = await SELF.fetch(`${ORIGIN}/gameai/user/access?roomId=${roomId}`, {
+			headers: await bearer(),
+		})
+		expect(res.status).toBe(200)
+		expect(await res.json()).toEqual(GAME_AI_GRANTED)
+	})
+
+	it.each([
+		'?roomId=1003',
+		'?roomId=1004',
+		'?roomId=1234',
+		'',
+		'?roomId=',
+		'?roomId=abc',
+		'?roomId=0',
+		'?roomId=-1',
+		'?roomId=1001junk',
+		'?roomId=18446744073709551615',
+	])('refuses with a 200 body for %s', async (query) => {
+		const res = await SELF.fetch(`${ORIGIN}/gameai/user/access${query}`, {
 			headers: await bearer(),
 		})
 		expect(res.status).toBe(200)
 		expect(await res.json()).toEqual(REFUSAL)
 	})
-
-	// `roomId` is optional in the reference signature and ignored here, so both forms and
-	// any room answer identically.
-	it.each(['', '?roomId=1', '?roomId=18446744073709551615'])(
-		'answers the same for %s',
-		async (query) => {
-			const res = await SELF.fetch(`${ORIGIN}/gameai/user/access${query}`, {
-				headers: await bearer(),
-			})
-			expect(res.status).toBe(200)
-			expect(await res.json()).toEqual(REFUSAL)
-		}
-	)
 
 	it('401s without a bearer token', async () => {
 		const res = await SELF.fetch(`${ORIGIN}/gameai/user/access?roomId=1234`)
@@ -92,6 +112,7 @@ describe('GET /gameai/user/access', () => {
 			headers: { Authorization: 'Bearer not-a-real-token' },
 		})
 		expect(res.status).toBe(401)
+		expect(await res.text()).toBe('')
 	})
 })
 
@@ -131,25 +152,27 @@ describe('GET /roomieai/user/access', () => {
 })
 
 describe('GET /gameai/room/:roomId/spendsummary', () => {
-	// Same refusal as the access check but with an explicit `value: null` — the access
-	// check omits the key. toEqual pins that difference: don't unify the two shapes.
-	it('refuses with a 200 body carrying a null value', async () => {
-		const res = await SELF.fetch(`${ORIGIN}/gameai/room/1234/spendsummary`, {
-			headers: await bearer(),
-		})
-		expect(res.status).toBe(200)
-		expect(await res.json()).toEqual({ ...REFUSAL, value: null })
-	})
-
-	// Room ids are ulong on the wire, so the largest one has 20 digits and exceeds what a
-	// JS number holds exactly. It's never parsed here, only matched by the route pattern.
-	it.each(['1', '18446744073709551615'])('answers the same for room %s', async (roomId) => {
+	it.each([
+		[1001, 'GameAI'],
+		[1002, 'GameAIRooms2'],
+	])('returns an empty unmetered summary for room %i named %s', async (roomId) => {
 		const res = await SELF.fetch(`${ORIGIN}/gameai/room/${roomId}/spendsummary`, {
 			headers: await bearer(),
 		})
 		expect(res.status).toBe(200)
-		expect(await res.json()).toEqual({ ...REFUSAL, value: null })
+		expect(await res.json()).toEqual({ ...GAME_AI_GRANTED, value: {} })
 	})
+
+	it.each(['1003', '1004', '1234', '18446744073709551615'])(
+		'refuses with a null value for room %s',
+		async (roomId) => {
+			const res = await SELF.fetch(`${ORIGIN}/gameai/room/${roomId}/spendsummary`, {
+				headers: await bearer(),
+			})
+			expect(res.status).toBe(200)
+			expect(await res.json()).toEqual({ ...REFUSAL, value: null })
+		}
+	)
 
 	it('401s without a bearer token', async () => {
 		const res = await SELF.fetch(`${ORIGIN}/gameai/room/1234/spendsummary`)
@@ -416,6 +439,12 @@ describe('GET /openapi.json', () => {
 		expect(realtimeSpec).toContain('SessionId')
 		expect(realtimeSpec).toContain('ClientSecret')
 		expect(realtimeSpec).toContain('401')
+		for (const route of ['/gameai/user/access', '/gameai/room/{roomId}/spendsummary']) {
+			const gameAiSpec = JSON.stringify(spec.paths[route].get)
+			expect(gameAiSpec).toContain('anyOf')
+			expect(gameAiSpec).toContain('AI.RoomDoesNotSupportGameAI')
+			expect(gameAiSpec).toContain('401')
+		}
 
 		for (const ops of Object.values(spec.paths)) {
 			for (const op of Object.values(ops)) expect(op.summary).toBeTruthy()
