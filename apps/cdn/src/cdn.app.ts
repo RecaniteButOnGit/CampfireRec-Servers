@@ -369,6 +369,24 @@ const app = new Hono<App>()
 		(c) => serveAsset(c, `room/${c.req.param('dataBlob')}`)
 	)
 
+	// Room-level metadata is uploaded separately from each subroom's scene (FileType 6).
+	// It carries the SuperRoomData cloud ledger used to resolve player cloud values.
+	.get(
+		'/roommetadata/:dataBlob{.+}',
+		describeRoute({
+			tags: ['Assets'],
+			summary: 'Serve room-level metadata',
+			description:
+				'Streams the room-level metadata uploaded as FileType 6 from `roommetadata/<dataBlob>`. The name may contain a date folder.',
+			parameters: [
+				keyParam('dataBlob', 'The room metadata blob name.', true),
+				...CONDITIONAL_HEADERS,
+			],
+			responses: assetResponses('The room metadata'),
+		}),
+		(c) => serveAsset(c, `roommetadata/${c.req.param('dataBlob')}`)
+	)
+
 	// Invention data by name. The client fetches this for an invention's
 	// `CurrentVersion.BlobName` to spawn it. Streamed from R2 under `invention/`.
 	// Like room blobs the name is date-foldered, and it carries the `.inv` extension

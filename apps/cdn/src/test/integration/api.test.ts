@@ -227,6 +227,16 @@ describe('cdn endpoints', () => {
 		expect(res.status).toBe(404)
 	})
 
+	test('GET /roommetadata/:dataBlob serves an uploaded room-level blob', async () => {
+		const name = '2026-10-01/4d92c4f2-3180-457d-8ad8-15e090eb6e22'
+		const bytes = new Uint8Array([16, 2, 26, 0])
+		await env.CDN_ASSETS.put(`roommetadata/${name}`, bytes)
+		const res = await exports.default.fetch(`${ORIGIN}/roommetadata/${name}`)
+		expect(res.status).toBe(200)
+		expect(new Uint8Array(await res.arrayBuffer())).toEqual(bytes)
+		expect((await exports.default.fetch(`${ORIGIN}/roommetadata/missing`)).status).toBe(404)
+	})
+
 	// The website lets a room's owner download their own scene data (the room page in
 	// `www`), which is a browser reading these bytes from another origin. Without the
 	// header it can fetch them but not read the result — and the page can't tell that
@@ -322,6 +332,7 @@ describe('cdn endpoints', () => {
 			'GET /data/{id}',
 			'GET /invention/{dataBlob}',
 			'GET /room/{dataBlob}',
+			'GET /roommetadata/{dataBlob}',
 			'GET /sigs/{sigName}',
 		])
 
