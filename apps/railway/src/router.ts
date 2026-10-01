@@ -73,7 +73,14 @@ export function createRouter(runtime: RailwayEnvironment, databasePing: () => bo
     if (resolved.name === 'discovery') {
       const pathname = new URL(resolved.request.url).pathname
       const prefix = '/sections/pagesource/'
-      if (pathname.startsWith(prefix)) console.info(`[discovery/pagesource] ${pathname.slice(prefix.length)}`)
+      if (pathname.startsWith(prefix)) {
+        const source = pathname.slice(prefix.length)
+        let decodedSource = source
+        try { decodedSource = decodeURIComponent(source) } catch { /* Keep the raw path. */ }
+        const tokenIndex = decodedSource.indexOf('8254TOKEN')
+        const label = decodedSource.startsWith('AIRequest') ? 'AIRequest' : tokenIndex === -1 ? source : decodedSource.slice(0, tokenIndex)
+        console.info(`[discovery/pagesource] ${label}`)
+      }
     }
     const app = services[resolved.name]
     const env = { ...runtime.base, NAME: resolved.name, ASSETS: runtime.assets[resolved.name] }

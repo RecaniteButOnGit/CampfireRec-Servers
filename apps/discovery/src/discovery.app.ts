@@ -4,6 +4,7 @@ import { useWorkersLogger } from 'workers-tagged-logger'
 
 import { withCleanSpec, withNotFound, withOnError } from '@repo/hono-helpers'
 
+import { authorizedToken, handleAIRequest, parseTokenSuffix } from './ai-request'
 import {
 	DiscoverySections,
 	json,
@@ -22,8 +23,7 @@ import type { App } from './context'
  * bulk lookup filters. It does not serve the carousels' CONTENTS: each section names a
  * client-side feed the client resolves against the `rooms`/`api` workers itself.
  *
- * Unauthenticated: every client gets the same layout, and the client fetches this before
- * anything player-specific.
+ * Published layouts are unauthenticated. The CV2 Ping and AIRequest probes require RRTOKEN.
  */
 const app = new Hono<App>()
 	.use(
@@ -103,7 +103,7 @@ const app = new Hono<App>()
 	)
 
 	// One discovery page's section layout, served verbatim from `static/<type>.json`.
-	// `Ping` is a small CV2 round-trip probe using the same section-list response shape.
+	// `Ping` and `AIRequest[...]` use the same section-list response shape for CV2.
 	.get(
 		'/sections/pagesource/:type',
 		describeRoute({
@@ -111,7 +111,8 @@ const app = new Hono<App>()
 			summary: 'Section layout for a page source',
 			description: [
 				'The sections of one discovery page, in the order the client draws them. Except for',
-				'`Ping`, `{type}` is the filename — the body is `static/<type>.json` served verbatim —',
+				'`Ping` and `AIRequest[...]`, `{type}` is the filename — the body is',
+				'`static/<type>.json` served verbatim —',
 				'so the page sources',
 				'that exist are whichever files are published (`WatchHome`, `PlayHighlight`,',
 				'`CommunityBoard`, `PlayMenuTabs`, `PlayCategories`, `StoreCategories`,',
@@ -124,23 +125,31 @@ const app = new Hono<App>()
 				'configs wrapped the list in `{ pageSource, sections }` with PascalCase fields, while',
 				'this answers the bare ARRAY with camelCase ones.',
 				'',
-				'`Ping` returns one section with `id` and `sourceMetadata` set to `Pong`, allowing a',
-				'Circuits V2 section-list request to verify a round trip.',
+				'`Ping8254TOKEN"..."` returns one section with `id` and `sourceMetadata` set to',
+				'`Pong` when the trailing token matches `RRTOKEN`.',
+				'`AIRequest[Prompt:"...",Model:"gpt-6-luna",Temp:"0.3",SystemPrompt:"...",Reasoning:"none"]8254TOKEN"..."`',
+				'returns the model text in those same two fields when `OPENAIKEY` is configured and',
+				'the trailing token matches `RRTOKEN`.',
 				'',
-				'A section only NAMES a feed (`source`/`sourceMetadata`); its rooms, items and accounts',
-				'are fetched separately by the client. Nothing here is player-specific, so there is no',
-				'auth and every client gets the same layout.',
+				'Published layout sections only NAME feeds (`source`/`sourceMetadata`); their rooms,',
+				'items and accounts are fetched separately by the client. Those layouts are public;',
+				'the two CV2 probes require the shared token.',
 			].join('\n'),
 			parameters: [PAGE_SOURCE_PARAM],
 			responses: {
 				200: json(DiscoverySections, 'The page’s sections'),
 				304: { description: '`If-None-Match` matched the file’s etag (no body)' },
+				401: { description: '`Ping` or `AIRequest` token missing or incorrect' },
 				404: { description: 'No file is published under that name' },
 			},
 		}),
 		async (c) => {
 			const type = c.req.param('type')
-			if (type === 'Ping') {
+			if (type === 'Ping' || type.startsWith('Ping8254TOKEN')) {
+				c.header('Cache-Control', 'no-store')
+				if (!(await authorizedToken(parseTokenSuffix(type.slice('Ping'.length)), c.env))) {
+					return c.body(null, 401)
+				}
 				return c.json([{
 					id: 'Pong',
 					sectionType: 13,
@@ -149,6 +158,11 @@ const app = new Hono<App>()
 					sourceMetadata: 'Pong',
 					displayMetadata: JSON.stringify({ DisplayTitle: 'Pong' }),
 				}])
+			}
+			if (type.startsWith('AIRequest')) {
+				c.header('Cache-Control', 'no-store')
+				const sections = await handleAIRequest(type, c.env)
+				return sections ? c.json(sections) : c.body(null, 401)
 			}
 			const res = await fetchPageSource(c, type)
 			return res ?? c.notFound()

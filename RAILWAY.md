@@ -60,7 +60,10 @@ Optional integration and policy variables (exact names accepted by the runtime):
 | Turnstile signup | `TURNSTILE_SITE_KEY`, `TURNSTILE_SECRET_KEY` |
 | Discord OAuth, benefits and scheduled gifts | `DISCORD_CLIENT_ID`, `DISCORD_CLIENT_SECRET`, `DISCORD_BOT_TOKEN`, `DISCORD_GUILD_ID`, `DISCORD_BENEFITS_ROLE_IDS`, `DISCORD_ROLE_TOKENS` |
 | Image signing | `IMG_SIGNING_KEY`, `IMG_SIGNING_ENABLED` |
+| CV2 AI requests | `OPENAIKEY`, `RRTOKEN` |
 | Deployment metadata | `SENTRY_RELEASE` |
+
+The CV2 discovery chip can request `/sections/pagesource/AIRequest[Prompt:"Hello",Model:"gpt-6-luna",Temp:"0.3",SystemPrompt:"You are an AI created for Rec Room",Reasoning:"none"]8254TOKEN"<RRTOKEN value>"` (URL-encode the path segment). The response is a one-item discovery section list with the model's text in `id` and `sourceMetadata`. The trailing token must match `RRTOKEN`; the server uses `OPENAIKEY` only after that check. `Temp` is accepted when `Reasoning` is `none`. Errors appear as `AIError:...` in the same section fields. The `Ping` probe also requires a token: `Ping8254TOKEN"<RRTOKEN value>"`. The Railway request logger records custom request names without their arguments or token.
 
 The related feature follows the upstream behavior when an optional integration is absent. In particular, web signup remains Turnstile-gated, Meta nonce login needs the Meta secret, Discord benefits need their credentials, and image signing uses the existing optional configuration.
 

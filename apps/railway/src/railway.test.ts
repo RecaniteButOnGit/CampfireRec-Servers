@@ -240,8 +240,7 @@ describe('routing, health and compatibility', () => {
       const log = vi.spyOn(console, 'info').mockImplementation(() => {})
       try {
         const ping = await route(new Request('https://discovery.example.test/sections/pagesource/Ping'))
-        expect(ping.status).toBe(200)
-        expect(await ping.json()).toMatchObject([{ id: 'Pong', sourceMetadata: 'Pong' }])
+        expect(ping.status).toBe(401)
         expect(log).toHaveBeenCalledWith('[discovery/pagesource] Ping')
         const probe = await route(new Request('https://discovery.example.test/sections/pagesource/Mayyybeeee'))
         expect(probe.status).toBe(404)
@@ -252,6 +251,37 @@ describe('routing, health and compatibility', () => {
       } finally { log.mockRestore() }
       runtime.hub.db.close()
     } finally { db.close(); process.env = prior }
+  })
+
+  it('routes a tokenized AIRequest without printing its token', async () => {
+    const prior = { ...process.env }
+    process.env.JWT_SECRET = 'test-secret'
+    process.env.DOMAIN = 'example.test'
+    process.env.OPENAIKEY = 'sk-test-openai'
+    process.env.RRTOKEN = 'rr-test-token'
+    const db = new SQLiteD1(join(temp(), 'ai-request.sqlite'))
+    const log = vi.spyOn(console, 'info').mockImplementation(() => {})
+    const outbound = vi.spyOn(globalThis, 'fetch').mockResolvedValue(Response.json({
+      output: [{ type: 'message', content: [{ type: 'output_text', text: 'Hello back' }] }],
+    }))
+    try {
+      const runtime = buildEnvironment(db)
+      try {
+        const route = createRouter(runtime, () => db.ping())
+        const ping = 'Ping8254TOKEN"rr-test-token"'
+        const pingResponse = await route(new Request(`https://discovery.example.test/sections/pagesource/${encodeURIComponent(ping)}`))
+        expect(pingResponse.status).toBe(200)
+        expect(await pingResponse.json()).toMatchObject([{ id: 'Pong', sourceMetadata: 'Pong' }])
+        expect(log).toHaveBeenCalledWith('[discovery/pagesource] Ping')
+        const command = 'AIRequest[Prompt:"Hello",Model:"gpt-6-luna",Temp:"0.3",Reasoning:"none"]8254TOKEN"rr-test-token"'
+        const response = await route(new Request(`https://discovery.example.test/sections/pagesource/${encodeURIComponent(command)}`))
+        expect(response.status).toBe(200)
+        expect(await response.json()).toMatchObject([{ id: 'Hello back', sourceMetadata: 'Hello back' }])
+        expect(outbound).toHaveBeenCalledTimes(1)
+        expect(log).toHaveBeenCalledWith('[discovery/pagesource] AIRequest')
+        expect(JSON.stringify(log.mock.calls)).not.toContain('rr-test-token')
+      } finally { runtime.hub.db.close() }
+    } finally { outbound.mockRestore(); log.mockRestore(); db.close(); process.env = prior }
   })
 
   it('serves only files inside the designated static directory', async () => {

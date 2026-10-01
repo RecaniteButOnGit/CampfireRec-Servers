@@ -1,5 +1,7 @@
-import { SELF } from 'cloudflare:test'
+import { env, SELF } from 'cloudflare:test'
 import { describe, expect, it } from 'vitest'
+
+import app from '../../discovery.app'
 
 /** Every layout published in `static/` today. Each is served under its own filename. */
 const PAGE_SOURCES = [
@@ -43,7 +45,9 @@ describe('GET /', () => {
 
 describe('GET /sections/pagesource/:type', () => {
 	it('returns a section carrying Pong for the CV2 Ping probe', async () => {
-		const res = await SELF.fetch('https://discovery.example.com/sections/pagesource/Ping')
+		const type = encodeURIComponent('Ping8254TOKEN"rr-test-token"')
+		const bindings = { ...env, RRTOKEN: { get: async () => 'rr-test-token' } } as never
+		const res = await app.fetch(new Request(`https://discovery.example.com/sections/pagesource/${type}`), bindings, {} as never)
 		expect(res.status).toBe(200)
 		expect(res.headers.get('content-type')).toContain('application/json')
 		expect(await res.json()).toEqual([{
@@ -54,6 +58,10 @@ describe('GET /sections/pagesource/:type', () => {
 			sourceMetadata: 'Pong',
 			displayMetadata: '{"DisplayTitle":"Pong"}',
 		}])
+		const bare = await app.fetch(new Request('https://discovery.example.com/sections/pagesource/Ping'), bindings, {} as never)
+		expect(bare.status).toBe(401)
+		const wrong = await app.fetch(new Request(`https://discovery.example.com/sections/pagesource/${encodeURIComponent('Ping8254TOKEN"wrong"')}`), bindings, {} as never)
+		expect(wrong.status).toBe(401)
 	})
 
 	// The point of the ASSETS binding: `{type}` is the filename, so every published file

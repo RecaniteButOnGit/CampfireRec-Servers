@@ -8,6 +8,10 @@ export type Env = SharedHonoEnv & {
 	 * way in, since `run_worker_first` keeps the runtime from serving the files directly.
 	 */
 	ASSETS: Fetcher
+	/** Optional server-side key for CV2 AIRequest calls. */
+	OPENAIKEY?: SecretsStoreSecret
+	/** Shared token required on CV2 AIRequest calls. */
+	RRTOKEN?: SecretsStoreSecret
 }
 
 /** Variables can be extended */

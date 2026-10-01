@@ -28,6 +28,7 @@ export function buildEnvironment(db: SQLiteD1) {
     DB: db as unknown as D1Database,
     JWT_SECRET: secret(process.env.JWT_SECRET), META_APP_SECRET: secret(process.env.META_APP_SECRET),
     OPENAIKEY: process.env.OPENAIKEY ? secret(process.env.OPENAIKEY) : undefined,
+    RRTOKEN: process.env.RRTOKEN ? secret(process.env.RRTOKEN) : undefined,
     OPENAI_REALTIME_MODEL: process.env.OPENAI_REALTIME_MODEL,
     TURNSTILE_SITE_KEY: secret(process.env.TURNSTILE_SITE_KEY), TURNSTILE_SECRET_KEY: secret(process.env.TURNSTILE_SECRET_KEY),
     DISCORD_CLIENT_ID: secret(process.env.DISCORD_CLIENT_ID), DISCORD_CLIENT_SECRET: secret(process.env.DISCORD_CLIENT_SECRET),
