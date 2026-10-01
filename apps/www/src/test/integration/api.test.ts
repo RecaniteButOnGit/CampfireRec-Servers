@@ -859,7 +859,7 @@ it('refuses every staff endpoint without a token, and without a staff role', asy
 	expect(player.status).toBe(403)
 })
 
-it('lets a developer add the derived RRO tag without changing other room tags', async () => {
+it('lets a developer enable RRO settings and system tags without changing other room tags', async () => {
 	const roomId = 8799
 	const path = `/api/staff/rooms/${roomId}/rro-tag`
 	await env.DB.prepare('INSERT INTO room (data) VALUES (?1)')
@@ -869,6 +869,8 @@ it('lets a developer add the derived RRO tag without changing other room tags', 
 				Name: 'DeveloperRroTest',
 				IsDorm: false,
 				IsRRO: false,
+				IsDeveloperOwned: false,
+				RestrictedCircuitsAllowListNames: ['Existing Restricted Chip'],
 				Accessibility: 1,
 				CreatorAccountId: 8700,
 				SubRooms: [],
@@ -878,23 +880,33 @@ it('lets a developer add the derived RRO tag without changing other room tags', 
 	await setRoomTags(env.DB, roomId, [
 		{ Tag: 'quest', Type: 0, IsPrimaryGenre: true },
 		{ Tag: 'rro', Type: 0 },
+		{ Tag: 'beta', Type: 0 },
 	])
 
 	const response = await devPost(path, 8110, {})
 	expect(response.status).toBe(200)
 	const room = await response.json<{
 		IsRRO: boolean
+		IsDeveloperOwned: boolean
+		RestrictedCircuitsAllowListNames: string[]
 		Tags: Array<{ Tag: string; Type: number; IsPrimaryGenre?: boolean }>
 	}>()
 	expect(room.IsRRO).toBe(true)
+	expect(room.IsDeveloperOwned).toBe(true)
+	expect(room.RestrictedCircuitsAllowListNames).toEqual([
+		'Existing Restricted Chip',
+		'Create Analytics Event Payload',
+	])
 	expect(room.Tags).toEqual([
+		{ Tag: 'beta', Type: 1 },
+		{ Tag: 'limitsv2', Type: 1 },
 		{ Tag: 'quest', Type: 0, IsPrimaryGenre: true },
 		{ Tag: 'rro', Type: 2 },
 	])
-	expect((await getRoomById(env.DB, roomId))?.IsRRO).toBe(true)
+	expect(await getRoomById(env.DB, roomId)).toMatchObject(room)
 	expect((await devPost(path, 8110, {})).status).toBe(200)
 	const audits = await env.DB.prepare(
-		"SELECT data FROM audit_log WHERE action = 'add_room_rro_tag' AND json_extract(data, '$.roomId') = ?1"
+		"SELECT data FROM audit_log WHERE action = 'enable_room_rro_features' AND json_extract(data, '$.roomId') = ?1"
 	)
 		.bind(roomId)
 		.all<{ data: string }>()

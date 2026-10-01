@@ -2324,18 +2324,38 @@ export async function setRoomTags(db: D1Database, roomId: number, tags: RoomTag[
 	await db.batch(statements)
 }
 
-/** Mark a room as a Rec Room Original without replacing its other tags or room fields. */
-export async function markRoomAsRRO(db: D1Database, roomId: number): Promise<Room> {
+/** A restricted chip a developer-owned RRO may place. The client matches its node name. */
+export const RRO_ALLOWED_CIRCUIT = 'Create Analytics Event Payload'
+
+/** Enable the room settings and system tags used by developer-owned RROs. */
+export async function markRoomAsRRO(db: D1Database, roomId: number, room: Room): Promise<Room> {
+	const existing = Array.isArray(room.RestrictedCircuitsAllowListNames)
+		? (room.RestrictedCircuitsAllowListNames as string[])
+		: []
+	const allowedCircuits = [...new Set([...existing, RRO_ALLOWED_CIRCUIT])]
 	await db.batch([
 		db
-			.prepare("UPDATE room SET data = json_set(data, '$.IsRRO', json('true')) WHERE room_id = ?1")
-			.bind(roomId),
+			.prepare(
+				`UPDATE room SET data = json_set(data,
+				 '$.IsRRO', json('true'),
+				 '$.IsDeveloperOwned', json('true'),
+				 '$.RestrictedCircuitsAllowListNames', json(?2)) WHERE room_id = ?1`
+			)
+			.bind(roomId, JSON.stringify(allowedCircuits)),
 		db
 			.prepare(
 				`INSERT INTO room_tag (room_id, tag, type, is_primary_genre) VALUES (?1, 'rro', ?2, 0)
 				 ON CONFLICT (room_id, tag) DO UPDATE SET type = ?2, is_primary_genre = 0`
 			)
 			.bind(roomId, RoomTagType.derived),
+		...(['beta', 'limitsv2'] as const).map((tag) =>
+			db
+				.prepare(
+					`INSERT INTO room_tag (room_id, tag, type, is_primary_genre) VALUES (?1, ?2, ?3, 0)
+				 ON CONFLICT (room_id, tag) DO UPDATE SET type = ?3, is_primary_genre = 0`
+				)
+				.bind(roomId, tag, RoomTagType.auto)
+		),
 	])
 	return (await getRoomById(db, roomId))!
 }

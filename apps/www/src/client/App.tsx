@@ -136,6 +136,8 @@ interface OwnedRoom {
 	/** False blocks `POST /rooms/{id}/clone` — nobody can take a copy of the room. */
 	CloningAllowed: boolean
 	IsRRO: boolean
+	IsDeveloperOwned: boolean
+	RestrictedCircuitsAllowListNames: string[]
 	SupportsScreens: boolean
 	SupportsWalkVR: boolean
 	SupportsTeleportVR: boolean
@@ -2365,17 +2367,22 @@ function DeveloperRoomRroTag({
 	onRoomChange: (room: OwnedRoom) => void
 }) {
 	const { pending, error, run } = useAction()
+	const hasTag = (name: string, type: number) =>
+		room.Tags?.some((tag) => tag.Tag.toLowerCase() === name && tag.Type === type)
 	const active =
-		room.IsRRO && room.Tags?.some((tag) => tag.Tag.toLowerCase() === 'rro' && tag.Type === 2)
+		room.IsRRO &&
+		room.IsDeveloperOwned &&
+		hasTag('rro', 2) &&
+		hasTag('beta', 1) &&
+		hasTag('limitsv2', 1) &&
+		room.RestrictedCircuitsAllowListNames?.includes('Create Analytics Event Payload')
 
 	return (
 		<section className="card">
 			<h2>Developer</h2>
-			<p className="muted">
-				Mark this room as a Rec Room Original for discovery and in-game display.
-			</p>
+			<p className="muted">Enable RRO, beta content, Limits V2, and developer circuit access.</p>
 			{active ? (
-				<p className="ok">RRO tag is active.</p>
+				<p className="ok">RRO features are active.</p>
 			) : (
 				<button
 					type="button"
@@ -2387,11 +2394,11 @@ function DeveloperRoomRroTag({
 								authed: true,
 							})
 							onRoomChange(updated)
-							return 'RRO tag added.'
+							return 'RRO features enabled.'
 						})
 					}
 				>
-					{pending ? 'Adding…' : 'Add RRO tag'}
+					{pending ? 'Applying…' : room.IsRRO ? 'Apply RRO settings' : 'Enable RRO'}
 				</button>
 			)}
 			{error && <p className="error">{error}</p>}

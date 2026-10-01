@@ -10,6 +10,7 @@ import {
 	getRoomById,
 	markRoomAsRRO,
 	movePlayerToDorm,
+	RRO_ALLOWED_CIRCUIT,
 	writeAuditLog,
 } from '@repo/domain'
 import { intVar, logger } from '@repo/hono-helpers'
@@ -858,13 +859,25 @@ export async function addRoomRroTagHandler(c: Context<App>) {
 	if (!room) return c.json({ error: 'Room not found' }, 404)
 	if (room.IsDorm) return c.json({ error: 'Dorms cannot be Rec Room Originals' }, 400)
 	const tags = Array.isArray(room.Tags) ? (room.Tags as RoomTag[]) : []
-	if (room.IsRRO === true && tags.some((tag) => tag.Tag === 'rro' && tag.Type === 2)) {
+	const hasTag = (name: string, type: number) =>
+		tags.some((tag) => tag.Tag === name && tag.Type === type)
+	const allowed = Array.isArray(room.RestrictedCircuitsAllowListNames)
+		? (room.RestrictedCircuitsAllowListNames as string[])
+		: []
+	if (
+		room.IsRRO === true &&
+		room.IsDeveloperOwned === true &&
+		hasTag('rro', 2) &&
+		hasTag('beta', 1) &&
+		hasTag('limitsv2', 1) &&
+		allowed.includes(RRO_ALLOWED_CIRCUIT)
+	) {
 		return c.json(room)
 	}
 
-	const updated = await markRoomAsRRO(c.env.DB, roomId)
-	await recordPlayerAudit(c, 'add_room_rro_tag', { roomId })
-	logger.info('developer marked room as RRO', { developerId: staffId(c), roomId })
+	const updated = await markRoomAsRRO(c.env.DB, roomId, room)
+	await recordPlayerAudit(c, 'enable_room_rro_features', { roomId })
+	logger.info('developer enabled RRO features', { developerId: staffId(c), roomId })
 	return c.json(updated)
 }
 

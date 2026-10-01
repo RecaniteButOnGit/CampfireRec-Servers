@@ -49,7 +49,22 @@ describe('SQLite D1 adapter and migrations', () => {
   it('applies source migrations once and persists across reopen', async () => {
     const path = join(temp(), 'recflare.sqlite')
     const first = new SQLiteD1(path)
-    expect(migrate(first)).toBe(101)
+    expect(migrate(first)).toBe(102)
+    const rro = await first.prepare(
+      `SELECT json_extract(data, '$.IsDeveloperOwned') AS developer_owned,
+              json_extract(data, '$.RestrictedCircuitsAllowListNames') AS allowed_circuits
+       FROM room WHERE room_id = 2`
+    ).first<{ developer_owned: number; allowed_circuits: string }>()
+    expect(rro?.developer_owned).toBe(1)
+    expect(JSON.parse(rro!.allowed_circuits)).toContain('Create Analytics Event Payload')
+    const rroTags = await first.prepare(
+      'SELECT tag, type FROM room_tag WHERE room_id = 2 ORDER BY tag'
+    ).all<{ tag: string; type: number }>()
+    expect(rroTags.results).toEqual([
+      { tag: 'beta', type: 1 },
+      { tag: 'limitsv2', type: 1 },
+      { tag: 'rro', type: 2 },
+    ])
     const makerRoom2 = await first.prepare(
       `SELECT json_extract(s.data, '$.UnitySceneId') AS scene, sv.data AS save
        FROM subroom s JOIN subroom_save sv ON sv.sub_room_data_save_id = s.current_save_id
