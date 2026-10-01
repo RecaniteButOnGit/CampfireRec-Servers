@@ -1,24 +1,3 @@
----
-lockfileVersion: '9.0'
-
-importers:
-
-  .:
-    configDependencies:
-      '@pnpm/trusted-deps':
-        specifier: 0.1.1
-        version: 0.1.1
-
-packages:
-
-  '@pnpm/trusted-deps@0.1.1':
-    resolution: {integrity: sha512-jI3PWNv2zCg9+KHI3qQTsa534c5nisZQrHFeWSyyHoUXcuzvjkXxQKPFLJ/qtNAF+PtKHDlRntO2aZKb3VDuHQ==}
-
-snapshots:
-
-  '@pnpm/trusted-deps@0.1.1': {}
-
----
 lockfileVersion: '9.0'
 
 settings:
@@ -3036,6 +3015,9 @@ packages:
 
   '@phosphor-icons/core@2.1.1':
     resolution: {integrity: sha512-v4ARvrip4qBCImOE5rmPUylOEK4iiED9ZyKjcvzuezqMaiRASCHKcRIuvvxL/twvLpkfnEODCOJp5dM4eZilxQ==}
+
+  '@pnpm/trusted-deps@0.1.1':
+    resolution: {integrity: sha512-jI3PWNv2zCg9+KHI3qQTsa534c5nisZQrHFeWSyyHoUXcuzvjkXxQKPFLJ/qtNAF+PtKHDlRntO2aZKb3VDuHQ==}
 
   '@poppinss/colors@4.1.5':
     resolution: {integrity: sha512-FvdDqtcRCtz6hThExcFOgW0cWX+xwSMWcRuQe5ZEb2m7cVQOAVZOIMt+/v9RxGiD9/OY16qJBXK4CVKWAPalBw==}
@@ -6386,6 +6368,8 @@ snapshots:
     optional: true
 
   '@phosphor-icons/core@2.1.1': {}
+
+  '@pnpm/trusted-deps@0.1.1': {}
 
   '@poppinss/colors@4.1.5':
     dependencies:
