@@ -232,7 +232,7 @@ function allIds(idParam: string): number[] {
  * var to 0 lifts the cap entirely, which a small private server will want. Existing
  * rooms are never touched — lowering the cap just stops new ones.
  */
-const DEFAULT_MAX_ROOMS_PER_ACCOUNT = 10
+const DEFAULT_MAX_ROOMS_PER_ACCOUNT = 20
 
 /** Account ids granted the global (Role 0) maker pen — the reference server's
  * hardcoded moderator/dev accounts. */

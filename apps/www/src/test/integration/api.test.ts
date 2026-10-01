@@ -27,7 +27,12 @@ import { getProgression, PROGRESSION_SCHEMA_DDL } from '@repo/domain/src/progres
 import { ROOM_INSTANCE_SCHEMA_DDL } from '@repo/domain/src/room-instance-db'
 // Banning a player moves them into their own dorm, which is a room (created on demand) with
 // a subroom — so those tables have to be here, as they are on the shared database.
-import { ROOM_SCHEMA_DDL, SUBROOM_SCHEMA_DDL } from '@repo/domain/src/rooms-db'
+import {
+	getRoomById,
+	ROOM_SCHEMA_DDL,
+	setRoomTags,
+	SUBROOM_SCHEMA_DDL,
+} from '@repo/domain/src/rooms-db'
 import { recordStat, STAT_SCHEMA_DDL } from '@repo/domain/src/stats-db'
 import { generateToken } from '@repo/jwt'
 
@@ -810,7 +815,11 @@ it('refuses every staff endpoint without a token, and without a staff role', asy
 		'/api/staff/players/1/username-changes',
 		'/api/staff/players/1/clear-password',
 	]
-	writes.push('/api/staff/rooms/1/gift-tokens', '/api/staff/online/gift-tokens')
+	writes.push(
+		'/api/staff/rooms/1/gift-tokens',
+		'/api/staff/rooms/1/rro-tag',
+		'/api/staff/online/gift-tokens'
+	)
 	for (const path of writes) {
 		expect((await SELF.fetch(`https://example.com${path}`, { method: 'POST' })).status).toBe(401)
 		const res = await SELF.fetch(`https://example.com${path}`, {
@@ -820,8 +829,8 @@ it('refuses every staff endpoint without a token, and without a staff role', asy
 		expect(res.status).toBe(403)
 	}
 
-	// The gifts are narrower: a moderator is staff, but not a developer.
-	for (const path of writes.filter((p) => p.includes('/gift-'))) {
+	// Developer actions are narrower: a moderator is staff, but not a developer.
+	for (const path of writes.filter((p) => p.includes('/gift-') || p.endsWith('/rro-tag'))) {
 		expect((await staffPost(path, 8101, { amount: 1 })).status).toBe(403)
 	}
 
@@ -848,6 +857,49 @@ it('refuses every staff endpoint without a token, and without a staff role', asy
 		body: JSON.stringify({ banned: true, days: 1 }),
 	})
 	expect(player.status).toBe(403)
+})
+
+it('lets a developer add the derived RRO tag without changing other room tags', async () => {
+	const roomId = 8799
+	const path = `/api/staff/rooms/${roomId}/rro-tag`
+	await env.DB.prepare('INSERT INTO room (data) VALUES (?1)')
+		.bind(
+			JSON.stringify({
+				RoomId: roomId,
+				Name: 'DeveloperRroTest',
+				IsDorm: false,
+				IsRRO: false,
+				Accessibility: 1,
+				CreatorAccountId: 8700,
+				SubRooms: [],
+			})
+		)
+		.run()
+	await setRoomTags(env.DB, roomId, [
+		{ Tag: 'quest', Type: 0, IsPrimaryGenre: true },
+		{ Tag: 'rro', Type: 0 },
+	])
+
+	const response = await devPost(path, 8110, {})
+	expect(response.status).toBe(200)
+	const room = await response.json<{
+		IsRRO: boolean
+		Tags: Array<{ Tag: string; Type: number; IsPrimaryGenre?: boolean }>
+	}>()
+	expect(room.IsRRO).toBe(true)
+	expect(room.Tags).toEqual([
+		{ Tag: 'quest', Type: 0, IsPrimaryGenre: true },
+		{ Tag: 'rro', Type: 2 },
+	])
+	expect((await getRoomById(env.DB, roomId))?.IsRRO).toBe(true)
+	expect((await devPost(path, 8110, {})).status).toBe(200)
+	const audits = await env.DB.prepare(
+		"SELECT data FROM audit_log WHERE action = 'add_room_rro_tag' AND json_extract(data, '$.roomId') = ?1"
+	)
+		.bind(roomId)
+		.all<{ data: string }>()
+	expect(audits.results).toHaveLength(1)
+	expect((await devPost('/api/staff/rooms/8798/rro-tag', 8110, {})).status).toBe(404)
 })
 
 // The reporter is the CALLER, never a body field — that is the record of who raised a

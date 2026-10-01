@@ -36,6 +36,7 @@ import { refreshDiscordRoles } from './discord-roles'
 import { docsPage, fetchSpec } from './docs'
 import { privacyPage } from './privacy'
 import {
+	addRoomRroTagHandler,
 	addUsernameChangeHandler,
 	banReportHandler,
 	bansInForceHandler,
@@ -493,6 +494,7 @@ const app = new Hono<App>()
 	.post('/api/staff/players/:id/gift-xp', requireDeveloper, giftXpHandler)
 	// Everyone standing in a room, across all of its instances.
 	.post('/api/staff/rooms/:roomId/gift-tokens', requireDeveloper, giftRoomTokensHandler)
+	.post('/api/staff/rooms/:roomId/rro-tag', requireDeveloper, addRoomRroTagHandler)
 	// The account page's token drop: the same gift to everyone online at once.
 	.post('/api/staff/online/gift-tokens', requireDeveloper, giftOnlineTokensHandler)
 	.post('/api/staff/players/:id/username-changes', addUsernameChangeHandler)

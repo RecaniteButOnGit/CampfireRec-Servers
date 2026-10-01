@@ -7,6 +7,8 @@ import {
 	getOnlinePlayerIds,
 	getPlayerIdsInRoom,
 	getPresences,
+	getRoomById,
+	markRoomAsRRO,
 	movePlayerToDorm,
 	writeAuditLog,
 } from '@repo/domain'
@@ -56,7 +58,7 @@ import { grantCustomAvatarItem, ownedCustomAvatarItemIds } from '../../econ/src/
 import { NotificationType } from '../../notify/src/notification-types'
 
 import type { Context, MiddlewareHandler } from 'hono'
-import type { GiftContent } from '@repo/domain'
+import type { GiftContent, RoomTag } from '@repo/domain'
 import type { CustomAvatarItem } from '../../api/src/custom-avatar-items-db'
 import type { ReportRow, ReportSearch } from '../../api/src/reports-db'
 import type { CatalogRow } from '../../econ/src/catalog-db'
@@ -844,6 +846,26 @@ async function sendTokens(
 	}
 	await announceGift(c, playerId, gift.id, content)
 	return { balance, giftId: gift.id }
+}
+
+/** Developer-only website action; the game-facing tag editor remains owner scoped. */
+export async function addRoomRroTagHandler(c: Context<App>) {
+	const roomId = Number(c.req.param('roomId'))
+	if (!Number.isInteger(roomId) || roomId <= 0) {
+		return c.json({ error: 'A numeric room id is required' }, 400)
+	}
+	const room = await getRoomById(c.env.DB, roomId)
+	if (!room) return c.json({ error: 'Room not found' }, 404)
+	if (room.IsDorm) return c.json({ error: 'Dorms cannot be Rec Room Originals' }, 400)
+	const tags = Array.isArray(room.Tags) ? (room.Tags as RoomTag[]) : []
+	if (room.IsRRO === true && tags.some((tag) => tag.Tag === 'rro' && tag.Type === 2)) {
+		return c.json(room)
+	}
+
+	const updated = await markRoomAsRRO(c.env.DB, roomId)
+	await recordPlayerAudit(c, 'add_room_rro_tag', { roomId })
+	logger.info('developer marked room as RRO', { developerId: staffId(c), roomId })
+	return c.json(updated)
 }
 
 /**

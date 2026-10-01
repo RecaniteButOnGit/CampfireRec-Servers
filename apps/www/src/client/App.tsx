@@ -135,6 +135,7 @@ interface OwnedRoom {
 	MaxPlayers: number
 	/** False blocks `POST /rooms/{id}/clone` — nobody can take a copy of the room. */
 	CloningAllowed: boolean
+	IsRRO: boolean
 	SupportsScreens: boolean
 	SupportsWalkVR: boolean
 	SupportsTeleportVR: boolean
@@ -1276,7 +1277,8 @@ function AvatarImport({ accountId, username }: { accountId: number; username: st
 		<section className="card">
 			<h2>Import avatar</h2>
 			<p className="muted">
-				Upload AvatarData.binpb or a ZIP containing it. This replaces @{username}&apos;s avatar data.
+				Upload AvatarData.binpb or a ZIP containing it. This replaces @{username}&apos;s avatar
+				data.
 			</p>
 			<form
 				className="blob-upload"
@@ -1286,10 +1288,10 @@ function AvatarImport({ accountId, username }: { accountId: number; username: st
 					void run(async () => {
 						const form = new FormData()
 						form.set('file', file)
-						await call<{ playerId: number }>(
-							`/api/avatar-import/players/${accountId}`,
-							{ authed: true, multipart: form }
-						)
+						await call<{ playerId: number }>(`/api/avatar-import/players/${accountId}`, {
+							authed: true,
+							multipart: form,
+						})
 						setFile(null)
 						return `Imported avatar data for @${username}.`
 					})
@@ -2208,6 +2210,16 @@ function RoomPage({
 						)
 					}
 				/>
+				{isDeveloper() && (
+					<DeveloperRoomRroTag
+						room={owned}
+						onRoomChange={(updated) =>
+							setMine((current) =>
+								(current ?? []).map((r) => (r.RoomId === updated.RoomId ? updated : r))
+							)
+						}
+					/>
+				)}
 				{owned.CreatorAccountId === accountId && (
 					<RoomDeleteControl room={owned} onDeleted={() => setTakenDown(owned.Name)} />
 				)}
@@ -2229,6 +2241,7 @@ function RoomPage({
 				<PublicRoomView
 					room={room}
 					navigate={navigate}
+					onRoomChange={setRoom}
 					onTakenDown={() => setTakenDown(room.Name)}
 				/>
 			) : (
@@ -2250,10 +2263,12 @@ function RoomPage({
 function PublicRoomView({
 	room,
 	navigate,
+	onRoomChange,
 	onTakenDown,
 }: {
 	room: OwnedRoom
 	navigate: Navigate
+	onRoomChange: (room: OwnedRoom) => void
 	onTakenDown: () => void
 }) {
 	const [creator, setCreator] = useState<{ username: string; displayName: string } | null>(null)
@@ -2332,11 +2347,55 @@ function PublicRoomView({
 			    role itself on the DELETE. */}
 			{isAdmin() && (
 				<>
+					{isDeveloper() && <DeveloperRoomRroTag room={room} onRoomChange={onRoomChange} />}
 					{isDeveloper() && <StaffRoomTokens room={room} />}
 					<RoomDeleteControl room={room} onDeleted={onTakenDown} />
 				</>
 			)}
 		</>
+	)
+}
+
+/** Add the system RRO classification from a developer's room page. */
+function DeveloperRoomRroTag({
+	room,
+	onRoomChange,
+}: {
+	room: OwnedRoom
+	onRoomChange: (room: OwnedRoom) => void
+}) {
+	const { pending, error, run } = useAction()
+	const active =
+		room.IsRRO && room.Tags?.some((tag) => tag.Tag.toLowerCase() === 'rro' && tag.Type === 2)
+
+	return (
+		<section className="card">
+			<h2>Developer</h2>
+			<p className="muted">
+				Mark this room as a Rec Room Original for discovery and in-game display.
+			</p>
+			{active ? (
+				<p className="ok">RRO tag is active.</p>
+			) : (
+				<button
+					type="button"
+					disabled={pending}
+					onClick={() =>
+						void run(async () => {
+							const updated = await call<OwnedRoom>(`/api/staff/rooms/${room.RoomId}/rro-tag`, {
+								method: 'POST',
+								authed: true,
+							})
+							onRoomChange(updated)
+							return 'RRO tag added.'
+						})
+					}
+				>
+					{pending ? 'Adding…' : 'Add RRO tag'}
+				</button>
+			)}
+			{error && <p className="error">{error}</p>}
+		</section>
 	)
 }
 

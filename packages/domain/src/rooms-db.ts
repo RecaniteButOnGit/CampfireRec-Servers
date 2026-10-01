@@ -2324,6 +2324,22 @@ export async function setRoomTags(db: D1Database, roomId: number, tags: RoomTag[
 	await db.batch(statements)
 }
 
+/** Mark a room as a Rec Room Original without replacing its other tags or room fields. */
+export async function markRoomAsRRO(db: D1Database, roomId: number): Promise<Room> {
+	await db.batch([
+		db
+			.prepare("UPDATE room SET data = json_set(data, '$.IsRRO', json('true')) WHERE room_id = ?1")
+			.bind(roomId),
+		db
+			.prepare(
+				`INSERT INTO room_tag (room_id, tag, type, is_primary_genre) VALUES (?1, 'rro', ?2, 0)
+				 ON CONFLICT (room_id, tag) DO UPDATE SET type = ?2, is_primary_genre = 0`
+			)
+			.bind(roomId, RoomTagType.derived),
+	])
+	return (await getRoomById(db, roomId))!
+}
+
 /**
  * A room read narrowed to the rooms carrying EVERY one of `tagSets` — one set per tag the
  * caller requires, and a room matches a set by carrying ANY tag in it (which is how a
