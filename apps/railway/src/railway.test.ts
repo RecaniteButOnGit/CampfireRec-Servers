@@ -239,6 +239,10 @@ describe('routing, health and compatibility', () => {
       expect((await discovery.json() as Record<string, string>).Auth).toBe('https://auth.example.test')
       const log = vi.spyOn(console, 'info').mockImplementation(() => {})
       try {
+        const ping = await route(new Request('https://discovery.example.test/sections/pagesource/Ping'))
+        expect(ping.status).toBe(200)
+        expect(await ping.json()).toMatchObject([{ id: 'Pong', sourceMetadata: 'Pong' }])
+        expect(log).toHaveBeenCalledWith('[discovery/pagesource] Ping')
         const probe = await route(new Request('https://discovery.example.test/sections/pagesource/Mayyybeeee'))
         expect(probe.status).toBe(404)
         expect(log).toHaveBeenCalledWith('[discovery/pagesource] Mayyybeeee')

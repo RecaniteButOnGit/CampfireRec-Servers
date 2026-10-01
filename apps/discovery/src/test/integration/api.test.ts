@@ -42,6 +42,20 @@ describe('GET /', () => {
 })
 
 describe('GET /sections/pagesource/:type', () => {
+	it('returns a section carrying Pong for the CV2 Ping probe', async () => {
+		const res = await SELF.fetch('https://discovery.example.com/sections/pagesource/Ping')
+		expect(res.status).toBe(200)
+		expect(res.headers.get('content-type')).toContain('application/json')
+		expect(await res.json()).toEqual([{
+			id: 'Pong',
+			sectionType: 13,
+			sectionSubType: 'Pong',
+			source: 'PageSource',
+			sourceMetadata: 'Pong',
+			displayMetadata: '{"DisplayTitle":"Pong"}',
+		}])
+	})
+
 	// The point of the ASSETS binding: `{type}` is the filename, so every published file
 	// is reachable without the worker knowing its name.
 	it.each(PAGE_SOURCES)('serves %s', async (type) => {

@@ -103,14 +103,16 @@ const app = new Hono<App>()
 	)
 
 	// One discovery page's section layout, served verbatim from `static/<type>.json`.
+	// `Ping` is a small CV2 round-trip probe using the same section-list response shape.
 	.get(
 		'/sections/pagesource/:type',
 		describeRoute({
 			tags: ['Discovery', '2025'],
 			summary: 'Section layout for a page source',
 			description: [
-				'The sections of one discovery page, in the order the client draws them. `{type}` IS',
-				'the filename — the body is `static/<type>.json` served verbatim — so the page sources',
+				'The sections of one discovery page, in the order the client draws them. Except for',
+				'`Ping`, `{type}` is the filename — the body is `static/<type>.json` served verbatim —',
+				'so the page sources',
 				'that exist are whichever files are published (`WatchHome`, `PlayHighlight`,',
 				'`CommunityBoard`, `PlayMenuTabs`, `PlayCategories`, `StoreCategories`,',
 				'`StoreFeatured`, `StoreClothing`, `StoreConsumables` and `bulk` at the time of',
@@ -121,6 +123,9 @@ const app = new Hono<App>()
 				'to `True` the client asks this service instead. The two are not the same shape — the',
 				'configs wrapped the list in `{ pageSource, sections }` with PascalCase fields, while',
 				'this answers the bare ARRAY with camelCase ones.',
+				'',
+				'`Ping` returns one section with `id` and `sourceMetadata` set to `Pong`, allowing a',
+				'Circuits V2 section-list request to verify a round trip.',
 				'',
 				'A section only NAMES a feed (`source`/`sourceMetadata`); its rooms, items and accounts',
 				'are fetched separately by the client. Nothing here is player-specific, so there is no',
@@ -134,7 +139,18 @@ const app = new Hono<App>()
 			},
 		}),
 		async (c) => {
-			const res = await fetchPageSource(c, c.req.param('type'))
+			const type = c.req.param('type')
+			if (type === 'Ping') {
+				return c.json([{
+					id: 'Pong',
+					sectionType: 13,
+					sectionSubType: 'Pong',
+					source: 'PageSource',
+					sourceMetadata: 'Pong',
+					displayMetadata: JSON.stringify({ DisplayTitle: 'Pong' }),
+				}])
+			}
+			const res = await fetchPageSource(c, type)
 			return res ?? c.notFound()
 		}
 	)

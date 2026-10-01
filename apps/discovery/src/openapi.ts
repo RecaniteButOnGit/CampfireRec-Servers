@@ -22,7 +22,7 @@ export function json(schema: z.ZodType, description: string) {
 	return { description, content: { 'application/json': { schema: resolver(schema) } } }
 }
 
-/** The `{type}` path parameter, which is the filename in `static/`. */
+/** The `{type}` path parameter, normally the filename in `static/`. */
 export const PAGE_SOURCE_PARAM: OpenAPIV3_1.ParameterObject = {
 	name: 'type',
 	in: 'path',
@@ -32,7 +32,8 @@ export const PAGE_SOURCE_PARAM: OpenAPIV3_1.ParameterObject = {
 		'`PlayCategories`, `StoreCategories`, `StoreFeatured`, `StoreClothing`,',
 		'`StoreConsumables` at the time of writing. It names a file in `static/`',
 		'(`<type>.json`) and is matched exactly, case included, so the set is whatever is',
-		'published rather than anything this worker enumerates.',
+		'published rather than anything this worker enumerates. `Ping` is a probe that returns',
+		'one section with `Pong` in its id and source metadata.',
 		'',
 		'`sections` is a file in `static/` too but is not one of these: it is the id-keyed',
 		'catalogue `/sections/bulk` filters, not a page anything draws.',
