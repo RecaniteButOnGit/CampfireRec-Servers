@@ -273,7 +273,7 @@ describe('routing, health and compatibility', () => {
         expect(pingResponse.status).toBe(200)
         expect(await pingResponse.json()).toMatchObject([{ id: 'Pong', sourceMetadata: 'Pong' }])
         expect(log).toHaveBeenCalledWith('[discovery/pagesource] Ping')
-        const command = 'AIRequest[Prompt:"Hello",Model:"gpt-6-luna",Temp:"0.3",Reasoning:"none"]8254TOKEN"rr-test-token"'
+        const command = 'AIRequest[Prompt:"Hello",Model:"gpt-6-luna",Reasoning:"none"]8254TOKEN"rr-test-token"'
         const response = await route(new Request(`https://discovery.example.test/sections/pagesource/${encodeURIComponent(command)}`))
         expect(response.status).toBe(200)
         expect(await response.json()).toMatchObject([{ id: 'Hello back', sourceMetadata: 'Hello back' }])

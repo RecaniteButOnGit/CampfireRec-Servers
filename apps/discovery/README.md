@@ -32,6 +32,16 @@ A section only _names_ a feed — `source`/`sourceMetadata`, e.g. `Hot`, `Recent
 `rooms`/`api` workers itself. Nothing here is player-specific, so the routes are
 unauthenticated and every client gets the same layout.
 
+## CV2 AI requests
+
+`AIRequest[Prompt:"...",Model:"...",SystemPrompt:"...",Reasoning:"..."]8254TOKEN"..."`
+is a page source name. URL-encode the **entire name** before appending it to
+`/sections/pagesource/`, especially when the prompt contains `#`, `?`, `/`, `%`, or Unicode.
+An unencoded `#` is a URL fragment and never reaches the server, so parsing cannot recover
+it. JSON-escaped field values are preferred; the handler also accepts literal quotes,
+backslashes, brackets, and newlines when the field boundaries remain clear. Keep the
+token JSON-quoted.
+
 ## API documentation
 
 `GET /openapi.json` serves a spec generated from `describeRoute` blocks that sit alongside

@@ -4,12 +4,11 @@ const PREFIX = 'AIRequest['
 const TOKEN_MARKER = '8254TOKEN'
 const OPENAI_RESPONSES_URL = 'https://api.openai.com/v1/responses'
 const REASONING_EFFORTS = new Set(['none', 'low', 'medium', 'high', 'xhigh', 'max'])
-const FIELDS = new Set(['Prompt', 'Model', 'Temp', 'SystemPrompt', 'Reasoning'])
+const FIELDS = new Set(['Prompt', 'Model', 'SystemPrompt', 'Reasoning'])
 
 type AIRequest = {
 	prompt: string
 	model: string
-	temperature?: number
 	systemPrompt?: string
 	reasoning: string
 	token: string
@@ -39,27 +38,51 @@ function parseFields(body: string): Record<string, string> | null {
 		while (/\s/.test(body[index] ?? '')) index++
 		if (body[index++] !== ':') return null
 		while (/\s/.test(body[index] ?? '')) index++
-		const valueStart = index
 		if (body[index++] !== '"') return null
-		let escaped = false
-		let closed = false
+		const valueStart = index
+		let valueEnd = -1
+		let nextField = body.length
+		let parsedValue: string | undefined
+		let rawBoundary: { end: number; next: number } | undefined
 		while (index < body.length) {
 			const char = body[index++]
-			if (escaped) escaped = false
-			else if (char === '\\') escaped = true
-			else if (char === '"') { closed = true; break }
+			if (char !== '"') continue
+			let afterQuote = index
+			while (/\s/.test(body[afterQuote] ?? '')) afterQuote++
+			let next = body.length
+			if (afterQuote !== body.length) {
+				if (body[afterQuote] !== ',') continue
+				let nextName = afterQuote + 1
+				while (/\s/.test(body[nextName] ?? '')) nextName++
+				const nextStart = nextName
+				while (/[A-Za-z]/.test(body[nextName] ?? '')) nextName++
+				if (nextName === nextStart) continue
+				while (/\s/.test(body[nextName] ?? '')) nextName++
+				if (body[nextName] !== ':') continue
+				next = afterQuote + 1
+			}
+			try {
+				const parsed: unknown = JSON.parse(body.slice(valueStart - 1, index))
+				if (typeof parsed !== 'string') return null
+				parsedValue = parsed
+				valueEnd = index - 1
+				nextField = next
+				break
+			} catch {
+				rawBoundary ??= { end: index - 1, next }
+			}
 		}
-		if (!closed) return null
-		try {
-			const value: unknown = JSON.parse(body.slice(valueStart, index))
-			if (typeof value !== 'string') return null
-			fields[name] = value
-		} catch { return null }
-		while (/\s/.test(body[index] ?? '')) index++
-		if (index === body.length) break
-		if (body[index++] !== ',') return null
-		while (/\s/.test(body[index] ?? '')) index++
-		if (index === body.length) return null
+		if (valueEnd === -1 && rawBoundary) {
+			valueEnd = rawBoundary.end
+			nextField = rawBoundary.next
+		}
+		if (valueEnd === -1) return null
+		if (parsedValue === undefined) {
+			// CV2 strings often contain literal newlines, quotes or backslashes rather than
+			// JSON escapes. Keep them as text when the field delimiters are unambiguous.
+			fields[name] = body.slice(valueStart, valueEnd)
+		} else fields[name] = parsedValue
+		index = nextField
 	}
 	return fields
 }
@@ -73,20 +96,15 @@ export function parseTokenSuffix(suffix: string): string | null {
 
 function parseEnvelope(value: string): { body: string; token: string } | null {
 	if (!value.startsWith(PREFIX)) return null
-	let quoted = false
-	let escaped = false
-	let closingBracket = -1
-	for (let index = PREFIX.length; index < value.length; index++) {
-		const char = value[index]
-		if (escaped) escaped = false
-		else if (quoted && char === '\\') escaped = true
-		else if (char === '"') quoted = !quoted
-		else if (!quoted && char === ']') { closingBracket = index; break }
+	// The token marker identifies the end of the request even when a raw quote or
+	// bracket in the prompt would confuse a quote-tracking scan.
+	const marker = `]${TOKEN_MARKER}`
+	for (let closingBracket = value.indexOf(marker, PREFIX.length); closingBracket !== -1;
+		closingBracket = value.indexOf(marker, closingBracket + 1)) {
+		const token = parseTokenSuffix(value.slice(closingBracket + 1))
+		if (token) return { body: value.slice(PREFIX.length, closingBracket), token }
 	}
-	if (closingBracket === -1) return null
-	const token = parseTokenSuffix(value.slice(closingBracket + 1))
-	if (!token) return null
-	return { body: value.slice(PREFIX.length, closingBracket), token }
+	return null
 }
 
 export function parseAIRequest(value: string): AIRequest | null {
@@ -99,9 +117,7 @@ export function parseAIRequest(value: string): AIRequest | null {
 	const model = fields.Model ?? 'gpt-6-luna'
 	const reasoning = fields.Reasoning ?? 'none'
 	if (!prompt?.trim() || !/^[A-Za-z0-9_.-]+$/.test(model) || !REASONING_EFFORTS.has(reasoning)) return null
-	const temperature = fields.Temp === undefined ? undefined : Number(fields.Temp)
-	if (temperature !== undefined && (!fields.Temp || !Number.isFinite(temperature) || temperature < 0 || temperature > 2 || reasoning !== 'none')) return null
-	return { prompt, model, reasoning, temperature, systemPrompt, token: envelope.token }
+	return { prompt, model, reasoning, systemPrompt, token: envelope.token }
 }
 
 async function tokenMatches(provided: string, configured: string): Promise<boolean> {
@@ -151,7 +167,6 @@ export async function handleAIRequest(value: string, env: App['Bindings']) {
 				input: request.prompt,
 				instructions: request.systemPrompt,
 				reasoning: { effort: request.reasoning },
-				temperature: request.temperature,
 				store: false,
 			}),
 			signal: AbortSignal.timeout(15_000),

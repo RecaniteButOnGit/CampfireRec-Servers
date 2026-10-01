@@ -127,7 +127,7 @@ const app = new Hono<App>()
 				'',
 				'`Ping8254TOKEN"..."` returns one section with `id` and `sourceMetadata` set to',
 				'`Pong` when the trailing token matches `RRTOKEN`.',
-				'`AIRequest[Prompt:"...",Model:"gpt-6-luna",Temp:"0.3",SystemPrompt:"...",Reasoning:"none"]8254TOKEN"..."`',
+				'`AIRequest[Prompt:"...",Model:"gpt-6-luna",SystemPrompt:"...",Reasoning:"none"]8254TOKEN"..."`',
 				'returns the model text in those same two fields when `OPENAIKEY` is configured and',
 				'the trailing token matches `RRTOKEN`.',
 				'',

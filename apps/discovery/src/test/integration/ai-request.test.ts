@@ -6,7 +6,7 @@ import app from '../../discovery.app'
 
 const TOKEN = 'rr-test-token'
 const KEY = 'sk-test-openai'
-const FIELDS = 'Prompt:"Hello",Model:"gpt-6-luna",Temp:"0.3",SystemPrompt:"You are an AI created for Rec Room",Reasoning:"none"'
+const FIELDS = 'Prompt:"Hello",Model:"gpt-6-luna",SystemPrompt:"You are an AI created for Rec Room",Reasoning:"none"'
 
 function command(fields = FIELDS, token = TOKEN) {
 	return `AIRequest[${fields}]8254TOKEN${JSON.stringify(token)}`
@@ -54,7 +54,6 @@ describe('CV2 AIRequest page source', () => {
 			input: 'Hello',
 			instructions: 'You are an AI created for Rec Room',
 			reasoning: { effort: 'none' },
-			temperature: 0.3,
 			store: false,
 		})
 		expect(JSON.stringify(init)).not.toContain(TOKEN)
@@ -64,6 +63,43 @@ describe('CV2 AIRequest page source', () => {
 		expect(parseAIRequest(command('Prompt:"Hello, [Rec Room]"'))).toMatchObject({
 			prompt: 'Hello, [Rec Room]', token: TOKEN,
 		})
+	})
+
+	it('passes URL-encoded special characters and JSON escapes through to OpenAI', async () => {
+		const prompt = 'What does "C:\\Games\\Rec Room" mean? #tag & 50% + / [a,b] 😀\nNext line'
+		const systemPrompt = 'Reply with "yes" and a backslash: \\'
+		const outbound = vi.spyOn(globalThis, 'fetch').mockResolvedValue(Response.json({
+			output: [{ type: 'message', content: [{ type: 'output_text', text: 'Accepted' }] }],
+		}))
+		const res = await request(command(`Prompt:${JSON.stringify(prompt)},SystemPrompt:${JSON.stringify(systemPrompt)}`))
+		expect(res.status).toBe(200)
+		expect(await res.json()).toMatchObject([{ id: 'Accepted' }])
+		const [, init] = outbound.mock.calls[0]
+		expect(JSON.parse(init?.body as string)).toMatchObject({ input: prompt, instructions: systemPrompt })
+	})
+
+	it('accepts literal CV2 quotes, backslashes, newlines and brackets in a field', async () => {
+		const prompt = 'What is "C:\\Games"? #tag [a,b]\nSecond line'
+		const outbound = vi.spyOn(globalThis, 'fetch').mockResolvedValue(Response.json({
+			output: [{ type: 'message', content: [{ type: 'output_text', text: 'Accepted' }] }],
+		}))
+		const res = await request(command(`Prompt:"${prompt}",Reasoning:"none"`))
+		expect(res.status).toBe(200)
+		expect(await res.json()).toMatchObject([{ id: 'Accepted' }])
+		const [, init] = outbound.mock.calls[0]
+		expect(JSON.parse(init?.body as string).input).toBe(prompt)
+	})
+
+	it('keeps the token boundary when the prompt contains its marker', () => {
+		expect(parseAIRequest(command('Prompt:"Please explain ]8254TOKEN in a prompt"'))).toMatchObject({
+			prompt: 'Please explain ]8254TOKEN in a prompt', token: TOKEN,
+		})
+	})
+
+	it('preserves a literal trailing backslash and escaped delimiter-like text', () => {
+		expect(parseAIRequest(command('Prompt:"C:\\",Reasoning:"none"'))?.prompt).toBe('C:\\')
+		const prompt = 'Explain ",Reasoning:" as literal text'
+		expect(parseAIRequest(command(`Prompt:${JSON.stringify(prompt)},Reasoning:"none"`))?.prompt).toBe(prompt)
 	})
 
 	it('rejects missing or wrong tokens before contacting OpenAI', async () => {
@@ -78,11 +114,26 @@ describe('CV2 AIRequest page source', () => {
 		expect(outbound).not.toHaveBeenCalled()
 	})
 
+	it('accepts low reasoning without sending temperature upstream', async () => {
+		const outbound = vi.spyOn(globalThis, 'fetch').mockResolvedValue(Response.json({
+			output: [{ type: 'message', content: [{ type: 'output_text', text: 'Hello back' }] }],
+		}))
+		const res = await request(command('Prompt:"Hello",Reasoning:"low"'))
+		expect(res.status).toBe(200)
+		expect(await res.json()).toMatchObject([{ id: 'Hello back' }])
+		const [, init] = outbound.mock.calls[0]
+		expect(JSON.parse(init?.body as string)).toMatchObject({ reasoning: { effort: 'low' } })
+		expect(JSON.parse(init?.body as string)).not.toHaveProperty('temperature')
+	})
+
 	it('returns a section error for invalid options with a valid token', async () => {
 		const outbound = vi.spyOn(globalThis, 'fetch')
-		const res = await request(command('Prompt:"Hello",Reasoning:"low",Temp:"0.3"'))
+		const res = await request(command('Prompt:"Hello",Reasoning:"1"'))
 		expect(res.status).toBe(200)
 		expect(await res.json()).toMatchObject([{ id: 'AIError:InvalidRequest' }])
+		expect(outbound).not.toHaveBeenCalled()
+		const oldFormat = await request(command('Prompt:"Hello",Reasoning:"low",Temp:"0.3"'))
+		expect(await oldFormat.json()).toMatchObject([{ id: 'AIError:InvalidRequest' }])
 		expect(outbound).not.toHaveBeenCalled()
 	})
 
