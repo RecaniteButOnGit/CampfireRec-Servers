@@ -34,6 +34,7 @@ import {
 	usernamesFor,
 	where,
 } from './api'
+import { customAvatarItemIdFromPath, ItemPage } from './Item'
 import { ModerationPage } from './Moderation'
 import { StatsPage } from './Stats'
 
@@ -522,9 +523,20 @@ interface BenefitsStatus {
 const fetchBenefitsStatus = (): Promise<BenefitsStatus> =>
 	call<BenefitsStatus>('/api/benefits/status', { authed: true })
 
+/** What a successful claim answers. */
+interface ClaimResult {
+	discordUsername?: string
+	/**
+	 * The supporter gift paid on this claim — the tokens the server hands a linked role once,
+	 * the FIRST time an account links its Discord. Null on a re-claim, when no role is mapped
+	 * to a gift, or when the server doesn't run one.
+	 */
+	tokensAwarded?: number | null
+}
+
 /** Redeem the code Discord sent us back with. The access token never reaches this page. */
-const claimBenefits = (code: string): Promise<{ discordUsername?: string }> =>
-	call<{ discordUsername?: string }>('/api/benefits/claim', { json: { code }, authed: true })
+const claimBenefits = (code: string): Promise<ClaimResult> =>
+	call<ClaimResult>('/api/benefits/claim', { json: { code }, authed: true })
 
 /**
  * The per-attempt CSRF nonce for the Discord round-trip, in sessionStorage.
@@ -724,11 +736,15 @@ function BenefitsPanel({ account, config }: { account: SelfAccount; config: Site
 		claimBenefits(code)
 			.then((result) => {
 				setStatus({ hasPlus: true, linked: true })
-				setDone(
-					result.discordUsername
-						? `Verified as ${result.discordUsername} — Rec Room Plus is now on your account.`
-						: 'Verified — Rec Room Plus is now on your account.'
-				)
+				const verified = result.discordUsername
+					? `Verified as ${result.discordUsername} — Rec Room Plus is now on your account.`
+					: 'Verified — Rec Room Plus is now on your account.'
+				// The first-link gift, when one was paid: it's sitting in a box in the game, and
+				// the player would otherwise only find it by opening their gifts.
+				const gift = result.tokensAwarded
+					? ` A welcome gift of ${result.tokensAwarded.toLocaleString()} tokens is waiting in your gift boxes.`
+					: ''
+				setDone(verified + gift)
 				setRelogin(true)
 			})
 			.catch((err: unknown) => setError(err instanceof Error ? err.message : String(err)))
@@ -1586,6 +1602,7 @@ export function App() {
 	const { path, search, navigate } = useRouter()
 	const roomId = roomIdFromPath(path)
 	const lookupUsername = usernameFromPath(path)
+	const customAvatarItemId = customAvatarItemIdFromPath(path)
 
 	useEffect(() => {
 		// Config first, and everything else after it: it carries the hostnames every other
@@ -1634,6 +1651,7 @@ export function App() {
 					account={account}
 					config={config}
 					initialTab={path === '/signup' ? 'signup' : 'login'}
+					search={search}
 					navigate={navigate}
 					onAuthed={setAccount}
 				/>
@@ -1660,6 +1678,16 @@ export function App() {
 				// its data comes from `/api/stats/online`, which the existing `/api/*` allowlist
 				// entry already sends to the Worker.
 				<StatsPage search={search} navigate={navigate} />
+			) : customAvatarItemId !== null ? (
+				// The game's share link for a store item (`/d/store/customavataritem/<uuid>`), so
+				// the path is the client's, not ours. Not in `run_worker_first` either: a cold
+				// load falls through to the SPA shell like every other page here. Gated on the
+				// session rather than the config because the lookup behind it needs a token.
+				<ItemPage
+					itemId={customAvatarItemId}
+					signedIn={account === undefined ? undefined : account !== null}
+					navigate={navigate}
+				/>
 			) : lookupUsername !== null ? (
 				<PlayerPage username={lookupUsername} config={config} navigate={navigate} />
 			) : roomId !== null ? (
@@ -1997,16 +2025,29 @@ function About({ slides, error }: { slides: Slide[] | null; error: string }) {
  * (it needs a Turnstile keypair; see SiteConfig). Redirects to the account page once a
  * session exists, however it was obtained.
  */
+/**
+ * A `?next=` worth redirecting to after sign-in, or null. Only an absolute PATH on this
+ * site qualifies: it has to start with one slash and not two (`//host` is scheme-relative,
+ * i.e. another site), and carry no scheme. Anything else is dropped rather than repaired.
+ */
+function safeNextPath(raw: string | null): string | null {
+	if (!raw || !raw.startsWith('/') || raw.startsWith('//') || raw.startsWith('/\\')) return null
+	return raw
+}
+
 function LoginPage({
 	account,
 	config,
 	initialTab,
+	search,
 	navigate,
 	onAuthed,
 }: {
 	account: SelfAccount | null | undefined
 	config: SiteConfig | undefined
 	initialTab: 'signup' | 'login'
+	/** The query string, for the `?next=` a page that needs a session sends people here with. */
+	search: string
 	navigate: Navigate
 	onAuthed: (a: SelfAccount) => void
 }) {
@@ -2014,13 +2055,19 @@ function LoginPage({
 	// never disagree — switching tabs pushes history, and back goes back to the other one.
 	const tab = initialTab
 
+	// Where to go once signed in: the page that sent the visitor here, when one did (an
+	// item's share link needs a session to render), otherwise the account page. Only a
+	// same-site path is honoured — one leading slash, so `//evil.example` can't ride in
+	// through a link someone was handed — since this is a redirect after a sign-in.
+	const next = safeNextPath(new URLSearchParams(search).get('next')) ?? '/account'
+
 	useEffect(() => {
-		if (account) navigate('/account')
-	}, [account, navigate])
+		if (account) navigate(next)
+	}, [account, navigate, next])
 
 	const authed = (a: SelfAccount) => {
 		onAuthed(a)
-		navigate('/account')
+		navigate(next)
 	}
 
 	const siteKey = config?.signupEnabled ? config.turnstileSiteKey : null
@@ -2030,12 +2077,16 @@ function LoginPage({
 			<section className="card">
 				{siteKey && (
 					<div className="tabs">
-						<button className={tab === 'login' ? 'active' : ''} onClick={() => navigate('/login')}>
+						{/* The query rides along, so switching doors keeps the `?next=`. */}
+						<button
+							className={tab === 'login' ? 'active' : ''}
+							onClick={() => navigate(`/login${search}`)}
+						>
 							Sign in
 						</button>
 						<button
 							className={tab === 'signup' ? 'active' : ''}
-							onClick={() => navigate('/signup')}
+							onClick={() => navigate(`/signup${search}`)}
 						>
 							Create account
 						</button>
@@ -2053,6 +2104,14 @@ function LoginPage({
 				) : (
 					<>
 						<h2>Sign in</h2>
+						{/* Someone who arrived at /signup while it's closed gets told so, instead of a
+						    sign-in form appearing where they expected to create an account. Only once
+						    the config has landed: before that, closed is just the not-yet-known state. */}
+						{tab === 'signup' && config && !config.signupEnabled && (
+							<p className="warn">
+								Account creation from the website is disabled. Launch the game to create an account.
+							</p>
+						)}
 						<p className="muted">
 							Use your username and password. Launching the game also creates an account, linked to
 							your Steam ID — set a password on it and it signs in here too.
@@ -2064,7 +2123,7 @@ function LoginPage({
 						{siteKey && (
 							<p className="muted swap">
 								Don&apos;t have an account?{' '}
-								<Link to="/signup" navigate={navigate}>
+								<Link to={`/signup${search}`} navigate={navigate}>
 									Create one
 								</Link>
 							</p>

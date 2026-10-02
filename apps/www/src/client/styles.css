@@ -2024,3 +2024,24 @@ button[type='submit']:disabled {
 		grid-template-columns: repeat(2, minmax(0, 1fr));
 	}
 }
+
+/* ---- Custom avatar item page (/d/store/customavataritem/<id>) -------------- */
+
+/* The item's thumbnail: a square PNG with transparent corners, so it's framed whole
+   rather than cropped to the room hero's 3:2 photo, on the raised surface so a dark
+   design stays visible on the dark theme. */
+.item-hero-img {
+	aspect-ratio: 1 / 1;
+	object-fit: contain;
+	padding: 12px;
+}
+
+/* The base item's colour, beside its hex code. */
+.swatch {
+	display: inline-block;
+	width: 0.9em;
+	height: 0.9em;
+	vertical-align: -0.1em;
+	border-radius: 3px;
+	border: 1px solid var(--line);
+}

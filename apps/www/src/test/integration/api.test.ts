@@ -63,6 +63,10 @@ import {
 } from '../../../../econ/src/balance-db'
 import { CATALOG_SCHEMA_DDL } from '../../../../econ/src/catalog-db'
 import { CONSUMABLE_SCHEMA_DDL, getConsumables } from '../../../../econ/src/consumables-db'
+import {
+	DISCORD_ROLE_GIFT_MESSAGE,
+	grantDiscordRoleGift,
+} from '../../../../econ/src/discord-role-gift'
 import { EQUIPMENT_SCHEMA_DDL, getEquipment } from '../../../../econ/src/equipment-db'
 import {
 	grantCustomAvatarItem,
@@ -238,6 +242,60 @@ it('treats an unresolvable or half-configured keypair as signup being off', asyn
 		siteKey: '0xsite',
 		secretKey: '0xsecret',
 	})
+})
+
+// The operator's switch, off by default. `auth` is what enforces it (see its tests); www
+// reads the same knob so the SPA hides the form and the endpoint answers in the sentence
+// the form would show, rather than every visitor learning it from auth's refusal.
+it('PASSWORD_SIGNUP=off reports signup closed and refuses the endpoint', async () => {
+	const original = env.PASSWORD_SIGNUP
+	try {
+		env.PASSWORD_SIGNUP = 'off'
+		const config = (await (await SELF.fetch('https://example.com/api/config')).json()) as {
+			signupEnabled: boolean
+			turnstileSiteKey: string | null
+		}
+		// Closed, and the site key withheld with it: no widget to mount for a form that
+		// isn't offered.
+		expect(config.signupEnabled).toBe(false)
+		expect(config.turnstileSiteKey).toBeNull()
+
+		const res = await SELF.fetch('https://example.com/api/signup', {
+			method: 'POST',
+			headers: { 'content-type': 'application/json' },
+			body: JSON.stringify({ password: 'hunter2', turnstileToken: 'XXXX.DUMMY.TOKEN.XXXX' }),
+		})
+		expect(res.status).toBe(403)
+		expect(await res.json()).toEqual({
+			error: 'Account creation from the website is disabled. Launch the game to create an account.',
+		})
+
+		// Unset is off as well.
+		delete env.PASSWORD_SIGNUP
+		const unset = await SELF.fetch('https://example.com/api/signup', {
+			method: 'POST',
+			headers: { 'content-type': 'application/json' },
+			body: JSON.stringify({ password: 'hunter2', turnstileToken: 'XXXX.DUMMY.TOKEN.XXXX' }),
+		})
+		expect(unset.status).toBe(403)
+	} finally {
+		env.PASSWORD_SIGNUP = original
+	}
+})
+
+// auth's own refusal of the grant, should a request reach it anyway, reads the same.
+it('translates auth’s password-signup refusal into the same sentence', async () => {
+	const failure = await readAuthError(
+		new Response(
+			JSON.stringify({ error: 'invalid_grant', error_description: 'password signup is disabled' }),
+			{ status: 400, headers: { 'content-type': 'application/json' } }
+		),
+		'signup'
+	)
+	expect(failure.message).toBe(
+		'Account creation from the website is disabled. Launch the game to create an account.'
+	)
+	expect(failure.status).toBe(400)
 })
 
 it('refuses a signup with no Turnstile token', async () => {
@@ -665,6 +723,64 @@ it('tells a repeat claim from a second account claiming the same discord identit
 // gate; this pins that the platform www writes to is one the gate actually excludes.
 it('stores the discord identity on a platform the login picker will not list', () => {
 	expect(CACHED_LOGIN_PLATFORMS).not.toContain(PlatformType.Discord)
+})
+
+// The one-time supporter gift the claim pays on an account's FIRST Discord link: econ's
+// cron grant, called on demand with the roles Discord just served, against www's own
+// bindings. Exercised at the grant, since the route's path to it runs through discord.com;
+// the claim decides "first" from the link table before it writes (see www.app.ts).
+it('pays the discord role gift once, on demand, from www’s bindings', async () => {
+	const hub = () => env.RECFLARE_NOTIFICATIONS_HUB.getByName('global')
+	await hub().fetch('http://do/all', { method: 'DELETE' })
+	const supporter = '1077000000000000001'
+	const booster = '1077000000000000002'
+	const giftEnv = { ...env, DISCORD_ROLE_TOKENS: `${supporter}=2500,${booster}=10000` } as Env
+
+	// No map, or a member holding no mapped role: nothing is paid and nothing is written.
+	await expect(
+		grantDiscordRoleGift({ ...env, DISCORD_ROLE_TOKENS: undefined } as Env, 4010, [supporter], 100)
+	).resolves.toBeNull()
+	await expect(
+		grantDiscordRoleGift(giftEnv, 4010, ['1077000000000000009'], 100)
+	).resolves.toBeNull()
+	expect(await getPendingGifts(env.DB, 4010)).toEqual([])
+	expect(await (await hub().fetch('http://do/all')).json()).toEqual([])
+
+	// The best of the member's mapped roles pays — one box, on top of the signup grant, which
+	// is seeded first so a never-touched balance doesn't start from the gift alone.
+	await expect(
+		grantDiscordRoleGift(giftEnv, 4010, [supporter, booster], DEFAULT_STARTING_TOKENS)
+	).resolves.toEqual({ roleId: booster, tokens: 10000 })
+	await expect(
+		getBalance(env.DB, 4010, CurrencyType.RecCenterTokens, DEFAULT_STARTING_TOKENS)
+	).resolves.toBe(DEFAULT_STARTING_TOKENS + 10000)
+	const gifts = await getPendingGifts(env.DB, 4010)
+	expect(gifts).toHaveLength(1)
+	expect(gifts[0]).toMatchObject({
+		FromPlayerId: 1,
+		CurrencyType: CurrencyType.RecCenterTokens,
+		Currency: 10000,
+		AvatarItemType: null,
+		Message: DISCORD_ROLE_GIFT_MESSAGE,
+	})
+
+	// Announced through www's hub binding exactly as econ's cron announces it: the resulting
+	// total into the -2 bucket, then the box.
+	const frames = (await (await hub().fetch('http://do/all')).json()) as Array<{
+		playerId: number
+		notificationType: number
+		data: Record<string, unknown>
+	}>
+	expect(frames.map((f) => [f.playerId, f.notificationType])).toEqual([
+		[4010, 61],
+		[4010, 31],
+	])
+	expect(frames[0].data).toEqual({
+		Balance: DEFAULT_STARTING_TOKENS + 10000,
+		CurrencyType: CurrencyType.RecCenterTokens,
+		Platform: -2,
+	})
+	expect(frames[1].data).toMatchObject({ Id: gifts[0]!.Id, Currency: 10000, BalanceType: -2 })
 })
 
 // The privacy policy is what the Meta Horizon Store's VRC.Privacy.1–4 checks are run
@@ -1294,14 +1410,16 @@ it('throws a banned player out of the instance they are standing in', async () =
 	expect(frames[0].data.GameSessionId).toBe(77001)
 
 	// The SAME ban the sign-in screen describes, not a generic one: its category, message and
-	// the Duration/TimeoutStartedAt pair, three days from when it was handed down.
+	// `Duration` — the seconds LEFT, which at the instant the ban is handed down is the whole
+	// three days. `TimeoutStartedAt` is not paired with it by the client and stays null.
 	const banned = await getReportById(env.DB, report.id)
 	expect(frames[0].data).toMatchObject({
 		ReportCategory: banned!.report_category,
 		Message: 'Rule violation',
-		TimeoutStartedAt: banned!.banned_at,
-		Duration: 3 * 86_400,
+		TimeoutStartedAt: null,
 	})
+	expect(frames[0].data.Duration).toBeGreaterThan(3 * 86_400 - 5)
+	expect(frames[0].data.Duration).toBeLessThanOrEqual(3 * 86_400)
 
 	// And they are out of that instance — moved into their own DORM, not deleted: `match`
 	// lets a banned player matchmake there and nowhere else, so it is where they read the

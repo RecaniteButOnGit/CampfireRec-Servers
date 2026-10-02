@@ -78,12 +78,6 @@ export const FORBIDDEN_RESPONSE = {
 	description: 'A valid token, but not the room’s creator or a co-owner (empty body)',
 }
 
-/** The 403 the friends-only routes return (empty body). */
-export const NOT_FRIENDS_RESPONSE = {
-	description:
-		'A valid token, but the caller is not that player (nor a friend of theirs) (empty body)',
-}
-
 // ---- Parameters ------------------------------------------------------------
 
 /** A digits-only id path parameter (the route patterns constrain these to `[0-9]+`). */

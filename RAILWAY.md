@@ -56,7 +56,7 @@ Optional integration and policy variables (exact names accepted by the runtime):
 | Photon | `PHOTON_REALTIME_APP_ID`, `PHOTON_VOICE_APP_ID`, `PHOTON_CHAT_APP_ID`, `PHOTON_REGION` |
 | Tachyon | `TACHYON_HOST_PORT`, `TACHYON_HOST_PORT_SANDBOX` |
 | Economy and rooms | `STARTING_TOKENS`, `ROOM_REDIRECTS`, `MAX_ROOMS_PER_ACCOUNT`, `MAX_CLUBS_PER_ACCOUNT`, `MAX_TOKEN_GIFT`, `MAX_XP_GIFT` |
-| Uploads and signup limits | `MAX_UPLOAD_BYTES`, `MAX_API_UPLOAD_BYTES` (also accepts `RECFLARE_MAX_API_UPLOAD_BYTES`), `MAX_ACCOUNTS_PER_PLATFORM_ID`, `MAX_ACCOUNTS_PER_IP`, `BAN_EVASION_MATCH` |
+| Uploads and signup limits | `MAX_UPLOAD_BYTES`, `MAX_API_UPLOAD_BYTES` (also accepts `RECFLARE_MAX_API_UPLOAD_BYTES`), `MAX_ACCOUNTS_PER_PLATFORM_ID`, `MAX_ACCOUNTS_PER_IP`, `MAX_ACCOUNTS_PER_DEVICE_ID`, `PASSWORD_SIGNUP`, `BAN_EVASION_MATCH` |
 | Turnstile signup | `TURNSTILE_SITE_KEY`, `TURNSTILE_SECRET_KEY` |
 | Discord OAuth, benefits and scheduled gifts | `DISCORD_CLIENT_ID`, `DISCORD_CLIENT_SECRET`, `DISCORD_BOT_TOKEN`, `DISCORD_GUILD_ID`, `DISCORD_BENEFITS_ROLE_IDS`, `DISCORD_ROLE_TOKENS` |
 | Image signing | `IMG_SIGNING_KEY`, `IMG_SIGNING_ENABLED` |
@@ -68,7 +68,8 @@ The CV2 discovery chip can request `/sections/pagesource/AIRequest[Prompt:"Hello
 
 The discovery service also accepts `EscapeesImport[...]` and `EscapeesImportProgress[...]` page sources. It stages a map in the CDN bucket, converts its volumes in a background task and records the new private room for `RRUser`. The scheduler resumes interrupted imports each minute. Apply the discovery migration when updating the server; command and response details are in [the discovery README](apps/discovery/README.md).
 
-The related feature follows the upstream behavior when an optional integration is absent. In particular, web signup remains Turnstile-gated, Meta nonce login needs the Meta secret, Discord benefits need their credentials, and image signing uses the existing optional configuration.
+The related feature follows the upstream behavior when an optional integration is absent. In particular, web signup requires Turnstile when enabled, Meta nonce login needs the Meta secret, Discord benefits need their credentials, and image signing uses the existing optional configuration.
+Web password signup is disabled by default in Recflare's current auth and website code. Set `PASSWORD_SIGNUP=on` alongside the Turnstile keys to offer it on Railway. Platform signup in the game remains available.
 
 For Photon Realtime, configure the Photon Dashboard Custom Authentication URL as `https://auth.<DOMAIN>/photon/authenticate` (for this deployment, `https://auth.campfire.recanite.net/photon/authenticate`). The auth app verifies the token minted by `/player/connection-info` using `JWT_SECRET` and `PHOTON_REALTIME_APP_ID`. A plain GET without a token returns HTTP 200 with Photon `ResultCode: 3`; this is a safe route smoke test.
 

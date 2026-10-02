@@ -20,6 +20,12 @@
  * never claimed on the website has no Discord link, and so holds no roles here, however
  * many they hold in the guild.
  *
+ * The same box is ALSO handed once, on demand, the first time an account links its Discord
+ * (`www`'s benefits claim calls `grantDiscordRoleGift` with the roles it just read), so a
+ * supporter who claims the day after a run isn't waiting a whole schedule for their first
+ * gift. That is the one grant here with a "first time" to it, and `www` decides it — this
+ * module keeps no ledger either way.
+ *
  * Each grant is the same three moves econ's other server-handed tokens make (the game
  * reward's tickets, the new-activity bonus): seed the signup grant, credit the balance,
  * then a box that displays the amount — announced with `StorefrontBalanceUpdate` (the
@@ -39,7 +45,6 @@ import { NotificationType } from '../../notify/src/notification-types'
 import { ALL_PLATFORMS, creditCurrency, CurrencyType, ensureStartingBalances } from './balance-db'
 
 import type { GiftContent } from '@repo/domain'
-import type { PlatformLink } from '../../auth/src/platform-db'
 import type {
 	BalanceResponsePayload,
 	GiftPackagePayload,
@@ -54,6 +59,13 @@ const HUB_INSTANCE = 'global'
 
 /** The message on the box. */
 export const DISCORD_ROLE_GIFT_MESSAGE = 'Thanks for supporting the server!'
+
+/**
+ * What a grant needs off the bindings: the database, the hub, and the role map. Named as a
+ * Pick so `www` — whose `Env` declares the same three — can hand its own bindings to
+ * `grantDiscordRoleGift` without pretending to be econ.
+ */
+export type RoleGiftEnv = Pick<Env, 'DB' | 'RECFLARE_NOTIFICATIONS_HUB' | 'DISCORD_ROLE_TOKENS'>
 
 /** One role's gift, as configured. */
 export interface RoleTokens {
@@ -95,13 +107,32 @@ export function parseRoleTokens(raw: string | undefined): {
 }
 
 /**
- * The gift a link earns: of the mapped roles it holds, the one paying the most — or null
- * when it holds none. Ties go to whichever is mapped first; they pay the same either way.
+ * The role map off the bindings, with every rejected entry logged — once per run for the
+ * cron, once per claim for the on-demand grant, which is seldom enough to be a reminder
+ * rather than noise. Empty when the gift is off.
  */
-export function bestRoleGift(link: PlatformLink, roles: readonly RoleTokens[]): RoleTokens | null {
+function configuredRoles(env: RoleGiftEnv): RoleTokens[] {
+	const { roles, rejected } = parseRoleTokens(env.DISCORD_ROLE_TOKENS)
+	for (const entry of rejected) {
+		console.error(
+			`discord role gift: ignoring "${entry}" in DISCORD_ROLE_TOKENS — expected <roleId>=<tokens>`
+		)
+	}
+	return roles
+}
+
+/**
+ * The gift a set of held roles earns: of the mapped roles among them, the one paying the
+ * most — or null when none is mapped. Ties go to whichever is mapped first; they pay the
+ * same either way.
+ */
+export function bestRoleGift(
+	held: readonly string[],
+	roles: readonly RoleTokens[]
+): RoleTokens | null {
 	let best: RoleTokens | null = null
 	for (const role of roles) {
-		if (!link.roles.includes(role.roleId)) continue
+		if (!held.includes(role.roleId)) continue
 		if (best === null || role.tokens > best.tokens) best = role
 	}
 	return best
@@ -174,12 +205,7 @@ export async function grantDiscordRoleGifts(
 		failed: 0,
 	}
 
-	const { roles, rejected } = parseRoleTokens(env.DISCORD_ROLE_TOKENS)
-	for (const entry of rejected) {
-		console.error(
-			`discord role gift: ignoring "${entry}" in DISCORD_ROLE_TOKENS — expected <roleId>=<tokens>`
-		)
-	}
+	const roles = configuredRoles(env)
 	if (roles.length === 0) {
 		console.log('discord role gift: off (no roles in DISCORD_ROLE_TOKENS)')
 		return { ...summary, skipped: true }
@@ -190,10 +216,10 @@ export async function grantDiscordRoleGifts(
 	summary.links = links.length
 
 	for (const link of links) {
-		const role = bestRoleGift(link, roles)
+		const role = bestRoleGift(link.roles, roles)
 		if (role === null) continue
 		try {
-			await grantOne(env, link, role, startingTokens)
+			await grantOne(env, link.accountId, role, startingTokens)
 			summary.granted++
 			summary.tokens += role.tokens
 		} catch (err) {
@@ -213,37 +239,60 @@ export async function grantDiscordRoleGifts(
 }
 
 /**
+ * The on-demand grant: pay ONE account the gift its roles earn right now, exactly as a cron
+ * run would — same map, same best-role pick, same box. Returns the role paid, or null when
+ * none of `held` is mapped (which includes the map being off), in which case nothing is
+ * written. Throws as `grantOne` does, so the caller decides what a half-landed grant means.
+ *
+ * `www`'s benefits claim calls this with the roles Discord just served, the first time an
+ * account links its Discord; whether it IS the first time is the caller's call, since this
+ * keeps no ledger. It reads the roles it is handed rather than the stored link so the
+ * caller can pay before, after or without writing the row.
+ */
+export async function grantDiscordRoleGift(
+	env: RoleGiftEnv,
+	accountId: number,
+	held: readonly string[],
+	startingTokens: number
+): Promise<RoleTokens | null> {
+	const role = bestRoleGift(held, configuredRoles(env))
+	if (role === null) return null
+	await grantOne(env, accountId, role, startingTokens)
+	return role
+}
+
+/**
  * Pay one account its role's gift: balance, box, then the two frames. The frames are
  * best-effort — the tokens are credited and the box stored before either is sent, and an
  * offline player meets both on their next login.
  */
 async function grantOne(
-	env: Env,
-	link: PlatformLink,
+	env: RoleGiftEnv,
+	accountId: number,
 	role: RoleTokens,
 	startingTokens: number
 ): Promise<void> {
-	await ensureStartingBalances(env.DB, link.accountId, startingTokens)
+	await ensureStartingBalances(env.DB, accountId, startingTokens)
 	const balance = await creditCurrency(
 		env.DB,
-		link.accountId,
+		accountId,
 		CurrencyType.RecCenterTokens,
 		role.tokens,
 		startingTokens
 	)
 	const content = roleGiftContent(role.tokens)
-	const gift = await createGift(env.DB, link.accountId, content)
+	const gift = await createGift(env.DB, accountId, content)
 
 	const hub = env.RECFLARE_NOTIFICATIONS_HUB.getByName(HUB_INSTANCE)
 	try {
 		// The balance first, so the box's announcement lands on a total that includes it.
 		// `Balance` is the RESULTING total, into the one -2 bucket: the frame SETS it.
-		await hub.notifyPlayer(link.accountId, NotificationType.StorefrontBalanceUpdate, {
+		await hub.notifyPlayer(accountId, NotificationType.StorefrontBalanceUpdate, {
 			Balance: balance,
 			CurrencyType: CurrencyType.RecCenterTokens,
 			Platform: ALL_PLATFORMS,
 		} satisfies BalanceResponsePayload)
-		await hub.notifyPlayer(link.accountId, NotificationType.GiftPackageReceivedImmediate, {
+		await hub.notifyPlayer(accountId, NotificationType.GiftPackageReceivedImmediate, {
 			Id: gift.id,
 			FromPlayerId: COACH_ACCOUNT_ID,
 			ConsumableItemDesc: content.ConsumableItemDesc,
@@ -263,7 +312,7 @@ async function grantOne(
 		} satisfies GiftPackagePayload)
 	} catch (err) {
 		console.error(
-			`discord role gift: could not notify account ${link.accountId} of box ${gift.id}: ${err instanceof Error ? err.message : String(err)}`
+			`discord role gift: could not notify account ${accountId} of box ${gift.id}: ${err instanceof Error ? err.message : String(err)}`
 		)
 	}
 }

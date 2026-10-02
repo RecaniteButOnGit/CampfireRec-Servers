@@ -6,7 +6,6 @@ import {
 	Accessibility,
 	answerRoomRoleInvite,
 	applyRoomTagEdit,
-	areFriends,
 	autocompleteRoomSearch,
 	banPlayerFromRoom,
 	canManageRoom,
@@ -33,6 +32,7 @@ import {
 	getPlayerIdsInRoom,
 	getPresence,
 	getPublicRoomsByCreator,
+	getPublicVisitedRooms,
 	getRecommendedRooms,
 	getRoomBanHistory,
 	getRoomBans,
@@ -125,7 +125,6 @@ import {
 	ModifySubRoomRequest,
 	MoveSubRoomRequest,
 	NameRequest,
-	NOT_FRIENDS_RESPONSE,
 	PagedRooms,
 	pageParams,
 	PhotonAccessTokenDto,
@@ -1636,42 +1635,52 @@ const app = new Hono<App>()
 		}
 	)
 
-	// Another player's visited rooms — what the client shows on a friend's profile.
-	// Auth-gated (401), and FRIENDS-ONLY: a valid token for someone who isn't that
-	// player and isn't a mutual friend of theirs is a 403, since where a player has
-	// been is not public. Registered after `visitedby/me` so the literal path wins.
-	// Paginated via skip/take (take defaults to 100) and, like `visitedby/me`, a bare
-	// array — the client's room-source loaders expect a plain list, not a page.
+	// Another player's visited rooms — what the client shows on their profile. Auth-gated
+	// (401) but otherwise open: anyone can look at anyone's history, as they can at the
+	// `ownedby/{accountId}` list beside it. Registered after `visitedby/me` so the
+	// literal path wins. Paginated via skip/take (take defaults to 100) and, like
+	// `visitedby/me`, a bare array — the client's room-source loaders expect a plain
+	// list, not a page.
+	//
+	// What is hidden is the ROOM, not the history: everyone else sees only the LISTABLE
+	// rooms of it (public, not a dorm, not opted out of lists — the same cut as
+	// `ownedby/{accountId}`). A visit is stamped wherever the player goes, so the raw
+	// history names their unpublished builds and the private rooms they were invited
+	// into, and served whole it leaked rooms nobody has released. Reading your OWN
+	// history by id is the full list, exactly as `visitedby/me` serves it.
 	.get(
 		'/rooms/visitedby/:playerId{[0-9]+}',
 		describeRoute({
 			tags: ['Rooms'],
-			summary: 'A friend’s visited rooms',
+			summary: 'Another player’s visited rooms',
 			description: [
-				'The rooms another player has visited, as a bare array. Friends only: the caller must',
-				'be that player or a mutual friend of theirs (403 otherwise) — visit history is not',
-				'public.',
+				'The rooms another player has visited, as a bare array. Any authed caller may read',
+				'anyone’s history, but only its listable rooms (public, not a dorm, not opted out of',
+				'lists): the player’s unpublished builds and the private rooms they were invited',
+				'into stay off the list. Asking for your own id serves the full history, as',
+				'`visitedby/me` does.',
 			].join(' '),
 			security: AUTHED,
 			parameters: [playerIdParam, ...pageParams(100)],
 			responses: {
 				200: json(RoomDto.array(), 'That player’s visited rooms'),
 				401: UNAUTHORIZED_RESPONSE,
-				403: NOT_FRIENDS_RESPONSE,
 			},
 		}),
 		async (c) => {
 			const accountId = await authedAccountId(c)
 			if (accountId === null) return unauthorized(c)
 			const playerId = Number.parseInt(c.req.param('playerId'), 10)
-			// Your own history is always readable (the client sometimes sends the id
-			// rather than `me`); anyone else's needs a mutual friendship.
-			if (playerId !== accountId && !(await areFriends(c.env.DB, accountId, playerId))) {
-				return c.body(null, 403)
-			}
+			// Your own history is the full one (the client sometimes sends the id rather
+			// than `me`); anyone else's is cut to its listable rooms.
+			const own = playerId === accountId
 			const skip = Number.parseInt(c.req.query('skip') ?? '0', 10) || 0
 			const take = Number.parseInt(c.req.query('take') ?? '100', 10) || 100
-			return c.json(await getVisitedRooms(c.env.DB, playerId, skip, take))
+			return c.json(
+				own
+					? await getVisitedRooms(c.env.DB, playerId, skip, take)
+					: await getPublicVisitedRooms(c.env.DB, playerId, skip, take)
+			)
 		}
 	)
 

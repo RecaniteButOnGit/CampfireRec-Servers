@@ -426,6 +426,68 @@ export const BuyInventionResponse = z.object({
 })
 
 /**
+ * `GET /api/storefronts/v1/buyRoomKey` — the client's `RoomKeyPurchaseResponseDTO`, recovered
+ * from its decoder: the room-key envelope `/api/roomkeys/v1/create` answers in, beside a
+ * BalanceUpdateResponse whose bucket key is `Platform` (NOT the `BalanceType` the invention
+ * buys echo) and whose entry `Data` is the key again.
+ *
+ * Every enum here reads an OMITTED key as its 0 member — `Status` 0 is success,
+ * `UpdateResponse` 0 is OK, `Platform` 0 is SteamPurchased — so all three are always sent.
+ */
+export const BuyRoomKeyResponse = z.object({
+	RoomKeyResponse: z.object({
+		Status: z.int().describe('0 on success; 1 on a refusal'),
+		RoomKey: JsonObject.nullable().describe(
+			'The bought key (the 10-key room key); null on a refusal'
+		),
+	}),
+	BalanceUpdateResponse: z.object({
+		BalanceUpdates: z.array(
+			z.object({
+				UpdateResponse: z
+					.int()
+					.describe(
+						'0 OK, 2 NotEnoughCredit, 3 AlreadyOwned, 4 NoItemAvailable, ' +
+							'6 RequestedPriceDoesNotMatch'
+					),
+				Data: JsonObject.nullable().describe('The key the request named; null when it named none'),
+			})
+		),
+		Balance: z.int().describe('The buyer’s RESULTING token total, not the change'),
+		CurrencyType: z.int().describe('2 = RecCenterTokens'),
+		Platform: z.int().describe('-2 — the one account-wide bucket every balance surface names'),
+	}),
+})
+
+/** `POST /api/storefronts/v1/PurchaseRoomKeyWithCurrency` — form-encoded. */
+export const PurchaseRoomKeyWithCurrencyRequest = z.object({
+	RoomKeyId: z.string().describe('The key to buy — a `room_key` id'),
+	RequestedPrice: z.string().describe('The price the client rendered; must equal the key’s'),
+	RequestedPurchaseCurrencyId: z
+		.string()
+		.describe('The room currency to pay in; must be the key’s own `PurchaseCurrencyId`'),
+})
+
+/**
+ * `POST /api/storefronts/v1/PurchaseRoomKeyWithCurrency` — the client's
+ * `RoomKeyPurchaseWithCurrencyResponseDTO`, recovered from its decoder. A BARE object, no
+ * envelope, and NOT buyRoomKey's shape: the outer `Balance` is an OBJECT (the 4-key
+ * room-currency balance) holding a numeric `Balance`, and there is no `Platform` anywhere.
+ */
+export const PurchaseRoomKeyWithCurrencyResponse = z.object({
+	Balance: z.object({
+		AccountId: z.int().describe('The buyer'),
+		CurrencyId: z.string().describe('The room currency paid in'),
+		Balance: z.int().describe('What the buyer holds of it afterwards — the RESULTING total'),
+		ModifiedAt: z.string().describe('ISO-8601 UTC'),
+	}),
+	RoomKeyResponse: z.object({
+		Status: z.int().describe('0 on success; 1 on a refusal. Always sent — omitted reads as 0'),
+		RoomKey: JsonObject.nullable().describe('The bought key; null on a refusal'),
+	}),
+})
+
+/**
  * `POST /api/storefronts/v3/buyInvention` — the purchase result the 2025 client wants,
  * which is NOT v2's despite settling the identical purchase. Two differences, both
  * recovered from a capture of the real response:
@@ -645,9 +707,9 @@ export const RoomKeyDto = z.object({
 	PurchaseCurrencyId: z
 		.string()
 		.nullable()
-		.describe('A `room_currency` id, or null — the create body names none'),
+		.describe('A `room_currency` id, or null for tokens — which a new key is priced in'),
 	CreatedAt: z.string().describe('ISO-8601 UTC'),
-	ImageName: z.string().nullable().describe('Null — a key cannot carry art yet'),
+	ImageName: z.string().nullable().describe('The key’s art; null until an edit sets one'),
 	Type: z.int().describe('The key type’s ordinal: 0 `Key`, the only one seen'),
 })
 
@@ -672,8 +734,93 @@ export const CreateRoomKeyRequest = z.object({
 	RoomId: z.string().describe('The room the key opens'),
 	Name: z.string().describe('Shown to players; profanity-masked like every typed string'),
 	Description: z.string().optional().describe('Defaults to empty'),
-	Price: z.string().optional().describe('What the key costs; defaults to 0'),
+	Price: z
+		.string()
+		.optional()
+		.describe('What the key costs, in tokens; defaults to 0. At most 1000'),
 })
+
+/**
+ * `PUT /api/roomkeys/v1/updateAll` — form-encoded. "All" is the FIELDS, not the keys: the body
+ * names one key and carries every editable field of it
+ * (`RoomKeyId=43&Name=key1&Description=…&Price=1000&PurchaseCurrencyId=`). For the two
+ * fields that can be emptied — `PurchaseCurrencyId` and `ImageName` — a BLANK value is an
+ * instruction to clear it; only a field absent from the body is left alone.
+ */
+export const UpdateRoomKeyRequest = z.object({
+	RoomKeyId: z.string().describe('The key to edit'),
+	Name: z.string().optional().describe('Left alone when absent; profanity-masked'),
+	Description: z.string().optional().describe('Left alone when absent; profanity-masked'),
+	Price: z
+		.string()
+		.optional()
+		.describe('Left alone when absent. At most 1000 in tokens, 1000000000 in a room currency'),
+	PurchaseCurrencyId: z
+		.string()
+		.optional()
+		.describe(
+			'EMPTY means tokens; otherwise a `room_currency` id of the key’s own room. Left alone when absent'
+		),
+	ImageName: z
+		.string()
+		.optional()
+		.describe('The key’s art. EMPTY clears it (served as null). Left alone when absent'),
+})
+
+/**
+ * `POST /api/roomkeys/v1/awardbulk` — a BARE JSON ARRAY of the keys to award, as the client
+ * posts it. `AccountId` is accepted and IGNORED: the token says who is awarded.
+ */
+export const AwardRoomKeysRequest = z.array(
+	z.object({
+		RoomKeyId: z.int().describe('The key to award — a `room_key` id'),
+		AccountId: z
+			.int()
+			.optional()
+			.describe('Accepted and IGNORED — the caller is who is awarded the key'),
+	})
+)
+
+/**
+ * `POST /api/roomkeys/v1/awardbulk` answers an ARRAY OF ENVELOPES — every element its own
+ * `{ Value, Success, Error, error_id }` around one award (recovered from the client's
+ * decoder). Not a bare array of awards, and not one envelope wrapping a list. Only the
+ * success form has been observed; a failed entry's null `Value` is an assumption.
+ */
+export const AwardRoomKeyResultList = z.array(
+	z.object({
+		Value: z
+			.object({
+				RoomKeyId: z.int(),
+				AccountId: z.int().describe('Who now holds the key — the caller'),
+			})
+			.nullable()
+			.describe('The award, or null on a failure'),
+		Success: z.boolean(),
+		Error: z.string().nullable().describe('Null on success; the failure message otherwise'),
+		error_id: z.null().describe('Always null. Present as a key, and lowercase'),
+	})
+)
+
+/**
+ * `POST /api/roomkeys/v1/owns/bulk` — a BARE JSON ARRAY of (player, key) pairs to check.
+ * Unlike the award's, this `AccountId` is READ: it names whose keys are being asked about.
+ */
+export const OwnsRoomKeysRequest = z.array(
+	z.object({
+		AccountId: z.int().describe('The player being asked about'),
+		RoomKeyId: z.int().describe('The key — a `room_key` id'),
+	})
+)
+
+/** `POST /api/roomkeys/v1/owns/bulk` — a bare array, one answer per pair in the order asked. */
+export const OwnsRoomKeysResponse = z.array(
+	z.object({
+		AccountId: z.int(),
+		RoomKeyId: z.int(),
+		DoesPlayerOwnRoomKey: z.boolean(),
+	})
+)
 
 /**
  * One purchase offer on a room currency — a way to BUY that currency, priced in another
@@ -888,6 +1035,46 @@ export const AwardRoomCurrencyResult = z.object({
 })
 
 export const AwardRoomCurrencyResultList = z.array(AwardRoomCurrencyResult)
+
+/**
+ * `POST /api/roomCurrencies/v2/purchase` — form-encoded
+ * (`PurchaseOfferId=ffab4157-…&RequestedAmount=444&RequestedPrice=555`). The offer alone says
+ * which currency is being bought; the two numbers are what the client rendered, and must match
+ * the offer.
+ */
+export const PurchaseRoomCurrencyRequest = z.object({
+	PurchaseOfferId: z.string().describe('The offer — a `CurrencyPurchaseOfferId`'),
+	RequestedAmount: z.string().describe('How much room currency; must equal the offer’s'),
+	RequestedPrice: z.string().describe('What it costs in tokens; must equal the offer’s'),
+})
+
+/**
+ * What `POST /api/roomCurrencies/v2/purchase` answers: both balances the purchase moved,
+ * inside the `{ Value, Success, Error, error_id }` envelope the room-currency writes use.
+ * Each `Balance` is a RESULTING total. Only the success form has been observed; a refusal's
+ * null `Value` is an assumption.
+ */
+export const PurchaseRoomCurrencyEnvelope = z.object({
+	Value: z
+		.object({
+			CurrencyBalanceResponse: z.object({
+				AccountId: z.int().describe('The buyer'),
+				CurrencyId: z.string().describe('The room currency bought'),
+				Balance: z.int().describe('What the buyer now holds of it'),
+				ModifiedAt: z.string().describe('ISO-8601 UTC'),
+			}),
+			TokenBalanceResponse: z.object({
+				Balance: z.int().describe('The buyer’s resulting token total'),
+				CurrencyType: z.int().describe('2 = RecCenterTokens'),
+				Platform: z.int().describe('-2 — the one account-wide bucket every balance surface names'),
+			}),
+		})
+		.nullable()
+		.describe('Null on a refusal'),
+	Success: z.boolean(),
+	Error: z.string().nullable().describe('Null on success; the refusal otherwise'),
+	error_id: z.null().describe('Always null. Present as a key, and lowercase'),
+})
 
 /**
  * `POST /api/roomcurrencies/v1/updateCurrency` — form-encoded. Names the currency by id

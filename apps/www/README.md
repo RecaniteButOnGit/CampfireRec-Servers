@@ -134,6 +134,18 @@ IGNORE`, so `linkedAt` keeps the first claim's time — so the page is safe to
 reload. Nothing revokes Plus: losing the role later leaves the flag set, so it
 records "held the role once", not "holds it today".
 
+**The first link pays the supporter gift once.** `econ`'s cron hands every account holding
+a role mapped in `DISCORD_ROLE_TOKENS` (`RECFLARE_DISCORD_ROLE_TOKENS` in the root `.env`,
+see the `econ` README) that role's tokens in a gift box each time it fires. The claim pays
+the same box, through the same `grantDiscordRoleGift`, the first time an account links a
+Discord — so a new supporter isn't waiting a whole schedule for their first one. "First"
+is decided from the link table before the write: a re-claim, and a claim that puts a second
+Discord identity on an account that already has one, both pay nothing. The response's
+`tokensAwarded` says what was paid (null when nothing was), and the claim page mentions the
+box. The grant runs after Plus is granted and the link written, and a failure in it is
+logged rather than failing the claim. Unset, the var awards nothing and the claim is as
+before.
+
 The link also records the member's **roles** (`platform_account.role`, a JSON array of
 role ids). The claim writes them from the member record it read; on their own they'd be
 a snapshot from claim time, because the claim revokes the player's token the moment it's

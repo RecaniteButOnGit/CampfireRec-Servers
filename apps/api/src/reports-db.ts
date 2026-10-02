@@ -125,9 +125,10 @@ export interface ReportRow {
 	banned_by_player_id: number | null
 	/**
 	 * ISO-8601 UTC instant the ban was HANDED DOWN — distinct from `created_at`, which is
-	 * when the report was filed, and the two can be months apart. This is what the client's
-	 * block screen counts the ban from (see `banBlockDetails`); rows written before
-	 * 0020_report_ban_audit.sql carry NULL and fall back to `created_at`.
+	 * when the report was filed, and the two can be months apart. The staff panel's audit
+	 * trail and its ordering (`getBansInForce`); the client's block screen does NOT count
+	 * from it (see `banBlockDetails`). Rows written before 0020_report_ban_audit.sql carry
+	 * NULL and fall back to `created_at` where a date is needed.
 	 */
 	banned_at: string | null
 	/**
@@ -271,8 +272,8 @@ export async function isPlayerBanned(
  * report itself intact.
  *
  * `bannedBy` is the acting moderator, and is recorded alongside `banned_at` — the instant
- * the ban was handed down, which is NOT the report's `created_at` and is what the client's
- * block screen counts from. A lift clears all four columns together: an unbanned row must
+ * the ban was handed down, which is NOT the report's `created_at`; the staff panel shows
+ * and sorts by it. A lift clears all four columns together: an unbanned row must
  * not keep an audit trail saying a ban runs from somewhere, and `banned = 0` with a
  * `banned_at` still set would read as a ban to anything checking the timestamp.
  *
@@ -507,9 +508,9 @@ export async function getBansInForce(
 // ---- Block details ----------------------------------------------------------
 
 /**
- * `Duration` on a permanent ban. The client's field is a 32-bit int of seconds that PAIRS
- * with `TimeoutStartedAt` — start + duration is the end of the block — so a ban with no
- * end gets the largest value the field holds, 68 years past its start.
+ * `Duration` on a permanent ban. The client's field is a 32-bit int of seconds LEFT, so a
+ * ban with no end gets the largest value the field holds — 68 years, which other
+ * implementations also send and the client's screen renders as permanent.
  */
 export const PERMANENT_BAN_DURATION = 2_147_483_647
 
@@ -547,18 +548,24 @@ export const NOT_BLOCKED = {
  * (the screen at sign-in) and `www`'s live `ModerationKick` frame (the screen when the ban is
  * handed down mid-session). Built once here so both screens describe the same ban.
  *
- * `Duration` and `TimeoutStartedAt` are a PAIR in the client: the block runs from the
- * start for the duration. The start is `banned_at`, the instant the ban was handed down
- * (see 0020_report_ban_audit.sql), and the duration is the seconds from there to
- * `ban_expires`, so the two sum to the expiry; or `PERMANENT_BAN_DURATION` when there is
- * none.
+ * `Duration` is the seconds LEFT on the ban as of `now` — the time from the request to
+ * `ban_expires`, rounded up so a ban with a second to run never reads 0 — or
+ * `PERMANENT_BAN_DURATION` when there is no expiry. The client counts it down from the
+ * moment it receives it, with no reference to when the ban began: other implementations
+ * with timed bans keep the instant they set the block PRIVATE and serve `Duration` minus
+ * the elapsed time on every read.
+ * This once sent the FULL span from `banned_at` instead, on the theory that the client
+ * pairs it with `TimeoutStartedAt` (start + duration = end). It does not: the screen read
+ * correctly only at the instant the ban was handed down — when the full span IS the
+ * remainder, so the mid-session `ModerationKick` looked right — and every later sign-in
+ * showed the whole ban still to run.
  *
- * It falls back to the report's `created_at` for a row banned before that column existed.
- * The two can be months apart, and using `created_at` as the start — which is what this
- * did before there was anything else to use — misreports both halves of the pair: a 7-day
- * ban applied to a 30-day-old report told the player their block began a month ago and
- * ended three weeks ago. Every pre-migration row still reads exactly as it used to, which
- * is the point of the fallback rather than a coalesce to now.
+ * `TimeoutStartedAt` stays null. Other implementations don't send it for a ban; where it is
+ * set at all it names the start of a voice-chat timeout, which is what the name is about.
+ * `banned_at` is the audit trail and the staff panel's, not the client's.
+ *
+ * `now` is a parameter so the caller can pass the same instant it resolved the ban with
+ * (`getActiveBan`), and a ban that was in force at the read can't come out as 0 left.
  *
  * The category is the one the report was
  * filed under, so the client's ban screen names the reason. `Message` is a fixed "Rule
@@ -568,19 +575,17 @@ export const NOT_BLOCKED = {
  * reported them. Everything else keeps its `NOT_BLOCKED` value: the other block kinds and
  * screen dressings, none of which this server hands out.
  */
-export function banBlockDetails(ban: ReportRow) {
-	const startedAtIso = ban.banned_at ?? ban.created_at
-	const startedAt = Date.parse(startedAtIso)
+export function banBlockDetails(ban: ReportRow, now: Date = new Date()) {
 	const duration =
 		ban.ban_expires === null
 			? PERMANENT_BAN_DURATION
-			: Math.max(1, Math.ceil((Date.parse(ban.ban_expires) - startedAt) / 1000))
+			: Math.max(1, Math.ceil((Date.parse(ban.ban_expires) - now.getTime()) / 1000))
 	return {
 		...NOT_BLOCKED,
 		ReportCategory: ban.report_category,
 		Duration: duration,
 		IsBan: true,
 		Message: 'Rule violation',
-		TimeoutStartedAt: startedAtIso,
+		TimeoutStartedAt: null,
 	}
 }

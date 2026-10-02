@@ -219,10 +219,11 @@ function banExpiry(
  * ROOM ban must never send it (`rooms` sends `IsBan: false` and is enforced by refusing the
  * room), because the client cannot tell the two apart and shows a game-wide ban screen.
  *
- * Its contents are {@link banBlockDetails} — the same `ReportCategory`, `Message` and the
- * `Duration`/`TimeoutStartedAt` pair `moderationBlockDetails` answers for this ban — so the
- * screen a player sees mid-session is the screen they see when they next sign in, not a
- * generic "banned" with no length.
+ * Its contents are {@link banBlockDetails} — the same `ReportCategory`, `Message` and
+ * `Duration` `moderationBlockDetails` answers for this ban — so the screen a player sees
+ * mid-session is the screen they see when they next sign in, not a generic "banned" with no
+ * length. `Duration` is the seconds LEFT, and this frame goes out the instant the ban is
+ * handed down, so here that is the ban's whole span; every later sign-in gets less.
  *
  * Sent to anyone ONLINE, not only to a player standing in an instance: someone in a menu is
  * as banned as someone in a room. `GameSessionId` is their instance, or 0 when they are in

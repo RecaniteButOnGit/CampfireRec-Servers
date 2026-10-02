@@ -14,6 +14,8 @@
  *  - `GET  /api/roomcurrencies/v1/currencies?roomId=` lists a room's
  *  - `POST /api/roomcurrencies/v1/awardCurrency/bulk` pays players
  *  - the purchase offers below are the shop that sells the currency for other money
+ *  - `POST /api/roomCurrencies/v2/purchase` buys from that shop, with tokens
+ *  - `POST /api/storefronts/v1/PurchaseRoomKeyWithCurrency` spends it, on a room key
  *
  * Two things to know before touching it:
  *
@@ -385,6 +387,38 @@ export async function createPurchaseOffer(
 	}
 }
 
+/** A purchase offer found by its own id, beside the room that sells it. */
+export interface FoundPurchaseOffer {
+	Offer: RoomCurrencyPurchaseOffer
+	RoomId: number
+}
+
+/**
+ * Find a purchase offer by its `CurrencyPurchaseOfferId` — all a purchase names. The offer
+ * lives inside its currency's `purchase_offers` JSON, so this walks the shops (`json_each`)
+ * for the one that lists it; the currency it sells is the row it was found on. Null when no
+ * shop lists that id.
+ */
+export async function findPurchaseOffer(
+	db: D1Database,
+	purchaseOfferId: string
+): Promise<FoundPurchaseOffer | null> {
+	const row = await db
+		.prepare(
+			`SELECT c.currency_id, c.room_id, o.value AS offer
+			 FROM room_currency AS c, json_each(c.purchase_offers) AS o
+			 WHERE json_valid(c.purchase_offers)
+			   AND lower(json_extract(o.value, '$.CurrencyPurchaseOfferId')) = lower(?1)
+			 LIMIT 1`
+		)
+		.bind(purchaseOfferId)
+		.first<{ currency_id: string; room_id: number; offer: string }>()
+	if (!row) return null
+
+	const [offer] = parsePurchaseOffers(row.currency_id, `[${row.offer}]`)
+	return offer ? { Offer: offer, RoomId: row.room_id } : null
+}
+
 /** One currency's shop — the group the batch read answers in, one per currency asked for. */
 export interface RoomCurrencyPurchaseOffers {
 	CurrencyId: string
@@ -546,4 +580,46 @@ export async function getRoomBalances(
 		PlayerId: r.playerId,
 		Amount: r.amount,
 	}))
+}
+
+/** What a player holds of one room currency; 0 when they have never earned any. */
+export async function getRoomBalance(
+	db: D1Database,
+	currencyId: string,
+	playerId: number
+): Promise<number> {
+	const row = await db
+		.prepare('SELECT amount FROM room_balance WHERE currency_id = ?1 AND player_id = ?2')
+		.bind(currencyId, playerId)
+		.first<{ amount: number }>()
+	return row?.amount ?? 0
+}
+
+/**
+ * Spend `amount` of a room currency. Returns false — changing nothing — when the player
+ * does not hold that much.
+ *
+ * NOT {@link awardRoomCurrency} with a negative delta: that floors at zero, which is right
+ * for a room taking coins away and wrong for a purchase — a player 1 coin short would pay
+ * what they had and still be sold the thing. The `amount >= ?3` guard lives in the UPDATE
+ * itself, so the check and the debit are one atomic statement, as `spendCurrency` is for
+ * tokens.
+ */
+export async function spendRoomCurrency(
+	db: D1Database,
+	currencyId: string,
+	playerId: number,
+	amount: number
+): Promise<boolean> {
+	if (!Number.isInteger(amount) || amount <= 0) {
+		throw new Error(`spendRoomCurrency: amount must be a positive integer, got ${amount}`)
+	}
+	const { meta } = await db
+		.prepare(
+			`UPDATE room_balance SET amount = amount - ?3
+			 WHERE currency_id = ?1 AND player_id = ?2 AND amount >= ?3`
+		)
+		.bind(currencyId, playerId, amount)
+		.run()
+	return meta.changes > 0
 }

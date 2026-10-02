@@ -49,7 +49,7 @@ describe('SQLite D1 adapter and migrations', () => {
   it('applies source migrations once and persists across reopen', async () => {
     const path = join(temp(), 'recflare.sqlite')
     const first = new SQLiteD1(path)
-    expect(migrate(first)).toBe(106)
+    expect(migrate(first)).toBe(113)
     const rro = await first.prepare(
       `SELECT json_extract(data, '$.IsDeveloperOwned') AS developer_owned,
               json_extract(data, '$.RestrictedCircuitsAllowListNames') AS allowed_circuits
@@ -206,6 +206,20 @@ describe('S3 R2 adapter and CDN', () => {
 })
 
 describe('routing, health and compatibility', () => {
+  it('forwards the upstream signup controls to auth and www', () => {
+    const prior = { ...process.env }
+    process.env.JWT_SECRET = 'test-secret'
+    process.env.PASSWORD_SIGNUP = 'on'
+    process.env.MAX_ACCOUNTS_PER_DEVICE_ID = '5'
+    const db = new SQLiteD1(join(temp(), 'signup-env.sqlite'))
+    try {
+      const runtime = buildEnvironment(db)
+      expect(runtime.base.PASSWORD_SIGNUP).toBe('on')
+      expect(runtime.base.MAX_ACCOUNTS_PER_DEVICE_ID).toBe('5')
+      runtime.hub.db.close()
+    } finally { db.close(); process.env = prior }
+  })
+
   it('passes optional OpenAI settings to the AI worker without requiring a key at startup', async () => {
     const prior = { ...process.env }
     process.env.JWT_SECRET = 'test-secret'

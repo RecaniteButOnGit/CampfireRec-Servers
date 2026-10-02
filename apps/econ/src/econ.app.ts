@@ -83,6 +83,8 @@ import {
 	AwardRoomConsumablesRequest,
 	AwardRoomCurrencyRequest,
 	AwardRoomCurrencyResultList,
+	AwardRoomKeyResultList,
+	AwardRoomKeysRequest,
 	BalanceEntry,
 	BulkPurchaseRequest,
 	BulkPurchaseResponse,
@@ -91,6 +93,7 @@ import {
 	BuyInventionV3Response,
 	BuyItemRequest,
 	BuyItemResponse,
+	BuyRoomKeyResponse,
 	ChallengeProgressRequest,
 	ChallengeProgressResponse,
 	ChecklistCompleteResponse,
@@ -119,6 +122,12 @@ import {
 	MakerAiFreeTrialEligibilityResponse,
 	OpaqueJsonBody,
 	OPTIONAL_AUTHED,
+	OwnsRoomKeysRequest,
+	OwnsRoomKeysResponse,
+	PurchaseRoomCurrencyEnvelope,
+	PurchaseRoomCurrencyRequest,
+	PurchaseRoomKeyWithCurrencyRequest,
+	PurchaseRoomKeyWithCurrencyResponse,
 	ReferralProgressResponse,
 	RoomConsumableDto,
 	RoomConsumableEnvelope,
@@ -140,6 +149,7 @@ import {
 	UpdateObjectiveRequest,
 	UpdateObjectiveResponse,
 	UpdateRoomCurrencyRequest,
+	UpdateRoomKeyRequest,
 	UpsertRoomConsumableRequest,
 } from './openapi'
 import { claimReward, isNewActivity } from './reward-db'
@@ -153,12 +163,25 @@ import {
 	awardRoomCurrency,
 	createPurchaseOffer,
 	createRoomCurrency,
+	findPurchaseOffer,
 	getPurchaseOffers,
+	getRoomBalance,
 	getRoomCurrencies,
 	getRoomCurrency,
+	spendRoomCurrency,
 	updateRoomCurrency,
 } from './room-currency-db'
-import { createRoomKey, getRoomKeys } from './room-key-db'
+import {
+	awardRoomKey,
+	claimRoomKey,
+	createRoomKey,
+	getRoomKey,
+	getRoomKeys,
+	getRoomOwnerId,
+	ownsRoomKeys,
+	releaseRoomKey,
+	updateRoomKey,
+} from './room-key-db'
 
 import type { Context } from 'hono'
 import type { GiftContent, Outfit, Progression, StoredGift, XpGrant } from '@repo/domain'
@@ -183,7 +206,7 @@ import type { Equipment } from './equipment-db'
 import type { AvatarItem } from './inventory-db'
 import type { RoomConsumable } from './room-consumable-db'
 import type { RoomCurrency, RoomCurrencyPurchaseOffer } from './room-currency-db'
-import type { RoomKey } from './room-key-db'
+import type { RoomKey, RoomKeyHolding } from './room-key-db'
 
 // Invention storage (owned by the `api` worker, on this same `recflare` database).
 // Imported directly rather than copied: these are plain D1 helpers with no bindings of
@@ -290,6 +313,14 @@ const ROOM_KEY_STATUS_FAILED = 1
  * refuses what the client already knows not to ask for.
  */
 const MAX_KEYS_PER_ROOM = 10
+
+/**
+ * The most a room key may cost, by what it is priced in: tokens (a null `PurchaseCurrencyId`)
+ * are real money to the player paying, so they are capped low; a room's own currency is the
+ * room's to inflate.
+ */
+const MAX_KEY_PRICE_TOKENS = 1000
+const MAX_KEY_PRICE_ROOM_CURRENCY = 1_000_000_000
 
 /**
  * The envelope the create endpoint answers in: `{ Value, Success, Error, error_id }`.
@@ -4257,6 +4288,134 @@ const app = new Hono<App>({ strict: false })
 		c.json([])
 	)
 
+	// Buy room currency with tokens, through one of the currency's purchase offers. The body
+	// names only the OFFER — which currency it sells is whichever one lists it — and the
+	// amount and price the client rendered, both of which must still match the offer.
+	.post(
+		'/api/roomCurrencies/v2/purchase',
+		describeRoute({
+			tags: ['Econ'],
+			summary: 'Buy room currency with tokens',
+			description: [
+				'Buys from a room currency’s shop. Form-encoded',
+				'(`PurchaseOfferId=ffab4157-…&RequestedAmount=444&RequestedPrice=555`): the caller',
+				'pays the offer’s `Price` in RecCenterTokens and is given its `CurrencyAmount` of the',
+				'currency the offer belongs to (`room_balance`).',
+				'',
+				'`PurchaseOfferId` is a `CurrencyPurchaseOfferId` out of a currency’s purchase offers,',
+				'and is all that says which currency is bought. `RequestedAmount` and `RequestedPrice`',
+				'must EQUAL the offer’s `CurrencyAmount` and `Price` — an offer edited since the client',
+				'drew it is refused rather than sold at numbers the player did not see.',
+				'',
+				'The tokens are paid to the room’s OWNER (its `CreatorAccountId`), as a room-key sale',
+				'is; an owner buying from their own shop, and a free offer, move no tokens.',
+				'',
+				'Answers the `{ Value, Success, Error, error_id }` envelope the room-currency writes',
+				'use. `Value` is BOTH balances the purchase moved, each a RESULTING total:',
+				'`CurrencyBalanceResponse` (`AccountId`, `CurrencyId`, `Balance`, `ModifiedAt`) is',
+				'what the buyer now holds of the room currency, and `TokenBalanceResponse`',
+				'(`Balance`, `CurrencyType`, `Platform`) their tokens. `Platform` is -2, the one',
+				'bucket every balance surface here names — any other value shows the buyer a phantom',
+				'second token balance. A refusal (no such offer, a mismatch, not enough tokens) is a',
+				'200 with `Success: false` and a null `Value` — that form is an assumption — and',
+				'nothing moved.',
+				'',
+				'When tokens moved, both players get a socket push carrying their resulting token',
+				'total — the buyer a StorefrontBalancePurchase, the owner a StorefrontBalanceUpdate.',
+			].join('\n'),
+			security: AUTHED,
+			requestBody: form(PurchaseRoomCurrencyRequest, 'The offer, and the numbers the client saw'),
+			responses: {
+				200: json(PurchaseRoomCurrencyEnvelope, 'The buyer’s new holding, or a refusal'),
+				401: UNAUTHORIZED_RESPONSE,
+			},
+		}),
+		async (c) => {
+			const id = await authedId(c)
+			if (id === null) return unauthorized(c)
+
+			const body = (await c.req.parseBody().catch(() => ({}))) as Record<string, unknown>
+			const str = (v: unknown): string => (typeof v === 'string' ? v.trim() : '')
+			const int = (v: unknown): number => (/^-?\d+$/.test(str(v)) ? Number(str(v)) : Number.NaN)
+			const refuse = (error: string) =>
+				c.json({ Value: null, Success: false, Error: error, error_id: null })
+
+			const offerId = str(body.PurchaseOfferId)
+			const found = offerId === '' ? null : await findPurchaseOffer(c.env.DB, offerId)
+			if (found === null) return refuse('No such purchase offer')
+			const { Offer: offer, RoomId: roomId } = found
+
+			// An offer that hands over nothing, or costs less than nothing, is not for sale.
+			if (!Number.isInteger(offer.CurrencyAmount) || offer.CurrencyAmount <= 0) {
+				return refuse('Purchase offer is not available')
+			}
+			if (!Number.isInteger(offer.Price) || offer.Price < 0) {
+				return refuse('Purchase offer is not available')
+			}
+			if (int(body.RequestedAmount) !== offer.CurrencyAmount) {
+				return refuse('Requested amount does not match')
+			}
+			if (int(body.RequestedPrice) !== offer.Price) return refuse('Requested price does not match')
+
+			const ownerId = await getRoomOwnerId(c.env.DB, roomId)
+			if (ownerId === null) return refuse('Purchase offer is not available')
+
+			// The owner paying themselves would be a debit and a credit of the same tokens.
+			const startingTokens = intVar(c.env.STARTING_TOKENS, DEFAULT_STARTING_TOKENS)
+			const tokens = CurrencyType.RecCenterTokens
+			const charged = offer.Price > 0 && ownerId !== id
+			// Charged FIRST, and atomically: a buyer who cannot pay is handed nothing.
+			if (charged && !(await spendCurrency(c.env.DB, id, tokens, offer.Price, startingTokens))) {
+				return refuse('Not enough tokens')
+			}
+
+			const { Balance: currencyBalance } = await awardRoomCurrency(
+				c.env.DB,
+				offer.CurrencyId,
+				id,
+				offer.CurrencyAmount
+			)
+
+			if (charged) {
+				// Seed the owner's signup grant BEFORE crediting them — `creditCurrency` upserts
+				// the row, which would otherwise cost a never-seen owner their starting tokens.
+				await ensureStartingBalances(c.env.DB, ownerId, startingTokens)
+				const ownerBalance = await creditCurrency(
+					c.env.DB,
+					ownerId,
+					tokens,
+					offer.Price,
+					startingTokens
+				)
+				// Both frames carry a RESULTING total — see the frame rule above pushBalanceUpdate.
+				await pushBalanceUpdate(c, ownerId, tokens, ownerBalance)
+			}
+			const tokenBalance = await getBalance(c.env.DB, id, tokens, startingTokens)
+			if (charged) await pushBalancePurchase(c, id, tokens, -offer.Price, tokenBalance)
+
+			// Both balances are RESULTING totals. `Platform` names the one account-wide bucket,
+			// like every other token balance this worker reports.
+			return c.json({
+				Value: {
+					CurrencyBalanceResponse: {
+						AccountId: id,
+						CurrencyId: offer.CurrencyId,
+						Balance: currencyBalance,
+						ModifiedAt: new Date().toISOString(),
+					},
+					TokenBalanceResponse: {
+						Balance: tokenBalance,
+						CurrencyType: tokens,
+						Platform: ALL_PLATFORMS,
+					},
+				},
+				Success: true,
+				Error: null,
+				error_id: null,
+			})
+		}
+	)
+
 	// The room-economy surface the client asks for on entering a room: the room's own
 	// inventory/offers/gift-drop shops and the caller's slice of them. Nothing here is
 	// stored yet, so every one is an empty list — the client reads that as "this room
@@ -5561,12 +5720,13 @@ const app = new Hono<App>({ strict: false })
 				'',
 				'`Name` and `Description` are masked by the same word list as every other string a',
 				'player types. A room may list at most 10 keys — the `RoomKeyConfig.MaxKeysPerRoom`',
-				'the `api` config tells the client — and the eleventh is refused.',
+				'the `api` config tells the client — and the eleventh is refused. A new key is priced',
+				'in tokens (the body names no currency), so a `Price` over 1000 is refused too.',
 				'',
 				'Answers `{ Status, RoomKey }` — `Status` 0 and the created key, as the live client',
 				'reads it — not the `{ Value, Success, Error, error_id }` envelope the room-currency',
 				'writes use. A recoverable refusal (an unusable `RoomId`, an empty `Name`, an unknown',
-				'room, a full room) is a 200 carrying a non-zero `Status` and a null `RoomKey`; only',
+				'room, a full room, a `Price` over the limit) is a 200 carrying a non-zero `Status` and a null `RoomKey`; only',
 				'the auth gates answer with an HTTP status of their own.',
 				'',
 				'Pushes `LocalRoomKeyCreated` (120), carrying the same object, to everyone in the',
@@ -5595,6 +5755,10 @@ const app = new Hono<App>({ strict: false })
 			if (!Number.isInteger(roomId)) return roomKeyEnvelope(c, null)
 			const name = str(body.Name).trim()
 			if (name === '') return roomKeyEnvelope(c, null)
+			// A key cannot cost less than nothing — nor, being priced in tokens until an edit
+			// says otherwise, more than the token cap.
+			const price = Math.max(0, int(body.Price, 0))
+			if (price > MAX_KEY_PRICE_TOKENS) return roomKeyEnvelope(c, null)
 
 			const canManage = await canManageRoomById(c.env.DB, roomId, accountId)
 			if (canManage === null) return roomKeyEnvelope(c, null)
@@ -5609,12 +5773,454 @@ const app = new Hono<App>({ strict: false })
 				Type: str(body.Type).trim() || 'Key',
 				Name: censorSwears(name),
 				Description: censorSwears(str(body.Description)),
-				// A key cannot cost less than nothing.
-				Price: Math.max(0, int(body.Price, 0)),
+				Price: price,
 			})
 
 			await pushRoomKeyCreated(c, key, accountId)
 			return roomKeyEnvelope(c, key)
+		}
+	)
+
+	// Buy a room key with tokens. A GET with query params — that is how the client sends it.
+	// The key's price leaves the buyer and is paid to the room's owner; holding the key is a
+	// `room_key_player` row. Every refusal is a 200 in the same shape, told apart by the
+	// entry's `UpdateResponse` — only a missing token answers with a status of its own.
+	.get(
+		'/api/storefronts/v1/buyRoomKey',
+		describeRoute({
+			tags: ['Storefront'],
+			summary: 'Buy a room key',
+			description: [
+				'Looks the key up by `RoomKeyId`, confirms the client’s `RequestedPrice` matches its',
+				'stored `Price`, debits the buyer that price in RecCenterTokens, pays it to the',
+				'room’s OWNER (its `CreatorAccountId`), and records the buyer as holding the key',
+				'(`room_key_player`). A free key, and an owner buying their own room’s key, move no',
+				'tokens. A GET because that is how the client sends it.',
+				'',
+				'Answers the client’s `RoomKeyPurchaseResponseDTO`: `RoomKeyResponse` is the',
+				'`{ Status, RoomKey }` the create answers in, and `BalanceUpdateResponse` carries one',
+				'entry (`UpdateResponse`, `Data` = the key) and the buyer’s RESULTING `Balance`.',
+				'`Platform` is -2, the one bucket every balance surface here names — any other value',
+				'shows the buyer a phantom second balance.',
+				'',
+				'A refusal is a 200 in the same shape — `Status` 1, a null `RoomKey`, the balance',
+				'untouched — with the reason in the entry’s `UpdateResponse`: 6 the price does not',
+				'match, 3 already held, 2 not enough tokens, 4 no such key (or no such room, or a key',
+				'priced in a ROOM CURRENCY, which this token route does not sell).',
+				'',
+				'When tokens moved, both players get a socket push carrying their resulting total —',
+				'the buyer a StorefrontBalancePurchase, the owner a StorefrontBalanceUpdate.',
+			].join('\n'),
+			security: AUTHED,
+			parameters: [
+				{
+					name: 'RoomKeyId',
+					in: 'query',
+					required: true,
+					description: 'The key to buy — a `room_key` id',
+					schema: { type: 'integer' },
+				},
+				{
+					name: 'RequestedPrice',
+					in: 'query',
+					required: false,
+					description: 'The price the client rendered; must equal the key’s. Defaults to 0',
+					schema: { type: 'integer' },
+				},
+			],
+			responses: {
+				200: json(BuyRoomKeyResponse, 'The purchase result, or a refusal in the same shape'),
+				401: UNAUTHORIZED_RESPONSE,
+			},
+		}),
+		async (c) => {
+			const id = await authedId(c)
+			if (id === null) return unauthorized(c)
+
+			const startingTokens = intVar(c.env.STARTING_TOKENS, DEFAULT_STARTING_TOKENS)
+			const currencyType = CurrencyType.RecCenterTokens
+			const roomKeyId = Number.parseInt(c.req.query('RoomKeyId') ?? '', 10)
+			// Absent/non-numeric reads as 0, which only matches a free key — a priced one then
+			// fails the confirmation below rather than selling for nothing.
+			const requestedPrice = Number.parseInt(c.req.query('RequestedPrice') ?? '0', 10) || 0
+			const key = Number.isInteger(roomKeyId) ? await getRoomKey(c.env.DB, roomKeyId) : null
+
+			// Every key is always sent: the client reads an omitted one as its enum's 0 member,
+			// which is success for `Status`/`UpdateResponse` and SteamPurchased for `Platform`.
+			const answer = async (code: number) =>
+				c.json({
+					RoomKeyResponse: {
+						Status: code === UpdateResponse.OK ? ROOM_KEY_STATUS_OK : ROOM_KEY_STATUS_FAILED,
+						RoomKey: code === UpdateResponse.OK ? key : null,
+					},
+					BalanceUpdateResponse: {
+						BalanceUpdates: [{ UpdateResponse: code, Data: key }],
+						Balance: await getBalance(c.env.DB, id, currencyType, startingTokens),
+						CurrencyType: currencyType,
+						Platform: ALL_PLATFORMS,
+					},
+				})
+
+			// A key priced in a room currency is not for sale in tokens.
+			if (key === null || key.PurchaseCurrencyId !== null) {
+				return answer(UpdateResponse.NoItemAvailable)
+			}
+			if (requestedPrice !== key.Price) return answer(UpdateResponse.RequestedPriceDoesNotMatch)
+			const ownerId = await getRoomOwnerId(c.env.DB, key.RoomId)
+			if (ownerId === null) return answer(UpdateResponse.NoItemAvailable)
+
+			// Claim the key BEFORE charging: the insert is atomic, so of two concurrent buys only
+			// one gets past here and only one is charged. A buyer who cannot pay gives it back.
+			if (!(await claimRoomKey(c.env.DB, id, key.RoomKeyId))) {
+				return answer(UpdateResponse.AlreadyOwned)
+			}
+			// The owner paying themselves would be a debit and a credit of the same tokens.
+			if (key.Price > 0 && ownerId !== id) {
+				if (!(await spendCurrency(c.env.DB, id, currencyType, key.Price, startingTokens))) {
+					await releaseRoomKey(c.env.DB, id, key.RoomKeyId)
+					return answer(UpdateResponse.NotEnoughCredit)
+				}
+				// Seed the owner's signup grant BEFORE crediting them — `creditCurrency` upserts
+				// the row, which would otherwise cost a never-seen owner their starting tokens.
+				await ensureStartingBalances(c.env.DB, ownerId, startingTokens)
+				const ownerBalance = await creditCurrency(
+					c.env.DB,
+					ownerId,
+					currencyType,
+					key.Price,
+					startingTokens
+				)
+				// Both frames carry a RESULTING total — see the frame rule above pushBalanceUpdate.
+				await pushBalanceUpdate(c, ownerId, currencyType, ownerBalance)
+				await pushBalancePurchase(
+					c,
+					id,
+					currencyType,
+					-key.Price,
+					await getBalance(c.env.DB, id, currencyType, startingTokens)
+				)
+			}
+
+			return answer(UpdateResponse.OK)
+		}
+	)
+
+	// Buy a room key with the room currency it is priced in — buyRoomKey's mirror image, and
+	// almost nothing shared on the wire: a POST with a form body, a bare `{ Balance,
+	// RoomKeyResponse }`, and a `Balance` that is an OBJECT. Nobody is paid: room currency is
+	// the room's own play money, so the price simply leaves the buyer.
+	.post(
+		'/api/storefronts/v1/PurchaseRoomKeyWithCurrency',
+		describeRoute({
+			tags: ['Storefront'],
+			summary: 'Buy a room key with room currency',
+			description: [
+				'Buys a key priced in a room currency. Form-encoded',
+				'(`RoomKeyId=43&RequestedPrice=1000&RequestedPurchaseCurrencyId=b9f41a7c-…`): the',
+				'key’s `Price` is subtracted from what the caller holds of that currency',
+				'(`room_balance`) and they are recorded as holding the key (`room_key_player`).',
+				'NOBODY IS PAID — unlike the token sale, the price does not reach the room’s owner.',
+				'',
+				'`RequestedPurchaseCurrencyId` must be the key’s own `PurchaseCurrencyId` and',
+				'`RequestedPrice` its `Price`. A key priced in TOKENS (a null `PurchaseCurrencyId`)',
+				'is not sold here — that is `GET /api/storefronts/v1/buyRoomKey`.',
+				'',
+				'Answers the client’s `RoomKeyPurchaseWithCurrencyResponseDTO`, a bare object with no',
+				'envelope: `Balance` is an OBJECT — `{ AccountId, CurrencyId, Balance, ModifiedAt }`,',
+				'the buyer’s RESULTING holding — and `RoomKeyResponse` the `{ Status, RoomKey }` the',
+				'create answers in. Not buyRoomKey’s shape; there is no `Platform` here.',
+				'',
+				'A refusal (no such key, a currency or price that is not the key’s, a key already',
+				'held, too little of the currency) is a 200 in the same shape: `Status` 1, a null',
+				'`RoomKey`, and the holding as it stands. That form is an assumption — only success',
+				'has been observed.',
+			].join('\n'),
+			security: AUTHED,
+			requestBody: form(PurchaseRoomKeyWithCurrencyRequest, 'The key, and what the client saw'),
+			responses: {
+				200: json(
+					PurchaseRoomKeyWithCurrencyResponse,
+					'The purchase result, or a refusal in the same shape'
+				),
+				401: UNAUTHORIZED_RESPONSE,
+			},
+		}),
+		async (c) => {
+			const id = await authedId(c)
+			if (id === null) return unauthorized(c)
+
+			const body = (await c.req.parseBody().catch(() => ({}))) as Record<string, unknown>
+			const str = (v: unknown): string => (typeof v === 'string' ? v.trim() : '')
+			const int = (v: unknown): number => (/^-?\d+$/.test(str(v)) ? Number(str(v)) : Number.NaN)
+
+			const requestedCurrencyId = str(body.RequestedPurchaseCurrencyId)
+			const roomKeyId = int(body.RoomKeyId)
+			const key = Number.isInteger(roomKeyId) ? await getRoomKey(c.env.DB, roomKeyId) : null
+			// The currency the answer reports on: the key's own once it is known to be the one
+			// asked for, the requested one on a refusal that never got that far.
+			const currencyId = key?.PurchaseCurrencyId ?? requestedCurrencyId
+
+			// `Status` is always sent: the client reads an omitted one as 0, which is success.
+			const answer = async (sold: boolean) =>
+				c.json({
+					Balance: {
+						AccountId: id,
+						CurrencyId: currencyId,
+						Balance: await getRoomBalance(c.env.DB, currencyId, id),
+						ModifiedAt: new Date().toISOString(),
+					},
+					RoomKeyResponse: {
+						Status: sold ? ROOM_KEY_STATUS_OK : ROOM_KEY_STATUS_FAILED,
+						RoomKey: sold ? key : null,
+					},
+				})
+
+			// A key priced in tokens is buyRoomKey's to sell, and a key is paid for in its own
+			// currency only — never whichever one the request would rather spend.
+			if (key === null || key.PurchaseCurrencyId === null) return answer(false)
+			if (requestedCurrencyId.toLowerCase() !== key.PurchaseCurrencyId.toLowerCase()) {
+				return answer(false)
+			}
+			if (int(body.RequestedPrice) !== key.Price) return answer(false)
+
+			// Claim the key BEFORE charging, as the token sale does: the insert is atomic, so of
+			// two concurrent buys only one is charged. A buyer who cannot pay gives it back.
+			if (!(await claimRoomKey(c.env.DB, id, key.RoomKeyId))) return answer(false)
+			if (
+				key.Price > 0 &&
+				!(await spendRoomCurrency(c.env.DB, key.PurchaseCurrencyId, id, key.Price))
+			) {
+				await releaseRoomKey(c.env.DB, id, key.RoomKeyId)
+				return answer(false)
+			}
+
+			return answer(true)
+		}
+	)
+
+	// Edit a room key. "All" is the key's FIELDS, not the room's keys: the body names one
+	// `RoomKeyId` and carries everything editable about it. Gated like the create — the room
+	// comes off the KEY, never the request.
+	.put(
+		'/api/roomkeys/v1/updateAll',
+		describeRoute({
+			tags: ['Econ'],
+			summary: 'Update a room key',
+			description: [
+				'Edits ONE key — despite the name, "all" is its fields — form-encoded',
+				'(`RoomKeyId=43&Name=key1&Description=…&Price=1000&PurchaseCurrencyId=`).',
+				'',
+				'Gated to the CREATOR or a CO-OWNER of the room that lists the key; a valid token',
+				'from anyone else is a 403.',
+				'',
+				'`PurchaseCurrencyId` sent EMPTY prices the key in tokens (stored and served as',
+				'null) — that is how a key on a room currency is taken back off it; otherwise it',
+				'must be a `room_currency` id belonging to the key’s own room.',
+				'`ImageName` is the key’s art, stored as posted; sent EMPTY it clears the art',
+				'(served as null). That `ImageName` rides in this form is an ASSUMPTION.',
+				'`Price` is capped by what the key ends up priced in: 1000 in tokens, 1000000000 in',
+				'a room currency. A field left out of the body is left alone rather than reset, and',
+				'the cap is checked against the resulting pair.',
+				'',
+				'`Name` and `Description` are masked by the same word list as every other string a',
+				'player types. What can never change: the ids, the room, the `Type`, `CreatedAt`.',
+				'',
+				'Answers the create’s `{ Status, RoomKey }` envelope with the key as it now stands',
+				'— an ASSUMPTION: what the client reads from this response has not been observed.',
+				'A recoverable refusal (no such key, a blank `Name`, a `Price` over the cap, an',
+				'unknown or foreign currency) is a 200 carrying a non-zero `Status` and a null',
+				'`RoomKey`.',
+			].join('\n'),
+			security: AUTHED,
+			requestBody: form(UpdateRoomKeyRequest, 'The key and its fields'),
+			responses: {
+				200: json(RoomKeyEnvelope, 'The key as it now stands, or a refusal'),
+				401: UNAUTHORIZED_RESPONSE,
+				403: { description: 'Not the room’s creator or a co-owner (empty body)' },
+			},
+		}),
+		async (c) => {
+			const accountId = await authedId(c)
+			if (accountId === null) return unauthorized(c)
+
+			const body = (await c.req.parseBody().catch(() => ({}))) as Record<string, unknown>
+			const str = (v: unknown): string | undefined => (typeof v === 'string' ? v : undefined)
+
+			const roomKeyId = Number.parseInt(str(body.RoomKeyId) ?? '', 10)
+			if (!Number.isInteger(roomKeyId)) return roomKeyEnvelope(c, null)
+
+			const existing = await getRoomKey(c.env.DB, roomKeyId)
+			if (!existing) return roomKeyEnvelope(c, null)
+
+			const canManage = await canManageRoomById(c.env.DB, existing.RoomId, accountId)
+			if (canManage === null) return roomKeyEnvelope(c, null)
+			if (!canManage) return c.body(null, 403)
+
+			// A name sent but blank is a bad edit, not an instruction to leave it alone.
+			const name = str(body.Name)?.trim()
+			if (name === '') return roomKeyEnvelope(c, null)
+
+			let price = existing.Price
+			if (str(body.Price) !== undefined) {
+				price = Number.parseInt(str(body.Price)!, 10)
+				if (!Number.isInteger(price) || price < 0) return roomKeyEnvelope(c, null)
+			}
+
+			// Present-but-empty is a VALUE here — tokens — unlike the fields above, where only
+			// absence means "leave alone".
+			let purchaseCurrencyId = existing.PurchaseCurrencyId
+			const postedCurrencyId = str(body.PurchaseCurrencyId)?.trim()
+			if (postedCurrencyId === '') {
+				purchaseCurrencyId = null
+			} else if (postedCurrencyId !== undefined && postedCurrencyId !== purchaseCurrencyId) {
+				// A key is sold in its own room's money, not another's.
+				const currency = await getRoomCurrency(c.env.DB, postedCurrencyId)
+				if (!currency || currency.RoomId !== existing.RoomId) return roomKeyEnvelope(c, null)
+				purchaseCurrencyId = currency.CurrencyId
+			}
+
+			const maxPrice =
+				purchaseCurrencyId === null ? MAX_KEY_PRICE_TOKENS : MAX_KEY_PRICE_ROOM_CURRENCY
+			if (price > maxPrice) return roomKeyEnvelope(c, null)
+
+			// Blank is a value here too: no art. Only absence leaves the stored name alone.
+			const postedImageName = str(body.ImageName)?.trim()
+			const imageName = postedImageName === undefined ? existing.ImageName : postedImageName || null
+
+			const description = str(body.Description)
+			return roomKeyEnvelope(
+				c,
+				await updateRoomKey(c.env.DB, roomKeyId, {
+					Name: name === undefined ? existing.Name : censorSwears(name),
+					Description: description === undefined ? existing.Description : censorSwears(description),
+					Price: price,
+					PurchaseCurrencyId: purchaseCurrencyId,
+					ImageName: imageName,
+				})
+			)
+		}
+	)
+
+	// Award the CALLER some room keys. Auth-gated (401); everything else is reported per
+	// entry, each in its OWN `{ Value, Success, Error, error_id }` envelope — the client
+	// decodes a list of single-value envelopes here. The body is a bare array of `{ RoomKeyId,
+	// AccountId }` — `AccountId` is accepted and unused: the token says who gets the key.
+	.post(
+		'/api/roomkeys/v1/awardbulk',
+		describeRoute({
+			tags: ['Econ'],
+			summary: 'Award room keys to the caller',
+			description: [
+				'Records the CALLER as holding each key the body names (`room_key_player`). The body',
+				'is a BARE JSON ARRAY, `[{ "RoomKeyId": 43, "AccountId": 205 }]`; `AccountId` is',
+				'accepted and IGNORED — the token says who is awarded.',
+				'',
+				'A key is held or it isn’t: awarding one the caller already holds succeeds and',
+				'changes nothing.',
+				'',
+				'The answer is an ARRAY OF ENVELOPES — one `{ Value, Success, Error, error_id }` per',
+				'entry, in the order posted, as the client’s decoder reads it; not a bare array of',
+				'awards, and not one envelope around a list. `Value` is `{ RoomKeyId, AccountId }`,',
+				'`AccountId` being the caller. Each entry stands alone: a `RoomKeyId` naming no listed',
+				'key answers `Success` false with a null `Value` (the failure form is an assumption —',
+				'only success has been observed) and leaves the rest to land.',
+				'',
+				'NOTE: this awards to whoever is asking, and nothing is spent for it — the key’s',
+				'`Price` is not charged and no room membership is checked.',
+			].join('\n'),
+			security: AUTHED,
+			requestBody: jsonBody(AwardRoomKeysRequest, 'The keys to give the caller'),
+			responses: {
+				200: json(AwardRoomKeyResultList, 'One result per entry, in the order posted'),
+				401: UNAUTHORIZED_RESPONSE,
+			},
+		}),
+		async (c) => {
+			const accountId = await authedId(c)
+			if (accountId === null) return unauthorized(c)
+
+			const body = await c.req.json<unknown>().catch(() => null)
+			// A body that is no list has no entries to report on.
+			if (!Array.isArray(body)) return c.json([])
+
+			const failed = (error: string) => ({
+				Value: null,
+				Success: false,
+				Error: error,
+				error_id: null,
+			})
+			const results = []
+			for (const entry of body as unknown[]) {
+				const roomKeyId =
+					typeof entry === 'object' && entry !== null
+						? (entry as { RoomKeyId?: unknown }).RoomKeyId
+						: undefined
+				if (typeof roomKeyId !== 'number' || !Number.isInteger(roomKeyId)) {
+					results.push(failed('Invalid room key'))
+					continue
+				}
+
+				const awardedAt = await awardRoomKey(c.env.DB, accountId, roomKeyId)
+				results.push(
+					awardedAt === null
+						? failed('No such room key')
+						: {
+								Value: { RoomKeyId: roomKeyId, AccountId: accountId },
+								Success: true,
+								Error: null,
+								error_id: null,
+							}
+				)
+			}
+
+			return c.json(results)
+		}
+	)
+
+	// Who holds which room key. Auth-gated (401). The body is a bare array of `{ AccountId,
+	// RoomKeyId }` pairs and — unlike the award's — `AccountId` is READ here: a room asks
+	// about the players standing in it, not only the caller. A bare array back, one answer
+	// per pair.
+	.post(
+		'/api/roomkeys/v1/owns/bulk',
+		describeRoute({
+			tags: ['Econ'],
+			summary: 'Whether players hold room keys',
+			description: [
+				'Answers, for each `{ AccountId, RoomKeyId }` pair posted, whether that player holds',
+				'that key (`room_key_player`). The body is a BARE JSON ARRAY, and so is the answer:',
+				'`[{ "AccountId": 205, "RoomKeyId": 43, "DoesPlayerOwnRoomKey": true }]`, one entry',
+				'per pair in the order posted — no envelope, unlike the award beside it.',
+				'',
+				'`AccountId` is honoured, not replaced by the caller: any signed-in player may ask',
+				'about any player. An unknown key or player is simply not held; an entry without two',
+				'integer ids is skipped.',
+			].join('\n'),
+			security: AUTHED,
+			requestBody: jsonBody(OwnsRoomKeysRequest, 'The (player, key) pairs to check'),
+			responses: {
+				200: json(OwnsRoomKeysResponse, 'One answer per pair, in the order posted'),
+				401: UNAUTHORIZED_RESPONSE,
+			},
+		}),
+		async (c) => {
+			const accountId = await authedId(c)
+			if (accountId === null) return unauthorized(c)
+
+			const body = await c.req.json<unknown>().catch(() => null)
+			if (!Array.isArray(body)) return c.json([])
+
+			const pairs: RoomKeyHolding[] = []
+			for (const entry of body as unknown[]) {
+				if (typeof entry !== 'object' || entry === null) continue
+				const { AccountId, RoomKeyId } = entry as Record<string, unknown>
+				if (typeof AccountId !== 'number' || !Number.isInteger(AccountId)) continue
+				if (typeof RoomKeyId !== 'number' || !Number.isInteger(RoomKeyId)) continue
+				pairs.push({ AccountId, RoomKeyId })
+			}
+
+			const owned = await ownsRoomKeys(c.env.DB, pairs)
+			return c.json(pairs.map((pair, i) => ({ ...pair, DoesPlayerOwnRoomKey: owned[i] })))
 		}
 	)
 

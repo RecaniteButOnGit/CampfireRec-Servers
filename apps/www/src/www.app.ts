@@ -5,7 +5,7 @@ import { getAccount, updateAccount } from '@repo/domain/src/accounts-db'
 import { PlatformType } from '@repo/domain/src/enums'
 import { countOnlinePlayers } from '@repo/domain/src/presence-db'
 import { getStatSeries } from '@repo/domain/src/stats-db'
-import { logger, withDefaultCors, withOnError } from '@repo/hono-helpers'
+import { intVar, logger, withDefaultCors, withOnError } from '@repo/hono-helpers'
 import { validateAndGetAccountId } from '@repo/jwt'
 
 // The `platform_account` link table, owned (and migrated) by the `auth` worker. A claimed
@@ -20,7 +20,12 @@ import {
 	isPlatformIdentityLinked,
 	linkPlatformIdentity,
 } from '../../auth/src/platform-db'
-import { authUnreachable } from './auth-messages'
+// The signup grant's default and the Discord supporter gift, both `econ`'s. The gift is
+// econ's cron paid on demand: the first time an account links its Discord, the claim hands
+// it the box one cron run would, so the amount and the box are econ's and not a copy.
+import { DEFAULT_STARTING_TOKENS } from '../../econ/src/balance-db'
+import { grantDiscordRoleGift } from '../../econ/src/discord-role-gift'
+import { authUnreachable, PASSWORD_SIGNUP_DISABLED } from './auth-messages'
 import { importAvatarHandler } from './avatar-import-handler'
 import {
 	AUTHORIZE_URL,
@@ -55,7 +60,7 @@ import {
 	searchReportsHandler,
 	topReportedHandler,
 } from './staff'
-import { turnstileKeys, verifyTurnstile } from './turnstile'
+import { passwordSignupOpen, turnstileKeys, verifyTurnstile } from './turnstile'
 import {
 	accountsBase,
 	apiBase,
@@ -163,11 +168,16 @@ const app = new Hono<App>()
 	// it calls directly. All three are served rather than baked into the client build so
 	// one build works for any operator. The site key is public (it ships in the widget
 	// markup either way); the secret never leaves the worker.
+	//
+	// Signup is open only when BOTH hold: the operator has switched password signup on
+	// (`PASSWORD_SIGNUP`, the knob auth enforces) and a Turnstile keypair is configured to
+	// guard it. Either missing and the SPA offers no form.
 	.get('/api/config', async (c) => {
 		const [keys, discord] = await Promise.all([turnstileKeys(c.env), discordConfig(c.env)])
+		const signupEnabled = passwordSignupOpen(c.env) && keys !== null
 		return c.json({
-			signupEnabled: keys !== null,
-			turnstileSiteKey: keys?.siteKey ?? null,
+			signupEnabled,
+			turnstileSiteKey: signupEnabled ? keys.siteKey : null,
 			// The benefits claim, on the same terms: open only when it's fully configured, and
 			// the SPA is handed a ready-made consent URL rather than the parts to build one.
 			// Nothing secret is served — the client id inside it is public — and the guild/role
@@ -247,11 +257,16 @@ const app = new Hono<App>()
 
 	// ---- Signup -------------------------------------------------------------
 
-	// Create an account from the website, behind a Turnstile bot check. The check is what
-	// makes this safe to leave open: `auth` binds no platform identity to a web account, so
-	// its per-IP cap (3, never decaying) is the only other thing in front of this path —
-	// and `auth` has no bot check of its own, which is why this one endpoint can't simply
-	// be called from the browser like the rest.
+	// Create an account from the website, behind a Turnstile bot check. `auth` binds no
+	// platform identity to a web account, so its signup caps are the only other thing in
+	// front of this path — and `auth` has no bot check of its own, which is why this one
+	// endpoint can't simply be called from the browser like the rest.
+	//
+	// The whole path is behind the `PASSWORD_SIGNUP` switch, OFF by default: a web account
+	// has no identity but its address, and the per-IP cap is reset by every VPN or Tor exit
+	// (one player made 150 accounts that way in a weekend). `auth` is what enforces the
+	// switch — it refuses the grant whatever this worker does — so the check here only
+	// spares a visitor the Turnstile round trip and answers in the sentence the form shows.
 	//
 	// Deliberately passes NO `platform`: create_account treats an asserted platform as one
 	// to verify against Steam and would reject RecNet, so this is the platform-less
@@ -262,6 +277,7 @@ const app = new Hono<App>()
 	// account's email, when the player gave one, is saved by the client afterwards with
 	// that token — `create_account` takes no email, and `accounts` owns the field.
 	.post('/api/signup', async (c) => {
+		if (!passwordSignupOpen(c.env)) return c.json({ error: PASSWORD_SIGNUP_DISABLED }, 403)
 		// No usable keypair means signup is closed rather than unprotected (see turnstile.ts).
 		const keys = await turnstileKeys(c.env)
 		if (!keys) return c.json({ error: 'Account creation is currently disabled.' }, 403)
@@ -365,6 +381,13 @@ const app = new Hono<App>()
 	 * That's deliberate for now — a sweep would need a bot token to enumerate the guild,
 	 * which this design specifically avoids — but it does mean the flag records "held the
 	 * role once", not "holds it today".
+	 *
+	 * The FIRST time an account links a Discord, the claim also pays the supporter gift
+	 * econ's cron would (`DISCORD_ROLE_TOKENS`, the amount for the best of the roles just
+	 * read) — once, so a new supporter isn't waiting a whole schedule for their first box.
+	 * "First" means the account had no Discord link at all before this claim: a re-claim,
+	 * and a claim that swaps in a second Discord identity, both pay nothing. The response's
+	 * `tokensAwarded` says what was paid (null when nothing was).
 	 */
 	.post('/api/benefits/claim', async (c) => {
 		const config = await discordConfig(c.env)
@@ -421,6 +444,12 @@ const app = new Hono<App>()
 			PlatformType.Discord,
 			membership.userId
 		)
+		// Whether this claim is the account's FIRST Discord link — what the one-time gift below
+		// keys on. Decided before the write, from the table: an account re-claiming with the
+		// same Discord is not first (`alreadyMine`), and neither is one that already carries a
+		// DIFFERENT Discord identity, which the once-only guard doesn't stop. Only asked when
+		// it could be true, to spare the re-claim a query.
+		let firstLink = false
 		if (!alreadyMine) {
 			const claimedElsewhere = await countAccountsForPlatformIdentity(
 				c.env.DB,
@@ -436,6 +465,8 @@ const app = new Hono<App>()
 					409
 				)
 			}
+			const links = await getLinksForAccount(c.env.DB, accountId)
+			firstLink = !links.some((link) => link.platform === PlatformType.Discord)
 		}
 
 		// Both writes are idempotent: the link is INSERT OR IGNORE (so `linkedAt` keeps the
@@ -448,7 +479,7 @@ const app = new Hono<App>()
 		// under a role that has since been retired from the config. Roles are the one part of
 		// the row a re-claim REFRESHES, because they're a snapshot of a membership that moves
 		// and this reading is the fresher one.
-		await linkPlatformIdentity(
+		const created = await linkPlatformIdentity(
 			c.env.DB,
 			accountId,
 			PlatformType.Discord,
@@ -458,9 +489,40 @@ const app = new Hono<App>()
 		await updateAccount(c.env.DB, accountId, { hasPlus: true })
 		logger.info('granted plus from a discord benefits claim', { accountId })
 
+		// The one-time supporter gift: the box econ's cron would hand this member, paid now,
+		// once. Gated on the insert having happened too (`created`), so two claims racing on
+		// one fresh account can't both pay. Best-effort AFTER Plus is granted and the link is
+		// written: a grant that fails partway is logged with what to check, as econ's cron
+		// logs its own, and the claim still answers — the player got what they came for, and
+		// a retry that also failed partway is how a balance gets credited twice.
+		let tokensAwarded: number | null = null
+		if (created && firstLink) {
+			try {
+				const role = await grantDiscordRoleGift(
+					c.env,
+					accountId,
+					membership.roles,
+					intVar(c.env.STARTING_TOKENS, DEFAULT_STARTING_TOKENS)
+				)
+				if (role !== null) {
+					tokensAwarded = role.tokens
+					logger.info('awarded the discord role gift on a first link', {
+						accountId,
+						roleId: role.roleId,
+						tokens: role.tokens,
+					})
+				}
+			} catch (err) {
+				logger.error('the discord role gift on a first link failed partway', {
+					accountId,
+					error: err instanceof Error ? err.message : String(err),
+				})
+			}
+		}
+
 		// The username is echoed for the confirmation line only — it is never stored, and a
 		// Discord member who has since renamed themselves is not a problem to solve here.
-		return c.json({ hasPlus: true, discordUsername: membership.username })
+		return c.json({ hasPlus: true, discordUsername: membership.username, tokensAwarded })
 	})
 
 	// ---- Staff moderation panel ---------------------------------------------

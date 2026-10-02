@@ -88,6 +88,11 @@ export const ROOM_SCHEMA_DDL: string[] = [
 		last_visited_at TEXT,
 		PRIMARY KEY (player_id, room_id)
 	)`,
+	// Per-ROOM access (migrations/0021_interaction_room_index.sql): the primary key
+	// serves the per-player reads, but the cheer/favorite aggregate every room read runs
+	// (`getRoomStats`) filters by room_id, which without this scanned the whole table.
+	// Covering — both counters are in the index, so the aggregate never touches the table.
+	`CREATE INDEX IF NOT EXISTS idx_interaction_room ON interaction (room_id, cheered, favorited)`,
 	// Per-room player bans (migrations/0010_room_ban.sql). One row per (room, player),
 	// so re-banning someone already banned updates their row rather than appending.
 	// `ban_mask` is the client's `banMask` field kept verbatim — its meaning isn't known
@@ -2472,9 +2477,6 @@ interface RoomStatsRow {
 /** The counters a room starts life with (and the shape the client expects). */
 const ZERO_STATS = { CheerCount: 0, FavoriteCount: 0, VisitorCount: 0, VisitCount: 0 }
 
-/** D1 caps a query at 100 bound parameters, and a feed page can carry more ids than that. */
-const STATS_ID_LIMIT = 90
-
 /** A room's RoomId, or 0 for a blob without one. */
 const roomIdOf = (room: Room): number => (typeof room.RoomId === 'number' ? room.RoomId : 0)
 
@@ -2499,10 +2501,14 @@ export async function recordRoomVisit(db: D1Database, roomId: number): Promise<v
 }
 
 /**
- * Cheer/favorite counts per room, aggregated from `interaction` in ONE grouped query.
- * Restricted to `roomIds` when given (a feed page), otherwise covering every room —
- * which is also what a page too large to bind gets, since scanning the whole table is
- * cheaper than splitting the query. Rooms nobody has interacted with are absent.
+ * Cheer/favorite counts per room, aggregated from `interaction` by a grouped query.
+ * Restricted to `roomIds` when given (a feed page), otherwise covering every room.
+ * Rooms nobody has interacted with are absent.
+ *
+ * The filtered form is an index range per id on `idx_interaction_room`, whose columns
+ * cover the counters — the table is never read. That's why a page with more ids than
+ * D1 lets us bind is split into batched queries rather than served by the unfiltered
+ * scan: every room read runs this, and the scan cost the whole table per call.
  */
 export async function getRoomStats(
 	db: D1Database,
@@ -2510,18 +2516,24 @@ export async function getRoomStats(
 ): Promise<Map<number, RoomStats>> {
 	const byRoom = new Map<number, RoomStats>()
 	if (roomIds && roomIds.length === 0) return byRoom
-	const ids = roomIds && roomIds.length <= STATS_ID_LIMIT ? roomIds : []
-	const where =
-		ids.length > 0 ? `WHERE room_id IN (${ids.map((_, i) => `?${i + 1}`).join(',')})` : ''
-	const { results } = await db
-		.prepare(
-			`SELECT room_id, SUM(cheered) AS cheers, SUM(favorited) AS favorites
-			 FROM interaction ${where} GROUP BY room_id`
-		)
-		.bind(...ids)
-		.all<RoomStatsRow>()
-	for (const r of results) {
-		byRoom.set(r.room_id, { CheerCount: r.cheers ?? 0, FavoriteCount: r.favorites ?? 0 })
+	const statement = (ids: number[]): D1PreparedStatement => {
+		const where = ids.length > 0 ? `WHERE room_id IN (${bindPlaceholders(ids)})` : ''
+		return db
+			.prepare(
+				`SELECT room_id, SUM(cheered) AS cheers, SUM(favorited) AS favorites
+				 FROM interaction ${where} GROUP BY room_id`
+			)
+			.bind(...ids)
+	}
+	const chunks = roomIds ? chunkForBinds(roomIds) : [[]]
+	const batches =
+		chunks.length === 1
+			? [await statement(chunks[0]!).all<RoomStatsRow>()]
+			: await db.batch<RoomStatsRow>(chunks.map(statement))
+	for (const { results } of batches) {
+		for (const r of results) {
+			byRoom.set(r.room_id, { CheerCount: r.cheers ?? 0, FavoriteCount: r.favorites ?? 0 })
+		}
 	}
 	return byRoom
 }
@@ -3051,6 +3063,10 @@ export async function getFavoritedRooms(
  * most recent first. Like favorites, it joins `interaction` to `rooms`, so a
  * visited room no longer in D1 is simply absent. Paginated via skip/take; returns
  * a bare array of rooms (the client's room-source loaders expect a plain list).
+ *
+ * This is the player's OWN history, so nothing is filtered on accessibility: their
+ * unpublished builds and the private rooms they were invited into are theirs to see.
+ * Anyone else reading it goes through {@link getPublicVisitedRooms}.
  */
 export async function getVisitedRooms(
 	db: D1Database,
@@ -3058,17 +3074,52 @@ export async function getVisitedRooms(
 	skip: number,
 	take: number
 ): Promise<Room[]> {
+	return visitedRooms(db, playerId, skip, take, false)
+}
+
+/**
+ * {@link getVisitedRooms} as SOMEONE ELSE sees it — a profile, which anyone can look at —
+ * narrowed to the rooms that are {@link isListable}. A visit is recorded wherever the
+ * player goes, so the unfiltered history names their unpublished builds and the private
+ * rooms they were invited into; served whole, it leaked a room its owner hasn't released,
+ * and `GET /rooms/{id}` is not gated, so the id alone was enough to open it. The same test
+ * the public `ownedby/{accountId}` profile list applies, so a room that opted out of lists
+ * stays off this one too. Paginated AFTER the filter, so a page is a page of what the
+ * viewer may see rather than a page with holes in it.
+ */
+export async function getPublicVisitedRooms(
+	db: D1Database,
+	playerId: number,
+	skip: number,
+	take: number
+): Promise<Room[]> {
+	return visitedRooms(db, playerId, skip, take, true)
+}
+
+async function visitedRooms(
+	db: D1Database,
+	playerId: number,
+	skip: number,
+	take: number,
+	listableOnly: boolean
+): Promise<Room[]> {
+	// The listable predicate is pushed down (see LISTABLE_WHERE) so the blobs of the
+	// rooms a friend may not see never leave D1; the in-memory filter remains the
+	// definition, as everywhere else it is used.
 	const { results } = await db
 		.prepare(
 			`SELECT r.data AS data, r.visits AS visits
 			 FROM interaction i
 			 JOIN room r ON r.room_id = i.room_id
 			 WHERE i.player_id = ?1 AND i.last_visited_at IS NOT NULL
+			 ${listableOnly ? `AND r.${LISTABLE_WHERE.replaceAll(' AND ', ' AND r.')}` : ''}
 			 ORDER BY i.last_visited_at DESC`
 		)
 		.bind(playerId)
 		.all<RoomRow>()
-	return hydrateRooms(db, parseAll(results).slice(skip, skip + take))
+	const rooms = parseAll(results)
+	const visible = listableOnly ? rooms.filter(isListable) : rooms
+	return hydrateRooms(db, visible.slice(skip, skip + take))
 }
 
 /** A player's interaction state with a room. */

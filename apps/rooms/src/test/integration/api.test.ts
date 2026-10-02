@@ -295,25 +295,6 @@ beforeAll(async () => {
 	await env.DB.prepare('INSERT OR IGNORE INTO account (data) VALUES (?1)')
 		.bind(JSON.stringify({ accountId: 999, username: 'Dormer' }))
 		.run()
-
-	// Relationship table (owned by the api worker) — `visitedby/:playerId` reads it to
-	// check the caller is a friend of the player whose history they're asking for.
-	await env.DB.prepare(
-		`CREATE TABLE IF NOT EXISTS relationship (
-			id INTEGER PRIMARY KEY AUTOINCREMENT,
-			requester_id INTEGER NOT NULL,
-			target_id INTEGER NOT NULL,
-			relationship_type INTEGER NOT NULL DEFAULT 0
-		)`
-	).run()
-	const insertRel = env.DB.prepare(
-		'INSERT INTO relationship (requester_id, target_id, relationship_type) VALUES (?1, ?2, ?3)'
-	)
-	await env.DB.batch([
-		insertRel.bind(791, 790, 3), // friends — the caller (791) is the requester
-		insertRel.bind(790, 792, 3), // friends — the caller (792) is the target
-		insertRel.bind(793, 790, 1), // request out, not accepted — 793 is NOT a friend
-	])
 })
 
 describe('rooms endpoints', () => {
@@ -957,7 +938,7 @@ describe('rooms endpoints', () => {
 		expect(other).toEqual([])
 	})
 
-	it('GET /rooms/visitedby/:playerId serves a friend’s visited rooms and 403s everyone else', async () => {
+	it('GET /rooms/visitedby/:playerId serves any player’s visited rooms to any authed caller', async () => {
 		// Give 790 a visit history (cheering/favoriting stamps a last-visit).
 		const subject = await bearer('790')
 		await SELF.fetch(`${ORIGIN}/rooms/2/interactionby/me/cheer`, {
@@ -969,11 +950,11 @@ describe('rooms endpoints', () => {
 			headers: subject,
 		})
 
-		// A mutual friend reads it — a bare array, regardless of which side of the
-		// relationship row the caller sits on.
-		for (const friend of ['791', '792']) {
+		// Anyone with a token reads it — a bare array. Friendship is not required: a
+		// player's history is as public as the rooms on their profile.
+		for (const viewer of ['791', '792', '793', '794']) {
 			const res = await SELF.fetch(`${ORIGIN}/rooms/visitedby/790`, {
-				headers: await bearer(friend),
+				headers: await bearer(viewer),
 			})
 			expect(res.status).toBe(200)
 			const body = (await res.json()) as Array<{ RoomId: number }>
@@ -994,14 +975,6 @@ describe('rooms endpoints', () => {
 		).json()) as unknown[]
 		expect(own.length).toBe(2)
 
-		// A pending request is not a friendship, and a stranger is not either → 403.
-		for (const outsider of ['793', '794']) {
-			const res = await SELF.fetch(`${ORIGIN}/rooms/visitedby/790`, {
-				headers: await bearer(outsider),
-			})
-			expect(res.status).toBe(403)
-		}
-
 		// No token at all → 401, never a fallback account.
 		const anon = await SELF.fetch(`${ORIGIN}/rooms/visitedby/790`)
 		expect(anon.status).toBe(401)
@@ -1011,6 +984,67 @@ describe('rooms endpoints', () => {
 			await SELF.fetch(`${ORIGIN}/rooms/visitedby/me`, { headers: subject })
 		).json()) as unknown[]
 		expect(me.length).toBe(2)
+	})
+
+	it('GET /rooms/visitedby/:playerId hides visits to unpublished rooms', async () => {
+		// 790 has been to an UNPUBLISHED room (their own build), an unlisted one, and a room
+		// that opted out of lists — each stamped as the most recent visit, ahead of the two
+		// public rooms the test above recorded.
+		const seed = (data: Record<string, unknown>) =>
+			env.DB.prepare('INSERT INTO room (data) VALUES (?1)').bind(JSON.stringify(data)).run()
+		await seed({
+			RoomId: 30501,
+			Name: 'VisitedUnpublished',
+			CreatorAccountId: 790,
+			Accessibility: 0,
+			SubRooms: [],
+		})
+		await seed({ RoomId: 30502, Name: 'VisitedUnlisted', Accessibility: 2, SubRooms: [] })
+		await seed({
+			RoomId: 30503,
+			Name: 'VisitedOptedOut',
+			Accessibility: 1,
+			ExcludeFromLists: true,
+			SubRooms: [],
+		})
+		await env.DB.prepare(
+			`INSERT INTO interaction (player_id, room_id, last_visited_at)
+			 VALUES (790, 30501, '2030-01-03T00:00:00.000Z'),
+			        (790, 30502, '2030-01-02T00:00:00.000Z'),
+			        (790, 30503, '2030-01-01T00:00:00.000Z')`
+		).run()
+		try {
+			const ids = async (headers: Record<string, string>, query = '') =>
+				(
+					(await (
+						await SELF.fetch(`${ORIGIN}/rooms/visitedby/790${query}`, { headers })
+					).json()) as Array<{ RoomId: number }>
+				).map((r) => r.RoomId)
+
+			// Anyone else sees only the listable rooms of the history — public, not opted
+			// out — and a page is a page of THOSE: the first two are the two public rooms,
+			// not two holes where the hidden ones sat.
+			const sorted = (list: number[]) => [...list].sort((a, b) => a - b)
+			const viewer = await bearer('794')
+			expect(sorted(await ids(viewer))).toEqual([2, 12])
+			expect(sorted(await ids(viewer, '?skip=0&take=2'))).toEqual([2, 12])
+
+			// The player's own history, by id or as `me`, is the whole of it, newest first.
+			const subject = await bearer('790')
+			const own = await ids(subject)
+			expect(own.slice(0, 3)).toEqual([30501, 30502, 30503])
+			expect(sorted(own)).toEqual([2, 12, 30501, 30502, 30503])
+			expect(
+				(
+					(await (
+						await SELF.fetch(`${ORIGIN}/rooms/visitedby/me`, { headers: subject })
+					).json()) as Array<{ RoomId: number }>
+				).map((r) => r.RoomId)
+			).toEqual(own)
+		} finally {
+			await env.DB.prepare('DELETE FROM room WHERE room_id BETWEEN 30501 AND 30503').run()
+			await env.DB.prepare('DELETE FROM interaction WHERE room_id BETWEEN 30501 AND 30503').run()
+		}
 	})
 
 	it('GET /rooms/hot returns a paginated { Results, TotalResults } of public rooms', async () => {
@@ -2041,13 +2075,12 @@ describe('rooms endpoints', () => {
 		expect(await del(staff)).toMatchObject({ Success: true })
 		expect(await roomExists()).toBe(false)
 
-		// The takedown is the one row in the audit log: the owner's own deletion in the test
-		// above wrote none, and the refused attempts wrote none. It names the actor and keeps
-		// enough of the room to say which one it was, now that the room itself is gone.
+		// The takedown wrote one audit row for this room. Other tests may have already
+		// recorded takedowns, so identify it by room id.
 		const { results: audit } = await env.DB.prepare(
-			'SELECT player_id, action, data FROM audit_log WHERE action = ?1'
+			"SELECT player_id, action, data FROM audit_log WHERE action = ?1 AND json_extract(data, '$.roomId') = ?2"
 		)
-			.bind('room_delete')
+			.bind('room_delete', 9501)
 			.all<{ player_id: number; action: string; data: string }>()
 		expect(audit).toHaveLength(1)
 		expect(audit[0].player_id).toBe(999)

@@ -51,6 +51,10 @@ missing/invalid). `~` = optional auth: served to anyone, personalised for a vali
 | GET      | `/api/roomkeys/v1/mine`                              |      | The player's room keys (stub `[]`)      |
 | GET      | `/api/roomkeys/v1/room`                              |      | The keys a room has listed              |
 | POST     | `/api/roomkeys/v1/create`                            | ✓    | List a key for a room (owner/co-owner)  |
+| PUT      | `/api/roomkeys/v1/updateAll`                         | ✓    | Edit one key (owner/co-owner)           |
+| GET      | `/api/storefronts/v1/buyRoomKey`                     | ✓    | Buy a room key; pays the room owner     |
+| POST     | `/api/storefronts/v1/PurchaseRoomKeyWithCurrency`    | ✓    | Buy a room key with its room currency   |
+| POST     | `/api/roomCurrencies/v2/purchase`                    | ✓    | Buy room currency with tokens (offer)   |
 | POST     | `/api/CampusCard/v1/UpdateAndGetSubscription`        | ~    | Gold year for `developer`s, else `{}`   |
 | GET      | `/openapi.json`                                      |      | Generated OpenAPI 3.1 spec (see below)  |
 
@@ -600,6 +604,11 @@ role that role's RecCenterTokens in a gift box, every time it fires. The map is 
   for the box. An offline player finds the box on their next `GET /api/avatar/v2/gifts`.
 - A grant that fails partway is logged with the account, role and amount and is not retried —
   a retry that also failed partway is how a balance gets credited twice.
+- **The first link is paid on demand.** `www`'s benefits claim calls `grantDiscordRoleGift`
+  — one account, the roles Discord just served, the same map and box — the first time an
+  account links its Discord, so a new supporter gets one box now rather than after the next
+  run. `www` decides "first" from the link table; this module keeps no ledger either way, and
+  the cron pays that account again on its next run like everyone else.
 
 One D1 read for the links, then a handful of writes and two hub calls per box, sequentially.
 A cron invocation has a fixed subrequest budget (50 free, 1000 paid); a community whose
