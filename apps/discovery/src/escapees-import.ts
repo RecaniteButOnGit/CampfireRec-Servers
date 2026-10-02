@@ -214,9 +214,9 @@ export async function runEscapeesImport(env: Env, mapId: string, jobId: string):
 		const snapshot = await env.CDN_ASSETS.get(job.snapshot_key)
 		if (!snapshot)
 			throw new ImportFailure('The saved map could not be read. Please try importing again.')
-		let volumes: ReturnType<typeof decodeEscapeesSnapshot>
+		let objects: ReturnType<typeof decodeEscapeesSnapshot>
 		try {
-			volumes = decodeEscapeesSnapshot(new Uint8Array(await snapshot.arrayBuffer()))
+			objects = decodeEscapeesSnapshot(new Uint8Array(await snapshot.arrayBuffer()))
 		} catch (error) {
 			throw new ImportFailure(
 				error instanceof Error && /^(The|This) Escapees map/.test(error.message)
@@ -231,7 +231,7 @@ export async function runEscapeesImport(env: Env, mapId: string, jobId: string):
 		if (!starter.ok) throw new ImportFailure('The room template is unavailable right now.')
 		const roomBytes = await buildEscapeesRoomAsync(
 			new Uint8Array(await starter.arrayBuffer()),
-			volumes,
+			objects,
 			(fraction) => progress(env.DB, job, 20 + Math.round(50 * fraction))
 		)
 		const account = await env.DB.prepare('SELECT account_id FROM account WHERE account_id = ?1')

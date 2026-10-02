@@ -22,6 +22,41 @@ function packedSize(x: number, y: number, z: number) {
 	return Array.from({ length: 5 }, (_, i) => Math.floor(packed / 2 ** (8 * i)) & 255)
 }
 
+function packedLight(x: number, y: number, z: number, preset: number) {
+	const packed =
+		BigInt(x + 4000) |
+		(BigInt(y + 4000) << 13n) |
+		(BigInt(z + 4000) << 26n) |
+		(BigInt(preset) << 39n)
+	return Array.from({ length: 6 }, (_, i) => Number((packed >> BigInt(i * 8)) & 255n))
+}
+
+function spawnableSnapshot(): Uint8Array {
+	return Uint8Array.from([
+		3,
+		0,
+		...i32(4),
+		1,
+		1,
+		...u16(10),
+		...u16(20),
+		...u16(30),
+		1,
+		2,
+		...u16(-10),
+		...u16(0),
+		...u16(5),
+		1,
+		3,
+		...u16(0),
+		...u16(-20),
+		...u16(0),
+		1,
+		4,
+		...packedLight(2, -4, 10, 1),
+	])
+}
+
 function snapshot(): Uint8Array {
 	const payload = Uint8Array.from([
 		...i32(3),
@@ -154,17 +189,19 @@ describe('Escapees CV2 import', () => {
 	})
 
 	it('writes centered Cube and Sphere views with Escapees custom colors and Cardboard', () => {
-		const volumes = decodeEscapeesSnapshot(snapshot())
-		expect(volumes).toEqual([
+		const objects = decodeEscapeesSnapshot(snapshot())
+		expect(objects).toEqual([
 			{ shape: 'box', origin: [0, 0, 0], size: [1, 2, 3], colorIndex: 1, material: 0 },
+			{ kind: 'playerSpawn', origin: [0, 0, 0] },
 			{ shape: 'ball', origin: [2, 0, 0], size: [1, 1, 1], colorIndex: 2, material: 0 },
 		])
-		const room = buildEscapeesRoom(new Uint8Array(), volumes)
+		const room = buildEscapeesRoom(new Uint8Array(), objects)
 		const views = readFields(room)
 			.filter((item) => item.number === 2)
 			.map((item) => item.value as Uint8Array)
-		expect(views).toHaveLength(2)
-		const shapes = views.map((view) => {
+		expect(views).toHaveLength(3)
+		const shapeViews = views.filter((view) => readFields(view).some((item) => item.number === 12))
+		const shapes = shapeViews.map((view) => {
 			const container = field(view, 12)
 			const collection = field(container, 1)
 			return field(collection, 1)
@@ -181,7 +218,7 @@ describe('Escapees CV2 import', () => {
 		expect(
 			shapes.map((shape) => readFields(shape).find((item) => item.number === 15)?.value)
 		).toEqual([50, 50])
-		expect(views.map((view) => vectorValues(field(field(view, 10), 1)))).toEqual([
+		expect(shapeViews.map((view) => vectorValues(field(field(view, 10), 1)))).toEqual([
 			[0.5, 1, 1.5],
 			[2.5, 0.5, 0.5],
 		])
@@ -189,6 +226,64 @@ describe('Escapees CV2 import', () => {
 			[-0.5, -1, -1.5],
 			[-0.5, -0.5, -0.5],
 		])
+	})
+
+	it('imports player, monster, and wander markers as tagged vectors and lights as point lights', () => {
+		const objects = decodeEscapeesSnapshot(spawnableSnapshot())
+		expect(objects).toEqual([
+			{ kind: 'playerSpawn', origin: [1, 2, 3] },
+			{ kind: 'monsterSpawn', origin: [-1, 0, 0.5] },
+			{ kind: 'monsterWander', origin: [0, -2, 0] },
+			{ kind: 'light', origin: [0.2, -0.4, 1], intensityPreset: 1 },
+		])
+		const views = readFields(buildEscapeesRoom(new Uint8Array(), objects))
+			.filter((item) => item.number === 2)
+			.map((item) => item.value as Uint8Array)
+		expect(views).toHaveLength(4)
+		const prefab = (view: Uint8Array) =>
+			Array.from(field(field(view, 11), 1), (byte) => byte.toString(16).padStart(2, '0')).join('')
+		expect(views.map(prefab)).toEqual([
+			'480fedc5d88e75499604ff401678f981',
+			'480fedc5d88e75499604ff401678f981',
+			'480fedc5d88e75499604ff401678f981',
+			'21dc1d87ce1e5b45b15759dbd8453e8a',
+		])
+		const tags = (view: Uint8Array) =>
+			readFields(field(field(view, 15), 1)).map((item) =>
+				new TextDecoder().decode(item.value as Uint8Array)
+			)
+		expect(views.map(tags)).toEqual([
+			['vector', 'PlayerSpawn'],
+			['vector', 'MonsterSpawn'],
+			['vector', 'MonsterWander'],
+			['pointlight'],
+		])
+		const positions = views.map((view) => vectorValues(field(field(view, 10), 1)))
+		expect(positions[0]).toEqual([1, 2, 3])
+		expect(positions[1]).toEqual([-1, 0, 0.5])
+		expect(positions[2]).toEqual([0, -2, 0])
+		expect(positions[3]![0]).toBeCloseTo(0.2)
+		expect(positions[3]![1]).toBeCloseTo(-0.4)
+		expect(positions[3]![2]).toBe(1)
+		const light = readFields(field(views[3]!, 45))
+		expect(light.find((item) => item.number === 3)?.value).toBe(1)
+		expect(light.find((item) => item.number === 4)?.value).toBeCloseTo(
+			((217 * 0.299 + 74 * 0.587 + 79 * 0.114) / 255) * 0.5
+		)
+		expect(light.find((item) => item.number === 5)?.value).toBe(8)
+		expect(readFields(field(views[3]!, 36)).find((item) => item.number === 1)?.value).toBe(
+			0xffffff + 1000
+		)
+	})
+
+	it('uses white intensity for older saves and rejects invalid packed light bits', () => {
+		const old = Uint8Array.from([2, 0, ...i32(1), 1, 4, ...u16(10), ...u16(0), ...u16(0)])
+		expect(decodeEscapeesSnapshot(old)).toEqual([
+			{ kind: 'light', origin: [1, 0, 0], intensityPreset: 30 },
+		])
+		const corrupt = spawnableSnapshot()
+		corrupt[corrupt.length - 1] |= 0xf0
+		expect(() => decodeEscapeesSnapshot(corrupt)).toThrow('invalid light')
 	})
 
 	it('returns a friendly ownership error before queueing work', async () => {

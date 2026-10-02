@@ -1,14 +1,25 @@
-import type { EscapeesVolume } from './escapees-snapshot'
+import type {
+	EscapeesLight,
+	EscapeesObject,
+	EscapeesSpawn,
+	EscapeesVolume,
+} from './escapees-snapshot'
 
 // Fields follow the attached PersistedRoomData, PersistenceViewData, ShapeContainerData,
 // ShapeData, TransformData and Vector3Data protobuf definitions. Native room exports
 // identify shape_type 19 as Cube and 20 as Sphere.
 const SHAPE_CONTAINER_PREFAB = hex('ba11967cdf3947478b14d93cfd65726d')
+// Identified from native room saves: Point Light and the tagged Vector component.
+const POINT_LIGHT_PREFAB = hex('21dc1d87ce1e5b45b15759dbd8453e8a')
+const VECTOR_COMPONENT_PREFAB = hex('480fedc5d88e75499604ff401678f981')
 // Rec Room stores a custom RGB color as its 0xRRGGBB value plus 1000;
 // shape_material 0 is Cardboard, and uv_scale 50 is material size 5000.
 const CUSTOM_COLOR_OFFSET = 1000
 const CARDBOARD_MATERIAL = 0
 const MATERIAL_SIZE_5000 = 50
+// EscapeesBakedLighting.LightRadius and EscapeesLight.IntensityScale.
+const LIGHT_RANGE = 8
+const LIGHT_INTENSITY_SCALE = 0.5
 const PALETTE = [
 	0x7a2428, 0xd94a4f, 0xf29a9d, 0x8a4b1f, 0xe67e2e, 0xf5b778, 0x8a741f, 0xe4c43a, 0xf3e58b,
 	0x356b32, 0x5fae58, 0xa1d79c, 0x2c6664, 0x4fa7a3, 0x9ad4d1, 0x315a8a, 0x4c83c4, 0x9abbe0,
@@ -63,6 +74,65 @@ function guidBytes(): Uint8Array {
 	return hex(crypto.randomUUID().replaceAll('-', ''))
 }
 
+function taggedView(
+	prefab: Uint8Array,
+	position: [number, number, number],
+	tags: readonly string[],
+	extra: readonly Uint8Array[] = []
+): Uint8Array {
+	const tagData = join(tags.map((tag) => bytesField(1, new TextEncoder().encode(tag))))
+	return join([
+		bytesField(1, guidBytes()),
+		bytesField(9, new Uint8Array()),
+		bytesField(10, join([bytesField(1, vector(...position)), floatField(5, 1)])),
+		bytesField(11, bytesField(1, prefab)),
+		bytesField(14, join([numberField(3, 1), bytesField(14, new Uint8Array())])),
+		bytesField(15, bytesField(1, tagData)),
+		bytesField(22, new Uint8Array()),
+		...extra,
+	])
+}
+
+function escapeesSpawnView(spawn: EscapeesSpawn): Uint8Array {
+	const tag =
+		spawn.kind === 'playerSpawn'
+			? 'PlayerSpawn'
+			: spawn.kind === 'monsterSpawn'
+				? 'MonsterSpawn'
+				: 'MonsterWander'
+	return taggedView(VECTOR_COMPONENT_PREFAB, spawn.origin, ['vector', tag])
+}
+
+function escapeesLightView(light: EscapeesLight): Uint8Array {
+	const color = PALETTE[light.intensityPreset]!
+	// Unity Color.grayscale uses these channel weights; EscapeesLight halves it.
+	const intensity =
+		((((color >> 16) & 0xff) * 0.299 + ((color >> 8) & 0xff) * 0.587 + (color & 0xff) * 0.114) /
+			255) *
+		LIGHT_INTENSITY_SCALE
+	return taggedView(
+		POINT_LIGHT_PREFAB,
+		light.origin,
+		['pointlight'],
+		[
+			// Escapees' baked illumination is untinted even for a colored marker.
+			bytesField(36, numberField(1, 0xffffff + CUSTOM_COLOR_OFFSET)),
+			bytesField(
+				45,
+				join([numberField(3, 1), floatField(4, intensity), floatField(5, LIGHT_RANGE)])
+			),
+		]
+	)
+}
+
+function escapeesObjectView(object: EscapeesObject): Uint8Array {
+	return 'shape' in object
+		? escapeesVolumeView(object)
+		: object.kind === 'light'
+			? escapeesLightView(object)
+			: escapeesSpawnView(object)
+}
+
 export function escapeesVolumeView(volume: EscapeesVolume): Uint8Array {
 	const [sx, sy, sz] = volume.size
 	const scale = Math.max(sx, sy, sz)
@@ -101,29 +171,29 @@ export function escapeesVolumeView(volume: EscapeesVolume): Uint8Array {
 /** Build a room-save protobuf from the clean, object-free starter scene. */
 export function buildEscapeesRoom(
 	base: Uint8Array,
-	volumes: EscapeesVolume[],
+	objects: EscapeesObject[],
 	onChunk?: (done: number) => void
 ): Uint8Array {
 	const parts = [base]
-	for (let i = 0; i < volumes.length; i++) {
-		parts.push(bytesField(2, escapeesVolumeView(volumes[i]!)))
+	for (let i = 0; i < objects.length; i++) {
+		parts.push(bytesField(2, escapeesObjectView(objects[i]!)))
 		if ((i + 1) % 256 === 0) onChunk?.(i + 1)
 	}
-	onChunk?.(volumes.length)
+	onChunk?.(objects.length)
 	return join(parts)
 }
 
 /** Yield between batches so a large map does not monopolize Railway's event loop. */
 export async function buildEscapeesRoomAsync(
 	base: Uint8Array,
-	volumes: EscapeesVolume[],
+	objects: EscapeesObject[],
 	onProgress: (fraction: number) => Promise<void>
 ): Promise<Uint8Array> {
 	const parts = [base]
-	for (let i = 0; i < volumes.length; i++) {
-		parts.push(bytesField(2, escapeesVolumeView(volumes[i]!)))
+	for (let i = 0; i < objects.length; i++) {
+		parts.push(bytesField(2, escapeesObjectView(objects[i]!)))
 		if ((i + 1) % 1024 === 0) {
-			await onProgress((i + 1) / volumes.length)
+			await onProgress((i + 1) / objects.length)
 			await new Promise<void>((resolve) => setTimeout(resolve, 0))
 		}
 	}
