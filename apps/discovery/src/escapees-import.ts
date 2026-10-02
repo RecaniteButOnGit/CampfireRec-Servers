@@ -1,4 +1,10 @@
-import { countRoomsByCreator, getAccountByUsername, getRoomByName, importRoom } from '@repo/domain'
+import {
+	countRoomsByCreator,
+	getAccountByUsername,
+	getRoomByName,
+	importRoom,
+	RoomTagType,
+} from '@repo/domain'
 
 import { authorizedToken, parseEnvelope, parseFields } from './ai-request'
 import { buildEscapeesRoomAsync } from './escapees-room'
@@ -254,6 +260,7 @@ export async function runEscapeesImport(env: Env, mapId: string, jobId: string):
 				Name: job.room_name,
 				Description: job.description || `Imported from Escapees map ${mapId}.`,
 				UgcVersion: 1,
+				Tags: [{ Tag: 'limitsv2', Type: RoomTagType.auto }],
 			},
 			'',
 			[

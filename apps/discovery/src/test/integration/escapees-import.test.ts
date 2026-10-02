@@ -71,14 +71,26 @@ function readFields(bytes: Uint8Array) {
 			const length = readVarint()
 			fields.push({ number, value: bytes.subarray(index, index + length) })
 			index += length
-		} else if (wire === 5) index += 4
-		else throw new Error(`Unexpected wire type ${wire}`)
+		} else if (wire === 5) {
+			fields.push({
+				number,
+				value: new DataView(bytes.buffer, bytes.byteOffset + index, 4).getFloat32(0, true),
+			})
+			index += 4
+		} else throw new Error(`Unexpected wire type ${wire}`)
 	}
 	return fields
 }
 
 function field(bytes: Uint8Array, number: number): Uint8Array {
 	return readFields(bytes).find((item) => item.number === number)?.value as Uint8Array
+}
+
+function vectorValues(bytes: Uint8Array): number[] {
+	const fields = readFields(bytes)
+	return [1, 2, 3].map(
+		(number) => (fields.find((item) => item.number === number)?.value as number) ?? 0
+	)
 }
 
 function command(name: string, fields: string): string {
@@ -152,13 +164,22 @@ describe('Escapees CV2 import', () => {
 			.filter((item) => item.number === 2)
 			.map((item) => item.value as Uint8Array)
 		expect(views).toHaveLength(2)
-		const shapeTypes = views.map((view) => {
+		const shapes = views.map((view) => {
 			const container = field(view, 12)
 			const collection = field(container, 1)
-			const shape = field(collection, 1)
-			return readFields(shape).find((item) => item.number === 1)?.value
+			return field(collection, 1)
 		})
-		expect(shapeTypes).toEqual([8, 3])
+		expect(
+			shapes.map((shape) => readFields(shape).find((item) => item.number === 1)?.value)
+		).toEqual([19, 20])
+		expect(views.map((view) => vectorValues(field(field(view, 10), 1)))).toEqual([
+			[0.5, 1, 1.5],
+			[2.5, 0.5, 0.5],
+		])
+		expect(shapes.map((shape) => vectorValues(field(shape, 7)))).toEqual([
+			[-0.5, -1, -1.5],
+			[-0.5, -0.5, -0.5],
+		])
 	})
 
 	it('returns a friendly ownership error before queueing work', async () => {
@@ -274,5 +295,9 @@ describe('Escapees CV2 import', () => {
 			CreatorAccountId: RR_ACCOUNT_ID,
 			Accessibility: 0,
 		})
+		const tags = await env.DB.prepare('SELECT tag, type FROM room_tag WHERE room_id = ?1')
+			.bind(job!.room_id)
+			.all<{ tag: string; type: number }>()
+		expect(tags.results).toContainEqual({ tag: 'limitsv2', type: 1 })
 	})
 })

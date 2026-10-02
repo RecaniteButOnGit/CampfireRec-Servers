@@ -1,8 +1,8 @@
 import type { EscapeesVolume } from './escapees-snapshot'
 
 // Fields follow the attached PersistedRoomData, PersistenceViewData, ShapeContainerData,
-// ShapeData, TransformData and Vector3Data protobuf definitions. Rec Room's simple
-// Sphere and Box shape_type values (3 and 8) were checked against an exported scene GLB.
+// ShapeData, TransformData and Vector3Data protobuf definitions. Native room exports
+// identify shape_type 19 as Cube and 20 as Sphere.
 const SHAPE_CONTAINER_PREFAB = hex('ba11967cdf3947478b14d93cfd65726d')
 const PALETTE = [
 	0x7a2428, 0xd94a4f, 0xf29a9d, 0x8a4b1f, 0xe67e2e, 0xf5b778, 0x8a741f, 0xe4c43a, 0xf3e58b,
@@ -62,10 +62,13 @@ export function escapeesVolumeView(volume: EscapeesVolume): Uint8Array {
 	const [sx, sy, sz] = volume.size
 	const scale = Math.max(sx, sy, sz)
 	const [x, y, z] = volume.origin
+	const center = vector(x + sx / 2, y + sy / 2, z + sz / 2)
 	const shape = join([
-		numberField(1, volume.shape === 'box' ? 8 : 3),
+		numberField(1, volume.shape === 'box' ? 19 : 20),
 		numberField(2, PALETTE[volume.colorIndex]!),
-		bytesField(7, vector(x + sx / 2, y + sy / 2, z + sz / 2)),
+		// Shape meshes occupy [0, 1] on each axis in native exports. Their local
+		// corner starts half a size below the centered container transform.
+		bytesField(7, vector(-sx / 2, -sy / 2, -sz / 2)),
 		bytesField(8, new Uint8Array()),
 		floatField(11, 10),
 		bytesField(12, guidBytes()),
@@ -76,7 +79,7 @@ export function escapeesVolumeView(volume: EscapeesVolume): Uint8Array {
 	])
 	const collection = bytesField(1, shape)
 	const container = join([bytesField(1, collection), numberField(4, 1)])
-	const transform = join([bytesField(1, vector(0, 0, 0)), floatField(5, 1)])
+	const transform = join([bytesField(1, center), floatField(5, 1)])
 	return join([
 		bytesField(1, guidBytes()),
 		bytesField(9, new Uint8Array()),

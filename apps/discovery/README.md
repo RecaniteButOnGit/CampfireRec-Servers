@@ -61,8 +61,10 @@ private rooms, or `Error:<message>` if the import fails. Progress is keyed by ma
 so one import of a given map can run at a time. A later import of that map replaces its
 completed progress record and creates another room.
 
-The importer converts Escapees boxes and balls to simple Rec Room boxes and spheres,
-including positions, sizes and palette colors. Other Escapees object types are skipped.
+The importer converts Escapees boxes and balls to Rec Room Cube and Sphere shapes,
+including positions, sizes and palette colors. Escapees volume origins are minimum
+corners; imported shape containers are centered on each volume. Imported rooms receive
+the `limitsv2` system tag. Other Escapees object types are skipped.
 `RRTOKEN`, the shared room DB and `CDN_ASSETS` bucket must be configured. The discovery
 worker needs its D1 migration applied, R2 bucket binding and scheduled trigger; Railway
 runs the same migration and recovery job. `ESCAPEES_API_URL` can override the game API
