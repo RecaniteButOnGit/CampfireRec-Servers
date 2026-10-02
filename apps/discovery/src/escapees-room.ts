@@ -4,6 +4,11 @@ import type { EscapeesVolume } from './escapees-snapshot'
 // ShapeData, TransformData and Vector3Data protobuf definitions. Native room exports
 // identify shape_type 19 as Cube and 20 as Sphere.
 const SHAPE_CONTAINER_PREFAB = hex('ba11967cdf3947478b14d93cfd65726d')
+// Rec Room stores a custom RGB color as its 0xRRGGBB value plus 1000;
+// shape_material 0 is Cardboard, and uv_scale 50 is material size 5000.
+const CUSTOM_COLOR_OFFSET = 1000
+const CARDBOARD_MATERIAL = 0
+const MATERIAL_SIZE_5000 = 50
 const PALETTE = [
 	0x7a2428, 0xd94a4f, 0xf29a9d, 0x8a4b1f, 0xe67e2e, 0xf5b778, 0x8a741f, 0xe4c43a, 0xf3e58b,
 	0x356b32, 0x5fae58, 0xa1d79c, 0x2c6664, 0x4fa7a3, 0x9ad4d1, 0x315a8a, 0x4c83c4, 0x9abbe0,
@@ -65,7 +70,7 @@ export function escapeesVolumeView(volume: EscapeesVolume): Uint8Array {
 	const center = vector(x + sx / 2, y + sy / 2, z + sz / 2)
 	const shape = join([
 		numberField(1, volume.shape === 'box' ? 19 : 20),
-		numberField(2, PALETTE[volume.colorIndex]!),
+		numberField(2, PALETTE[volume.colorIndex]! + CUSTOM_COLOR_OFFSET),
 		// Shape meshes occupy [0, 1] on each axis in native exports. Their local
 		// corner starts half a size below the centered container transform.
 		bytesField(7, vector(-sx / 2, -sy / 2, -sz / 2)),
@@ -73,8 +78,9 @@ export function escapeesVolumeView(volume: EscapeesVolume): Uint8Array {
 		floatField(11, 10),
 		bytesField(12, guidBytes()),
 		floatField(13, scale),
-		floatField(15, 1),
+		floatField(15, MATERIAL_SIZE_5000),
 		bytesField(16, bytesField(2, vector(sx / scale, sy / scale, sz / scale))),
+		numberField(18, CARDBOARD_MATERIAL),
 		numberField(19, 1),
 	])
 	const collection = bytesField(1, shape)

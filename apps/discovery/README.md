@@ -62,9 +62,10 @@ so one import of a given map can run at a time. A later import of that map repla
 completed progress record and creates another room.
 
 The importer converts Escapees boxes and balls to Rec Room Cube and Sphere shapes,
-including positions, sizes and palette colors. Escapees volume origins are minimum
-corners; imported shape containers are centered on each volume. Imported rooms receive
-the `limitsv2` system tag. Other Escapees object types are skipped.
+including positions, sizes and exact custom colors from the Escapees Unity palette.
+Escapees volume origins are minimum corners; imported shape containers are centered on
+each volume. Shapes use Cardboard with material size 5000. Imported rooms receive the
+`limitsv2` system tag. Other Escapees object types are skipped.
 `RRTOKEN`, the shared room DB and `CDN_ASSETS` bucket must be configured. The discovery
 worker needs its D1 migration applied, R2 bucket binding and scheduled trigger; Railway
 runs the same migration and recovery job. `ESCAPEES_API_URL` can override the game API

@@ -153,7 +153,7 @@ describe('Escapees CV2 import', () => {
 		expect(fullRequest.body[0]?.id).toBe('Error:That Campfire Rec user was not found.')
 	})
 
-	it('decodes a compressed Escapees v3 snapshot and writes simple RR box and sphere views', () => {
+	it('writes centered Cube and Sphere views with Escapees custom colors and Cardboard', () => {
 		const volumes = decodeEscapeesSnapshot(snapshot())
 		expect(volumes).toEqual([
 			{ shape: 'box', origin: [0, 0, 0], size: [1, 2, 3], colorIndex: 1, material: 0 },
@@ -172,6 +172,15 @@ describe('Escapees CV2 import', () => {
 		expect(
 			shapes.map((shape) => readFields(shape).find((item) => item.number === 1)?.value)
 		).toEqual([19, 20])
+		expect(
+			shapes.map((shape) => readFields(shape).find((item) => item.number === 2)?.value)
+		).toEqual([0xd94a4f + 1000, 0xf29a9d + 1000])
+		expect(
+			shapes.map((shape) => readFields(shape).find((item) => item.number === 18)?.value)
+		).toEqual([0, 0])
+		expect(
+			shapes.map((shape) => readFields(shape).find((item) => item.number === 15)?.value)
+		).toEqual([50, 50])
 		expect(views.map((view) => vectorValues(field(field(view, 10), 1)))).toEqual([
 			[0.5, 1, 1.5],
 			[2.5, 0.5, 0.5],
