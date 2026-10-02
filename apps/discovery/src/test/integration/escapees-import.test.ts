@@ -116,6 +116,31 @@ beforeAll(async () => {
 afterEach(() => vi.restoreAllMocks())
 
 describe('Escapees CV2 import', () => {
+	it('accepts lobby as a map ID and identifies missing import fields', async () => {
+		const progress = await call(command('EscapeesImportProgress', 'Map:"lobby"'))
+		expect(progress.body[0]?.id).toBe('Error:No import was found for that map.')
+		const malformedProgress = await call(command('EscapeesImportProgress', '"lobby"'))
+		expect(malformedProgress.body[0]?.id).toBe('Error:Check the progress format: Map:"lobby".')
+
+		const missingUser = await call(
+			command('EscapeesImport', 'Map:"lobby",Password:"secret123",RRUser:"ImportTester"')
+		)
+		expect(missingUser.body[0]?.id).toBe('Error:Enter your Escapees username.')
+
+		const missingRRUser = await call(
+			command('EscapeesImport', 'Map:"lobby",User:"escapees",Password:"secret123"')
+		)
+		expect(missingRRUser.body[0]?.id).toBe('Error:Enter your Campfire Rec username.')
+
+		const fullRequest = await call(
+			command(
+				'EscapeesImport',
+				'Map:"lobby",User:"escapees",Password:"secret123",RRUser:"UnknownCampfireUser"'
+			)
+		)
+		expect(fullRequest.body[0]?.id).toBe('Error:That Campfire Rec user was not found.')
+	})
+
 	it('decodes a compressed Escapees v3 snapshot and writes simple RR box and sphere views', () => {
 		const volumes = decodeEscapeesSnapshot(snapshot())
 		expect(volumes).toEqual([

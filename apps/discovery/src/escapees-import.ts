@@ -293,23 +293,17 @@ export async function startEscapeesImport(
 	if (!envelope || !(await authorizedToken(envelope.token, env)))
 		return 'Error:The import key is missing or incorrect.'
 	const fields = parseFields(envelope.body, IMPORT_FIELDS)
+	if (!fields)
+		return 'Error:Check the import format: Map:"...",User:"...",Password:"...",RRUser:"...".'
 	const mapId = fields?.Map?.trim().toLowerCase()
 	const user = fields?.User?.trim()
 	const password = fields?.Password
 	const rrUser = fields?.RRUser?.trim()
-	if (
-		!mapId ||
-		!MAP_ID.test(mapId) ||
-		!user ||
-		!password ||
-		!rrUser ||
-		mapId.length > 80 ||
-		user.length > 80 ||
-		password.length > 128 ||
-		rrUser.length > 80
-	) {
-		return 'Error:Enter a valid map ID, Escapees username and password, and Campfire Rec username.'
-	}
+	if (!mapId || !MAP_ID.test(mapId) || mapId.length > 80)
+		return 'Error:Enter a valid Escapees map ID, such as "lobby".'
+	if (!user || user.length > 80) return 'Error:Enter your Escapees username.'
+	if (!password || password.length > 128) return 'Error:Enter your Escapees password.'
+	if (!rrUser || rrUser.length > 80) return 'Error:Enter your Campfire Rec username.'
 	try {
 		if (!env.DB || !env.CDN_ASSETS)
 			throw new ImportFailure('Map imports are unavailable right now.')
@@ -378,6 +372,7 @@ export async function escapeesImportProgress(value: string, env: Env): Promise<s
 	if (!envelope || !(await authorizedToken(envelope.token, env)))
 		return 'Error:The import key is missing or incorrect.'
 	const fields = parseFields(envelope.body, PROGRESS_FIELDS)
+	if (!fields) return 'Error:Check the progress format: Map:"lobby".'
 	const mapId = fields?.Map?.trim().toLowerCase()
 	if (!mapId || !MAP_ID.test(mapId) || mapId.length > 80)
 		return 'Error:Enter a valid Escapees map ID.'
