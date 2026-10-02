@@ -2430,7 +2430,17 @@ async function attachSubRooms(db: D1Database, rooms: Room[]): Promise<void> {
 		list.push(subs[i]!)
 		byRoom.set(r.room_id, list)
 	})
-	for (const room of rooms) room.SubRooms = byRoom.get(Number(room.RoomId)) ?? []
+	for (const room of rooms) {
+		const subRooms = byRoom.get(Number(room.RoomId)) ?? []
+		room.SubRooms = subRooms
+		// SuperRoomData is a room-wide blob. Older saves recorded its upload key only
+		// on the subroom, leaving the room loader with no metadata filename. Project
+		// the newest available key onto the room response so existing rooms can load it.
+		const latest = subRooms
+			.filter((sub) => typeof sub.RoomDataBlob === 'string' && sub.RoomDataBlob !== '')
+			.sort((a, b) => String(b.DataSavedAt ?? '').localeCompare(String(a.DataSavedAt ?? '')))[0]
+		if (latest) room.RoomDataBlob = latest.RoomDataBlob
+	}
 }
 
 // ---- Room stats -----------------------------------------------------------

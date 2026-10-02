@@ -371,6 +371,10 @@ export const RoomDto = z.object({
 		.string()
 		.optional()
 		.describe('Legacy: room saves used to write this here; it now lives on the SUBROOM'),
+	RoomDataBlob: z
+		.string()
+		.optional()
+		.describe('Room-wide SuperRoomData key projected from the latest subroom save'),
 })
 
 /** A paged room list (`PagedResultsDTO<RoomDTO>`) — search, hot, similar. */
