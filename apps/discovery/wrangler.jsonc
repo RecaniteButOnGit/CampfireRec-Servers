@@ -19,6 +19,19 @@
 	"cache": {
 		"enabled": true
 	},
+	"d1_databases": [
+		{
+			"binding": "DB",
+			"database_name": "recflare",
+			"database_id": "local",
+			"migrations_dir": "migrations",
+			"migrations_table": "discovery_migrations"
+		}
+	],
+	"r2_buckets": [
+		{ "binding": "CDN_ASSETS", "bucket_name": "recflare-cdn" }
+	],
+	"triggers": { "crons": ["* * * * *"] },
 	"assets": {
 		"binding": "ASSETS",
 		"directory": "./static",

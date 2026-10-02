@@ -1,7 +1,7 @@
 import { env, SELF } from 'cloudflare:test'
 import { describe, expect, it } from 'vitest'
 
-import app from '../../discovery.app'
+import { app } from '../../discovery.app'
 
 /** Every layout published in `static/` today. Each is served under its own filename. */
 const PAGE_SOURCES = [

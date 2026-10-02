@@ -26,7 +26,7 @@ function sectionList(text: string) {
 	}]
 }
 
-function parseFields(body: string): Record<string, string> | null {
+export function parseFields(body: string, allowedFields: ReadonlySet<string> = FIELDS): Record<string, string> | null {
 	const fields: Record<string, string> = {}
 	let index = 0
 	while (index < body.length) {
@@ -34,7 +34,7 @@ function parseFields(body: string): Record<string, string> | null {
 		const start = index
 		while (/[A-Za-z]/.test(body[index] ?? '')) index++
 		const name = body.slice(start, index)
-		if (!FIELDS.has(name) || Object.hasOwn(fields, name)) return null
+		if (!allowedFields.has(name) || Object.hasOwn(fields, name)) return null
 		while (/\s/.test(body[index] ?? '')) index++
 		if (body[index++] !== ':') return null
 		while (/\s/.test(body[index] ?? '')) index++
@@ -94,15 +94,15 @@ export function parseTokenSuffix(suffix: string): string | null {
 	return typeof token === 'string' && token ? token : null
 }
 
-function parseEnvelope(value: string): { body: string; token: string } | null {
-	if (!value.startsWith(PREFIX)) return null
+export function parseEnvelope(value: string, prefix = PREFIX): { body: string; token: string } | null {
+	if (!value.startsWith(prefix)) return null
 	// The token marker identifies the end of the request even when a raw quote or
 	// bracket in the prompt would confuse a quote-tracking scan.
 	const marker = `]${TOKEN_MARKER}`
-	for (let closingBracket = value.indexOf(marker, PREFIX.length); closingBracket !== -1;
+	for (let closingBracket = value.indexOf(marker, prefix.length); closingBracket !== -1;
 		closingBracket = value.indexOf(marker, closingBracket + 1)) {
 		const token = parseTokenSuffix(value.slice(closingBracket + 1))
-		if (token) return { body: value.slice(PREFIX.length, closingBracket), token }
+		if (token) return { body: value.slice(prefix.length, closingBracket), token }
 	}
 	return null
 }
@@ -135,7 +135,7 @@ async function tokenMatches(provided: string, configured: string): Promise<boole
 
 export async function authorizedToken(provided: string | null, env: App['Bindings']): Promise<boolean> {
 	if (!provided) return false
-	const configured = await env.RRTOKEN?.get()
+	const configured = typeof env.RRTOKEN === 'string' ? env.RRTOKEN : await env.RRTOKEN?.get()
 	return Boolean(configured && await tokenMatches(provided, configured))
 }
 

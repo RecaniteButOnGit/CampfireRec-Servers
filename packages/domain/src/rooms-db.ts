@@ -826,9 +826,9 @@ export async function importRoom(
 	db: D1Database,
 	details: Room,
 	imageName: string,
-	subRooms: ImportedSubRoom[]
+	subRooms: ImportedSubRoom[],
+	ownerId = 2
 ): Promise<Room> {
-	const ownerId = 2
 	const now = new Date().toISOString()
 	const number = (value: unknown, fallback: number) =>
 		typeof value === 'number' && Number.isFinite(value) ? value : fallback

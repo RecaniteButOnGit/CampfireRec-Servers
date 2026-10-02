@@ -43,6 +43,32 @@ the reliable format. JSON-escaped field values are preferred; the handler also a
 backslashes, brackets, and newlines when the field boundaries remain clear. Keep the
 token JSON-quoted.
 
+## CV2 Escapees map imports
+
+Use these page source names, URL-encoding the entire name after `/sections/pagesource/`:
+
+```text
+EscapeesImport[Map:"map_id",User:"escapees_user",Password:"escapees_password",RRUser:"campfire_user"]8254TOKEN"shared_token"
+EscapeesImportProgress[Map:"map_id"]8254TOKEN"shared_token"
+```
+
+Read the response section's `id` or `sourceMetadata`. The first call checks the token,
+Campfire Rec user and room limit, Escapees login and map ownership, then saves the map
+snapshot and returns `received`. It returns `Error:<message>` for a check that fails.
+The import continues on the Campfire Rec server. Poll progress about once a second;
+it returns a number from `0` to `100`, then `done` after the room is in the user's
+private rooms, or `Error:<message>` if the import fails. Progress is keyed by map ID,
+so one import of a given map can run at a time. A later import of that map replaces its
+completed progress record and creates another room.
+
+The importer converts Escapees boxes and balls to simple Rec Room boxes and spheres,
+including positions, sizes and palette colors. Other Escapees object types are skipped.
+`RRTOKEN`, the shared room DB and `CDN_ASSETS` bucket must be configured. The discovery
+worker needs its D1 migration applied, R2 bucket binding and scheduled trigger; Railway
+runs the same migration and recovery job. `ESCAPEES_API_URL` can override the game API
+URL for development. The provided DB read API key is not used by this runtime feature.
+For a standalone Cloudflare discovery Worker, set `RRTOKEN` as a Worker secret.
+
 ## API documentation
 
 `GET /openapi.json` serves a spec generated from `describeRoute` blocks that sit alongside

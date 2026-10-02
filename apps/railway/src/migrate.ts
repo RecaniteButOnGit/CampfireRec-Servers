@@ -3,7 +3,7 @@ import { resolve } from 'node:path'
 
 import { SQLiteD1 } from './d1-adapter'
 
-const MIGRATION_SERVICES = ['auth', 'api', 'rooms', 'match', 'clubs', 'chat', 'econ', 'img', 'lists', 'leaderboard', 'roomcomments'] as const
+const MIGRATION_SERVICES = ['auth', 'api', 'rooms', 'match', 'clubs', 'chat', 'econ', 'img', 'lists', 'leaderboard', 'roomcomments', 'discovery'] as const
 const repo = resolve(import.meta.dirname, '../../..')
 
 export function migrate(db: SQLiteD1): number {

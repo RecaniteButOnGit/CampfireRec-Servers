@@ -5,6 +5,7 @@ import { useWorkersLogger } from 'workers-tagged-logger'
 import { withCleanSpec, withNotFound, withOnError } from '@repo/hono-helpers'
 
 import { authorizedToken, handleAIRequest, parseTokenSuffix } from './ai-request'
+import { escapeesImportProgress, importResponse, resumeEscapeesImports, startEscapeesImport } from './escapees-import'
 import {
 	DiscoverySections,
 	json,
@@ -23,7 +24,7 @@ import type { App } from './context'
  * bulk lookup filters. It does not serve the carousels' CONTENTS: each section names a
  * client-side feed the client resolves against the `rooms`/`api` workers itself.
  *
- * Published layouts are unauthenticated. The CV2 Ping and AIRequest probes require RRTOKEN.
+ * Published layouts are unauthenticated. CV2 commands require RRTOKEN.
  */
 const app = new Hono<App>()
 	.use(
@@ -103,7 +104,7 @@ const app = new Hono<App>()
 	)
 
 	// One discovery page's section layout, served verbatim from `static/<type>.json`.
-	// `Ping` and `AIRequest[...]` use the same section-list response shape for CV2.
+	// CV2 commands use the same section-list response shape as page layouts.
 	.get(
 		'/sections/pagesource/:type',
 		describeRoute({
@@ -130,10 +131,14 @@ const app = new Hono<App>()
 				'`AIRequest[Prompt:"...",Model:"gpt-6-luna",SystemPrompt:"...",Reasoning:"none"]8254TOKEN"..."`',
 				'returns the model text in those same two fields when `OPENAIKEY` is configured and',
 				'the trailing token matches `RRTOKEN`.',
+				'`EscapeesImport[Map:"...",User:"...",Password:"...",RRUser:"..."]8254TOKEN"..."`',
+				'returns `received` after validation or a user-friendly `Error:<message>`. Import runs in',
+				'the background. `EscapeesImportProgress[Map:"..."]8254TOKEN"..."` returns 0–100,',
+				'then `done` or `Error:<message>`. URL-encode the complete command.',
 				'',
 				'Published layout sections only NAME feeds (`source`/`sourceMetadata`); their rooms,',
 				'items and accounts are fetched separately by the client. Those layouts are public;',
-				'the two CV2 probes require the shared token.',
+				'CV2 commands require the shared token.',
 			].join('\n'),
 			parameters: [PAGE_SOURCE_PARAM],
 			responses: {
@@ -169,6 +174,20 @@ const app = new Hono<App>()
 					: null
 				const sections = await handleAIRequest(queryText === null ? type : `${type}?${queryText}`, c.env)
 				return sections ? c.json(sections) : c.body(null, 401)
+			}
+			if (type.startsWith('EscapeesImportProgress') || type.startsWith('EscapeesImport')) {
+				c.header('Cache-Control', 'no-store')
+				// CV2 should URL-encode the whole command. Recover a bare '?' in a field
+				// the same way AIRequest does when an older circuit sends it unencoded.
+				const query = new URL(c.req.url).search
+				const queryText = query && !type.includes(']8254TOKEN')
+					? new URLSearchParams(`value=${query.slice(1).replaceAll('&', '%26').replaceAll('+', '%2B')}`).get('value')
+					: null
+				const command = queryText === null ? type : `${type}?${queryText}`
+				const result = type.startsWith('EscapeesImportProgress')
+					? await escapeesImportProgress(command, c.env)
+					: await startEscapeesImport(command, c.env, task => c.executionCtx.waitUntil(task))
+				return c.json(importResponse(result))
 			}
 			const res = await fetchPageSource(c, type)
 			return res ?? c.notFound()
@@ -211,4 +230,10 @@ app.get(
 	)
 )
 
-export default app
+export { app }
+
+export const scheduled: ExportedHandlerScheduledHandler<App['Bindings']> = (_controller, env, ctx) => {
+	ctx.waitUntil(resumeEscapeesImports(env))
+}
+
+export default { fetch: app.fetch, scheduled } satisfies ExportedHandler<App['Bindings']>

@@ -8,7 +8,7 @@ import chat from '../../chat/src/chat.app'
 import clubs from '../../clubs/src/clubs.app'
 import commerce from '../../commerce/src/commerce.app'
 import datacollection from '../../datacollection/src/datacollection.app'
-import discovery from '../../discovery/src/discovery.app'
+import { app as discovery } from '../../discovery/src/discovery.app'
 import { app as econ } from '../../econ/src/econ.app'
 import img from '../../img/src/img.app'
 import leaderboard from '../../leaderboard/src/leaderboard.app'
@@ -78,7 +78,10 @@ export function createRouter(runtime: RailwayEnvironment, databasePing: () => bo
         let decodedSource = source
         try { decodedSource = decodeURIComponent(source) } catch { /* Keep the raw path. */ }
         const tokenIndex = decodedSource.indexOf('8254TOKEN')
-        const label = decodedSource.startsWith('AIRequest') ? 'AIRequest' : tokenIndex === -1 ? source : decodedSource.slice(0, tokenIndex)
+        const label = decodedSource.startsWith('AIRequest') ? 'AIRequest'
+			: decodedSource.startsWith('EscapeesImportProgress') ? 'EscapeesImportProgress'
+			: decodedSource.startsWith('EscapeesImport') ? 'EscapeesImport'
+			: tokenIndex === -1 ? source : decodedSource.slice(0, tokenIndex)
         console.info(`[discovery/pagesource] ${label}`)
       }
     }

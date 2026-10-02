@@ -30,6 +30,7 @@ export function buildEnvironment(db: SQLiteD1) {
     OPENAIKEY: process.env.OPENAIKEY ? secret(process.env.OPENAIKEY) : undefined,
     RRTOKEN: process.env.RRTOKEN ? secret(process.env.RRTOKEN) : undefined,
     OPENAI_REALTIME_MODEL: process.env.OPENAI_REALTIME_MODEL,
+		ESCAPEES_API_URL: process.env.ESCAPEES_API_URL,
     TURNSTILE_SITE_KEY: secret(process.env.TURNSTILE_SITE_KEY), TURNSTILE_SECRET_KEY: secret(process.env.TURNSTILE_SECRET_KEY),
     DISCORD_CLIENT_ID: secret(process.env.DISCORD_CLIENT_ID), DISCORD_CLIENT_SECRET: secret(process.env.DISCORD_CLIENT_SECRET),
     REDIS_URL: process.env.REDIS_URL,

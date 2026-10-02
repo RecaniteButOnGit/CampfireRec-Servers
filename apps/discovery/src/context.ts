@@ -11,7 +11,13 @@ export type Env = SharedHonoEnv & {
 	/** Optional server-side key for CV2 AIRequest calls. */
 	OPENAIKEY?: SecretsStoreSecret
 	/** Shared token required on CV2 AIRequest calls. */
-	RRTOKEN?: SecretsStoreSecret
+	RRTOKEN?: SecretsStoreSecret | string
+	/** Shared room database and scene bucket used by CV2 Escapees imports. */
+	DB: D1Database
+	CDN_ASSETS: R2Bucket
+	/** Optional override; the Escapees game currently uses https://api.escapees.net. */
+	ESCAPEES_API_URL?: string
+	MAX_ROOMS_PER_ACCOUNT?: string | number
 }
 
 /** Variables can be extended */

@@ -2,7 +2,7 @@ import { env } from 'cloudflare:test'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 
 import { parseAIRequest } from '../../ai-request'
-import app from '../../discovery.app'
+import { app } from '../../discovery.app'
 
 const TOKEN = 'rr-test-token'
 const KEY = 'sk-test-openai'
