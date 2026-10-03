@@ -49,7 +49,9 @@ describe('SQLite D1 adapter and migrations', () => {
   it('applies source migrations once and persists across reopen', async () => {
     const path = join(temp(), 'recflare.sqlite')
     const first = new SQLiteD1(path)
-    expect(migrate(first)).toBe(113)
+    expect(migrate(first)).toBe(115)
+    expect(await first.prepare('SELECT value FROM cv2_counter WHERE id = 1').first('value')).toBe(0)
+    expect(await first.prepare('UPDATE cv2_counter SET value = value + 1 WHERE id = 1 RETURNING value').first('value')).toBe(1)
     const rro = await first.prepare(
       `SELECT json_extract(data, '$.IsDeveloperOwned') AS developer_owned,
               json_extract(data, '$.RestrictedCircuitsAllowListNames') AS allowed_circuits
@@ -81,7 +83,11 @@ describe('SQLite D1 adapter and migrations', () => {
     })
     first.close()
     const second = new SQLiteD1(path)
-    try { expect(migrate(second)).toBe(0); expect(second.ping()).toBe(true) } finally { second.close() }
+    try {
+      expect(migrate(second)).toBe(0)
+      expect(second.ping()).toBe(true)
+      expect(await second.prepare('SELECT value FROM cv2_counter WHERE id = 1').first('value')).toBe(1)
+    } finally { second.close() }
   })
 })
 

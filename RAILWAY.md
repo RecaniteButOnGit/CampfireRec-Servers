@@ -61,12 +61,15 @@ Optional integration and policy variables (exact names accepted by the runtime):
 | Discord OAuth, benefits and scheduled gifts | `DISCORD_CLIENT_ID`, `DISCORD_CLIENT_SECRET`, `DISCORD_BOT_TOKEN`, `DISCORD_GUILD_ID`, `DISCORD_BENEFITS_ROLE_IDS`, `DISCORD_ROLE_TOKENS` |
 | Image signing | `IMG_SIGNING_KEY`, `IMG_SIGNING_ENABLED` |
 | CV2 AI requests | `OPENAIKEY`, `RRTOKEN` |
+| CV2 counter | `RRTOKEN` |
 | CV2 Escapees imports | `RRTOKEN`, `CDN_*` bucket credentials; optional `ESCAPEES_API_URL` |
 | Deployment metadata | `SENTRY_RELEASE` |
 
 The CV2 discovery chip can request `/sections/pagesource/AIRequest[Prompt:"Hello",Model:"gpt-6-luna",SystemPrompt:"You are an AI created for Rec Room",Reasoning:"none"]8254TOKEN"<RRTOKEN value>"` (URL-encode the path segment). The response is a one-item discovery section list with the model's text in `id` and `sourceMetadata`. The trailing token must match `RRTOKEN`; the server uses `OPENAIKEY` only after that check. The supported fields are `Prompt`, `Model`, `SystemPrompt`, and `Reasoning`; `Temp` is no longer accepted or sent to OpenAI. Errors appear as `AIError:...` in the same section fields. The `Ping` probe also requires a token: `Ping8254TOKEN"<RRTOKEN value>"`. The Railway request logger records custom request names without their arguments or token.
 
 The discovery service also accepts `EscapeesImport[...]` and `EscapeesImportProgress[...]` page sources. It stages a map in the CDN bucket, converts its volumes in a background task and records the new private room for `RRUser`. The scheduler resumes interrupted imports each minute. Apply the discovery migration when updating the server; command and response details are in [the discovery README](apps/discovery/README.md).
+
+The discovery service also accepts `CounterAdd8254TOKEN"<RRTOKEN value>"` and `CounterGet8254TOKEN"<RRTOKEN value>"`. They share one persistent SQLite counter and return its updated or current value in the section's `id` and `sourceMetadata`. The counter starts at 0; the discovery migration creates it.
 
 The related feature follows the upstream behavior when an optional integration is absent. In particular, web signup requires Turnstile when enabled, Meta nonce login needs the Meta secret, Discord benefits need their credentials, and image signing uses the existing optional configuration.
 Web password signup is disabled by default in Recflare's current auth and website code. Set `PASSWORD_SIGNUP=on` alongside the Turnstile keys to offer it on Railway. Platform signup in the game remains available.

@@ -5,6 +5,7 @@ import { useWorkersLogger } from 'workers-tagged-logger'
 import { withCleanSpec, withNotFound, withOnError } from '@repo/hono-helpers'
 
 import { authorizedToken, handleAIRequest, parseTokenSuffix } from './ai-request'
+import { counterAdd, counterGet, counterResponse } from './counter'
 import { escapeesImportProgress, importResponse, resumeEscapeesImports, startEscapeesImport } from './escapees-import'
 import {
 	DiscoverySections,
@@ -112,7 +113,7 @@ const app = new Hono<App>()
 			summary: 'Section layout for a page source',
 			description: [
 				'The sections of one discovery page, in the order the client draws them. Except for',
-				'`Ping` and `AIRequest[...]`, `{type}` is the filename — the body is',
+				'CV2 commands, `{type}` is the filename — the body is',
 				'`static/<type>.json` served verbatim —',
 				'so the page sources',
 				'that exist are whichever files are published (`WatchHome`, `PlayHighlight`,',
@@ -128,6 +129,9 @@ const app = new Hono<App>()
 				'',
 				'`Ping8254TOKEN"..."` returns one section with `id` and `sourceMetadata` set to',
 				'`Pong` when the trailing token matches `RRTOKEN`.',
+				'`CounterAdd8254TOKEN"..."` atomically adds one to a persistent shared counter;',
+				'`CounterGet8254TOKEN"..."` reads it. Both return the number as text in `id`',
+				'and `sourceMetadata`. The counter starts at 0.',
 				'`AIRequest[Prompt:"...",Model:"gpt-6-luna",SystemPrompt:"...",Reasoning:"none"]8254TOKEN"..."`',
 				'returns the model text in those same two fields when `OPENAIKEY` is configured and',
 				'the trailing token matches `RRTOKEN`.',
@@ -144,7 +148,7 @@ const app = new Hono<App>()
 			responses: {
 				200: json(DiscoverySections, 'The page’s sections'),
 				304: { description: '`If-None-Match` matched the file’s etag (no body)' },
-				401: { description: '`Ping` or `AIRequest` token missing or incorrect' },
+				401: { description: 'CV2 command token missing or incorrect' },
 				404: { description: 'No file is published under that name' },
 			},
 		}),
@@ -163,6 +167,15 @@ const app = new Hono<App>()
 					sourceMetadata: 'Pong',
 					displayMetadata: JSON.stringify({ DisplayTitle: 'Pong' }),
 				}])
+			}
+			if (type.startsWith('CounterAdd') || type.startsWith('CounterGet')) {
+				c.header('Cache-Control', 'no-store')
+				const name = type.startsWith('CounterAdd') ? 'CounterAdd' : 'CounterGet'
+				if (!(await authorizedToken(parseTokenSuffix(type.slice(name.length)), c.env))) {
+					return c.body(null, 401)
+				}
+				const value = name === 'CounterAdd' ? await counterAdd(c.env) : await counterGet(c.env)
+				return c.json(counterResponse(value))
 			}
 			if (type.startsWith('AIRequest')) {
 				c.header('Cache-Control', 'no-store')

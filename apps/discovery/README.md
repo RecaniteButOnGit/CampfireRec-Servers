@@ -43,6 +43,21 @@ the reliable format. JSON-escaped field values are preferred; the handler also a
 backslashes, brackets, and newlines when the field boundaries remain clear. Keep the
 token JSON-quoted.
 
+## CV2 counter
+
+One counter is shared by all callers and stored in the discovery database. It starts at
+`0` and survives server restarts and deployments. URL-encode the complete page source name:
+
+```text
+CounterAdd8254TOKEN"shared_token"
+CounterGet8254TOKEN"shared_token"
+```
+
+`CounterAdd` increases the value by exactly one and returns the new value. `CounterGet`
+returns the current value without changing it. Read the number from the response section's
+`id` or `sourceMetadata`. Both commands require `RRTOKEN`; an absent or incorrect token
+returns HTTP 401. Apply the discovery database migrations before serving requests.
+
 ## CV2 Escapees map imports
 
 Use these page source names, URL-encoding the entire name after `/sections/pagesource/`:

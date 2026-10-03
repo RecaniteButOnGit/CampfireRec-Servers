@@ -10,7 +10,7 @@ export type Env = SharedHonoEnv & {
 	ASSETS: Fetcher
 	/** Optional server-side key for CV2 AIRequest calls. */
 	OPENAIKEY?: SecretsStoreSecret
-	/** Shared token required on CV2 AIRequest calls. */
+	/** Shared token required on CV2 commands. */
 	RRTOKEN?: SecretsStoreSecret | string
 	/** Shared room database and scene bucket used by CV2 Escapees imports. */
 	DB: D1Database
