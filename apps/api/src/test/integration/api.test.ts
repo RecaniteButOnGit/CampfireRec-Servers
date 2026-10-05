@@ -2166,6 +2166,35 @@ describe('public endpoints', () => {
 		expect(await res.json()).toEqual([])
 	})
 
+	test('GET /api/inventions/v2/mine serves a v3-published invention as public', async () => {
+		const save = await exports.default.fetch(`${ORIGIN}/api/inventions/v6/save`, {
+			method: 'POST',
+			headers: { ...(await bearer('5149')), 'Content-Type': 'application/json' },
+			body: JSON.stringify({ name: 'Published the old way', inventionDataFilename: 'a.inv' }),
+		})
+		const { Invention } = (await save.json()) as InventionSaveResult
+		await exports.default.fetch(
+			`${ORIGIN}/api/inventions/v3/publish?inventionId=${Invention.InventionId}`,
+			{ headers: await bearer('5149') }
+		)
+
+		// `v3/publish` names no accessibility, so the record keeps the 0 a save mints. The
+		// 2025 client has no `IsPublished` to read, only `Accessibility` — 0 is Private.
+		const mine = await exports.default.fetch(`${ORIGIN}/api/inventions/v2/mine`, {
+			headers: await bearer('5149'),
+		})
+		expect((await mine.json()) as SavedInvention[]).toMatchObject([
+			{ InventionId: Invention.InventionId, IsPublished: true, Accessibility: 1 },
+		])
+
+		// Published, so it would otherwise turn up in the feeds the later tests count.
+		await exports.default.fetch(`${ORIGIN}/api/inventions/v2/delete`, {
+			method: 'POST',
+			headers: { ...(await bearer('5149')), 'Content-Type': 'application/json' },
+			body: JSON.stringify({ InventionId: Invention.InventionId }),
+		})
+	})
+
 	test('POST /api/inventions/v6/save persists the invention and lists it in mine', async () => {
 		const body = {
 			name: '071126 13:10:50',
@@ -2235,6 +2264,19 @@ describe('public endpoints', () => {
 		expect(mine.status).toBe(200)
 		const list = (await mine.json()) as SavedInvention[]
 		expect(list.map((i) => i.InventionId)).toContain(saved.InventionId)
+		// The 2025 client decodes this list into its flat `RRInvention`, so every key of
+		// that DTO is present even on a v6 record that stores none of them — and the keys
+		// the older client reads are still there beside them.
+		expect(list.find((i) => i.InventionId === saved.InventionId)).toMatchObject({
+			UgcVersion: 1,
+			LatestVersionNumber: 1,
+			ForceCannotPublish: false,
+			IsRecRoomApproved: false,
+			DisplayMetadataJson: null,
+			Accessibility: 0,
+			IsPublished: false,
+			CurrentVersion: { VersionNumber: 1 },
+		})
 
 		// The saved invention is fetchable by id via the v1 lookup.
 		const one = await exports.default.fetch(
@@ -2354,7 +2396,7 @@ describe('public endpoints', () => {
 		expect(res.status).toBe(200)
 		const value = ((await res.json()) as InventionSaveV9Result).Value
 		if (value === null) throw new Error('Value must not be null on a successful save')
-		expect(value.Invention.UgcVersion).toBe(0)
+		expect(value.Invention.UgcVersion).toBe(1)
 		expect(value.Invention.DisplayMetadataJson).toBeNull()
 		// A save always mints a version; the key is nullable only because econ's
 		// `v3/buyInvention` answers in this same envelope and a buy mints none.
@@ -2838,7 +2880,7 @@ describe('public endpoints', () => {
 			.run()
 	})
 
-	test('POST /api/inventions/v4/publish keeps an unlisted invention out of the feeds', async () => {
+	test('POST /api/inventions/v4/publish keeps an unlisted invention out of the store, and v2/unpublish undoes it', async () => {
 		const save = await exports.default.fetch(`${ORIGIN}/api/inventions/v9/save`, {
 			method: 'POST',
 			headers: { ...(await bearer('5171')), 'Content-Type': 'application/json' },
@@ -2858,8 +2900,8 @@ describe('public endpoints', () => {
 		const value = ((await res.json()) as InventionSaveV9Result).Value
 		expect(value?.Invention.Accessibility).toBe(2)
 
-		// Unlisted is published — it is reachable by id, which is the whole point of it —
-		// but it is not something anyone comes across.
+		// Unlisted is published — on the creator's portfolio and reachable by id — but it is
+		// not in the store: search and the feeds leave it out.
 		const one = await exports.default.fetch(
 			`${ORIGIN}/api/inventions/v1?inventionId=${inventionId}`
 		)
@@ -2873,6 +2915,39 @@ describe('public endpoints', () => {
 		expect(await found.json()).toEqual([])
 		const room = await exports.default.fetch(`${ORIGIN}/api/inventions/v1/room?id=4171`)
 		expect(await room.json()).toEqual([])
+		const portfolio = async (): Promise<number[]> =>
+			(
+				(await (
+					await exports.default.fetch(`${ORIGIN}/api/inventions/v1/fromcreators?id=5171`)
+				).json()) as SavedInvention[]
+			).map((i) => i.InventionId)
+		expect(await portfolio()).toEqual([inventionId])
+
+		// Unpublishing is creator only, and puts back what a save mints: not published,
+		// Accessibility 0 — off the portfolio, still on the creator's own shelf.
+		const unpublish = async (who: string): Promise<InventionSaveV9Result> =>
+			(await (
+				await exports.default.fetch(`${ORIGIN}/api/inventions/v2/unpublish`, {
+					method: 'POST',
+					headers: { ...(await bearer(who)), 'Content-Type': 'application/json' },
+					body: JSON.stringify({ InventionId: inventionId }),
+				})
+			).json()) as InventionSaveV9Result
+		expect((await unpublish('5199')).Success).toBe(false)
+		expect(await portfolio()).toEqual([inventionId])
+
+		const undone = await unpublish('5171')
+		expect(undone.Success).toBe(true)
+		expect(undone.Value?.Invention.Accessibility).toBe(0)
+		expect(await portfolio()).toEqual([])
+		const stored = (await (
+			await exports.default.fetch(`${ORIGIN}/api/inventions/v2/mine`, {
+				headers: await bearer('5171'),
+			})
+		).json()) as SavedInvention[]
+		const shelved = stored.find((i) => i.InventionId === inventionId)
+		expect(shelved).toMatchObject({ IsPublished: false, Accessibility: 0 })
+		expect(shelved?.FirstPublishedAt).not.toBeNull()
 	})
 
 	test('POST /api/inventions/v4/publish leaves a price and a first-publish date alone', async () => {
@@ -3882,6 +3957,50 @@ describe('public endpoints', () => {
 		expect(noId.status).toBe(400)
 	})
 
+	test('POST /api/inventions/v2/cheer is v1/cheer in the newer client’s envelope', async () => {
+		const saved = await exports.default.fetch(`${ORIGIN}/api/inventions/v6/save`, {
+			method: 'POST',
+			headers: { ...(await bearer('8210')), 'Content-Type': 'application/json' },
+			body: JSON.stringify({ name: 'Cheerable Sofa', inventionDataFilename: 'cheerable2.inv' }),
+		})
+		const { InventionId } = ((await saved.json()) as InventionSaveResult).Invention
+		const cheer = async (body: unknown, sub?: string) =>
+			exports.default.fetch(`${ORIGIN}/api/inventions/v2/cheer`, {
+				method: 'POST',
+				headers: { ...(sub ? await bearer(sub) : {}), 'Content-Type': 'application/json' },
+				body: JSON.stringify(body),
+			})
+		const stored = async (): Promise<number> =>
+			(
+				(await (
+					await exports.default.fetch(`${ORIGIN}/api/inventions/v1?inventionId=${InventionId}`)
+				).json()) as SavedInvention
+			).CheerCount
+		const ok = { Value: null, Success: true, Error: null, error_id: null }
+
+		const anonymous = await cheer({ InventionId, Cheer: true })
+		expect(anonymous.status).toBe(401)
+		expect(await anonymous.json()).toMatchObject({ Value: null, Success: false })
+
+		expect(await (await cheer({ InventionId, Cheer: true }, '44')).json()).toEqual(ok)
+		expect(await (await cheer({ InventionId, Cheer: true }, '44')).json()).toEqual(ok)
+		expect(await stored()).toBe(1)
+		const personal = await exports.default.fetch(
+			`${ORIGIN}/api/inventions/v1/personaldetails/${InventionId}`,
+			{ headers: await bearer('44') }
+		)
+		expect(await personal.json()).toEqual({ IsCheering: true })
+
+		expect(await (await cheer({ InventionId, Cheer: false }, '44')).json()).toEqual(ok)
+		expect(await stored()).toBe(0)
+
+		// Refusals stay in the envelope, at 200.
+		const unknown = await cheer({ InventionId: 999999, Cheer: true }, '44')
+		expect(unknown.status).toBe(200)
+		expect(await unknown.json()).toMatchObject({ Success: false, Error: 'No such invention' })
+		expect(await (await cheer({ InventionId }, '44')).json()).toMatchObject({ Success: false })
+	})
+
 	test('POST /api/inventions/v1/cheer persists and personaldetails reflects it', async () => {
 		const saved = await exports.default.fetch(`${ORIGIN}/api/inventions/v6/save`, {
 			method: 'POST',
@@ -4320,24 +4439,87 @@ describe('public endpoints', () => {
 		expect(await price(cheap)).toBe(50)
 	})
 
-	test('GET /api/inventions/v1/fromcreators is an empty feed for now', async () => {
-		// A stub: the client renders an empty array as "this creator has published nothing",
-		// where a 404 would read as a row that failed to load.
-		const res = await exports.default.fetch(
-			`${ORIGIN}/api/inventions/v1/fromcreators?id=207&skip=0&take=100`
-		)
-		expect(res.status).toBe(200)
-		expect(await res.json()).toEqual([])
+	test('GET /api/inventions/v1/fromcreators lists a creator’s public inventions', async () => {
+		const json = async (creator: string, path: string, body: unknown): Promise<Response> =>
+			exports.default.fetch(`${ORIGIN}${path}`, {
+				method: 'POST',
+				headers: { ...(await bearer(creator)), 'Content-Type': 'application/json' },
+				body: JSON.stringify(body),
+			})
+		const save = async (creator: string, name: string): Promise<number> => {
+			const res = await json(creator, '/api/inventions/v9/save', {
+				name,
+				inventionDataFilename: 'portfolio.inv',
+				ugcVersion: 1,
+			})
+			const id = ((await res.json()) as InventionSaveV9Result).Value?.Invention.InventionId
+			if (id === undefined) throw new Error('save failed')
+			return id
+		}
+		const publish = (creator: string, id: number, accessibility: number): Promise<Response> =>
+			json(creator, '/api/inventions/v4/publish', {
+				InventionId: id,
+				Permission: 20,
+				Accessibility: accessibility,
+			})
 
-		// The params are accepted and ignored, including a repeated `id` and none at all.
-		expect(
-			await (
-				await exports.default.fetch(`${ORIGIN}/api/inventions/v1/fromcreators?id=1&id=2`)
-			).json()
-		).toEqual([])
-		expect(
-			await (await exports.default.fetch(`${ORIGIN}/api/inventions/v1/fromcreators`)).json()
-		).toEqual([])
+		const draft = await save('5301', 'Portfolio Draft')
+		const listed = await save('5301', 'Portfolio Public')
+		const unlisted = await save('5301', 'Portfolio Unlisted')
+		const legacy = await save('5301', 'Portfolio Legacy')
+		const other = await save('5302', 'Other Creator')
+		await publish('5301', listed, 1)
+		await publish('5301', unlisted, 2)
+		await publish('5302', other, 1)
+		// `v3/publish` names no accessibility, so the record keeps the 0 a save mints.
+		await exports.default.fetch(`${ORIGIN}/api/inventions/v3/publish?inventionId=${legacy}`, {
+			headers: await bearer('5301'),
+		})
+
+		const shelf = async (query: string): Promise<SavedInvention[]> =>
+			(await (
+				await exports.default.fetch(`${ORIGIN}/api/inventions/v1/fromcreators?${query}`)
+			).json()) as SavedInvention[]
+
+		// Published is what lists an invention here, whatever its accessibility: the draft
+		// is not on the shelf, the Unlisted one is — and the `v3/publish` one, which stores
+		// the 0 a save mints, is served as Public.
+		const mine = await shelf('id=5301&skip=0&take=100')
+		expect(mine.map((i) => i.InventionId)).toEqual([legacy, unlisted, listed])
+		expect(mine.map((i) => i.Accessibility)).toEqual([1, 2, 1])
+
+		// The creator gets the same shelf as anyone: their drafts are `v2/mine`'s alone.
+		const own = (await (
+			await exports.default.fetch(`${ORIGIN}/api/inventions/v1/fromcreators?id=5301`, {
+				headers: await bearer('5301'),
+			})
+		).json()) as SavedInvention[]
+		expect(own.map((i) => i.InventionId)).not.toContain(draft)
+
+		// `id` repeats, newest first across creators, and skip/take page it.
+		expect((await shelf('id=5301&id=5302')).map((i) => i.InventionId)).toEqual([
+			other,
+			legacy,
+			unlisted,
+			listed,
+		])
+		expect((await shelf('id=5301&id=5302&skip=1&take=1')).map((i) => i.InventionId)).toEqual([
+			legacy,
+		])
+
+		// No creator, or one with nothing public, is an empty shelf rather than a 404.
+		expect(await shelf('')).toEqual([])
+		expect(await shelf('id=999999')).toEqual([])
+
+		// Published, so they would otherwise turn up in the feeds the later tests count.
+		for (const [creator, id] of [
+			['5301', listed],
+			['5301', unlisted],
+			['5301', legacy],
+			['5302', other],
+		] as const) {
+			await json(creator, '/api/inventions/v2/delete', { InventionId: id })
+		}
 	})
 
 	test('GET /api/inventions/v1/toptoday + v1/featured serve the invention feeds', async () => {
@@ -6542,11 +6724,11 @@ describe('images', () => {
 		// A metadata row was created, and it's readable by name via /api/images/v6.
 		const meta = (await (
 			await exports.default.fetch(`${ORIGIN}/api/images/v6?name=${ImageName}`)
-		).json()) as { ImageName: string; PlayerId: number; SavedImageId: number; CheerCount: number }
+		).json()) as { ImageName: string; PlayerId: number; Id: number; CheerCount: number }
 		expect(meta.ImageName).toBe(ImageName)
 		expect(meta.PlayerId).toBe(42)
-		// `SavedImageId`, not `Id` — v6 renames like the player lists do.
-		expect(typeof meta.SavedImageId).toBe('number')
+		// `Id`, not `SavedImageId` — v6 serves the raw record, unlike the player lists.
+		expect(typeof meta.Id).toBe('number')
 		expect(meta.CheerCount).toBe(0)
 	})
 
@@ -6891,7 +7073,7 @@ describe('images', () => {
 		expect(entries.filter((e) => e.IsCheered)).toHaveLength(1)
 	})
 
-	test('GET /api/images/v6 serves the metadata projection, nothing nullable', async () => {
+	test('GET /api/images/v6 serves the raw SavedImage by name', async () => {
 		const img = await createImage(env.DB, {
 			imageName: 'v6shape.jpg',
 			playerId: 7301,
@@ -6899,22 +7081,96 @@ describe('images', () => {
 		})
 		const res = await exports.default.fetch(`${ORIGIN}/api/images/v6?name=v6shape.jpg`)
 		expect(res.status).toBe(200)
+		// The client's 13-key DTO: `Id` and `Type`, `TaggedPlayerIds`, nulls left null — the
+		// same record `v6/:id` serves.
 		expect(await res.json()).toEqual({
-			SavedImageId: img.Id,
+			Id: img.Id,
 			ImageName: 'v6shape.jpg',
+			Description: null,
 			PlayerId: 7301,
-			// Nulls on the row come out as 0 / "" — the client's DTO has no null to put there.
-			RoomId: 0,
-			PlayerEventId: 0,
-			ClubId: 0,
-			Description: '',
+			RoomId: null,
+			PlayerEventId: null,
 			Accessibility: 1,
 			AccessibilityLocked: false,
-			SavedImageType: 1,
+			Type: 1,
 			CreatedAt: img.CreatedAt,
+			TaggedPlayerIds: [],
 			CheerCount: 0,
 			CommentCount: 0,
 		})
+	})
+
+	test('POST /api/images/v1/:id/report files a bodiless report against the photo’s author', async () => {
+		const img = await createImage(env.DB, { imageName: 'reported.jpg', playerId: 7310 })
+		const report = async (id: number, sub?: string) =>
+			exports.default.fetch(`${ORIGIN}/api/images/v1/${id}/report`, {
+				method: 'POST',
+				headers: sub ? await bearer(sub) : undefined,
+			})
+
+		expect((await report(img.Id)).status).toBe(401)
+		const unknown = await report(99999999, '7311')
+		expect(unknown.status).toBe(404)
+		expect(await unknown.json()).toEqual({ success: false, error: 'No such image' })
+
+		const res = await report(img.Id, '7311')
+		expect(res.status).toBe(200)
+		expect(await res.json()).toEqual({ success: true, error: '' })
+
+		const { results } = await env.DB.prepare('SELECT * FROM report WHERE image_id = ?1')
+			.bind(img.Id)
+			.all()
+		expect(results).toHaveLength(1)
+		expect(results[0]).toMatchObject({
+			reporter_player_id: 7311,
+			reported_player_id: 7310,
+			image_id: img.Id,
+			report_category: 0,
+			details: null,
+			event_id: null,
+			invention_id: null,
+			custom_avatar_item_id: null,
+			chat_message_id: null,
+		})
+	})
+
+	test('GET /api/images/v6/:id serves the raw SavedImage, private ones to their owner only', async () => {
+		const img = await createImage(env.DB, { imageName: 'v6byid.jpg', playerId: 7302 })
+		const get = async (id: number, sub?: string) =>
+			exports.default.fetch(
+				`${ORIGIN}/api/images/v6/${id}`,
+				sub ? { headers: await bearer(sub) } : undefined
+			)
+
+		// The 13-key record, nulls left null.
+		const res = await get(img.Id)
+		expect(res.status).toBe(200)
+		expect(await res.json()).toEqual({
+			Id: img.Id,
+			ImageName: 'v6byid.jpg',
+			Description: null,
+			PlayerId: 7302,
+			RoomId: null,
+			PlayerEventId: null,
+			Accessibility: 1,
+			AccessibilityLocked: false,
+			Type: 1,
+			CreatedAt: img.CreatedAt,
+			TaggedPlayerIds: [],
+			CheerCount: 0,
+			CommentCount: 0,
+		})
+		expect((await get(99999999)).status).toBe(404)
+
+		// Made private, it is its owner's alone — ids are sequential.
+		await env.DB.prepare(
+			"UPDATE image SET data = json_set(data, '$.Accessibility', 0) WHERE id = ?1"
+		)
+			.bind(img.Id)
+			.run()
+		expect((await get(img.Id)).status).toBe(404)
+		expect((await get(img.Id, '7303')).status).toBe(404)
+		expect((await get(img.Id, '7302')).status).toBe(200)
 	})
 
 	test('GET /api/images/v6 400s without a name and 404s for an unknown one', async () => {
@@ -6948,23 +7204,20 @@ describe('images', () => {
 		const meta = (await (
 			await exports.default.fetch(`${ORIGIN}/api/images/v6?name=${ImageName}`)
 		).json()) as {
-			SavedImageType: number
+			Type: number
 			RoomId: number
 			Accessibility: number
-			PlayerEventId: number
-			ClubId: number
-			Description: string
+			PlayerEventId: number | null
+			TaggedPlayerIds: number[]
 		}
-		expect(meta.SavedImageType).toBe(1)
+		expect(meta.Type).toBe(1)
 		expect(meta.RoomId).toBe(777)
 		expect(meta.Accessibility).toBe(2)
-		// v6 carries no TaggedPlayerIds — the upload still records them, which the stored row
-		// below proves. Nothing on this projection is nullable: a "none" event reads 0, not
-		// null, and the club (which nothing here sets) reads 0 too.
-		expect(meta).not.toHaveProperty('TaggedPlayerIds')
-		expect(meta.PlayerEventId).toBe(0)
-		expect(meta.ClubId).toBe(0)
-		expect(meta.Description).toBe('')
+		// v6 serves the stored record as it is: the tagged players ride along, a "none"
+		// event is null rather than 0, and there is no `ClubId`.
+		expect(meta.TaggedPlayerIds).toEqual([5, 6])
+		expect(meta.PlayerEventId).toBeNull()
+		expect(meta).not.toHaveProperty('ClubId')
 
 		// The tagged players and the null event id, as actually stored.
 		const row = await env.DB.prepare('SELECT data FROM image WHERE image_name = ?1')
@@ -6975,7 +7228,7 @@ describe('images', () => {
 			PlayerEventId: number | null
 		}
 		expect(stored.TaggedPlayerIds).toEqual([5, 6])
-		// playerEventId 0 means "none" → stored as null, and serialized back out as 0.
+		// playerEventId 0 means "none" → stored as null.
 		expect(stored.PlayerEventId).toBeNull()
 	})
 
@@ -8781,9 +9034,7 @@ describe('player events', () => {
 		])
 
 		// Paging walks the sorted order, and an unknown sort is the default, not a 400.
-		expect(await search('?query=sortable&sort=Attendance&skip=1&take=1')).toEqual([
-			byAttendance[1],
-		])
+		expect(await search('?query=sortable&sort=Attendance&skip=1&take=1')).toEqual([byAttendance[1]])
 		const unknown = await get('/api/playerevents/v1/search?query=sortable&sort=Popularity')
 		expect(unknown.status).toBe(200)
 		expect(((await unknown.json()) as PlayerEvent[]).map((e) => e.PlayerEventId)).toEqual([
@@ -9874,6 +10125,7 @@ describe('openapi', () => {
 			'GET /api/images/v5/cheered/bulk',
 			'GET /api/images/v5/player/{playerId}',
 			'GET /api/images/v6',
+			'GET /api/images/v6/{id}',
 			'GET /api/inventions/v1',
 			'GET /api/inventions/v1/details',
 			'GET /api/inventions/v1/featured',
@@ -9958,6 +10210,7 @@ describe('openapi', () => {
 			'POST /api/images/v1/cheer',
 			'POST /api/images/v1/deletesaved',
 			'POST /api/images/v1/modifydescription',
+			'POST /api/images/v1/{id}/report',
 			'POST /api/images/v2/modifyaccessibility',
 			'POST /api/images/v4/uploadsaved',
 			'POST /api/images/v5/cheered/bulk',
@@ -9966,7 +10219,9 @@ describe('openapi', () => {
 			'POST /api/inventions/v1/settags',
 			'POST /api/inventions/v1/update',
 			'POST /api/inventions/v1/updateprice',
+			'POST /api/inventions/v2/cheer',
 			'POST /api/inventions/v2/delete',
+			'POST /api/inventions/v2/unpublish',
 			'POST /api/inventions/v2/update',
 			'POST /api/inventions/v4/publish',
 			'POST /api/inventions/v6/save',

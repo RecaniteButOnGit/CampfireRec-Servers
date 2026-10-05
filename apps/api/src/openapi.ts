@@ -567,7 +567,7 @@ export const InventionV9Dto = z.object({
 	Name: z.string(),
 	Description: z.string(),
 	ImageName: z.string(),
-	UgcVersion: z.int().describe('The UGC format the blob was written in; 0 when unsent'),
+	UgcVersion: z.int().describe('The UGC format the blob was written in; 1 when the save named none'),
 	CurrentVersionNumber: z.int(),
 	LatestVersionNumber: z.int().describe('The same as CurrentVersionNumber on a fresh save'),
 	Accessibility: z.int(),
@@ -760,7 +760,7 @@ export const PublishInventionRequest = z.object({
 		.int()
 		.nullable()
 		.optional()
-		.describe('Private 0, Public 1, Unlisted 2. Unlisted stays out of browse and search'),
+		.describe('Public 1 publishes it into the store; Unlisted 2 publishes it but keeps it out of search and the feeds'),
 	Price: z
 		.int()
 		.nullable()
@@ -769,6 +769,11 @@ export const PublishInventionRequest = z.object({
 			'Price in tokens, at most 1000 (MAX_INVENTION_PRICE); null leaves it as it is, a ' +
 				'negative one is ignored, and one over the cap refuses the publish'
 		),
+})
+
+/** `POST /api/inventions/v2/unpublish` JSON body — the id and nothing else. */
+export const UnpublishInventionRequest = z.object({
+	InventionId: z.int().describe('The invention to unpublish; the caller must have created it'),
 })
 
 /** `POST /api/inventions/v2/delete` JSON body — the id and nothing else. */
@@ -1586,29 +1591,6 @@ export const SavedImageDto = z.object({
 	TaggedPlayerIds: z.array(z.int()),
 	RoomId: z.int().nullable(),
 	PlayerEventId: z.int().nullable(),
-	CreatedAt: z.string(),
-	CheerCount: z.int(),
-	CommentCount: z.int(),
-})
-
-/**
- * `GET /api/images/v6` — an image's metadata by bucket key. A third projection of the same
- * row: renamed like `ImagesPlayer` (`SavedImageId`/`SavedImageType`, no `TaggedPlayerIds`)
- * but carrying `ClubId`, and with no nullable fields — `RoomId`, `PlayerEventId` and
- * `ClubId` are 0 where the row holds null, `Description` is `""`. Don't unify it with the
- * other two.
- */
-export const ImageMetadataDto = z.object({
-	SavedImageId: z.int(),
-	ImageName: z.string().describe('The bucket key the img worker serves it back by'),
-	PlayerId: z.int(),
-	RoomId: z.int().describe('0 when the photo was not taken in a room'),
-	PlayerEventId: z.int().describe('0 when it belongs to no event'),
-	ClubId: z.int().describe('Always 0 — nothing here associates an image with a club'),
-	Description: z.string().describe('Empty string, never null'),
-	Accessibility: z.int(),
-	AccessibilityLocked: z.boolean(),
-	SavedImageType: z.int().describe('1 = share camera, 3 = room, 4 = profile, …'),
 	CreatedAt: z.string(),
 	CheerCount: z.int(),
 	CommentCount: z.int(),

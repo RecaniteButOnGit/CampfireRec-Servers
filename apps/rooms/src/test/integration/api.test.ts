@@ -10,7 +10,9 @@ import { beforeAll, describe, expect, it } from 'vitest'
 
 import {
 	AUDIT_LOG_SCHEMA_DDL,
+	countRoomsUsingInvention,
 	createRoomInstance,
+	decodeInventionUsage,
 	getRoomInstance,
 	MessageType,
 	NOTIFICATION_SCHEMA_DDL,
@@ -22,6 +24,7 @@ import {
 	SUBROOM_SCHEMA_DDL,
 } from '@repo/domain'
 
+import { SCHEMA_DDL as INVENTION_SCHEMA_DDL } from '../../../../api/src/inventions-db'
 import { SCHEMA_DDL as ROOM_VOTE_SCHEMA_DDL } from '../../../../api/src/votes-db'
 import { NotificationType } from '../../../../notify/src/notification-types'
 import importRooms from '../../../static/ImportRooms.json'
@@ -280,6 +283,8 @@ beforeAll(async () => {
 	// Vote-to-kick ballots (owned by `api`) and game invites (owned by `match`) — the cron
 	// here sweeps the stale ones.
 	for (const stmt of ROOM_VOTE_SCHEMA_DDL) await env.DB.prepare(stmt).run()
+	// Inventions (owned by the api worker) — a room save writes each one's room count.
+	for (const stmt of INVENTION_SCHEMA_DDL) await env.DB.prepare(stmt).run()
 	for (const stmt of ROOM_INVITE_SCHEMA_DDL) await env.DB.prepare(stmt).run()
 	// Seed each room and split its subrooms into the subroom table (mirrors 0007's backfill).
 	for (const r of importRooms) await seedRoomWithSubRooms(env.DB, r as Record<string, unknown>)
@@ -3858,9 +3863,19 @@ describe('rooms endpoints', () => {
 			(s) => s.SubRoomId === 2
 		)!
 		expect(savedSub).toMatchObject({
-			RoomDataBlob: '5c618c920f6247efb8327e327d0b4417',
 			CreatorAccountId: 1,
 			PersistenceVersion: 41,
+		})
+		// `RoomData` is the ROOM-level metadata blob: it lands on the room as `DataBlob`, which
+		// is where the client reads it — not on the subroom, which has no field for it.
+		expect(savedSub).not.toHaveProperty('RoomDataBlob')
+		expect(saved.value.room).toMatchObject({
+			DataBlob: '5c618c920f6247efb8327e327d0b4417',
+			DataBlobHash: null,
+		})
+		expect(await (await SELF.fetch(`${ORIGIN}/rooms/2`)).json()).toMatchObject({
+			DataBlob: '5c618c920f6247efb8327e327d0b4417',
+			DataBlobHash: null,
 		})
 		expect(savedSub.CurrentSave).toMatchObject({
 			DataBlob: 'a84167b16796452ab70ee8a6a5b1dc5f',
@@ -3935,6 +3950,61 @@ describe('rooms endpoints', () => {
 			expect('CurrentSave' in sub).toBe(true)
 			expect(sub.CurrentSave).toBeNull()
 		}
+	})
+
+	it('a room save records which inventions the room uses in room_invention', async () => {
+		const save = async (inventionUsage: string) => {
+			const res = await SELF.fetch(`${ORIGIN}/rooms/2/subrooms/2/data`, {
+				method: 'POST',
+				headers: { 'Content-Type': 'application/json', ...(await bearer('1')) },
+				body: JSON.stringify({ InventionUsage: inventionUsage, AutoPublish: true }),
+			})
+			expect(((await res.json()) as { success: boolean }).success).toBe(true)
+		}
+		const rows = async (): Promise<number[]> =>
+			(
+				await env.DB.prepare(
+					'SELECT invention_id FROM room_invention WHERE room_id = 2 ORDER BY invention_id'
+				).all<{ invention_id: number }>()
+			).results.map((r) => r.invention_id)
+
+		// The invention records the counts are written onto (the `api` worker's table).
+		for (const id of [257, 27941]) {
+			await env.DB.prepare('INSERT INTO invention (data) VALUES (?1)')
+				.bind(JSON.stringify({ InventionId: id, NumPlayersHaveUsedInRoom: 0 }))
+				.run()
+		}
+		const usedIn = async (id: number): Promise<number> =>
+			(
+				await env.DB.prepare(
+					"SELECT json_extract(data, '$.NumPlayersHaveUsedInRoom') AS n FROM invention WHERE id = ?1"
+				)
+					.bind(id)
+					.first<{ n: number }>()
+			)?.n ?? -1
+
+		// A real client value: `{ 1: 1, 2: [{ 1: 27941, 2: 1 }, { 1: 257, 2: 1 }] }`.
+		expect(decodeInventionUsage('CAESBgil2gEQARIFCIECEAE=')).toEqual([27941, 257])
+		await save('CAESBgil2gEQARIFCIECEAE=')
+		expect(await rows()).toEqual([257, 27941])
+		expect(await countRoomsUsingInvention(env.DB, 27941)).toBe(1)
+		// The invention's own counter is the number of rooms it is in.
+		expect([await usedIn(257), await usedIn(27941)]).toEqual([1, 1])
+
+		// Saving the same inventions again is not a second use.
+		await save('CAESBgil2gEQARIFCIECEAE=')
+		expect([await usedIn(257), await usedIn(27941)]).toEqual([1, 1])
+
+		// An invention taken out of the room drops out, and its counter comes back down.
+		await save('CAESBQiBAhAB')
+		expect(await rows()).toEqual([257])
+		expect(await countRoomsUsingInvention(env.DB, 27941)).toBe(0)
+		expect([await usedIn(257), await usedIn(27941)]).toEqual([1, 0])
+
+		// A value that doesn't decode records nothing and does not fail the save.
+		await save('not base64 !!')
+		expect(await rows()).toEqual([])
+		expect(await usedIn(257)).toBe(0)
 	})
 
 	it('a real client room-save body stages, and publish_save makes it live', async () => {

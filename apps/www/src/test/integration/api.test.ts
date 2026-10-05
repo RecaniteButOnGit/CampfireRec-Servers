@@ -930,11 +930,13 @@ it('refuses every staff endpoint without a token, and without a staff role', asy
 		'/api/staff/players/1/gift-xp',
 		'/api/staff/players/1/username-changes',
 		'/api/staff/players/1/clear-password',
+		'/api/staff/players/1/grant-plus',
 	]
 	writes.push(
 		'/api/staff/rooms/1/gift-tokens',
 		'/api/staff/rooms/1/rro-tag',
-		'/api/staff/online/gift-tokens'
+		'/api/staff/online/gift-tokens',
+		'/api/staff/discord-roles/1/gift-tokens'
 	)
 	for (const path of writes) {
 		expect((await SELF.fetch(`https://example.com${path}`, { method: 'POST' })).status).toBe(401)
@@ -946,7 +948,7 @@ it('refuses every staff endpoint without a token, and without a staff role', asy
 	}
 
 	// Developer actions are narrower: a moderator is staff, but not a developer.
-	for (const path of writes.filter((p) => p.includes('/gift-') || p.endsWith('/rro-tag'))) {
+	for (const path of writes.filter((p) => p.includes('/gift-') || p.endsWith('/rro-tag') || p.includes('/grant-plus'))) {
 		expect((await staffPost(path, 8101, { amount: 1 })).status).toBe(403)
 	}
 
@@ -1938,6 +1940,101 @@ it('refuses a token drop over the cap, without a message, or with nobody online'
 	expect((await drop({ amount: 1_000, message: 'hi' })).status).toBe(404)
 })
 
+// The role drop's audience is the Discord links that record the role — offline included,
+// since that is the point — and nobody else: a link holding other roles, a link holding none,
+// a player with no link at all. The same Discord identity on two accounts pays both.
+it('drops tokens on every account whose Discord link holds the role, online or not', async () => {
+	const ROLE = '1077000000000000777'
+	const OTHER = '1077000000000000778'
+	await linkPlatformIdentity(env.DB, 8390, PlatformType.Discord, '900000000000008390', [ROLE])
+	await linkPlatformIdentity(env.DB, 8391, PlatformType.Discord, '900000000000008391', [
+		OTHER,
+		ROLE,
+	])
+	await linkPlatformIdentity(env.DB, 8392, PlatformType.Discord, '900000000000008392', [OTHER])
+	await linkPlatformIdentity(env.DB, 8393, PlatformType.Discord, '900000000000008393', [])
+	// One Discord user, two accounts: both links hold the role.
+	await linkPlatformIdentity(env.DB, 8394, PlatformType.Discord, '900000000000008394', [ROLE])
+	await linkPlatformIdentity(env.DB, 8395, PlatformType.Discord, '900000000000008394', [ROLE])
+	// Only one of them is online; the rest are paid anyway.
+	await env.DB.prepare('DELETE FROM presence').run()
+	await setPresence(env.DB, {
+		accountId: 8390,
+		roomInstance: null,
+		statusVisibility: 0,
+		deviceClass: 0,
+		vrMovementMode: 0,
+		platform: 4,
+		appVersion: 'test',
+	})
+
+	const res = await devPost(`/api/staff/discord-roles/${ROLE}/gift-tokens`, 8110, {
+		amount: 250,
+		message: 'Thanks for supporting the server!',
+	})
+	expect(res.status).toBe(200)
+	const body = (await res.json()) as {
+		roleId: string
+		amount: number
+		message: string
+		paid: number[]
+	}
+	expect(body.roleId).toBe(ROLE)
+	expect(body.amount).toBe(250)
+	expect(body.message).toBe('Thanks for supporting the server!')
+	expect([...body.paid].sort((a, b) => a - b)).toEqual([8390, 8391, 8394, 8395])
+
+	for (const playerId of [8390, 8391, 8394, 8395]) {
+		await expect(
+			getBalance(env.DB, playerId, CurrencyType.RecCenterTokens, DEFAULT_STARTING_TOKENS)
+		).resolves.toBe(DEFAULT_STARTING_TOKENS + 250)
+		const gifts = await getPendingGifts(env.DB, playerId)
+		expect(gifts).toHaveLength(1)
+		expect(gifts[0]).toMatchObject({
+			Currency: 250,
+			CurrencyType: CurrencyType.RecCenterTokens,
+			AvatarItemType: null,
+			Message: 'Thanks for supporting the server!',
+		})
+	}
+	for (const playerId of [8392, 8393]) {
+		expect(await getPendingGifts(env.DB, playerId)).toEqual([])
+		await expect(
+			getBalance(env.DB, playerId, CurrencyType.RecCenterTokens, DEFAULT_STARTING_TOKENS)
+		).resolves.toBe(DEFAULT_STARTING_TOKENS)
+	}
+
+	const { results } = await env.DB.prepare(
+		`SELECT player_id, data FROM audit_log WHERE action = 'gift_tokens_role'`
+	).all<{ player_id: number; data: string }>()
+	expect(results).toHaveLength(1)
+	expect(results[0].player_id).toBe(8110)
+	expect(JSON.parse(results[0].data)).toMatchObject({
+		roleId: ROLE,
+		amount: 250,
+		message: 'Thanks for supporting the server!',
+	})
+})
+
+// Same bounds as the online drop, plus the role has to be a snowflake, and a role nobody's
+// link records is a 404 rather than a silent success.
+it('refuses a role drop over the cap, without a message, with a bad role, or with no holders', async () => {
+	const drop = (role: string, body: unknown) =>
+		devPost(`/api/staff/discord-roles/${role}/gift-tokens`, 8110, body)
+	await linkPlatformIdentity(env.DB, 8396, PlatformType.Discord, '900000000000008396', [
+		'1077000000000000779',
+	])
+	expect((await drop('1077000000000000779', { amount: 1_001, message: 'hi' })).status).toBe(400)
+	expect((await drop('1077000000000000779', { amount: 0, message: 'hi' })).status).toBe(400)
+	expect((await drop('1077000000000000779', { amount: -5, message: 'hi' })).status).toBe(400)
+	expect((await drop('1077000000000000779', { amount: 10, message: '   ' })).status).toBe(400)
+	expect((await drop('1077000000000000779', { amount: 10 })).status).toBe(400)
+	expect((await drop('supporters', { amount: 10, message: 'hi' })).status).toBe(400)
+	expect((await drop('1077000000000000780', { amount: 10, message: 'hi' })).status).toBe(404)
+	// Nothing above paid anyone.
+	expect(await getPendingGifts(env.DB, 8396)).toEqual([])
+})
+
 // Zero is a real gift here: nothing moves, and the player gets an empty box.
 it('sends an empty box on a zero token gift', async () => {
 	await updateAccount(env.DB, 8361, { username: 'Emptyhanded' })
@@ -1993,6 +2090,38 @@ it('clears a player’s password so they can set a new one in game', async () =>
 		{ actor: 8110, data: { playerId: 8320, hadPassword: false } },
 	])
 	expect((await staffPost('/api/staff/players/8397/clear-password', 8110, {})).status).toBe(404)
+})
+
+it('grants a player Plus, developers only', async () => {
+	await updateAccount(env.DB, 8330, { username: 'Plusless' })
+	const hasPlus = async () =>
+		await env.DB.prepare(
+			"SELECT json_extract(data, '$.hasPlus') AS plus, json_extract(data, '$.username') AS username FROM account WHERE account_id = 8330"
+		).first<{ plus: number | null; username: string }>()
+
+	// A moderator is staff but not a developer: refused, and nothing is written.
+	expect((await staffPost('/api/staff/players/8330/grant-plus', 8101, {})).status).toBe(403)
+	expect(await hasPlus()).toEqual({ plus: null, username: 'Plusless' })
+
+	let res = await devPost('/api/staff/players/8330/grant-plus', 8110, {})
+	expect(res.status).toBe(200)
+	expect(await res.json()).toEqual({ playerId: 8330, hasPlus: true, hadPlus: false })
+	// Only the flag is set: the rest of the account is untouched.
+	expect(await hasPlus()).toEqual({ plus: 1, username: 'Plusless' })
+
+	// Granting it again is harmless, and says they already had it.
+	res = await devPost('/api/staff/players/8330/grant-plus', 8110, {})
+	expect(await res.json()).toEqual({ playerId: 8330, hasPlus: true, hadPlus: true })
+
+	expect(await auditRows('grant_plus', 8330)).toEqual([
+		{ actor: 8110, data: { playerId: 8330, hadPlus: false } },
+		{ actor: 8110, data: { playerId: 8330, hadPlus: true } },
+	])
+	// An unknown player is a 404, and no account is conjured for them.
+	expect((await devPost('/api/staff/players/8396/grant-plus', 8110, {})).status).toBe(404)
+	expect(
+		await env.DB.prepare('SELECT 1 AS hit FROM account WHERE account_id = 8396').first()
+	).toBeNull()
 })
 
 /** A custom avatar item made by `creatorAccountId`; published unless `accessibility` says. */

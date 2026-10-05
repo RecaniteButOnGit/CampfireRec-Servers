@@ -751,6 +751,17 @@ function persistenceVersionRefusal(
 const ROOM_IS_PRIVATE = MatchmakingErrorCode.RoomIsPrivate
 
 /**
+ * Whether a room is PUBLISHED — Public, or Unlisted (reachable by whoever holds the id,
+ * just not listed). Every other accessibility (Private, and the two Dev_ ones) is a room
+ * its owner hasn't released.
+ */
+function isPublished(room: Room): boolean {
+	return (
+		room.Accessibility === Accessibility.Public || room.Accessibility === Accessibility.Unlisted
+	)
+}
+
+/**
  * Whether a room MATCHMAKE may enter this room at all, before any instance is found or
  * made. A PUBLISHED room — Public, or Unlisted (reachable by whoever holds the id, just
  * not listed) — admits anyone; every other accessibility (Private, and the two Dev_ ones)
@@ -768,12 +779,7 @@ const ROOM_IS_PRIVATE = MatchmakingErrorCode.RoomIsPrivate
  * their guests through the invite routes, not this one.
  */
 async function canEnterRoom(db: D1Database, room: Room, accountId: number): Promise<boolean> {
-	if (
-		room.Accessibility === Accessibility.Public ||
-		room.Accessibility === Accessibility.Unlisted
-	) {
-		return true
-	}
+	if (isPublished(room)) return true
 	if (room.CreatorAccountId === accountId) return true
 	if (roomRoles(room).some((r) => r.AccountId === accountId && r.Role !== Role.None)) return true
 	return hasRoomInviteTo(db, accountId, Number(room.RoomId))
@@ -1383,6 +1389,10 @@ function roomRedirects(env: Env): Map<number, string> {
  * default subroom. Substitution is a single hop — `2=3,3=2` swaps the two rooms rather
  * than looping — and an unresolvable target leaves the original room in place, so a
  * typo'd knob degrades to "no substitution" instead of a dead hub.
+ *
+ * Only builds NEWER than the 2023 client ({@link BUILD_2023}) are substituted. A caller on
+ * that build or an older one — or on a token that names none, which matchmakes as
+ * `GAME_VERSION` (see {@link callerGameVersion}) — enters the room they asked for.
  */
 async function substituteRoom(
 	c: Context<App>,
@@ -1392,6 +1402,9 @@ async function substituteRoom(
 	const fromId = typeof room.RoomId === 'number' ? room.RoomId : NaN
 	const to = roomRedirects(c.env).get(fromId)
 	if (to === undefined) return { room, subRoomId }
+
+	const build = buildNumber(await callerGameVersion(c))
+	if (build === null || build <= BUILD_2023) return { room, subRoomId }
 
 	const toId = Number.parseInt(to, 10)
 	const target = Number.isNaN(toId)
@@ -1468,6 +1481,16 @@ async function resolveRoomInstance(
 		return { instance: null, errorCode: ROOM_IS_PRIVATE }
 	}
 
+	// An unpublished room has no PUBLIC instances, whatever `JoinMode` asked for. The gate
+	// above only decides who may START a session; a public one is then a door for everyone
+	// it never admitted — a friend follows the owner in, and `IsPrivate: false` tells every
+	// client the session is open. The owner walking through their own room's subroom door
+	// posts `JoinMode` 0, so this has to be decided here rather than trusted from the body.
+	// Private means a fresh instance each time, as `JoinMode` 2 always has: the room's
+	// people reach each other by invite. Room routes only, like the gate — an event or a
+	// clubhouse held in a private room is a session its own guest list shares.
+	const privateInstance = isPrivate || (gateOnAccessibility && !isPublished(room))
+
 	// The build this player is on, from their token. A 2023 client can't load a scene
 	// saved at a newer persistence version, so it is refused the room outright (see
 	// persistenceVersionRefusal) before any instance is created or reused.
@@ -1489,7 +1512,7 @@ async function resolveRoomInstance(
 	// search, which pushes them to another live instance if one exists or forces a
 	// fresh one below. (Only the public path reuses instances, so only it needs the
 	// read; a private matchmake always gets a fresh instance.)
-	const currentInstanceId = isPrivate
+	const currentInstanceId = privateInstance
 		? undefined
 		: (await getPresence<RoomInstance>(c.env.DB, ownerId))?.roomInstance?.roomInstanceId
 	// The same build, with GAME_VERSION standing in for a token that names none. It scopes
@@ -1501,7 +1524,7 @@ async function resolveRoomInstance(
 	// another, and neither must a session running a different version of the room.
 	// Private matchmakes always get a fresh instance. Create one when there's nothing
 	// to join.
-	let instance = isPrivate
+	let instance = privateInstance
 		? null
 		: await getJoinableInstance(c.env.DB, f.roomId, gameVersion, f.subRoomId, currentInstanceId)
 	if (!instance) {
@@ -1514,7 +1537,7 @@ async function resolveRoomInstance(
 			photonRoomId: crypto.randomUUID(),
 			name: f.name,
 			maxCapacity: f.maxCapacity,
-			isPrivate: isPrivate || f.isDorm,
+			isPrivate: privateInstance || f.isDorm,
 			roomInstanceType: f.roomInstanceType,
 			gameVersion,
 		})
@@ -1523,7 +1546,7 @@ async function resolveRoomInstance(
 		instance: roomInstanceFromRoom(
 			c.env,
 			room,
-			isPrivate,
+			privateInstance,
 			instance.roomInstanceId,
 			instance.photonRoomId,
 			f.subRoomId
@@ -1542,7 +1565,8 @@ async function resolveRoomInstance(
  * The one gate that is these routes' alone is the room's ACCESSIBILITY (see
  * {@link canEnterRoom}): a room that isn't published answers `RoomIsPrivate` (25) to anyone
  * but its creator, its role holders and its invitees, in either join mode — a private
- * instance of an unpublished room is still a way into it.
+ * instance of an unpublished room is still a way into it. Those it does admit always get
+ * a PRIVATE instance of it, whatever `JoinMode` they posted.
  *
  * `subRoomId` is optional: absent, `resolveRoomInstance` falls back to the room's first
  * subroom (its default entrance).
@@ -2315,6 +2339,21 @@ const app = new Hono<App>()
 			if (await isPlayerBannedFromRoom(c.env.DB, instance.roomId, id)) {
 				logger.info('follow refused: player banned from room', { roomId: instance.roomId, id })
 				return matchmakeResult(c, BANNED_FROM_ROOM, null)
+			}
+
+			// Nor through the room's accessibility gate: friendship is not a key to a room its
+			// owner hasn't published, so the friend must be someone that room admits on their
+			// own account (canEnterRoom). The same opaque refusal as "not in a room" — a
+			// distinct code would tell the caller where their friend is. An instance naming no
+			// stored room (a dorm's synthetic one) has nothing to gate on.
+			const followedRoom = await getRoomById(c.env.DB, instance.roomId)
+			if (followedRoom && !(await canEnterRoom(c.env.DB, followedRoom, id))) {
+				logger.info('follow refused: friend is in an unpublished room', {
+					roomId: instance.roomId,
+					targetId,
+					id,
+				})
+				return matchmakeResult(c, NO_SUCH_ROOM, null)
 			}
 
 			// Nor does it go through the build scoping the room matchmakes get by

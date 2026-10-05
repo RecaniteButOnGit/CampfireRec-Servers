@@ -37,7 +37,12 @@ import type { App } from './context'
  *
  * RoomSave (1) lands under `room/` (not `roomsave/`) so the `cdn` worker's
  * `GET /room/:dataBlob` route serves the blob back — both bind the same
- * `recflare-cdn` bucket, so the key prefixes must match.
+ * `recflare-cdn` bucket, so the key prefixes must match. RoomMetadata (6) — the
+ * room-level blob a room save posts as `RoomData`, which the room then names as its
+ * `DataBlob` — lands under `room/` too: the client fetches it from the same
+ * `/room/<name>` path it fetches the scene from. It once went under `roommetadata/`,
+ * where nothing ever asked for it. The two never collide — every upload is named by
+ * a fresh GUID under the day's folder.
  */
 const UPLOAD_SUBFOLDER: Record<number, string> = {
 	1: 'room',
@@ -45,7 +50,7 @@ const UPLOAD_SUBFOLDER: Record<number, string> = {
 	3: 'image',
 	4: 'video',
 	5: 'invention',
-	6: 'roommetadata',
+	6: 'room',
 }
 
 /** Resolve the storage subfolder for a posted FileType, or `undefined` when unknown. */

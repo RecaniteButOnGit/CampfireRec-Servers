@@ -5,6 +5,7 @@ import {
 	createImage,
 	deleteImage,
 	getCheeredImageIds,
+	getImageById,
 	getImageByName,
 	getImagesByIds,
 	getImagesByPlayer,
@@ -19,7 +20,6 @@ import {
 	setImageDescription,
 	SLIDESHOW_LIMIT,
 	SLIDESHOW_MAX_LIMIT,
-	toImageMetadata,
 	toImagesPlayer,
 } from '@repo/domain'
 
@@ -33,7 +33,6 @@ import {
 	ErrorResponse,
 	form,
 	idParam,
-	ImageMetadataDto,
 	ImagesPlayerDto,
 	intQuery,
 	json,
@@ -47,11 +46,13 @@ import {
 	SavedImageDto,
 	SlideshowResponse,
 	stringQuery,
+	SuccessErrorEnvelope,
 	SuccessResponse,
 	UNAUTHORIZED_RESPONSE,
 	UploadImageRequest,
 	UploadImageResponse,
 } from '../openapi'
+import { createReport } from '../reports-db'
 import { exceedsApiUploadLimit, maxApiUploadBytes } from '../upload-limit'
 
 import type { Context } from 'hono'
@@ -642,23 +643,24 @@ export const imageRoutes = new Hono<App>({ strict: false })
 		}
 	)
 
-	// Image metadata by filename. Returns the stored SavedImage record, or 404 when
-	// there's no metadata row for that name.
+	// Image metadata by filename, or 404 when there's no metadata row for that name.
+	//
+	// Serves the RAW 13-key `SavedImage`, the same type the client decodes `v6/:id` into.
+	// This once answered a projection of its own (`SavedImageId`/`SavedImageType`, a
+	// `ClubId`, no `TaggedPlayerIds`, nulls as 0/""): the client's DTO has `Id` and `Type`
+	// and no `ClubId`, so it was silently dropping most of that.
 	.get(
 		'/api/images/v6',
 		describeRoute({
 			tags: ['Images'],
 			summary: 'Image metadata by filename',
 			description:
-				'An image’s metadata for a bucket key. 404s when the object exists but has no ' +
-				'metadata row.\n\n' +
-				'Its own projection: renamed like the player lists (`SavedImageId`/`SavedImageType`, ' +
-				'no `TaggedPlayerIds`) but carrying `ClubId`, and with nothing nullable — `RoomId`, ' +
-				'`PlayerEventId` and `ClubId` read 0 where the row holds null, `Description` reads ' +
-				'`""`. Three shapes of one row; keep them straight.',
+				'An image’s stored `SavedImage` record for a bucket key — the raw record, as ' +
+				'`v6/{id}` and `v5/bulk` serve, with `Description`, `RoomId` and `PlayerEventId` ' +
+				'null where the row holds null. 404s when the object exists but has no metadata row.',
 			parameters: [stringQuery('name', 'The image name (bucket key); required')],
 			responses: {
-				200: json(ImageMetadataDto, 'The image’s metadata'),
+				200: json(SavedImageDto, 'The image record'),
 				400: json(ErrorResponse, 'No name given'),
 				404: { description: 'No metadata for that name' },
 			},
@@ -667,7 +669,85 @@ export const imageRoutes = new Hono<App>({ strict: false })
 			const name = c.req.query('name') ?? ''
 			if (name === '') return c.json({ error: 'name is required' }, 400)
 			const image = await getImageByName(c.env.DB, name)
-			return image ? c.json(toImageMetadata(image)) : c.notFound()
+			return image ? c.json(image) : c.notFound()
+		}
+	)
+
+	// One image by id — the client opening a single photo it holds only the id of.
+	//
+	// Serves the RAW 13-key `SavedImage` (`Id`/`Type`, `TaggedPlayerIds`, nulls left null),
+	// which is the type the client decodes this route into — the same record `v6?name=`
+	// serves, and `v5/bulk` a list of. NOT the `ImagesPlayer` projection of the player lists.
+	//
+	// Public, or the caller's own: ids are sequential, so anyone else's private photo is a
+	// 404 here, the same as an id that doesn't exist.
+	.get(
+		'/api/images/v6/:id{[0-9]+}',
+		describeRoute({
+			tags: ['Images'],
+			summary: 'One image by id',
+			description:
+				'The stored `SavedImage` record for an image id — the raw record, as `v5/bulk` ' +
+				'serves, with `Description`, `RoomId` and `PlayerEventId` null where the row holds ' +
+				'null. A private image is served only to the player who took it; to anyone else ' +
+				'it is a 404, like an unknown id.',
+			parameters: [idParam('id', 'Image id')],
+			responses: {
+				200: json(SavedImageDto, 'The image record'),
+				404: { description: 'No such image, or not the caller’s to see' },
+			},
+		}),
+		async (c) => {
+			const image = await getImageById(c.env.DB, Number.parseInt(c.req.param('id'), 10))
+			if (image === null) return c.notFound()
+			if (image.Accessibility !== 1 && image.PlayerId !== (await authedId(c))) return c.notFound()
+			return c.json(image)
+		}
+	)
+
+	// Report a saved image. Stored in the `report` table the player, event, invention, item
+	// and chat reports use — same moderation life — with `image_id` set. See
+	// migrations/0034_report_image.sql.
+	//
+	// The request has NO body: the path names the image and the token names the reporter,
+	// and that is the whole report. The reported player is whoever took the image, read from
+	// the image. The `{ success, error: "" }` reply is the envelope the other reports use,
+	// which is an ASSUMPTION here: what the client does with this response has not been
+	// observed.
+	.post(
+		'/api/images/v1/:id{[0-9]+}/report',
+		describeRoute({
+			tags: ['Images', 'Moderation'],
+			summary: 'Report a photo',
+			description:
+				'Files a report against a saved image, as a row in the same `report` table the ' +
+				'player, event, invention, custom-avatar-item and chat reports go to. There is no ' +
+				'request body: the row is the reporter (the caller), the image (`image_id`), and ' +
+				'`reported_player_id` — the image’s `PlayerId`, who took it. No category or ' +
+				'description is stored, since none is sent. Nothing dedupes the rows, and an ' +
+				'unknown image is refused rather than filed against nobody.',
+			security: AUTHED,
+			parameters: [idParam('id', 'Image id')],
+			responses: {
+				200: json(SuccessErrorEnvelope, '`{ success: true, error: "" }`'),
+				401: UNAUTHORIZED_RESPONSE,
+				404: json(SuccessErrorEnvelope, 'No such image'),
+			},
+		}),
+		async (c) => {
+			const reporterId = await authedId(c)
+			if (reporterId === null) return unauthorized(c)
+
+			const imageId = Number.parseInt(c.req.param('id'), 10)
+			const image = await getImageById(c.env.DB, imageId)
+			if (image === null) return c.json({ success: false, error: 'No such image' }, 404)
+
+			await createReport(c.env.DB, {
+				reporterPlayerId: reporterId,
+				reportedPlayerId: image.PlayerId,
+				imageId,
+			})
+			return c.json({ success: true, error: '' })
 		}
 	)
 

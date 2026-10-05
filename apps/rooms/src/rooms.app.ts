@@ -3686,10 +3686,11 @@ const app = new Hono<App>()
 			if (!canManageRoom(room, accountId)) return c.body(null, 403)
 
 			// The client uploads BOTH blobs to `storage` first and sends their keys here:
-			// `SubRoomData` is the scene blob (what the loader downloads), `RoomData` the
-			// metadata blob. `OwnershipProof` is accepted and ignored.
+			// `SubRoomData` is the scene blob (what the loader downloads, onto the subroom's
+			// save), `RoomData` the room-level metadata blob (onto the ROOM, as `DataBlob`).
+			// `OwnershipProof` is accepted and ignored.
 			const body = (await c.req.json().catch(() => ({}))) as {
-				RoomData?: { Filename?: string }
+				RoomData?: { Filename?: string; Hash?: string | null }
 				SubRoomData?: { Filename?: string; Hash?: string | null }
 				UnityAssetId?: string | null
 				Description?: string
@@ -3703,6 +3704,7 @@ const app = new Hono<App>()
 				subRoomDataHash:
 					typeof body.SubRoomData?.Hash === 'string' ? body.SubRoomData.Hash : undefined,
 				roomDataFilename: body.RoomData?.Filename,
+				roomDataHash: typeof body.RoomData?.Hash === 'string' ? body.RoomData.Hash : undefined,
 				unityAssetId: typeof body.UnityAssetId === 'string' ? body.UnityAssetId : undefined,
 				autoPublish: body.AutoPublish === true,
 				description: typeof body.Description === 'string' ? body.Description : undefined,

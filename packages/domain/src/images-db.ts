@@ -204,6 +204,16 @@ export async function getImageByName(db: D1Database, name: string): Promise<Save
 }
 
 /**
+ * Look up one image record by id, or null. Whatever its accessibility — unlike
+ * {@link getImagesByIds} this does not filter, so the caller decides who may see a
+ * private one.
+ */
+export async function getImageById(db: D1Database, id: number): Promise<SavedImage | null> {
+	const row = await db.prepare('SELECT data FROM image WHERE id = ?1').bind(id).first<ImageRow>()
+	return row ? (JSON.parse(row.data) as SavedImage) : null
+}
+
+/**
  * Look up image records by name (the R2 key), returned keyed by ImageName. One query
  * for the whole set; names with no record are simply absent from the map.
  */
@@ -415,55 +425,6 @@ export async function getImagesByPlayer(
 		.filter((img) => isPhoto(img) && (own || img.Accessibility === 1))
 		.sort(sort === 1 ? (a, b) => b.CheerCount - a.CheerCount || newestFirst(a, b) : newestFirst)
 		.slice(skip, skip + take)
-}
-
-/**
- * An image's metadata as `GET /api/images/v6` serves it — the by-name lookup's shape.
- *
- * A THIRD projection of the same row, and deliberately not either of the other two: it
- * renames like `ImagesPlayer` (`Id` → `SavedImageId`, `Type` → `SavedImageType`, no
- * `TaggedPlayerIds`) but adds `ClubId`, and its numbers and strings are never null —
- * `RoomId`, `PlayerEventId` and `ClubId` come out as 0 and `Description` as `""` where the
- * row holds null. The reference's DTO declares them non-nullable, so a null is a decode
- * failure rather than "none".
- *
- * `ClubId` is always 0: nothing here associates an image with a club.
- */
-export interface ImageMetadata {
-	SavedImageId: number
-	ImageName: string
-	PlayerId: number
-	RoomId: number
-	PlayerEventId: number
-	ClubId: number
-	Description: string
-	Accessibility: number
-	AccessibilityLocked: boolean
-	SavedImageType: number
-	CreatedAt: string
-	CheerCount: number
-	CommentCount: number
-}
-
-/** Project a stored image into the {@link ImageMetadata} shape `/api/images/v6` answers. */
-export function toImageMetadata(img: SavedImage): ImageMetadata {
-	return {
-		SavedImageId: img.Id,
-		ImageName: img.ImageName,
-		PlayerId: img.PlayerId,
-		// Null means "not taken in a room" / "no event"; the client's DTO has no null to put
-		// there, and 0 is the id it treats as none.
-		RoomId: img.RoomId ?? 0,
-		PlayerEventId: img.PlayerEventId ?? 0,
-		ClubId: 0,
-		Description: img.Description ?? '',
-		Accessibility: img.Accessibility,
-		AccessibilityLocked: img.AccessibilityLocked,
-		SavedImageType: img.Type,
-		CreatedAt: img.CreatedAt,
-		CheerCount: img.CheerCount,
-		CommentCount: img.CommentCount,
-	}
 }
 
 /**

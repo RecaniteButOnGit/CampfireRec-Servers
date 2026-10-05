@@ -565,6 +565,30 @@ export const UgcPurchasableItemDto = z.object({
 export const UgcPurchasableItemList = z.array(UgcPurchasableItemDto)
 
 /**
+ * `GET /api/ugcPurchasables/v1/items/room/{roomId}` — one line of a room's shop. The same
+ * 10 keys as the bulk lookup's item, with `ItemType` naming the kind (0 room key, 1 room
+ * consumable, 3 currency purchase offer) and `ImageName` nullable, as a key or consumable
+ * without art is served everywhere else.
+ */
+export const RoomPurchasableDto = UgcPurchasableItemDto.extend({
+	ItemType: z
+		.number()
+		.int()
+		.describe('0 RoomKey, 1 RoomConsumable, 3 RoomCurrencyItem (a currency pack for tokens)'),
+	ItemId: z
+		.string()
+		.describe('A bare GUID — the key’s ReplicationId, the consumable’s or offer’s id'),
+	ImageName: z.string().nullable().describe('Null for a listing with no art'),
+	PurchaseCurrencyId: z
+		.string()
+		.nullable()
+		.describe('The room currency the line is charged in; null for tokens'),
+})
+
+/** The room’s shop — a bare array, empty for a room that sells nothing. */
+export const RoomPurchasableList = z.array(RoomPurchasableDto)
+
+/**
  * `POST /api/items/purchaseInfos` JSON body — the same `{ itemType, itemId }` reference
  * shape the UGC bulk lookup takes, minus the room. camelCase INSIDE the reference, which is
  * the client's own inconsistency: the response wraps this very object under a PascalCase

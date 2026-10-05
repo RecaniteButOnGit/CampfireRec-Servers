@@ -219,6 +219,17 @@ export const SUBROOM_SCHEMA_DDL: string[] = [
 		value TEXT NOT NULL,
 		PRIMARY KEY (sub_room_id, permission, role)
 	)`,
+	// Which inventions a room has in it (migrations/0023_room_invention.sql): one row per
+	// (room, invention), re-derived on every room save from the `InventionUsage` each of the
+	// room's subrooms last reported — see {@link syncRoomInventions}. The second index is
+	// the reverse lookup, "which rooms use this invention" — what an invention's
+	// `NumPlayersHaveUsedInRoom` is counted from.
+	`CREATE TABLE IF NOT EXISTS room_invention (
+		room_id INTEGER NOT NULL,
+		invention_id INTEGER NOT NULL,
+		PRIMARY KEY (room_id, invention_id)
+	)`,
+	`CREATE INDEX IF NOT EXISTS idx_room_invention_invention ON room_invention (invention_id)`,
 ]
 
 /** A stored room — the parsed JSON blob (full client-facing room response). */
@@ -1462,8 +1473,15 @@ export interface SaveSubRoomDataInput {
 	subRoomDataFilename?: string
 	/** `SubRoomData.Hash` — echoed back as the save response's `dataBlobHash`. */
 	subRoomDataHash?: string
-	/** Uploaded blob key for the room-level METADATA blob (a separate upload). */
+	/**
+	 * `RoomData.Filename` — the uploaded ROOM-level metadata blob (a separate upload from the
+	 * scene). It lands on the ROOM as `DataBlob`, not on the subroom: the client's `Room` has
+	 * `DataBlob`/`DataBlobHash` and its `SubRoom` has no field for it (`RoomDataBlob`, where
+	 * this once went, is not a key the client knows, and it dropped it silently).
+	 */
 	roomDataFilename?: string
+	/** `RoomData.Hash` — stored beside it as the room's `DataBlobHash`; null when unsent. */
+	roomDataHash?: string
 	/**
 	 * The save comment — a description of THIS revision, typed into the client's save box.
 	 * It belongs to the save (and shows up in the `…/saves` history); it is not the room's
@@ -1636,6 +1654,152 @@ function legacySubRoomSave(sub: SubRoom): SubRoomDataSave | null {
 }
 
 /**
+ * The invention ids inside a room save's `InventionUsage`, in the order it lists them.
+ *
+ * The value is a base64 PROTOBUF message, recovered by reading real saves — there is no
+ * schema, only field numbers:
+ *
+ *   1: varint            — 1 on every save seen; a format version by the look of it
+ *   2: repeated message  — one per invention in the scene
+ *        1: varint       — the invention id
+ *        2: varint       — 1 on every save seen; probably how many times it is placed
+ *
+ * `CAESBgil2gEQARIFCIECEAE=` is `{ 1: 1, 2: [{ 1: 27941, 2: 1 }, { 1: 257, 2: 1 }] }`.
+ *
+ * Only the ids are read. Anything that doesn't parse — not base64, a truncated message, a
+ * wire type this doesn't know — yields the ids found up to that point rather than
+ * throwing: this is bookkeeping riding on a room save, and a format the client changes
+ * must not be able to fail the save.
+ */
+export function decodeInventionUsage(inventionUsage: string): number[] {
+	let bytes: Uint8Array
+	try {
+		bytes = Uint8Array.from(atob(inventionUsage), (ch) => ch.charCodeAt(0))
+	} catch {
+		return []
+	}
+
+	/** Walk one message's fields; false from `visit`, or anything malformed, stops the walk. */
+	const walk = (
+		buf: Uint8Array,
+		visit: (field: number, value: number | Uint8Array) => void
+	): void => {
+		let at = 0
+		const varint = (): number | null => {
+			let value = 0
+			for (let shift = 0; at < buf.length; shift += 7) {
+				const byte = buf[at++]
+				// Multiplication, not `<<`: ids past 2^31 would wrap as a 32-bit shift.
+				value += (byte & 0x7f) * 2 ** shift
+				if ((byte & 0x80) === 0) return value
+			}
+			return null
+		}
+		while (at < buf.length) {
+			const key = varint()
+			if (key === null) return
+			const field = Math.floor(key / 8)
+			const wireType = key % 8
+			if (wireType === 0) {
+				const value = varint()
+				if (value === null) return
+				visit(field, value)
+			} else if (wireType === 2) {
+				const length = varint()
+				if (length === null || at + length > buf.length) return
+				visit(field, buf.subarray(at, at + length))
+				at += length
+			} else {
+				return
+			}
+		}
+	}
+
+	const ids: number[] = []
+	walk(bytes, (field, entry) => {
+		if (field !== 2 || typeof entry === 'number') return
+		walk(entry, (inner, value) => {
+			if (inner === 1 && typeof value === 'number' && Number.isSafeInteger(value)) ids.push(value)
+		})
+	})
+	return ids
+}
+
+/**
+ * Re-derive a room's `room_invention` rows from its subrooms: the union of the inventions
+ * each subroom's last save reported in `InventionUsage`. An invention removed from the room
+ * drops out on the next save — and the set is derived from EVERY subroom rather than the
+ * one just saved, because the table is per room and a save of one subroom says nothing
+ * about what the others still hold.
+ *
+ * A subroom's `InventionUsage` is whatever its latest save sent, staged or published, so
+ * this is the room as its builders last left it, not strictly what players are loading.
+ *
+ * Every invention that entered or left the room then has its `NumPlayersHaveUsedInRoom`
+ * resynced — the number of ROOMS it is in, which is what this server has to put behind
+ * that field. Derived from the table, like `CheerCount` and `NumDownloads` from theirs, and
+ * a `json_set` on the one key of the `invention` record (the `api` worker's table, same
+ * database). Only the rows that changed are written, so the usual save — same inventions
+ * as last time — costs one read.
+ */
+export async function syncRoomInventions(
+	db: D1Database,
+	roomId: number,
+	room: Room
+): Promise<void> {
+	const subRooms = Array.isArray(room.SubRooms) ? (room.SubRooms as SubRoom[]) : []
+	const now = new Set<number>()
+	for (const sub of subRooms) {
+		if (typeof sub.InventionUsage !== 'string') continue
+		for (const id of decodeInventionUsage(sub.InventionUsage)) now.add(id)
+	}
+
+	const { results } = await db
+		.prepare('SELECT invention_id FROM room_invention WHERE room_id = ?1')
+		.bind(roomId)
+		.all<{ invention_id: number }>()
+	const before = new Set(results.map((r) => r.invention_id))
+	const added = [...now].filter((id) => !before.has(id))
+	const removed = [...before].filter((id) => !now.has(id))
+	if (added.length === 0 && removed.length === 0) return
+
+	// One batch, in order: the membership changes land before the counts are re-derived.
+	await db.batch([
+		...removed.map((id) =>
+			db
+				.prepare('DELETE FROM room_invention WHERE room_id = ?1 AND invention_id = ?2')
+				.bind(roomId, id)
+		),
+		...added.map((id) =>
+			db
+				.prepare('INSERT OR IGNORE INTO room_invention (room_id, invention_id) VALUES (?1, ?2)')
+				.bind(roomId, id)
+		),
+		...[...added, ...removed].map((id) =>
+			db
+				.prepare(
+					`UPDATE invention SET data = json_set(data, '$.NumPlayersHaveUsedInRoom',
+						(SELECT COUNT(*) FROM room_invention WHERE invention_id = ?1))
+					 WHERE id = ?1`
+				)
+				.bind(id)
+		),
+	])
+}
+
+/** How many rooms an invention is used in — the stat `room_invention` exists to answer. */
+export async function countRoomsUsingInvention(
+	db: D1Database,
+	inventionId: number
+): Promise<number> {
+	const row = await db
+		.prepare('SELECT COUNT(*) AS n FROM room_invention WHERE invention_id = ?1')
+		.bind(inventionId)
+		.first<{ n: number }>()
+	return row?.n ?? 0
+}
+
+/**
  * Persist a room-save against a specific subroom. Everything the save carries belongs to
  * that subroom's revision — nothing is written to the room. Returns the updated
  * (hydrated) room AND the save that was just created — the route answers with both — or
@@ -1702,18 +1866,35 @@ export async function saveSubRoomData(
 		})
 	)
 	const saveId = Number(save.SubRoomDataSaveId)
-	if (input.roomDataFilename) sub.RoomDataBlob = input.roomDataFilename
 	sub.DataSavedAt = new Date().toISOString()
 	if (input.persistenceVersion !== undefined) sub.PersistenceVersion = input.persistenceVersion
 	if (input.inventionUsage !== undefined) sub.InventionUsage = input.inventionUsage
 
-	// Nothing here touches the ROOM. A room save is a revision of one SUBROOM, and every
-	// field it carries describes that revision: `Description` is the save comment shown in
-	// the `…/saves` history, `PersistenceVersion` and `InventionUsage` describe the scene
-	// just saved. They used to be copied onto the room as well, which meant each save
-	// silently replaced the room's public description with the save comment. The room's own
-	// fields are edited through their own routes (`PUT /rooms/:id/description` and
-	// friends), so the room row is not rewritten here at all.
+	// The ONE thing a save writes on the ROOM: `RoomData`, the room-level metadata blob the
+	// client uploads beside the scene. The client's `Room` reads it as `DataBlob` (with
+	// `DataBlobHash`), so that is where it goes — a targeted `json_set` of those two keys,
+	// never a rewrite of the room row. It used to be put on the subroom as `RoomDataBlob`,
+	// which the client has no field for, so no save ever reached it.
+	//
+	// Everything else the save carries describes the SUBROOM's revision: `Description` is the
+	// save comment shown in the `…/saves` history, `PersistenceVersion` and `InventionUsage`
+	// describe the scene just saved. They used to be copied onto the room as well, which
+	// meant each save silently replaced the room's public description with the save comment.
+	// The room's own fields are edited through their own routes (`PUT /rooms/:id/description`
+	// and friends).
+	const roomWrites: D1PreparedStatement[] = []
+	if (input.roomDataFilename) {
+		const hash = input.roomDataHash ?? null
+		room.DataBlob = input.roomDataFilename
+		room.DataBlobHash = hash
+		roomWrites.push(
+			db
+				.prepare(
+					"UPDATE room SET data = json_set(data, '$.DataBlob', ?2, '$.DataBlobHash', ?3) WHERE room_id = ?1"
+				)
+				.bind(roomId, input.roomDataFilename, hash)
+		)
+	}
 
 	// Publish outright when the client asked to (`AutoPublish`), or for a dorm — a dorm is
 	// the player's own private space with no publish step in the client, so staging one
@@ -1721,6 +1902,7 @@ export async function saveSubRoomData(
 	// `publish_save`. One round trip for the rest of the save.
 	const publishNow = input.autoPublish === true || room.IsDorm === true
 	await db.batch([
+		...roomWrites,
 		publishNow
 			? db
 					.prepare(
@@ -1737,6 +1919,9 @@ export async function saveSubRoomData(
 
 	// Re-hydrate so the returned room reflects the just-saved subroom.
 	await attachSubRooms(db, [room])
+	// The one thing a save records OUTSIDE the subroom and its save row: which inventions
+	// the room now has in it. Its own table, so the room row is still not rewritten.
+	await syncRoomInventions(db, roomId, room)
 	return { room, save }
 }
 

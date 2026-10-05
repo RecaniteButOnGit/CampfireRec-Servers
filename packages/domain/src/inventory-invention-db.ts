@@ -9,6 +9,10 @@
  * creator is not listed here either — they own their invention through its
  * `CreatorPlayerId`, and the buy path refuses to sell an invention to its own creator.
  *
+ * The one thing a grant does write on the invention record is its `NumDownloads`: the
+ * number of rows here that name it, re-derived on every grant (see `grantInvention`), the
+ * way `CheerCount` is re-derived from `invention_interaction` on every cheer.
+ *
  * The `econ` worker owns the schema/migration (apps/econ/migrations/
  * 0008_inventory_invention.sql) and is the only writer; `api` only reads, to fold bought
  * inventions into `GET /api/inventions/v2/mine`. Both import these helpers so the table
@@ -23,24 +27,46 @@ export const INVENTORY_INVENTION_SCHEMA_DDL: string[] = [
 		acquired_at TEXT NOT NULL,
 		PRIMARY KEY (account_id, invention_id)
 	)`,
+	// Backs the per-invention count `grantInvention` re-derives (migrations/0026).
+	`CREATE INDEX IF NOT EXISTS idx_inventory_invention_invention
+		ON inventory_invention (invention_id)`,
 ]
 
 /**
  * Grant an invention to a player. INSERT OR IGNORE on the (account, invention) primary
  * key: owning an invention is boolean, so a second grant keeps the original
  * `acquired_at` rather than back-dating the purchase to now.
+ *
+ * Then resyncs the invention's denormalized `NumDownloads` — the number of players who
+ * have it — and returns it. The count is DERIVED from this table rather than incremented,
+ * so a repeated grant can't inflate it and a drifted number heals on the next one. It is
+ * a `json_set` on the one key, like the cheer count, so it doesn't touch `ModifiedAt` or
+ * race a full-record rewrite into losing anything but this number.
  */
 export async function grantInvention(
 	db: D1Database,
 	accountId: number,
 	inventionId: number
-): Promise<void> {
+): Promise<number> {
 	await db
 		.prepare(
 			'INSERT OR IGNORE INTO inventory_invention (account_id, invention_id, acquired_at) VALUES (?1, ?2, ?3)'
 		)
 		.bind(accountId, inventionId, new Date().toISOString())
 		.run()
+
+	const row = await db
+		.prepare('SELECT COUNT(*) AS n FROM inventory_invention WHERE invention_id = ?1')
+		.bind(inventionId)
+		.first<{ n: number }>()
+	const downloads = row?.n ?? 0
+	await db
+		.prepare(
+			"UPDATE invention SET data = json_set(data, '$.NumDownloads', CAST(?2 AS INTEGER)) WHERE id = ?1"
+		)
+		.bind(inventionId, downloads)
+		.run()
+	return downloads
 }
 
 /**

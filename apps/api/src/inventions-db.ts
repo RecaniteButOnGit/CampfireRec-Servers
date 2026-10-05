@@ -23,9 +23,10 @@ import { getInventionAcquisitionCounts, getOwnedInventionIds } from '@repo/domai
 /**
  * Schema DDL (mirror of migrations/0002_invention.sql + 0003_invention_featured.sql +
  * 0008_invention_visibility.sql, sans any seed rows). `is_featured` backs the featured
- * feed's query and `is_published`/`hide_from_player` most of the "may anyone see this"
- * filter every feed shares (see `VISIBLE_IN_FEEDS`, which also excludes unlisted ones); json_extract of a JSON `true` is 1, so those columns are 1/0 — and
- * NULL when the key is missing, which fails a `= 1` or `= 0` test either way.
+ * feed's query and `is_published`/`hide_from_player` most of the "is this in the store"
+ * filter every feed shares (see `VISIBLE_IN_FEEDS`, which also excludes unlisted ones);
+ * json_extract of a JSON `true` is 1, so those columns are 1/0 — and NULL when the key is
+ * missing, which fails a `= 1` or `= 0` test either way.
  */
 export const SCHEMA_DDL: string[] = [
 	`CREATE TABLE IF NOT EXISTS invention (
@@ -321,11 +322,20 @@ export function toInventionV9(invention: SavedInvention): InventionV9Dto {
 		Name: invention.Name,
 		Description: invention.Description,
 		ImageName: invention.ImageName,
-		UgcVersion: invention.UgcVersion ?? 0,
+		// A record saved through `v6/save` stores no `UgcVersion`, and the client's byte
+		// defaults to 0 — a generation no client writes (every `v9/save` sends 1). The 2025
+		// client lists nothing that declares 0: these were on the wire and invisible.
+		UgcVersion: invention.UgcVersion ?? 1,
 		CurrentVersionNumber: invention.CurrentVersionNumber,
 		// One save, one version: the newest is the current one.
 		LatestVersionNumber: invention.CurrentVersionNumber,
-		Accessibility: invention.Accessibility,
+		// A published invention cannot be private. Everything published through
+		// `v3/publish` still stores the 0 a save mints (see INVENTION_ACCESSIBILITY), which
+		// this DTO — it has no `IsPublished` — would read as Private; serve it as Public.
+		Accessibility:
+			invention.IsPublished && invention.Accessibility === INVENTION_ACCESSIBILITY.private
+				? INVENTION_ACCESSIBILITY.public
+				: invention.Accessibility,
 		ForceCannotPublish: false,
 		ModifiedAt: invention.ModifiedAt,
 		CreatedAt: invention.CreatedAt,
@@ -582,8 +592,19 @@ export async function getInventionsByCreator(
  * purchase, they are still on the shelf of the player who paid for them. An owned id
  * with no invention row left (deleted) simply drops out. Newest first, like the other
  * invention lists; not paginated.
+ *
+ * Each row is the stored record WITH the client's `RRInvention` laid over it
+ * ({@link toInventionV9}). The 2025 client decodes this list into that flat DTO, and a
+ * key the record lacks defaults silently: no `LatestVersionNumber` reads as a current
+ * version newer than the latest, no `UgcVersion` as generation 0 whatever was saved, and
+ * a published record's stored `Accessibility` 0 as Private. The stored keys that DTO has
+ * no member for (`CurrentVersion`, `IsPublished`, `Tags`, …) stay on the row: its decoder
+ * drops them, and the older client still reads them.
  */
-export async function getMyInventions(db: D1Database, playerId: number): Promise<SavedInvention[]> {
+export async function getMyInventions(
+	db: D1Database,
+	playerId: number
+): Promise<ListedInvention[]> {
 	const [created, ownedIds] = await Promise.all([
 		getInventionsByCreator(db, playerId),
 		getOwnedInventionIds(db, playerId),
@@ -592,9 +613,51 @@ export async function getMyInventions(db: D1Database, playerId: number): Promise
 
 	const byId = new Map<number, SavedInvention>()
 	for (const invention of [...created, ...bought]) byId.set(invention.InventionId, invention)
-	return [...byId.values()].sort(
-		(a, b) => b.CreatedAt.localeCompare(a.CreatedAt) || b.InventionId - a.InventionId
-	)
+	return [...byId.values()]
+		.sort((a, b) => b.CreatedAt.localeCompare(a.CreatedAt) || b.InventionId - a.InventionId)
+		.map(withClientInvention)
+}
+
+/** A stored record with the client's flat `RRInvention` laid over it — see {@link getMyInventions}. */
+type ListedInvention = Omit<SavedInvention, keyof InventionV9Dto> & InventionV9Dto
+
+function withClientInvention(invention: SavedInvention): ListedInvention {
+	return { ...invention, ...toInventionV9(invention) }
+}
+
+/** The most creators one `v1/fromcreators` call may name — D1 caps a statement's binds. */
+const MAX_PORTFOLIO_CREATORS = 50
+
+/**
+ * A creator's portfolio (`v1/fromcreators?id=…`) — the shelf on their profile, and the
+ * "from creators you follow" row. Newest first, paged in SQL via skip/take.
+ *
+ * Only PUBLISHED inventions (minus hidden ones), whoever asks — the creator included. A
+ * creator's drafts are on `v2/mine` and nowhere else; this is what they MADE and put out,
+ * not what they bought or are still working on. Unlisted ones ARE here: unlisted means
+ * "not in the store", and a portfolio is not the store.
+ */
+export async function getInventionsByCreators(
+	db: D1Database,
+	creatorPlayerIds: number[],
+	skip: number,
+	take: number
+): Promise<ListedInvention[]> {
+	const creators = [...new Set(creatorPlayerIds)].slice(0, MAX_PORTFOLIO_CREATORS)
+	const limit = Math.max(take, 0)
+	if (creators.length === 0 || limit === 0) return []
+
+	const { results } = await db
+		.prepare(
+			`SELECT data FROM invention
+			 WHERE creator_player_id IN (${creators.map((_, i) => `?${i + 3}`).join(', ')})
+			   AND is_published = 1 AND hide_from_player = 0
+			 ORDER BY json_extract(data, '$.CreatedAt') DESC, id DESC
+			 LIMIT ?1 OFFSET ?2`
+		)
+		.bind(limit, Math.max(skip, 0), ...creators)
+		.all<InventionRow>()
+	return results.map((r) => withClientInvention(JSON.parse(r.data) as SavedInvention))
 }
 
 /**
@@ -858,17 +921,20 @@ export const INVENTION_PERMISSION = {
 } as const
 
 /**
- * Where a published invention may be FOUND, which `v4/publish` sets and nothing before it
- * did — every record written before that endpoint carries 0, the value a save mints.
+ * Whether a PUBLISHED invention is in the store, which `v4/publish` sets and nothing before
+ * it did. The publish sheet sends one of two values, and both publish:
  *
- * Only `unlisted` is recovered from the client for certain; the other two mirror the room
- * accessibility enum, which they match member-for-member, and the publish sheet sends 1 for
- * an ordinary publish.
+ * - `public` (1) — published and in the store: search and the browse feeds list it.
+ * - `unlisted` (2) — published but NOT in the store. It is still published, so it is on the
+ *   creator's portfolio (`v1/fromcreators`) and reachable by id; it just isn't for browsing.
  *
- * Note what that leaves ambiguous: a stored 0 is either "private" or "written before this
- * enum meant anything", and the two are indistinguishable without a backfill. So the browse
- * filter excludes `unlisted` by name rather than requiring `public` — the latter reads
- * every invention published through `v3/publish` as private and empties the feeds.
+ * `private` (0) is what a save mints and what `v2/unpublish` puts back — the state of an
+ * invention that isn't published at all. Whether anyone else can see an invention is
+ * `IsPublished`; this field only decides, of the published ones, which the store shows.
+ *
+ * Every record published through the older `v3/publish` also still carries 0, since that
+ * endpoint names no accessibility. So the store filter excludes `unlisted` by name rather
+ * than requiring `public` — the latter would read all of those as private and drop them.
  */
 export const INVENTION_ACCESSIBILITY = {
 	private: 0,
@@ -877,9 +943,9 @@ export const INVENTION_ACCESSIBILITY = {
 } as const
 
 /**
- * The "anyone may come across this" test the browse feeds and search share: published, not
- * hidden, and not unlisted. An unlisted invention is still reachable BY ID — that is what
- * unlisted means — so the by-id reads deliberately don't apply it.
+ * The "is this in the store" test search and the browse feeds share: published, not hidden
+ * by moderation, and not unlisted. A creator's portfolio deliberately does NOT apply the
+ * last term (see `getInventionsByCreators`), nor do the by-id reads.
  *
  * `idx_invention_feed_newest` (SCHEMA_DDL, migrations/0027) is a partial index over exactly
  * these terms — edit one here and edit it there, or the feed goes back to a full scan.
@@ -987,6 +1053,29 @@ export async function publishInvention(
 		Price: publish.price ?? invention.Price,
 		// The FIRST publish is the one that gets dated; re-publishing doesn't reset it.
 		FirstPublishedAt: invention.FirstPublishedAt ?? new Date().toISOString(),
+	}
+	await writeInvention(db, updated)
+	return updated
+}
+
+/**
+ * Unpublish an invention (`v2/unpublish`) — back to what a save mints: not published, and
+ * `Accessibility` private, so the next publish sets both afresh. Buyers keep it (`v2/mine`
+ * lists a bought invention whatever its state), and `FirstPublishedAt` stays: it dates the
+ * FIRST publish, which still happened. The permission and price are left for the next
+ * publish to restate or keep. Returns the updated invention, or null when there's no such row.
+ */
+export async function unpublishInvention(
+	db: D1Database,
+	inventionId: number
+): Promise<SavedInvention | null> {
+	const invention = await getInventionById(db, inventionId)
+	if (invention === null) return null
+
+	const updated: SavedInvention = {
+		...invention,
+		IsPublished: false,
+		Accessibility: INVENTION_ACCESSIBILITY.private,
 	}
 	await writeInvention(db, updated)
 	return updated

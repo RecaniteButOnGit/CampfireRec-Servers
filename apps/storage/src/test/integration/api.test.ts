@@ -70,7 +70,7 @@ it('POST /upload 401s without a token', async () => {
 	expect(res.status).toBe(401)
 })
 
-it('POST /upload stores a RoomMetadata (FileType 6) file under roommetadata/ and returns its name', async () => {
+it('POST /upload stores a RoomMetadata (FileType 6) file under room/ and returns its name', async () => {
 	// Mirrors the client's multipart upload: FileType=6, File=<binary>.
 	const bytes = new Uint8Array([0x10, 0x02, 0x1a, 0x00])
 	const res = await SELF.fetch(`${ORIGIN}/upload`, {
@@ -84,8 +84,9 @@ it('POST /upload stores a RoomMetadata (FileType 6) file under roommetadata/ and
 		/^\d{4}-\d{2}-\d{2}\/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/
 	)
 
-	// The bytes are persisted in the shared CDN bucket under the type subfolder.
-	const stored = await env.CDN_ASSETS.get(`roommetadata/${filename}`)
+	// The bytes are persisted in the shared CDN bucket under `room/`, the same folder as a
+	// scene blob: the client downloads the room's `DataBlob` from the cdn's `/room/<name>`.
+	const stored = await env.CDN_ASSETS.get(`room/${filename}`)
 	expect(stored).not.toBeNull()
 	expect(new Uint8Array(await stored!.arrayBuffer())).toEqual(bytes)
 })

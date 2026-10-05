@@ -104,9 +104,18 @@ import {
 } from '../../inventory-custom-db'
 import { INVENTORY_SCHEMA_DDL } from '../../inventory-db'
 import { REWARD_STATUS_SCHEMA_DDL } from '../../reward-db'
-import { ROOM_CONSUMABLE_SCHEMA_DDL, ROOM_INVENTORY_SCHEMA_DDL } from '../../room-consumable-db'
-import { ROOM_BALANCE_SCHEMA_DDL, ROOM_CURRENCY_SCHEMA_DDL } from '../../room-currency-db'
-import { ROOM_KEY_SCHEMA_DDL } from '../../room-key-db'
+import {
+	ROOM_CONSUMABLE_SCHEMA_DDL,
+	ROOM_INVENTORY_SCHEMA_DDL,
+	upsertRoomConsumable,
+} from '../../room-consumable-db'
+import {
+	createPurchaseOffer,
+	createRoomCurrency,
+	ROOM_BALANCE_SCHEMA_DDL,
+	ROOM_CURRENCY_SCHEMA_DDL,
+} from '../../room-currency-db'
+import { createRoomKey, ROOM_KEY_SCHEMA_DDL } from '../../room-key-db'
 
 import type { CatalogLoadRow, CatalogRow, CatalogValue, StoreListing } from '../../catalog-db'
 import type { Env } from '../../context'
@@ -2896,12 +2905,98 @@ describe('econ endpoints', () => {
 			'/econ/roomOffer/room/92',
 			'/econ/roomOffer/room/92/purchaseCounts',
 			'/econ/roomGiftDropShops/room/92',
-			'/api/ugcPurchasables/v1/items/room/92',
 		]) {
 			const res = await exports.default.fetch(`${ORIGIN}${path}`)
 			expect(res.status, path).toBe(200)
 			expect(await res.json(), path).toEqual([])
 		}
+	})
+
+	test('GET /api/ugcPurchasables/v1/items/room/:roomId lists keys, consumables and currency packs as one shop', async () => {
+		const shop = async (roomId: number) =>
+			(await (
+				await exports.default.fetch(`${ORIGIN}/api/ugcPurchasables/v1/items/room/${roomId}`)
+			).json()) as Array<Record<string, unknown>>
+
+		// A room that sells nothing is `[]`, never `{}` — the client's decoder throws on that.
+		expect(await shop(93)).toEqual([])
+
+		const key = await createRoomKey(env.DB, {
+			RoomId: 93,
+			Type: 'Key',
+			Name: 'VIP Key',
+			Description: '',
+			Price: 250,
+		})
+		const consumable = await upsertRoomConsumable(env.DB, null, {
+			RoomId: 93,
+			Name: 'Potion',
+			Description: 'Drink me',
+			ImageName: 'potion.png',
+			Price: 5,
+			PurchaseCurrencyId: 'c0ffee00-0000-4000-8000-000000000093',
+			MaximumCountPerPurchase: 10,
+		})
+		const currency = await createRoomCurrency(env.DB, {
+			RoomId: 93,
+			Name: 'Gems',
+			Description: 'Shiny',
+			Limit: 100,
+			Shape: 0,
+			Color: 0,
+		})
+		// The client names an offer by a GUID — not a label anyone should see.
+		const offer = await createPurchaseOffer(env.DB, currency.CurrencyId, {
+			Name: '5a1c3e4f-0000-4000-8000-000000000093',
+			CurrencyAmount: 100,
+			Price: 400,
+			Order: 0,
+		})
+
+		// The client's 10-key `UgcPurchasableItem`, `ItemType` saying which table a line is
+		// from and `ItemId` a bare GUID: a key is named by its ReplicationId, not its number.
+		expect(await shop(93)).toEqual([
+			{
+				ItemType: 0,
+				ItemId: key.ReplicationId,
+				Name: 'VIP Key',
+				Description: '',
+				ImageName: null,
+				RoomId: 93,
+				Price: 250,
+				PurchaseCurrencyId: null,
+				CreatedAt: key.CreatedAt,
+				ModifiedAt: key.CreatedAt,
+			},
+			{
+				ItemType: 1,
+				ItemId: consumable.RoomConsumableId,
+				Name: 'Potion',
+				Description: 'Drink me',
+				ImageName: 'potion.png',
+				RoomId: 93,
+				Price: 5,
+				PurchaseCurrencyId: 'c0ffee00-0000-4000-8000-000000000093',
+				CreatedAt: consumable.ModifiedAt,
+				ModifiedAt: consumable.ModifiedAt,
+			},
+			{
+				ItemType: 3,
+				ItemId: offer.CurrencyPurchaseOfferId,
+				// So a pack is labelled by what it is, and wears the currency's description.
+				Name: '100 Gems',
+				Description: 'Shiny',
+				ImageName: null,
+				RoomId: 93,
+				Price: 400,
+				// A currency pack is bought with tokens.
+				PurchaseCurrencyId: null,
+				CreatedAt: offer.ModifiedAt,
+				ModifiedAt: offer.ModifiedAt,
+			},
+		])
+		// Another room's shop is untouched.
+		expect(await shop(92)).toEqual([])
 	})
 
 	test('POST /api/ugcPurchasables/v1/items/bulk resolves custom avatar items, echoing RoomId', async () => {
@@ -5054,7 +5149,7 @@ describe('econ endpoints', () => {
 			}
 			InventionResponse: {
 				Status: number
-				Invention: { InventionId: number; Name: string }
+				Invention: { InventionId: number; Name: string; NumDownloads: number }
 				InventionVersion: { InventionId: number; VersionNumber: number }
 			}
 		}
@@ -5070,9 +5165,22 @@ describe('econ endpoints', () => {
 
 		expect(await getOwnedInventionIds(env.DB, 50)).toEqual([8])
 
-		// Owning an invention is boolean: buying it again is a conflict, not a second row.
+		// `NumDownloads` is the number of players who have it, re-derived on the grant:
+		// the response carries it and so does the stored record.
+		const storedDownloads = async (): Promise<number> =>
+			(
+				await env.DB.prepare(
+					"SELECT json_extract(data, '$.NumDownloads') AS n FROM invention WHERE id = 8"
+				).first<{ n: number }>()
+			)?.n ?? -1
+		expect(body.InventionResponse.Invention.NumDownloads).toBe(1)
+		expect(await storedDownloads()).toBe(1)
+
+		// Owning an invention is boolean: buying it again is a conflict, not a second row —
+		// and not a second download.
 		expect((await buyInvention('50', 8)).status).toBe(409)
 		expect(await getOwnedInventionIds(env.DB, 50)).toEqual([8])
+		expect(await storedDownloads()).toBe(1)
 	})
 
 	test('GET /api/storefronts/v2/buyInvention pays the creator the buyer’s tokens', async () => {

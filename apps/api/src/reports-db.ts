@@ -8,8 +8,8 @@
  *
  * The `api` worker owns this schema/migration (migrations/0004_report.sql,
  * 0009_report_ban.sql, 0011_report_event.sql, 0016_report_invention.sql,
- * 0017_report_custom_avatar_item.sql, 0020_report_ban_audit.sql and
- * 0025_report_chat_message.sql, applied under its own `migrations_table` so it doesn't clash
+ * 0017_report_custom_avatar_item.sql, 0020_report_ban_audit.sql,
+ * 0025_report_chat_message.sql and 0034_report_image.sql, applied under its own `migrations_table` so it doesn't clash
  * with the other workers' migrations that share the database).
  *
  * The moderation-side READS here — `searchReports`, `getTopReported`, `getBansInForce` —
@@ -24,7 +24,9 @@
  * CREATOR — see `POST /api/playerevents/v1/report`, `POST /api/inventions/v1/report` and
  * `POST /api/customAvatarItems/v1/{id}/report`. A reported CHAT MESSAGE is the fourth kind:
  * `chat_message_id`, with the message's SENDER as the reported player — see
- * `POST /api/chatreport/createChatReport`. The four id columns are mutually exclusive; a row
+ * `POST /api/chatreport/createChatReport`. A reported IMAGE is the fifth: `image_id`, with
+ * the player who took it as the reported player — see `POST /api/images/v1/{id}/report`.
+ * The five id columns are mutually exclusive; a row
  * with none of them is an ordinary player report. They are separate columns rather than one
  * polymorphic id because the keys differ in TYPE (numbers and a guid) and in what they key.
  *
@@ -42,9 +44,10 @@
 /**
  * Schema DDL (mirror of migrations/0004_report.sql + 0009_report_ban.sql +
  * 0011_report_event.sql + 0016_report_invention.sql + 0017_report_custom_avatar_item.sql +
- * 0020_report_ban_audit.sql + 0025_report_chat_message.sql + 0029_report_ban_lifted.sql).
+ * 0020_report_ban_audit.sql + 0025_report_chat_message.sql + 0029_report_ban_lifted.sql +
+ * 0034_report_image.sql).
  *
- * None of `event_id`, `invention_id`, `custom_avatar_item_id` or `chat_message_id` is
+ * None of `event_id`, `invention_id`, `custom_avatar_item_id`, `chat_message_id` or `image_id` is
  * indexed: each is written on every report of its kind and read by nothing — no query here filters on any of them,
  * and the reads that do exist go by player or by the ban flag. 0011's partial index over
  * `event_id` was dropped in 0016 rather than mirrored. Add one back alongside the query that
@@ -71,7 +74,8 @@ export const SCHEMA_DDL: string[] = [
 		banned_at TEXT,
 		chat_message_id INTEGER,
 		unbanned_by_player_id INTEGER,
-		unbanned_at TEXT
+		unbanned_at TEXT,
+		image_id INTEGER
 	)`,
 	`CREATE INDEX IF NOT EXISTS idx_report_reported ON report (reported_player_id)`,
 	`CREATE INDEX IF NOT EXISTS idx_report_reporter ON report (reporter_player_id)`,
@@ -150,6 +154,13 @@ export interface ReportRow {
 	unbanned_by_player_id: number | null
 	/** ISO-8601 UTC instant the ban was lifted; NULL with `unbanned_by_player_id`. */
 	unbanned_at: string | null
+	/**
+	 * The saved image (photo) this report is against, or NULL for any other kind — mutually
+	 * exclusive with the four id columns above. See `POST /api/images/v1/{id}/report`: the
+	 * request has no body, so `reported_player_id` is the image's `PlayerId` (who took it),
+	 * read from the image, and there is no category or description to store.
+	 */
+	image_id: number | null
 }
 
 /**
@@ -175,6 +186,8 @@ export interface NewReport {
 	customAvatarItemId?: string | null
 	/** Set only when reporting a CHAT MESSAGE; never set alongside the three above. */
 	chatMessageId?: number | null
+	/** Set only when reporting an IMAGE; never set alongside the four above. */
+	imageId?: number | null
 }
 
 /** Record a submitted report, returning the stored row (with its assigned id). */
@@ -184,8 +197,8 @@ export async function createReport(db: D1Database, input: NewReport): Promise<Re
 			`INSERT INTO report (
 				reporter_player_id, reported_player_id, report_category, details,
 				height_reporter, height_reported, room_id, room_instance_type, created_at,
-				event_id, invention_id, custom_avatar_item_id, chat_message_id
-			 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
+				event_id, invention_id, custom_avatar_item_id, chat_message_id, image_id
+			 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)
 			 RETURNING *`
 		)
 		.bind(
@@ -201,7 +214,8 @@ export async function createReport(db: D1Database, input: NewReport): Promise<Re
 			input.eventId ?? null,
 			input.inventionId ?? null,
 			input.customAvatarItemId ?? null,
-			input.chatMessageId ?? null
+			input.chatMessageId ?? null,
+			input.imageId ?? null
 		)
 		.first<ReportRow>()
 	// RETURNING always yields the inserted row; the non-null assert keeps the caller

@@ -11,8 +11,10 @@ import {
 	markRoomAsRRO,
 	movePlayerToDorm,
 	RRO_ALLOWED_CIRCUIT,
+	updateAccount,
 	writeAuditLog,
 } from '@repo/domain'
+import { PlatformType } from '@repo/domain/src/enums'
 import { intVar, logger } from '@repo/hono-helpers'
 import { validateAndGetAccountId, validateAndGetRoles } from '@repo/jwt'
 
@@ -34,6 +36,9 @@ import {
 	searchReports,
 } from '../../api/src/reports-db'
 import { getWarningsAgainst } from '../../api/src/warnings-db'
+// The platform links, owned by `auth`: a Discord link carries the roles its member held at
+// their claim or the last daily sweep (discord-roles.ts), which is what the role drop reads.
+import { getLinksForPlatform } from '../../auth/src/platform-db'
 // Balances, owned by `econ`. A staff token gift is the same credit econ's own faucets make.
 import {
 	ALL_PLATFORMS,
@@ -991,6 +996,79 @@ export async function giftOnlineTokensHandler(c: Context<App>) {
 }
 
 /**
+ * Send tokens to EVERYONE HOLDING A DISCORD ROLE — online or not. The account page's second
+ * drop, beside the one to everyone online: the same box, the same cap, a different audience.
+ *
+ * The audience is every account whose Discord link records the role: the snapshot the
+ * benefits claim wrote and the daily sweep (discord-roles.ts) refreshes, read when the button
+ * is pressed. Nothing asks Discord here — a member who gained the role since the last sweep
+ * is missed until the next one, and one who lost it is still paid until then; the form says
+ * as much. A player who holds the role in the guild but never claimed on the website has no
+ * link, and so is not in the audience however many roles they hold there. The link is the
+ * unit, so a Discord identity linked to two accounts pays both; an account is paid once
+ * whatever its links say.
+ *
+ * Offline is the point: the econ cron's supporter gift (discord-role-gift.ts) is this on a
+ * schedule, and this is the hand-run version with an operator's amount and message on it. A
+ * player who isn't signed in meets the box in `GET /api/avatar/v2/gifts` and the balance on
+ * their next read, as they do for every box the server hands over.
+ *
+ * The role is a Discord snowflake — all digits, compared exactly, as the sweep stores them.
+ * The amount is bounded as the online drop's is ({@link MAX_TOKEN_DROP} each, positive only):
+ * this one multiplies by a role's whole membership, which can be larger than the server has
+ * ever had online at once. The message is required for the same reason.
+ */
+export async function giftRoleTokensHandler(c: Context<App>) {
+	const roleId = c.req.param('roleId') ?? ''
+	if (!/^\d+$/.test(roleId)) {
+		return c.json({ error: 'A Discord role id is all digits' }, 400)
+	}
+
+	const body = (await c.req.json().catch(() => ({}))) as { amount?: unknown; message?: unknown }
+	const amount = Number(body.amount)
+	if (!Number.isInteger(amount) || amount <= 0) {
+		return c.json({ error: 'Enter a whole number of tokens greater than 0' }, 400)
+	}
+	if (amount > MAX_TOKEN_DROP) {
+		return c.json(
+			{ error: `A token drop can carry at most ${MAX_TOKEN_DROP.toLocaleString()} tokens each` },
+			400
+		)
+	}
+	if (typeof body.message !== 'string' || body.message.trim() === '') {
+		return c.json({ error: 'Enter the message for the gift box' }, 400)
+	}
+	const message = giftMessage(body)
+	if (message === undefined) return c.json({ error: GIFT_MESSAGE_TOO_LONG }, 400)
+
+	const links = await getLinksForPlatform(c.env.DB, PlatformType.Discord)
+	const playerIds = [
+		...new Set(links.filter((l) => l.roles.includes(roleId)).map((l) => l.accountId)),
+	]
+	if (playerIds.length === 0) {
+		return c.json({ error: 'No linked account holds that Discord role' }, 404)
+	}
+
+	const startingTokens = intVar(c.env.STARTING_TOKENS, DEFAULT_STARTING_TOKENS)
+	const paid: number[] = []
+	for (const playerId of playerIds) {
+		// A positive amount never comes back null: nothing to skip.
+		if ((await sendTokens(c, playerId, amount, startingTokens, message)) !== null) {
+			paid.push(playerId)
+		}
+	}
+
+	await recordPlayerAudit(c, 'gift_tokens_role', { roleId, amount, message, paid })
+	logger.info('staff dropped tokens on a discord role', {
+		moderatorId: staffId(c),
+		roleId,
+		amount,
+		paidCount: paid.length,
+	})
+	return c.json({ roleId, amount, message, paid })
+}
+
+/**
  * Give a player XP, in a gift box — the way a game reward pays its XP. The XP is banked
  * here (the box, like every box, grants nothing when opened) and spent on any levels it now
  * pays for; a `PlayerProgressionLevelUpdate` moves the level bar, and the box is announced
@@ -1364,4 +1442,29 @@ export async function clearPasswordHandler(c: Context<App>) {
 	await recordPlayerAudit(c, 'clear_password', { playerId, hadPassword })
 	logger.info('staff cleared a password', { moderatorId: staffId(c), playerId, hadPassword })
 	return c.json({ playerId, hadPassword })
+}
+
+/**
+ * Give a player Rec Room Plus by setting `hasPlus` on their account — the same flag the
+ * Discord benefits claim and `runx admin grant-plus` set, with no Discord link involved.
+ * Developer-only. `hadPlus` says whether they already had it; granting it again succeeds,
+ * changes nothing, and is still logged.
+ *
+ * `auth` stamps the flag into the token's `rn.plus` claim, so the player has Plus from their
+ * NEXT sign-in or token refresh, not the moment this answers.
+ */
+export async function grantPlusHandler(c: Context<App>) {
+	const playerId = playerIdParam(c)
+	if (playerId === null) return c.json({ error: 'A numeric player id is required' }, 400)
+
+	// Read first: `updateAccount` creates the row when there is none.
+	const account = await getAccount(c.env.DB, playerId)
+	if (account === null) return c.json({ error: 'No such player' }, 404)
+
+	const hadPlus = account.hasPlus === true
+	if (!hadPlus) await updateAccount(c.env.DB, playerId, { hasPlus: true })
+
+	await recordPlayerAudit(c, 'grant_plus', { playerId, hadPlus })
+	logger.info('staff granted plus', { moderatorId: staffId(c), playerId, hadPlus })
+	return c.json({ playerId, hasPlus: true, hadPlus })
 }

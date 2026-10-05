@@ -35,6 +35,7 @@ import {
 	deleteInvention,
 	getFeaturedInventions,
 	getInventionById,
+	getInventionsByCreators,
 	getInventionsByIds,
 	getInventionsByRoom,
 	getInventionTagFilters,
@@ -57,6 +58,7 @@ import {
 	setInventionTags,
 	toSaveResult,
 	toSaveResultV9,
+	unpublishInvention,
 	updateInvention,
 } from '../inventions-db'
 import {
@@ -84,6 +86,7 @@ import {
 	InventionReportRequest,
 	InventionSaveResult,
 	InventionSaveV9Result,
+	InventionV9Dto,
 	InventionVersionDto,
 	json,
 	JsonArray,
@@ -107,6 +110,7 @@ import {
 	SuccessValueEnvelope,
 	TagFilters,
 	UNAUTHORIZED_RESPONSE,
+	UnpublishInventionRequest,
 	UpdateCustomAvatarItemRequest,
 	UpdateInventionMetadataRequest,
 	UpdateInventionRequest,
@@ -1704,30 +1708,29 @@ export const avatarRoutes = new Hono<App>({ strict: false })
 	)
 
 	// Inventions by particular creators (`?id=207&id=…`) — what the client fills a creator's
-	// shelf, and the "from creators you follow" row, from.
+	// portfolio, and the "from creators you follow" row, from.
 	//
-	// STUB: an empty list for now. It is the honest answer rather than a placeholder, since
-	// the client reads it as "this creator has published nothing" and renders an empty
-	// shelf, where a 404 would read as a row that failed to load. When it becomes real it is
-	// a filter on the invention table's creator column, the same feed shape as `toptoday`
-	// and `featured` above — `id` is repeatable, and `skip`/`take` page it.
+	// Published only, for every caller — a creator's own drafts are `v2/mine`'s alone.
 	.get(
 		'/api/inventions/v1/fromcreators',
 		describeRoute({
 			tags: ['Inventions'],
-			summary: 'Inventions by particular creators (stub)',
+			summary: 'Inventions by particular creators',
 			description:
-				'The published inventions of the accounts named by `id` (repeatable), newest first — ' +
-				'a creator’s shelf, and the "from creators you follow" row. STUB: always an empty ' +
-				'array for now, which the client renders as "nothing published" rather than as a ' +
-				'failed load. `id`, `skip` and `take` are accepted and, for the moment, ignored.',
-			parameters: [
-				intQuery('id', 'Creator account id; repeatable. Accepted and ignored by the stub'),
-				...pageParams(100),
-			],
-			responses: { 200: json(InventionDto.array(), 'Empty — nothing is served here yet') },
+				'The inventions of the accounts named by `id` (repeatable), newest first — a ' +
+				'creator’s portfolio, and the "from creators you follow" row. Only PUBLISHED ' +
+				'inventions are listed, the caller’s own included: unpublished ones are served by ' +
+				'`v2/mine` alone. No `id` is an empty array.',
+			parameters: [intQuery('id', 'Creator account id; repeatable'), ...pageParams(100)],
+			responses: {
+				200: json(InventionDto.extend(InventionV9Dto.shape).array(), 'The creators’ inventions'),
+			},
 		}),
-		(c) => c.json([])
+		async (c) => {
+			const skip = Number.parseInt(c.req.query('skip') ?? '0', 10) || 0
+			const take = Number.parseInt(c.req.query('take') ?? '100', 10) || 100
+			return c.json(await getInventionsByCreators(c.env.DB, inventionIdQuery(c), skip, take))
+		}
 	)
 
 	// Invention search/browse: published inventions matching `value` (matched against
@@ -1777,7 +1780,10 @@ export const avatarRoutes = new Hono<App>({ strict: false })
 				'invention listed even if it has since been unpublished or hidden. Not paginated.',
 			security: AUTHED,
 			responses: {
-				200: json(InventionDto.array(), 'The caller’s inventions'),
+				200: json(
+					InventionDto.extend(InventionV9Dto.shape).array(),
+					'The caller’s inventions — the stored record with the newer client’s flat DTO laid over it'
+				),
 				401: UNAUTHORIZED_RESPONSE,
 			},
 		}),
@@ -1891,6 +1897,49 @@ export const avatarRoutes = new Hono<App>({ strict: false })
 			}
 			await setInventionCheer(c.env.DB, playerId, inventionId, body.Cheer)
 			return c.json({ success: true, error: '' })
+		}
+	)
+	// The newer client's cheer: the same body as `v1/cheer` and the same write, at a new
+	// path. It answers the `{ Value, Success, Error, error_id }` envelope the other v2+
+	// invention routes use, refusals in-band — an ASSUMPTION: only the request has been
+	// observed, not what the client reads off the reply.
+	.post(
+		'/api/inventions/v2/cheer',
+		describeRoute({
+			tags: ['Inventions'],
+			summary: 'Cheer or un-cheer an invention (v2)',
+			description:
+				'`v1/cheer` for the newer client: persists the caller’s cheer state and resyncs ' +
+				'the invention’s `CheerCount`; repeating the same state is idempotent. Answers ' +
+				'the `{ Value, Success, Error, error_id }` envelope with `Value` null, and a ' +
+				'refusal — a bad body, an unknown invention — is `Success: false` with a message ' +
+				'rather than an error status.',
+			security: AUTHED,
+			requestBody: jsonBody(InventionCheerRequest, 'The invention and new cheer state'),
+			responses: {
+				200: json(InventionDeleteResult, 'The envelope, `Value` null either way'),
+				401: json(InventionDeleteResult, 'The same envelope, refused — not an empty body'),
+			},
+		}),
+		async (c) => {
+			const playerId = await authedId(c)
+			if (playerId === null) return c.json(inventionDeleteResult('Unauthorized'), 401)
+			const body = await c.req
+				.json<{ InventionId?: unknown; Cheer?: unknown }>()
+				.catch(() => ({}) as Record<string, unknown>)
+			const inventionId = body.InventionId
+			if (
+				typeof inventionId !== 'number' ||
+				!Number.isInteger(inventionId) ||
+				typeof body.Cheer !== 'boolean'
+			) {
+				return c.json(inventionDeleteResult('InventionId and Cheer are required'))
+			}
+			if ((await getInventionById(c.env.DB, inventionId)) === null) {
+				return c.json(inventionDeleteResult('No such invention'))
+			}
+			await setInventionCheer(c.env.DB, playerId, inventionId, body.Cheer)
+			return c.json(inventionDeleteResult())
 		}
 	)
 	// Report an invention. Stored in the `report` table the player and event reports use —
@@ -2271,14 +2320,15 @@ export const avatarRoutes = new Hono<App>({ strict: false })
 			description:
 				'What puts an invention into search and the feeds. Creator only.\n\n' +
 				'`Permission` is the `GeneralPermission` other players get, as a raw ladder ' +
-				'number (the publish sheet sends 20, UseOnly). `Accessibility` says where it can ' +
-				'be found — 1 (Public) lists it, 2 (Unlisted) publishes it reachable by id but ' +
-				'keeps it out of browse and search. A null `Price` leaves the price alone rather ' +
+				'number (the publish sheet sends 20, UseOnly). `Accessibility` says whether it ' +
+				'is in the store — 1 (Public) lists it in search and the feeds, 2 (Unlisted) ' +
+				'publishes it onto the creator’s portfolio and reachable by id but keeps it out ' +
+				'of both. A null `Price` leaves the price alone rather ' +
 				'than zeroing it, so re-publishing something that was for sale doesn’t give it ' +
 				'away; every field but `InventionId` is nullable and an omitted one keeps what ' +
 				'the invention has. A price over 1000 tokens (`MAX_INVENTION_PRICE`) refuses the ' +
 				'publish in-band.\n\n' +
-				'Publishing is not undone here, and re-publishing doesn’t re-date the first ' +
+				'Publishing is undone by `v2/unpublish`, and re-publishing doesn’t re-date the first ' +
 				'publish. Refusals answer `Success: false` with a null `Value`, the way ' +
 				'`v9/save` does.',
 			security: AUTHED,
@@ -2326,6 +2376,56 @@ export const avatarRoutes = new Hono<App>({ strict: false })
 			})
 			if (published === null) return c.json(inventionSaveV9Failure('No such invention'))
 			return c.json(toSaveResultV9(published, published.Tags ?? []))
+		}
+	)
+
+	// Unpublish an invention: `v4/publish` undone. Same body shape as `v2/delete` — the id
+	// and nothing else — and creator only.
+	//
+	// The reply is the `v9/save` envelope carrying the UPDATED invention, as `v4/publish`
+	// answers. That is an ASSUMPTION: what the client reads off this response has not been
+	// observed, only the request.
+	.post(
+		'/api/inventions/v2/unpublish',
+		describeRoute({
+			tags: ['Inventions'],
+			summary: 'Unpublish an invention',
+			description:
+				'Creator only. Takes the invention back out of search, the feeds and the ' +
+				'creator’s portfolio: `IsPublished` goes false and `Accessibility` back to 0, the ' +
+				'state a save mints, so the next `v4/publish` sets both afresh. Players who ' +
+				'already bought it keep it, the price and permission are left as they are, and ' +
+				'the first-publish date is not cleared.\n\n' +
+				'Answers the enveloped result `v4/publish` answers, carrying the unpublished ' +
+				'invention. Refusals are `Success: false` with a null `Value`.',
+			security: AUTHED,
+			requestBody: jsonBody(UnpublishInventionRequest, 'The invention to unpublish'),
+			responses: {
+				200: json(
+					InventionSaveV9Result,
+					'The envelope — the unpublished invention under `Value`, or `Success: false` ' +
+						'with `Error` when it was refused'
+				),
+				401: json(InventionSaveV9Result, 'The same envelope, refused — not an empty body'),
+			},
+		}),
+		async (c) => {
+			const body = (await c.req.json().catch(() => null)) as Record<string, unknown> | null
+			if (body === null) return c.json(inventionSaveV9Failure('Invalid request body'))
+
+			const gate = await creatorsInventionResult(
+				c,
+				typeof body.InventionId === 'number' ? body.InventionId : Number.NaN
+			)
+			if ('rejection' in gate) {
+				return gate.status === 401
+					? c.json(inventionSaveV9Failure(gate.rejection), 401)
+					: c.json(inventionSaveV9Failure(gate.rejection))
+			}
+
+			const unpublished = await unpublishInvention(c.env.DB, gate.invention.InventionId)
+			if (unpublished === null) return c.json(inventionSaveV9Failure('No such invention'))
+			return c.json(toSaveResultV9(unpublished, unpublished.Tags ?? []))
 		}
 	)
 

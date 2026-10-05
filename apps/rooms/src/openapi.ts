@@ -269,7 +269,10 @@ export const SubRoomDto = z.object({
 		'The latest room save — where the client finds the scene blob. Null until first save'
 	),
 	DataBlob: z.string().optional().describe('Legacy flat key; the client reads `CurrentSave`'),
-	RoomDataBlob: z.string().optional().describe('Uploaded room-data key; absent until first save'),
+	RoomDataBlob: z
+		.string()
+		.optional()
+		.describe('Legacy; the room-level blob is the ROOM’s `DataBlob`. Not a key the client knows'),
 	DataSavedAt: z.string().optional().describe('ISO timestamp of the last save'),
 	PersistenceVersion: z.int().optional(),
 	InventionUsage: z.string().optional().describe('Recorded by a room save; absent until then'),
@@ -318,6 +321,11 @@ export const RoomDto = z.object({
 	PublishedAt: z.string(),
 	BecameRRStudioRoomAt: z.string().nullable(),
 	Stats: RoomStatsDto,
+	DataBlob: z
+		.string()
+		.optional()
+		.describe('The room-level metadata blob a room save uploads as `RoomData`; absent until one'),
+	DataBlobHash: z.string().nullable().optional().describe('`RoomData.Hash` from that save'),
 	BoostCount: z
 		.int()
 		.describe('Boosts on the room. Nothing grants boosts here, so always 0 — but present'),
@@ -895,9 +903,11 @@ export const SaveSubRoomDataRequest = z.object({
 		.optional()
 		.describe('The uploaded scene-data blob — becomes the subroom’s `CurrentSave.DataBlob`'),
 	RoomData: z
-		.object({ Filename: z.string() })
+		.object({ Filename: z.string(), Hash: z.string().nullable().optional() })
 		.optional()
-		.describe('The uploaded room-level data blob — becomes `RoomDataBlob`'),
+		.describe(
+			'The uploaded room-level metadata blob — becomes the ROOM’s `DataBlob`/`DataBlobHash`'
+		),
 	Description: z
 		.string()
 		.optional()

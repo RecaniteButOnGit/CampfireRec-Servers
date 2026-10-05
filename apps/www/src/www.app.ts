@@ -50,9 +50,11 @@ import {
 	getReportHandler,
 	giftItemHandler,
 	giftOnlineTokensHandler,
+	giftRoleTokensHandler,
 	giftRoomTokensHandler,
 	giftTokensHandler,
 	giftXpHandler,
+	grantPlusHandler,
 	linkedAccountsHandler,
 	playerHistoryHandler,
 	requireDeveloper,
@@ -559,6 +561,11 @@ const app = new Hono<App>()
 	.post('/api/staff/rooms/:roomId/rro-tag', requireDeveloper, addRoomRroTagHandler)
 	// The account page's token drop: the same gift to everyone online at once.
 	.post('/api/staff/online/gift-tokens', requireDeveloper, giftOnlineTokensHandler)
+	// Its sibling: the same gift to every account whose Discord link holds a role, offline
+	// included — the supporter cron's audience, with an operator's amount and message.
+	.post('/api/staff/discord-roles/:roleId/gift-tokens', requireDeveloper, giftRoleTokensHandler)
+	// Rec Room Plus is worth tokens and a discount, so granting it is developer-only too.
+	.post('/api/staff/players/:id/grant-plus', requireDeveloper, grantPlusHandler)
 	.post('/api/staff/players/:id/username-changes', addUsernameChangeHandler)
 	.post('/api/staff/players/:id/clear-password', clearPasswordHandler)
 	// Exclusive to the verified session for account 2; accepts a protobuf file or ZIP.

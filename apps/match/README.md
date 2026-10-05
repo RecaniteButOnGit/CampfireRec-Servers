@@ -112,6 +112,8 @@ substitutes the same as asking by id.
 - **One hop only** — `2=3,3=2` swaps the two rooms rather than looping.
 - **An unresolvable target leaves the original room in place** (logged), so a typo doesn't
   make a room unreachable.
+- **Only builds newer than `20230414` are substituted** — a caller on the 2023 client or
+  an older one (or on a token that names no build) enters the room they asked for.
 - **Following a friend and joining a specific instance are unaffected** — those enter a
   live instance, which is already in whichever room it was created in.
 

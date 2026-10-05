@@ -94,6 +94,7 @@ interface ReportRow {
 	banned_by_player_id: number | null
 	banned_at: string | null
 	chat_message_id: number | null
+	image_id: number | null
 	/**
 	 * Who lifted the ban that once stood on this row, and when — null until one is lifted,
 	 * and cleared again by a re-ban. A lift wipes the four ban columns, so this pair is the
@@ -230,7 +231,7 @@ function LiftedBan({ report, names }: { report: ReportRow; names: Map<number, Pu
 }
 
 /**
- * What kind of thing a report is against. The four id columns are mutually exclusive and
+ * What kind of thing a report is against. The five id columns are mutually exclusive and
  * a row with none of them is an ordinary player report (see reports-db) — which is the
  * only way to tell the kinds apart, so it is worth a column of its own.
  */
@@ -239,6 +240,7 @@ function reportKind(report: ReportRow): string {
 	if (report.invention_id !== null) return 'Invention'
 	if (report.custom_avatar_item_id !== null) return 'Avatar item'
 	if (report.chat_message_id !== null) return 'Chat message'
+	if (report.image_id != null) return 'Photo'
 	return 'Player'
 }
 

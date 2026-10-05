@@ -1371,6 +1371,7 @@ function StaffPlayerActions({ account, navigate }: { account: PublicAccount; nav
 	const itemGift = useAction()
 	const usernameChange = useAction()
 	const clearPassword = useAction()
+	const grantPlus = useAction()
 	const base = `/api/staff/players/${account.accountId}`
 
 	return (
@@ -1538,6 +1539,26 @@ function StaffPlayerActions({ account, navigate }: { account: PublicAccount; nav
 				>
 					{usernameChange.pending ? 'Adding…' : 'Add username change'}
 				</button>
+				{/* Developer-only, like the gifts; www refuses it to moderators. */}
+				{isDeveloper() && (
+					<button
+						type="submit"
+						disabled={grantPlus.pending}
+						onClick={() =>
+							void grantPlus.run(async () => {
+								const res = await call<{ hadPlus: boolean }>(`${base}/grant-plus`, {
+									authed: true,
+									method: 'POST',
+								})
+								return res.hadPlus
+									? `@${account.username} already has Plus.`
+									: `@${account.username} now has Plus. It takes effect the next time they sign in.`
+							})
+						}
+					>
+						{grantPlus.pending ? 'Granting…' : 'Grant Plus'}
+					</button>
+				)}
 				{confirmingClear ? (
 					<>
 						<button
@@ -1589,6 +1610,8 @@ function StaffPlayerActions({ account, navigate }: { account: PublicAccount; nav
 			{usernameChange.done && <p className="ok">{usernameChange.done}</p>}
 			{clearPassword.error && <p className="error">{clearPassword.error}</p>}
 			{clearPassword.done && <p className="ok">{clearPassword.done}</p>}
+			{grantPlus.error && <p className="error">{grantPlus.error}</p>}
+			{grantPlus.done && <p className="ok">{grantPlus.done}</p>}
 		</section>
 	)
 }
@@ -3459,7 +3482,17 @@ function Dashboard({
 						label: 'Import room',
 						render: () => <RoomImport navigate={navigate} />,
 					},
-					{ id: 'tokens', label: 'Token drop', render: () => <TokenDropForm /> },
+					{
+						id: 'tokens',
+						label: 'Token drop',
+						// Two audiences for one gift: whoever is online now, or whoever holds a Discord role.
+						render: () => (
+							<>
+								<TokenDropForm />
+								<RoleTokenDropForm />
+							</>
+						),
+					},
 				]
 			: []),
 		...(account.accountId === 2
@@ -4039,6 +4072,97 @@ function TokenDropForm() {
 				{done && <p className="ok">{done}</p>}
 				<button type="submit" disabled={pending}>
 					{pending ? 'Sending…' : 'Send to everyone online'}
+				</button>
+			</form>
+		</section>
+	)
+}
+
+/**
+ * Developer-only: give every player whose Discord link holds a role the same number of
+ * tokens, in a gift box carrying the operator's message — the token drop's sibling, with a
+ * different audience. Offline is the point: the box waits for whoever isn't signed in.
+ *
+ * The audience is the roles the website recorded at each player's benefits claim and
+ * refreshes once a day, so it trails Discord by up to a day and never includes a member who
+ * hasn't claimed; the copy says so. Same cap as the online drop, repeated on the input.
+ */
+function RoleTokenDropForm() {
+	const [roleId, setRoleId] = useState('')
+	const [message, setMessage] = useState('')
+	const [tokens, setTokens] = useState('')
+	const { pending, error, done, run } = useAction()
+
+	return (
+		<section className="card">
+			<h2>Discord role drop</h2>
+			<p className="muted">
+				Give everyone holding a Discord role the same number of tokens, whether or not they are
+				online — a player who is signed out finds the gift box waiting. Only players who have
+				claimed benefits on this site are counted, and their roles are refreshed once a day, so a
+				role given or taken since then isn&apos;t seen yet. Up to {MAX_TOKEN_DROP.toLocaleString()}{' '}
+				tokens each.
+			</p>
+			<form
+				onSubmit={(e) => {
+					e.preventDefault()
+					void run(async () => {
+						const amount = Number(tokens)
+						const role = roleId.trim()
+						const res = await call<{ paid: number[] }>(
+							`/api/staff/discord-roles/${encodeURIComponent(role)}/gift-tokens`,
+							{ authed: true, json: { amount, message: message.trim() } }
+						)
+						setTokens('')
+						setMessage('')
+						const n = res.paid.length
+						return `Sent ${amount.toLocaleString()} tokens to ${n} player${n === 1 ? '' : 's'} holding role ${role}.`
+					})
+				}}
+			>
+				<label>
+					Discord role id
+					<input
+						type="text"
+						inputMode="numeric"
+						pattern="[0-9]+"
+						value={roleId}
+						placeholder="1077000000000000001"
+						required
+						onChange={(e) => setRoleId(e.target.value)}
+					/>
+					<span className="hint">
+						The role&apos;s numeric id, from Discord&apos;s role settings (Copy Role ID), not its
+						name.
+					</span>
+				</label>
+				<label>
+					Gift box message
+					<textarea
+						value={message}
+						rows={3}
+						maxLength={256}
+						placeholder="Thanks for supporting the server!"
+						onChange={(e) => setMessage(e.target.value)}
+						required
+					/>
+				</label>
+				<label>
+					Tokens per player
+					<input
+						type="number"
+						min={1}
+						max={MAX_TOKEN_DROP}
+						step={1}
+						value={tokens}
+						required
+						onChange={(e) => setTokens(e.target.value)}
+					/>
+				</label>
+				{error && <p className="error">{error}</p>}
+				{done && <p className="ok">{done}</p>}
+				<button type="submit" disabled={pending}>
+					{pending ? 'Sending…' : 'Send to everyone with the role'}
 				</button>
 			</form>
 		</section>
