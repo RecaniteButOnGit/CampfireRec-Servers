@@ -60,6 +60,8 @@ import { grantCustomAvatarItem, ownedCustomAvatarItemIds } from '../../econ/src/
 // The notification ids and the kick frame's recovered shape, owned by `notify`. Both are
 // imported as values/types with no runtime dependencies.
 import { NotificationType } from '../../notify/src/notification-types'
+// The sweep itself, so a developer can run it on demand instead of waiting for the cron.
+import { refreshDiscordRoles } from './discord-roles'
 
 import type { Context, MiddlewareHandler } from 'hono'
 import type { GiftContent } from '@repo/domain'
@@ -1093,6 +1095,31 @@ export async function giftRoleTokensHandler(c: Context<App>) {
 		paidCount: paid.length,
 	})
 	return c.json({ roleId, amount, message, paid })
+}
+
+/**
+ * Run the Discord role sweep NOW — the daily cron (discord-roles.ts) on a button, for a
+ * developer who has just changed the bot, invited it to the guild, or needs the role drop
+ * above to see this morning's roles. Same code, same credentials, same writes: every Discord
+ * link is re-read through the bot token and `platform_account.role` rewritten.
+ *
+ * The point of having it as a request is the ANSWER. The cron's summary goes to a log line
+ * on a worker with observability off, so a sweep that halts on its first call (a token
+ * Discord refuses, a bot not in the guild) halts silently every night, and the table looks
+ * exactly as it did — which is how it was found never to have completed a run. Here the
+ * same summary comes back as the response, `halted` reason and all.
+ *
+ * Always a 200 with the summary, whatever it says: a `skipped` or `halted` run is not a
+ * malformed request, it is the sweep reporting on its configuration, and the operator
+ * reads the reason off the body. Two developers pressing it at once run two sweeps that
+ * interleave harmlessly — each write is the absolute role list Discord served — at twice the
+ * Discord calls; nothing locks it. It is on the audit log like any other developer action.
+ */
+export async function syncDiscordRolesHandler(c: Context<App>) {
+	const summary = await refreshDiscordRoles(c.env)
+	await recordPlayerAudit(c, 'sync_discord_roles', { ...summary })
+	logger.info('staff ran the discord role sweep', { moderatorId: staffId(c), ...summary })
+	return c.json(summary)
 }
 
 /**

@@ -58,6 +58,7 @@ import {
 	requireDeveloper,
 	requireStaff,
 	searchReportsHandler,
+	syncDiscordRolesHandler,
 	topReportedHandler,
 } from './staff'
 import {
@@ -572,6 +573,9 @@ const app = new Hono<App>()
 	// Its sibling: the same gift to every account whose Discord link holds a role, offline
 	// included — the supporter cron's audience, with an operator's amount and message.
 	.post('/api/staff/discord-roles/:roleId/gift-tokens', requireDeveloper, giftRoleTokensHandler)
+	// The daily role sweep, run now and answered with its summary (halt reason included) —
+	// the cron reports only to a log line, and this is the way to see why it wrote nothing.
+	.post('/api/staff/discord-roles/sync', requireDeveloper, syncDiscordRolesHandler)
 	// Rec Room Plus is worth tokens and a discount, so granting it is developer-only too.
 	.post('/api/staff/players/:id/grant-plus', requireDeveloper, grantPlusHandler)
 	.post('/api/staff/players/:id/username-changes', addUsernameChangeHandler)

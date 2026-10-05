@@ -876,7 +876,8 @@ it('refuses every staff endpoint without a token, and without a staff role', asy
 	writes.push(
 		'/api/staff/rooms/1/gift-tokens',
 		'/api/staff/online/gift-tokens',
-		'/api/staff/discord-roles/1/gift-tokens'
+		'/api/staff/discord-roles/1/gift-tokens',
+		'/api/staff/discord-roles/sync'
 	)
 	for (const path of writes) {
 		expect((await SELF.fetch(`https://example.com${path}`, { method: 'POST' })).status).toBe(401)
@@ -887,8 +888,11 @@ it('refuses every staff endpoint without a token, and without a staff role', asy
 		expect(res.status).toBe(403)
 	}
 
-	// The gifts and the Plus grant are narrower: a moderator is staff, but not a developer.
-	for (const path of writes.filter((p) => p.includes('/gift-') || p.includes('/grant-plus'))) {
+	// The gifts, the Plus grant and the role sweep are narrower: a moderator is staff, but
+	// not a developer.
+	for (const path of writes.filter(
+		(p) => p.includes('/gift-') || p.includes('/grant-plus') || p.endsWith('/sync')
+	)) {
 		expect((await staffPost(path, 8101, { amount: 1 })).status).toBe(403)
 	}
 
@@ -2627,6 +2631,34 @@ it('runs the sweep from the scheduled handler and stays off without a guild', as
 	await scheduled(createScheduledController(), env, ctx)
 	await waitOnExecutionContext(ctx)
 	expect(await discordLink(9100)).toEqual(before)
+})
+
+// The same sweep on a developer's request, answered with its summary. The deployed test
+// config has no guild, so this pins the shape of the answer and the audit row, not a
+// Discord round trip: the sweep's own behaviour is covered below through its seams.
+it('runs the sweep on demand for a developer and answers with the summary', async () => {
+	await onlyDiscordLinks([[9100, '900000000000000100', [ROLE_A]]])
+	const before = await discordLink(9100)
+
+	const res = await devPost('/api/staff/discord-roles/sync', 8110, {})
+	expect(res.status).toBe(200)
+	const summary = (await res.json()) as Record<string, unknown>
+	expect(summary).toEqual({
+		skipped: true,
+		refreshed: 0,
+		changed: 0,
+		gone: 0,
+		failed: 0,
+		halted: null,
+	})
+	expect(await discordLink(9100)).toEqual(before)
+
+	const row = await env.DB.prepare(
+		`SELECT player_id, data FROM audit_log WHERE action = 'sync_discord_roles'
+		 ORDER BY audit_log_id DESC LIMIT 1`
+	).first<{ player_id: number; data: string }>()
+	expect(row?.player_id).toBe(8110)
+	expect(JSON.parse(row?.data ?? '{}')).toMatchObject({ skipped: true })
 })
 
 it('re-reads every discord link and writes the roles back', async () => {

@@ -3363,6 +3363,7 @@ function Dashboard({
 							<>
 								<TokenDropForm />
 								<RoleTokenDropForm />
+								<DiscordRoleSyncCard />
 							</>
 						),
 					},
@@ -3829,6 +3830,75 @@ function RoleTokenDropForm() {
 					{pending ? 'Sending…' : 'Send to everyone with the role'}
 				</button>
 			</form>
+		</section>
+	)
+}
+
+/** What one run of the Discord role sweep did — www's `SweepSummary`, as the sync answers. */
+interface SweepSummary {
+	skipped: boolean
+	refreshed: number
+	changed: number
+	gone: number
+	failed: number
+	halted: string | null
+}
+
+/**
+ * Developer-only: run the Discord role sweep now, instead of waiting for its nightly cron.
+ * Sits under the role drop because the drop reads the snapshot this refreshes — press this
+ * first and the drop sees this morning's roles rather than yesterday's.
+ *
+ * The answer is the point. The cron reports only to a log line, so a sweep that halts on
+ * its first call (a token Discord refuses, a bot not yet in the guild) halts silently every
+ * night; here the same run comes back with its summary, and a `halted` or `skipped` run is
+ * shown as the error it is for the operator, with the reason the server gave. A run that
+ * went through is summed up in a sentence.
+ */
+function DiscordRoleSyncCard() {
+	const { pending, error, done, run } = useAction()
+
+	return (
+		<section className="card">
+			<h2>Refresh Discord roles</h2>
+			<p className="muted">
+				Re-read every linked Discord member&apos;s roles from the server now. This runs on its own
+				once a day; use it after changing the bot or inviting it to the server, or when the role
+				drop above needs today&apos;s roles. If the sweep can&apos;t run, the reason is shown here.
+			</p>
+			{error && <p className="error">{error}</p>}
+			{done && <p className="ok">{done}</p>}
+			<button
+				type="button"
+				disabled={pending}
+				onClick={() =>
+					void run(async () => {
+						const s = await call<SweepSummary>('/api/staff/discord-roles/sync', {
+							authed: true,
+							method: 'POST',
+						})
+						if (s.skipped) {
+							throw new Error(
+								'The sweep is off: no Discord guild or bot token is configured on the server.'
+							)
+						}
+						if (s.halted !== null) {
+							throw new Error(
+								`The sweep stopped before writing anything: ${s.halted}. ${s.refreshed} link${s.refreshed === 1 ? '' : 's'} refreshed first.`
+							)
+						}
+						const parts = [
+							`Refreshed ${s.refreshed} link${s.refreshed === 1 ? '' : 's'}`,
+							`${s.changed} changed`,
+							`${s.gone} left the server`,
+						]
+						if (s.failed > 0) parts.push(`${s.failed} skipped for a transient error`)
+						return `${parts.join(', ')}.`
+					})
+				}
+			>
+				{pending ? 'Refreshing…' : 'Refresh roles now'}
+			</button>
 		</section>
 	)
 }
