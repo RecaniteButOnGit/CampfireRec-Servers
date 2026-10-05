@@ -847,6 +847,79 @@ export const OwnsRoomKeysResponse = z.array(
 )
 
 /**
+ * One wishlist entry — the client's five-key DTO, in its order. An element of the GET's bare
+ * array and the `Value` of the add/remove envelope.
+ *
+ * `PurchasableItemId` is a plain int on the client, so an entry for a custom avatar item
+ * carries 0 there and the item's GUID in `CustomAvatarItemId`; a storefront-item entry has
+ * the id and a null GUID. Exactly one of the two names the item.
+ */
+export const WishlistItemDto = z.object({
+	WishlistItemId: z.string().describe('GUID — the client’s `Guid`, so never an int'),
+	AccountId: z.int().describe('Whose list the entry is on'),
+	PurchasableItemId: z
+		.int()
+		.describe('The storefront item wished for, or 0 when the entry names a custom avatar item'),
+	CustomAvatarItemId: z
+		.string()
+		.nullable()
+		.describe('The custom avatar item wished for, or null when the entry names a storefront item'),
+	CreatedAt: z.string().describe('ISO-8601 UTC'),
+})
+
+/** `GET /api/itemWishlists/v1/wishlist/me|{accountId}` — a bare array, newest wish first. */
+export const WishlistItemList = z.array(WishlistItemDto)
+
+/**
+ * The envelope `wishlist/add` and `wishlist/remove` answer in — the same `{ Value, Success,
+ * Error, error_id }` the room-currency writes use. The client reads `add`’s `Value` and
+ * discards `remove`’s, but parses both as this shape: a bare entry or a 204 fails the same
+ * way `Success: false` does. `Error` is shown to the player verbatim behind “Wishlist error: ”.
+ */
+export const WishlistEnvelope = z.object({
+	Value: WishlistItemDto.nullable().describe(
+		'The entry added or removed; null on a refusal, or on removing an item that wasn’t listed'
+	),
+	Success: z.boolean(),
+	Error: z.string().nullable().describe('Null on success; the failure message otherwise'),
+	error_id: z.null().describe('Always null. Present as a key, and lowercase'),
+})
+
+/**
+ * `wishlist/add` and `wishlist/remove` — form-encoded. The client posts BOTH fields every
+ * time with the unused one empty (`purchasableItemId=1534&customAvatarItemId=`); either may
+ * also be omitted. Exactly one has to name an item.
+ */
+export const WishlistItemRequest = z.object({
+	purchasableItemId: z
+		.string()
+		.optional()
+		.describe('The storefront item, as a positive integer; empty or absent for a custom item'),
+	customAvatarItemId: z
+		.string()
+		.optional()
+		.describe('The custom avatar item’s GUID; empty or absent for a storefront item'),
+})
+
+/**
+ * `POST /api/itemWishlists/v1/isonwishlist/bulk` — form-encoded. `accountIds` is REPEATED,
+ * once per account (`accountIds=205&accountIds=207`); a comma-separated single value is
+ * accepted too. The item is named as on add/remove.
+ */
+export const IsOnWishlistBulkRequest = WishlistItemRequest.extend({
+	accountIds: z
+		.array(z.string())
+		.describe('The players to ask about, repeated once per id — answered in this order'),
+})
+
+/**
+ * `isonwishlist/bulk`’s answer: a bare POSITIONAL array of booleans, one per `accountIds`
+ * entry in the order posted. A short array leaves the tail reading as “not wished for”, so
+ * every id gets an element — an unknown player’s is false.
+ */
+export const IsOnWishlistBulkResponse = z.array(z.boolean())
+
+/**
  * One purchase offer on a room currency — a way to BUY that currency, priced in another
  * ("5 SuperTokens for 500 Rec Center Tokens"). The client's own model, member for member and
  * in its order.

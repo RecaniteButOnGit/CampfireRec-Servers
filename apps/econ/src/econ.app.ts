@@ -112,6 +112,8 @@ import {
 	GameRewardRequest,
 	InfluencerIdsResponse,
 	InfluencerTierResponse,
+	IsOnWishlistBulkRequest,
+	IsOnWishlistBulkResponse,
 	ItemPurchaseInfoList,
 	ItemPurchaseInfosRequest,
 	json,
@@ -152,6 +154,9 @@ import {
 	UpdateRoomCurrencyRequest,
 	UpdateRoomKeyRequest,
 	UpsertRoomConsumableRequest,
+	WishlistEnvelope,
+	WishlistItemList,
+	WishlistItemRequest,
 } from './openapi'
 import { claimReward, isNewActivity } from './reward-db'
 import {
@@ -184,6 +189,13 @@ import {
 	updateRoomKey,
 } from './room-key-db'
 import { getRoomPurchasables } from './room-purchasables-db'
+import {
+	addWishlistItem,
+	getWishlist,
+	isOnWishlists,
+	parseWishlistTarget,
+	removeWishlistItem,
+} from './wishlist-db'
 
 import type { Context } from 'hono'
 import type { GiftContent, Outfit, Progression, StoredGift, XpGrant } from '@repo/domain'
@@ -209,6 +221,7 @@ import type { AvatarItem } from './inventory-db'
 import type { RoomConsumable } from './room-consumable-db'
 import type { RoomCurrency, RoomCurrencyPurchaseOffer } from './room-currency-db'
 import type { RoomKey, RoomKeyHolding } from './room-key-db'
+import type { WishlistItem } from './wishlist-db'
 
 // Invention storage (owned by the `api` worker, on this same `recflare` database).
 // Imported directly rather than copied: these are plain D1 helpers with no bindings of
@@ -222,7 +235,7 @@ import type { RoomKey, RoomKeyHolding } from './room-key-db'
  * inventory (avatar items, equipment, bought inventions), consumables, saved outfits,
  * avatars, gift boxes, weekly-challenge progress and game-reward eligibility are D1-backed;
  * storefront catalogs are static assets (`sf{N}.json`) served via the ASSETS
- * binding. Some routes are still empty-list stubs (room keys, wishlist, …).
+ * binding. Some routes are still empty-list stubs (equipment, room consumables, …).
  *
  * Auth-gated routes validate the Bearer JWT issued by the `auth` worker.
  */
@@ -254,6 +267,39 @@ async function authedBuild(c: Context<App>): Promise<number | null> {
 /** Results.Unauthorized() equivalent — 401 with empty body. */
 function unauthorized(c: Context<App>) {
 	return c.body(null, 401)
+}
+
+/**
+ * The `Error` a wishlist write answers when its body names no item. Shown to the player
+ * verbatim behind the client's “Wishlist error: ” prefix, so it is a sentence, not a code.
+ */
+const WISHLIST_NO_ITEM = 'No item was specified.'
+
+/**
+ * The `{ Value, Success, Error, error_id }` envelope the wishlist writes answer in — the
+ * same shape the room-currency writes use. A null `item` with no `error` is still a success
+ * (removing something that wasn't listed); an `error` makes it a refusal.
+ */
+function wishlistEnvelope(c: Context<App>, item: WishlistItem | null, error?: string) {
+	return c.json({
+		Value: item,
+		Success: error === undefined,
+		Error: error ?? null,
+		error_id: null,
+	})
+}
+
+/**
+ * The item a wishlist write's form body names — `purchasableItemId` or `customAvatarItemId`,
+ * as the client spells them, with the PascalCase spellings accepted for a hand-written
+ * request. Null when the body names nothing usable (see `parseWishlistTarget`).
+ */
+async function wishlistTargetFromBody(c: Context<App>) {
+	const body = (await c.req.parseBody().catch(() => ({}))) as Record<string, unknown>
+	return parseWishlistTarget(
+		body.purchasableItemId ?? body.PurchasableItemId,
+		body.customAvatarItemId ?? body.CustomAvatarItemId
+	)
 }
 
 /**
@@ -3115,20 +3161,41 @@ const app = new Hono<App>({ strict: false })
 		}
 	)
 
-	// The caller's item wishlist. [Authorize]; empty — nothing stores wishlists yet.
+	// The caller's item wishlist. [Authorize]. A bare array of entries, newest wish first;
+	// `[]` for a player who has wished for nothing. The client appends a KEYLESS query string
+	// (`/me?True`, `/me?False` — a raw `bool.ToString()` after the `?`, no parameter name) that
+	// no server can bind by name, so it is ignored: both spellings serve the same list. The
+	// client caches this for five seconds and drops the cache when an add succeeds.
 	.get(
 		'/api/itemWishlists/v1/wishlist/me',
-		listRoute('The player’s item wishlist', 'Empty for now', true),
+		describeRoute({
+			tags: ['Econ'],
+			summary: 'The player’s item wishlist',
+			description: [
+				'The caller’s wishlist as a bare array of entries, newest first — `[]` when empty.',
+				'Each entry names ONE item: a storefront item by `PurchasableItemId`, or a custom',
+				'avatar item by `CustomAvatarItemId` (with `PurchasableItemId` 0, the client’s field',
+				'being a plain int).',
+				'',
+				'The client appends `?True` or `?False` with no parameter name; it cannot be read',
+				'and is ignored — both serve the same list.',
+			].join('\n'),
+			security: AUTHED,
+			responses: {
+				200: json(WishlistItemList, 'The caller’s wishlist, newest first'),
+				401: UNAUTHORIZED_RESPONSE,
+			},
+		}),
 		async (c) => {
 			const id = await authedId(c)
 			if (id === null) return unauthorized(c)
-			return c.json([])
+			return c.json(await getWishlist(c.env.DB, id))
 		}
 	)
 
 	// Another player's item wishlist, by account id — what the client reads to show what
-	// somebody else is hoping for (and to mark items in the store as already wished for).
-	// Empty like `/me`: nothing stores wishlists, so there is nothing to show for anyone.
+	// somebody else is hoping for. Public to any signed-in player: a wishlist exists to be
+	// read by others. An unknown account has simply wished for nothing.
 	//
 	// Registered AFTER `/me` so that path stays its own route rather than being read as an
 	// account id — the pattern here is digits-only, so it could not swallow `me`, but the
@@ -3139,10 +3206,11 @@ const app = new Hono<App>({ strict: false })
 			tags: ['Econ'],
 			summary: 'Another player’s item wishlist',
 			description: [
-				'The wishlist of the account named in the path, as a bare array. Empty for now —',
-				'nothing on this server stores wishlists, so every player’s is empty, and an empty',
-				'list is what the client renders as “nothing wished for” where a 404 would read as a',
-				'failed load.',
+				'The wishlist of the account named in the path, as a bare array of entries, newest',
+				'first. Readable by any signed-in player — a wishlist is for others to see. An',
+				'unknown account answers `[]`, which the client renders as “nothing wished for”',
+				'where a 404 would read as a failed load. The keyless `?True`/`?False` the client',
+				'appends is ignored, as on `/me`.',
 			].join(' '),
 			security: AUTHED,
 			parameters: [
@@ -3155,14 +3223,136 @@ const app = new Hono<App>({ strict: false })
 				},
 			],
 			responses: {
-				200: json(JsonArray, 'That player’s wishlist — empty for now'),
+				200: json(WishlistItemList, 'That player’s wishlist, newest first'),
 				401: UNAUTHORIZED_RESPONSE,
 			},
 		}),
 		async (c) => {
 			const id = await authedId(c)
 			if (id === null) return unauthorized(c)
-			return c.json([])
+			const accountId = Number.parseInt(c.req.param('accountId'), 10)
+			if (!Number.isInteger(accountId)) return c.json([])
+			return c.json(await getWishlist(c.env.DB, accountId))
+		}
+	)
+
+	// Wish for an item. [Authorize]. Form-encoded: the client posts BOTH `purchasableItemId`
+	// and `customAvatarItemId` every time with the unused one empty (its two nullables are
+	// boxed without a HasValue guard), so either may be empty or absent; exactly one has to
+	// name an item. Answers the `{ Value, Success, Error, error_id }` envelope with the entry.
+	// An item already on the list answers its EXISTING entry: the toggle is driven by the
+	// client's idea of the current state, and re-adding changes nothing.
+	//
+	// The row has to persist: on success the client drops its cached list and re-reads it,
+	// so a 200 that stored nothing shows the heart un-filling again at once.
+	.post(
+		'/api/itemWishlists/v1/wishlist/add',
+		describeRoute({
+			tags: ['Econ'],
+			summary: 'Wish for an item',
+			description: [
+				'Adds an item to the caller’s wishlist. Form-encoded; the client posts both',
+				'`purchasableItemId` and `customAvatarItemId` with the unused one EMPTY',
+				'(`purchasableItemId=1534&customAvatarItemId=`), and either may also be absent —',
+				'exactly one has to name an item.',
+				'',
+				'Answers `{ Value, Success, Error, error_id }` with the entry as `Value`. An item',
+				'already on the list answers its existing entry rather than a twin or a refusal.',
+				'A body naming no item is `Success: false` with a player-readable `Error` — the',
+				'client shows it verbatim behind “Wishlist error: ”. A bare entry or a 204 fails the',
+				'client the same way `Success: false` does.',
+			].join('\n'),
+			security: AUTHED,
+			requestBody: form(WishlistItemRequest, 'The item to wish for'),
+			responses: {
+				200: json(WishlistEnvelope, 'The entry, or a refusal in the same shape'),
+				401: UNAUTHORIZED_RESPONSE,
+			},
+		}),
+		async (c) => {
+			const id = await authedId(c)
+			if (id === null) return unauthorized(c)
+			const target = await wishlistTargetFromBody(c)
+			if (target === null) return wishlistEnvelope(c, null, WISHLIST_NO_ITEM)
+			return wishlistEnvelope(c, await addWishlistItem(c.env.DB, id, target))
+		}
+	)
+
+	// Take an item off the caller's wishlist. [Authorize]. A POST, not a DELETE, with the same
+	// form body as `add`. The client parses the same envelope and discards `Value`, so the
+	// removed entry is served anyway; an item that wasn't on the list is still a success —
+	// the list ends up as asked — with a null `Value`.
+	.post(
+		'/api/itemWishlists/v1/wishlist/remove',
+		describeRoute({
+			tags: ['Econ'],
+			summary: 'Un-wish an item',
+			description: [
+				'Removes an item from the caller’s wishlist. A POST (not a DELETE) with the same',
+				'form body as `add`. Answers the same envelope with the REMOVED entry as `Value`;',
+				'the client discards it but parses the shape, so a bare body or 204 fails it. An',
+				'item that wasn’t on the list is still `Success: true`, with a null `Value`. A body',
+				'naming no item is `Success: false`.',
+			].join('\n'),
+			security: AUTHED,
+			requestBody: form(WishlistItemRequest, 'The item to un-wish'),
+			responses: {
+				200: json(WishlistEnvelope, 'The removed entry, or a refusal in the same shape'),
+				401: UNAUTHORIZED_RESPONSE,
+			},
+		}),
+		async (c) => {
+			const id = await authedId(c)
+			if (id === null) return unauthorized(c)
+			const target = await wishlistTargetFromBody(c)
+			if (target === null) return wishlistEnvelope(c, null, WISHLIST_NO_ITEM)
+			return wishlistEnvelope(c, await removeWishlistItem(c.env.DB, id, target))
+		}
+	)
+
+	// Whether each of several players has an item wished for. [Authorize]. Form-encoded:
+	// `accountIds` repeated once per player plus the item named as on add/remove. A BARE
+	// positional array of booleans back, one per id in the order posted — a short array would
+	// leave the tail reading as unset, so every id is answered, unknown players as false.
+	.post(
+		'/api/itemWishlists/v1/isonwishlist/bulk',
+		describeRoute({
+			tags: ['Econ'],
+			summary: 'Whether players have an item wished for',
+			description: [
+				'For each `accountIds` entry, whether that player’s wishlist has the item named by',
+				'`purchasableItemId` or `customAvatarItemId`. Form-encoded, `accountIds` repeated',
+				'once per id (a comma-separated single value is accepted too). The answer is a BARE',
+				'array of booleans, one per id in the order posted. A body naming no item answers',
+				'false for everyone.',
+			].join(' '),
+			security: AUTHED,
+			requestBody: form(IsOnWishlistBulkRequest, 'The players to ask about, and the item'),
+			responses: {
+				200: json(IsOnWishlistBulkResponse, 'One boolean per `accountIds` entry, in order'),
+				401: UNAUTHORIZED_RESPONSE,
+			},
+		}),
+		async (c) => {
+			const id = await authedId(c)
+			if (id === null) return unauthorized(c)
+			const body = await c.req
+				.parseBody({ all: true })
+				.catch(() => ({}) as Record<string, string | string[] | File | File[]>)
+			// `all: true` keeps the repeated field a list; a single value arrives as a string.
+			const accountIds = [body.accountIds, body.AccountIds]
+				.flat()
+				.filter((v): v is string => typeof v === 'string')
+				.flatMap((v) => v.split(','))
+				.map((v) => Number.parseInt(v.trim(), 10))
+				.filter((n) => Number.isInteger(n))
+			const first = (v: unknown): unknown => (Array.isArray(v) ? v[0] : v)
+			const target = parseWishlistTarget(
+				first(body.purchasableItemId ?? body.PurchasableItemId),
+				first(body.customAvatarItemId ?? body.CustomAvatarItemId)
+			)
+			if (target === null) return c.json(accountIds.map(() => false))
+			return c.json(await isOnWishlists(c.env.DB, accountIds, target))
 		}
 	)
 

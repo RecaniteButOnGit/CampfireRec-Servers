@@ -116,6 +116,7 @@ import {
 	ROOM_CURRENCY_SCHEMA_DDL,
 } from '../../room-currency-db'
 import { createRoomKey, ROOM_KEY_SCHEMA_DDL } from '../../room-key-db'
+import { WISHLIST_SCHEMA_DDL } from '../../wishlist-db'
 
 import type { CatalogLoadRow, CatalogRow, CatalogValue, StoreListing } from '../../catalog-db'
 import type { Env } from '../../context'
@@ -223,6 +224,7 @@ beforeAll(async () => {
 	for (const stmt of ROOM_CONSUMABLE_SCHEMA_DDL) await env.DB.prepare(stmt).run()
 	for (const stmt of ROOM_INVENTORY_SCHEMA_DDL) await env.DB.prepare(stmt).run()
 	for (const stmt of ROOM_KEY_SCHEMA_DDL) await env.DB.prepare(stmt).run()
+	for (const stmt of WISHLIST_SCHEMA_DDL) await env.DB.prepare(stmt).run()
 	// The platform link table (owned by `auth`) — the Discord supporter gift reads the roles
 	// `www` records on each Discord link.
 	for (const stmt of PLATFORM_SCHEMA_DDL) await env.DB.prepare(stmt).run()
@@ -827,6 +829,206 @@ describe('econ endpoints', () => {
 			headers: await bearer(),
 		})
 		expect(mine.status).toBe(200)
+	})
+
+	describe('item wishlist', () => {
+		const WISHLIST = `${ORIGIN}/api/itemWishlists/v1`
+		const GUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/
+		// The form body exactly as the client posts it: both fields, the unused one empty.
+		const post = async (path: string, sub: string, body: string) =>
+			exports.default.fetch(`${WISHLIST}${path}`, {
+				method: 'POST',
+				headers: { ...(await bearer(sub)), 'Content-Type': 'application/x-www-form-urlencoded' },
+				body,
+			})
+		const list = async (who: string, sub: string) =>
+			(
+				await exports.default.fetch(`${WISHLIST}/wishlist/${who}`, { headers: await bearer(sub) })
+			).json()
+
+		test('the writes 401 without a token', async () => {
+			for (const path of ['/wishlist/add', '/wishlist/remove', '/isonwishlist/bulk']) {
+				const res = await exports.default.fetch(`${WISHLIST}${path}`, {
+					method: 'POST',
+					headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+					body: 'purchasableItemId=1534&customAvatarItemId=',
+				})
+				expect(res.status, path).toBe(401)
+			}
+		})
+
+		test('add stores an entry, serves it enveloped, and the list reads it back newest first', async () => {
+			const first = await post('/wishlist/add', '601', 'purchasableItemId=1534&customAvatarItemId=')
+			expect(first.status).toBe(200)
+			const env1 = (await first.json()) as {
+				Value: Record<string, unknown>
+				Success: boolean
+				Error: null
+				error_id: null
+			}
+			// The envelope, `Value` first; the entry is the client's five keys in its order, with
+			// a GUID id and a NULL custom id for a storefront item.
+			expect(Object.keys(env1)).toEqual(['Value', 'Success', 'Error', 'error_id'])
+			expect(env1.Success).toBe(true)
+			expect(env1.Error).toBeNull()
+			expect(env1.error_id).toBeNull()
+			expect(Object.keys(env1.Value)).toEqual([
+				'WishlistItemId',
+				'AccountId',
+				'PurchasableItemId',
+				'CustomAvatarItemId',
+				'CreatedAt',
+			])
+			expect(env1.Value.WishlistItemId).toMatch(GUID_RE)
+			expect(env1.Value.AccountId).toBe(601)
+			expect(env1.Value.PurchasableItemId).toBe(1534)
+			expect(env1.Value.CustomAvatarItemId).toBeNull()
+			expect(typeof env1.Value.CreatedAt).toBe('string')
+
+			// Wait so the second wish sorts after the first by its timestamp.
+			await new Promise((r) => setTimeout(r, 5))
+			// A custom avatar item is the mirror image: `PurchasableItemId` 0 (the client's field
+			// is a plain int), the GUID beside it — lowercased, however the client spelled it.
+			const second = await post(
+				'/wishlist/add',
+				'601',
+				'purchasableItemId=&customAvatarItemId=C3ED9841-1B4A-40A6-B266-5DBCFD7F2865'
+			)
+			const env2 = (await second.json()) as { Value: Record<string, unknown> }
+			expect(env2.Value.PurchasableItemId).toBe(0)
+			expect(env2.Value.CustomAvatarItemId).toBe('c3ed9841-1b4a-40a6-b266-5dbcfd7f2865')
+
+			// Newest first — the order the reference served. The keyless `?True`/`?False` the
+			// client appends is ignored, so both spellings serve the same list.
+			const mine = (await list('me?True', '601')) as Array<Record<string, unknown>>
+			expect(mine.map((e) => e.WishlistItemId)).toEqual([
+				env2.Value.WishlistItemId,
+				env1.Value.WishlistItemId,
+			])
+			expect(await list('me?False', '601')).toEqual(mine)
+			expect(await list('me', '601')).toEqual(mine)
+			// Readable by another signed-in player under the account id.
+			expect(await list('601?False', '602')).toEqual(mine)
+			// And nobody else's list picked it up.
+			expect(await list('me', '602')).toEqual([])
+		})
+
+		test('re-adding an item answers the existing entry rather than a twin', async () => {
+			const first = (await (
+				await post('/wishlist/add', '603', 'purchasableItemId=2137&customAvatarItemId=')
+			).json()) as { Value: { WishlistItemId: string } }
+			const again = (await (
+				await post('/wishlist/add', '603', 'purchasableItemId=2137&customAvatarItemId=')
+			).json()) as { Success: boolean; Value: { WishlistItemId: string } }
+			expect(again.Success).toBe(true)
+			expect(again.Value.WishlistItemId).toBe(first.Value.WishlistItemId)
+			expect(((await list('me', '603')) as unknown[]).length).toBe(1)
+		})
+
+		test('remove answers the removed entry; removing an unlisted item is still a success', async () => {
+			const added = (await (
+				await post('/wishlist/add', '604', 'purchasableItemId=1274&customAvatarItemId=')
+			).json()) as { Value: { WishlistItemId: string } }
+
+			const removed = await post(
+				'/wishlist/remove',
+				'604',
+				'purchasableItemId=1274&customAvatarItemId='
+			)
+			expect(removed.status).toBe(200)
+			expect(await removed.json()).toEqual({
+				Value: expect.objectContaining({
+					WishlistItemId: added.Value.WishlistItemId,
+					AccountId: 604,
+					PurchasableItemId: 1274,
+				}),
+				Success: true,
+				Error: null,
+				error_id: null,
+			})
+			expect(await list('me', '604')).toEqual([])
+
+			// Already gone: the list is as asked, so this is not an error — a null `Value`.
+			const again = await post(
+				'/wishlist/remove',
+				'604',
+				'purchasableItemId=1274&customAvatarItemId='
+			)
+			expect(await again.json()).toEqual({
+				Value: null,
+				Success: true,
+				Error: null,
+				error_id: null,
+			})
+		})
+
+		test('remove only touches the caller’s own list', async () => {
+			await post('/wishlist/add', '605', 'purchasableItemId=1274&customAvatarItemId=')
+			const other = await post(
+				'/wishlist/remove',
+				'606',
+				'purchasableItemId=1274&customAvatarItemId='
+			)
+			expect(((await other.json()) as { Value: unknown }).Value).toBeNull()
+			expect(((await list('me', '605')) as unknown[]).length).toBe(1)
+		})
+
+		test('a body naming no item is a refusal in the envelope, with a readable Error', async () => {
+			for (const body of [
+				'',
+				'purchasableItemId=&customAvatarItemId=',
+				'purchasableItemId=abc',
+				'customAvatarItemId=not-a-guid',
+				'purchasableItemId=0',
+			]) {
+				for (const path of ['/wishlist/add', '/wishlist/remove']) {
+					const res = await post(path, '607', body)
+					expect(res.status, `${path} ${body}`).toBe(200)
+					expect(await res.json(), `${path} ${body}`).toEqual({
+						Value: null,
+						Success: false,
+						Error: 'No item was specified.',
+						error_id: null,
+					})
+				}
+			}
+			expect(await list('me', '607')).toEqual([])
+		})
+
+		test('POST /isonwishlist/bulk answers one boolean per accountId, in order', async () => {
+			await post('/wishlist/add', '608', 'purchasableItemId=3001&customAvatarItemId=')
+			await post('/wishlist/add', '610', 'purchasableItemId=3001&customAvatarItemId=')
+			await post(
+				'/wishlist/add',
+				'609',
+				'purchasableItemId=&customAvatarItemId=8f0c1e4a-2b77-4b16-9a3e-5dbcfd7f2865'
+			)
+
+			// `accountIds` repeated once per id, as the client's list parameter encodes; the
+			// unknown account 611 reads false rather than shortening the array.
+			const res = await post(
+				'/isonwishlist/bulk',
+				'608',
+				'accountIds=608&accountIds=609&accountIds=610&accountIds=611&purchasableItemId=3001&customAvatarItemId='
+			)
+			expect(res.status).toBe(200)
+			expect(await res.json()).toEqual([true, false, true, false])
+
+			// A comma-separated single value, and a custom item, matched case-insensitively.
+			const custom = await post(
+				'/isonwishlist/bulk',
+				'608',
+				'accountIds=609,608&purchasableItemId=&customAvatarItemId=8F0C1E4A-2B77-4B16-9A3E-5DBCFD7F2865'
+			)
+			expect(await custom.json()).toEqual([true, false])
+
+			// No item named: false for everyone, still one per id.
+			const none = await post('/isonwishlist/bulk', '608', 'accountIds=608&accountIds=610')
+			expect(await none.json()).toEqual([false, false])
+			// No ids: an empty array.
+			const empty = await post('/isonwishlist/bulk', '608', 'purchasableItemId=3001')
+			expect(await empty.json()).toEqual([])
+		})
 	})
 
 	test('GET /api/avatar/v3/saved 401s without a token, returns [] with one', async () => {
@@ -6791,6 +6993,9 @@ describe('econ endpoints', () => {
 			'POST /api/consumables/v1/consume',
 			'POST /api/equipment/v1/update',
 			'POST /api/gamerewards/v1/request',
+			'POST /api/itemWishlists/v1/isonwishlist/bulk',
+			'POST /api/itemWishlists/v1/wishlist/add',
+			'POST /api/itemWishlists/v1/wishlist/remove',
 			'POST /api/items/bulkpurchase',
 			'POST /api/items/purchaseInfos',
 			'POST /api/objectives/v1/cleargroup',
