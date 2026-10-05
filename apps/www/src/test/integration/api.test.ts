@@ -2042,15 +2042,15 @@ it('drops tokens on every account whose Discord link holds the role, online or n
 	})
 })
 
-// Same bounds as the online drop, plus the role has to be a snowflake, and a role nobody's
-// link records is a 404 rather than a silent success.
+// Same bounds as the online drop but with a higher cap (10,000), plus the role has to be a
+// snowflake, and a role nobody's link records is a 404 rather than a silent success.
 it('refuses a role drop over the cap, without a message, with a bad role, or with no holders', async () => {
 	const drop = (role: string, body: unknown) =>
 		devPost(`/api/staff/discord-roles/${role}/gift-tokens`, 8110, body)
 	await linkPlatformIdentity(env.DB, 8396, PlatformType.Discord, '900000000000008396', [
 		'1077000000000000779',
 	])
-	expect((await drop('1077000000000000779', { amount: 1_001, message: 'hi' })).status).toBe(400)
+	expect((await drop('1077000000000000779', { amount: 10_001, message: 'hi' })).status).toBe(400)
 	expect((await drop('1077000000000000779', { amount: 0, message: 'hi' })).status).toBe(400)
 	expect((await drop('1077000000000000779', { amount: -5, message: 'hi' })).status).toBe(400)
 	expect((await drop('1077000000000000779', { amount: 10, message: '   ' })).status).toBe(400)

@@ -579,6 +579,13 @@ export const DEFAULT_MAX_XP_GIFT = 100
  */
 export const MAX_TOKEN_DROP = 1_000
 
+/**
+ * The most the Discord ROLE drop can carry per player. Higher than {@link MAX_TOKEN_DROP}:
+ * the audience is a named role, not whoever happens to be on, so the operator chooses who is
+ * paid and the drop is a reward rather than a server-wide thank-you.
+ */
+export const MAX_ROLE_TOKEN_DROP = 10_000
+
 /** The longest message a staff box may carry — the same cap a client message has. */
 const MAX_GIFT_MESSAGE = 256
 
@@ -1048,9 +1055,10 @@ export async function giftOnlineTokensHandler(c: Context<App>) {
  * their next read, as they do for every box the server hands over.
  *
  * The role is a Discord snowflake — all digits, compared exactly, as the sweep stores them.
- * The amount is bounded as the online drop's is ({@link MAX_TOKEN_DROP} each, positive only):
- * this one multiplies by a role's whole membership, which can be larger than the server has
- * ever had online at once. The message is required for the same reason.
+ * The amount is bounded as the online drop's is, positive only, but with its own cap
+ * ({@link MAX_ROLE_TOKEN_DROP} each): this one multiplies by a role's whole membership, which
+ * can be larger than the server has ever had online at once. The message is required for the
+ * same reason.
  */
 export async function giftRoleTokensHandler(c: Context<App>) {
 	const roleId = c.req.param('roleId') ?? ''
@@ -1063,9 +1071,11 @@ export async function giftRoleTokensHandler(c: Context<App>) {
 	if (!Number.isInteger(amount) || amount <= 0) {
 		return c.json({ error: 'Enter a whole number of tokens greater than 0' }, 400)
 	}
-	if (amount > MAX_TOKEN_DROP) {
+	if (amount > MAX_ROLE_TOKEN_DROP) {
 		return c.json(
-			{ error: `A token drop can carry at most ${MAX_TOKEN_DROP.toLocaleString()} tokens each` },
+			{
+				error: `A token drop can carry at most ${MAX_ROLE_TOKEN_DROP.toLocaleString()} tokens each`,
+			},
 			400
 		)
 	}

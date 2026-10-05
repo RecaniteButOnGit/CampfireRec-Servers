@@ -3672,6 +3672,9 @@ function MaintenanceForm() {
  */
 const MAX_TOKEN_DROP = 1_000
 
+/** The role drop's own, higher cap — a mirror of www's `MAX_ROLE_TOKEN_DROP`. */
+const MAX_ROLE_TOKEN_DROP = 10_000
+
 /**
  * Developer-only: give every player online right now the same number of tokens, in a gift
  * box carrying the operator's message — the server-wide cousin of the room page's staff gift.
@@ -3750,7 +3753,8 @@ function TokenDropForm() {
  *
  * The audience is the roles the website recorded at each player's benefits claim and
  * refreshes once a day, so it trails Discord by up to a day and never includes a member who
- * hasn't claimed; the copy says so. Same cap as the online drop, repeated on the input.
+ * hasn't claimed; the copy says so. Its own cap (`MAX_ROLE_TOKEN_DROP`, 10,000 each), repeated
+ * on the input.
  */
 function RoleTokenDropForm() {
 	const [roleId, setRoleId] = useState('')
@@ -3765,8 +3769,8 @@ function RoleTokenDropForm() {
 				Give everyone holding a Discord role the same number of tokens, whether or not they are
 				online — a player who is signed out finds the gift box waiting. Only players who have
 				claimed benefits on this site are counted, and their roles are refreshed once a day, so a
-				role given or taken since then isn&apos;t seen yet. Up to {MAX_TOKEN_DROP.toLocaleString()}{' '}
-				tokens each.
+				role given or taken since then isn&apos;t seen yet. Up to{' '}
+				{MAX_ROLE_TOKEN_DROP.toLocaleString()} tokens each.
 			</p>
 			<form
 				onSubmit={(e) => {
@@ -3817,7 +3821,7 @@ function RoleTokenDropForm() {
 					<input
 						type="number"
 						min={1}
-						max={MAX_TOKEN_DROP}
+						max={MAX_ROLE_TOKEN_DROP}
 						step={1}
 						value={tokens}
 						required
