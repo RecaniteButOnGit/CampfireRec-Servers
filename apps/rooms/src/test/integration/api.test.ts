@@ -18,6 +18,7 @@ import {
 	NOTIFICATION_SCHEMA_DDL,
 	PRESENCE_SCHEMA_DDL,
 	publicStudioBundleFilename,
+	putUnityAsset,
 	ROOM_INSTANCE_SCHEMA_DDL,
 	ROOM_INVITE_SCHEMA_DDL,
 	ROOM_SCHEMA_DDL,
@@ -25,6 +26,7 @@ import {
 	sha256HexToBase64,
 	STUDIO_UNITY_ASSET_SCHEMA_DDL,
 	SUBROOM_SCHEMA_DDL,
+	UNITY_ASSET_SCHEMA_DDL,
 } from '@repo/domain'
 
 import { SCHEMA_DDL as INVENTION_SCHEMA_DDL } from '../../../../api/src/inventions-db'
@@ -128,6 +130,8 @@ beforeAll(async () => {
 	// Inventions (owned by the api worker) — a room save writes each one's room count.
 	for (const stmt of INVENTION_SCHEMA_DDL) await env.DB.prepare(stmt).run()
 	for (const stmt of ROOM_INVITE_SCHEMA_DDL) await env.DB.prepare(stmt).run()
+	// Baked unity asset bundles — what `POST /unity_assets/baked/bulk` serves.
+	for (const stmt of UNITY_ASSET_SCHEMA_DDL) await env.DB.prepare(stmt).run()
 	// Seed each room and split its subrooms into the subroom table (mirrors 0007's backfill).
 	for (const r of importRooms) await seedRoomWithSubRooms(env.DB, r as Record<string, unknown>)
 
@@ -5469,6 +5473,120 @@ describe('rooms endpoints', () => {
 		expect((await get(detail, '999')).status).toBe(403)
 	})
 
+	describe('POST /unity_assets/baked/bulk', () => {
+		const URL = `${ORIGIN}/unity_assets/baked/bulk`
+		const post = (body: string) =>
+			SELF.fetch(URL, {
+				method: 'POST',
+				headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+				body,
+			})
+		const A = '4f0c1e4a-2b77-4b16-9a3e-5dbcfd7f2865'
+		const B = '9a3e5dbc-fd7f-2865-8f0c-1e4a2b774b16'
+		const C = '22555d14-2918-43f3-94d4-da0c893d96c4'
+
+		beforeAll(async () => {
+			await putUnityAsset(env.DB, {
+				UnityAssetId: A,
+				Target: 0,
+				Version: 227,
+				Filename: '2026-10-05/a0d83019-675d-41c0-8924-c238c5a12ee8',
+				Hash: 'R0SVMvrAW4n1TIF2lxaOAQZ5XXVJh7prEP6GpiLCrQo=',
+			})
+			await putUnityAsset(env.DB, {
+				UnityAssetId: A,
+				Target: 2,
+				Version: 227,
+				Filename: '2026-10-05/quest-a',
+				Hash: 'quest-a-hash',
+			})
+			// B was built twice for Windows.
+			await putUnityAsset(env.DB, {
+				UnityAssetId: B,
+				Target: 0,
+				Version: 3,
+				Filename: '2026-10-05/b-v3',
+				Hash: 'b-v3-hash',
+			})
+			await putUnityAsset(env.DB, {
+				UnityAssetId: B,
+				Target: 0,
+				Version: 5,
+				Filename: '2026-10-05/b-v5',
+				Hash: 'b-v5-hash',
+			})
+		})
+
+		it('answers a bare array of five-key entries for the ids asked, in order', async () => {
+			const res = await post(`target=0&version=227&id=${B}&id=${A}`)
+			expect(res.status).toBe(200)
+			const body = (await res.json()) as Array<Record<string, unknown>>
+			expect(body.map((e) => e.UnityAssetId)).toEqual([B, A])
+			expect(Object.keys(body[1]!)).toEqual([
+				'UnityAssetId',
+				'Target',
+				'Version',
+				'Filename',
+				'Hash',
+			])
+			expect(body[1]).toEqual({
+				UnityAssetId: A,
+				Target: 0,
+				Version: 227,
+				Filename: '2026-10-05/a0d83019-675d-41c0-8924-c238c5a12ee8',
+				Hash: 'R0SVMvrAW4n1TIF2lxaOAQZ5XXVJh7prEP6GpiLCrQo=',
+			})
+		})
+
+		it('serves the build for the target asked, and leaves out assets with none', async () => {
+			// C has no build at all, so no blank row: the client downloads nothing for it either
+			// way, and a row with no Filename is the quieter failure.
+			const quest = (await (
+				await post(`target=2&version=227&id=${A}&id=${C}&id=${B}`)
+			).json()) as Array<Record<string, unknown>>
+			expect(quest).toEqual([
+				{
+					UnityAssetId: A,
+					Target: 2,
+					Version: 227,
+					Filename: '2026-10-05/quest-a',
+					Hash: 'quest-a-hash',
+				},
+			])
+		})
+
+		it('prefers the build at the requested version and falls back to the newest', async () => {
+			const exact = (await (await post(`target=0&version=3&id=${B}`)).json()) as Array<{
+				Version: number
+			}>
+			expect(exact.map((e) => e.Version)).toEqual([3])
+			// A version nothing was built at still answers the asset — its newest build.
+			const newest = (await (await post(`target=0&version=4&id=${B}`)).json()) as Array<{
+				Version: number
+			}>
+			expect(newest.map((e) => e.Version)).toEqual([5])
+			// No version at all: the newest.
+			const none = (await (await post(`target=0&id=${B}`)).json()) as Array<{ Version: number }>
+			expect(none.map((e) => e.Version)).toEqual([5])
+		})
+
+		it('matches ids case-insensitively and accepts a comma-separated list', async () => {
+			const body = (await (
+				await post(`target=0&version=227&id=${A.toUpperCase()},${B}`)
+			).json()) as Array<{
+				UnityAssetId: string
+			}>
+			expect(body.map((e) => e.UnityAssetId)).toEqual([A, B])
+		})
+
+		it('answers [] for no ids, an unknown id, or a non-integer target', async () => {
+			expect(await (await post('target=0&version=227')).json()).toEqual([])
+			expect(await (await post(`target=0&version=227&id=${C}`)).json()).toEqual([])
+			expect(await (await post(`target=win&version=227&id=${A}`)).json()).toEqual([])
+			expect(await (await post('')).json()).toEqual([])
+		})
+	})
+
 	it('GET /openapi.json documents every route', async () => {
 		const res = await SELF.fetch(`${ORIGIN}/openapi.json`)
 		expect(res.status).toBe(200)
@@ -5544,6 +5662,7 @@ describe('rooms endpoints', () => {
 			'POST /rooms/{roomId}/subrooms/{subRoomId}/data',
 			'POST /rooms/{roomId}/subrooms/{subRoomId}/move',
 			'POST /rooms/{roomId}/subrooms/{subRoomId}/publish_save',
+			'POST /unity_assets/baked/bulk',
 			'PUT /rooms/{roomId}/accessibility',
 			'PUT /rooms/{roomId}/cloning',
 			'PUT /rooms/{roomId}/creator',

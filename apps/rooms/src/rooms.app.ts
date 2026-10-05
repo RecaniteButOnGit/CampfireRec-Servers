@@ -22,6 +22,7 @@ import {
 	deleteSubRoom,
 	findSubRoom,
 	getAccount,
+	getBakedUnityAssets,
 	getBaseRooms,
 	getContributedRooms,
 	getFavoritedRooms,
@@ -99,6 +100,8 @@ import { NotificationType } from '../../notify/src/notification-types'
 import {
 	AccessibilityRequest,
 	AUTHED,
+	BakedUnityAssetBulkList,
+	BakedUnityAssetBulkRequest,
 	bannedPlayerIdParam,
 	BanRequest,
 	BulkRoomsRequest,
@@ -4501,6 +4504,59 @@ const app = new Hono<App>()
 				error_id: null,
 				error: null,
 			})
+	)
+
+	// The baked asset bundles behind a room load. The client posts the unity asset ids its
+	// saves name, with the target it runs on and the asset version it wants, and gets back
+	// a BARE ARRAY of blob references — `Filename` is what it then downloads from the CDN.
+	// Form-encoded, `id` repeated once per GUID. No auth, like `…/unityasset`: the room
+	// document already names these files, and a 401 here would only make the room load
+	// nothing with no error anywhere — which is also what `[]` does, so an asset with no
+	// stored build is simply left out rather than answered with a blank row.
+	.post(
+		'/unity_assets/baked/bulk',
+		describeRoute({
+			tags: ['Subrooms'],
+			summary: 'The baked bundles for unity assets',
+			description: [
+				'The stored builds of the unity assets named by `id` (repeated once per GUID) on',
+				'`target` (0 Windows, 2 Android/Quest), as a bare array of',
+				'`{ UnityAssetId, Target, Version, Filename, Hash }` — one entry per asset that has a',
+				'build, in the order asked; `[]` when none does. `Filename` is the blob the client',
+				'downloads from the CDN, so an entry is never served without one.',
+				'',
+				'`version` is a preference, not a filter: an asset built more than once answers the',
+				'build at that version when there is one and its newest otherwise. A body naming no',
+				'ids, or a non-integer `target`, answers `[]`.',
+			].join(' '),
+			requestBody: form(BakedUnityAssetBulkRequest, 'The assets wanted, and for which target'),
+			responses: {
+				200: json(BakedUnityAssetBulkList, 'The baked bundles, one per asset found'),
+			},
+		}),
+		async (c) => {
+			const body = await c.req
+				.parseBody({ all: true })
+				.catch(() => ({}) as Record<string, string | string[] | File | File[]>)
+			const first = (v: unknown): string => {
+				const one = Array.isArray(v) ? v[0] : v
+				return typeof one === 'string' ? one.trim() : ''
+			}
+			const target = Number.parseInt(first(body.target), 10)
+			if (!Number.isInteger(target)) return c.json([])
+			// Absent or unparseable, the version prefers nothing and the newest build is served.
+			const version = Number.parseInt(first(body.version), 10)
+			// `all: true` keeps the repeated field a list; a single value arrives as a string.
+			const ids = [body.id, body.ids]
+				.flat()
+				.filter((v): v is string => typeof v === 'string')
+				.flatMap((v) => v.split(','))
+				.map((v) => v.trim())
+				.filter((v) => v !== '')
+			return c.json(
+				await getBakedUnityAssets(c.env.DB, ids, target, Number.isInteger(version) ? version : -1)
+			)
+		}
 	)
 
 	// Photon access token + room permissions the client needs to spawn into a room.

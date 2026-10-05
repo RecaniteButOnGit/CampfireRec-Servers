@@ -40,6 +40,9 @@ same number, because the client's paged DTO and the reference disagree on the na
 (target 0 Windows, 2 Android/Quest). `unityAssetTarget` keeps only that target. Maker-pen
 saves keep the arrays empty. `GET …/unityasset?unityAssetId=` is the bare metadata for
 those files; the bytes are on the CDN.
+`POST /unity_assets/baked/bulk` (form `target=0&version=3&id=<guid>&id=<guid>`) is the
+2025 client's bulk lookup of baked bundles from the `unity_asset` table — a bare array of
+`{ UnityAssetId, Target, Version, Filename, Hash }`, one per asset that has a build.
 
 ## Cron
 

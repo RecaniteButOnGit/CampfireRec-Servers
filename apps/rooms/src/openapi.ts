@@ -989,6 +989,35 @@ export const UnityAssetWithSourceDto = z.object({
 	hash: z.string().describe('Base64 SHA-256 of `filename`'),
 })
 
+/**
+ * `POST /unity_assets/baked/bulk` — form-encoded. `id` is REPEATED, once per unity asset
+ * (`target=0&version=3&id=<guid>&id=<guid>`); a comma-separated single value is accepted too.
+ */
+export const BakedUnityAssetBulkRequest = z.object({
+	target: z.string().describe('The build target wanted: 0 Windows, 2 Android/Quest'),
+	version: z
+		.string()
+		.optional()
+		.describe('The asset version the client wants — preferred when an asset has several builds'),
+	id: z.array(z.string()).describe('The unity asset GUIDs, repeated once per id'),
+})
+
+/**
+ * One baked bundle as `POST /unity_assets/baked/bulk` lists it — the client's five-key DTO
+ * in its order, PascalCase (unlike the editor's camelCase `bakedUnityAssets` above). The
+ * client downloads `Filename` from the CDN; an entry without one downloads nothing.
+ */
+export const BakedUnityAssetBulkDto = z.object({
+	UnityAssetId: z.string().describe('GUID, as asked for'),
+	Target: z.int().describe('0 Windows, 2 Android/Quest — the target asked for'),
+	Version: z.int().describe('The build’s version, which need not be the one asked for'),
+	Filename: z.string().describe('The storage blob path, `<date>/<guid>`'),
+	Hash: z.string().describe('Base64 SHA-256 of the blob'),
+})
+
+/** The bare array `POST /unity_assets/baked/bulk` answers — `[]` when nothing is stored. */
+export const BakedUnityAssetBulkList = z.array(BakedUnityAssetBulkDto)
+
 // ---- Session ---------------------------------------------------------------
 
 /** One entry of the permission table the client applies when it spawns into a room. */
