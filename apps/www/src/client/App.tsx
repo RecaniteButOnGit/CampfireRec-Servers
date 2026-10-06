@@ -108,6 +108,11 @@ interface SubRoom {
 		 * this one first, ahead of the subroom's own.
 		 */
 		DataBlob: string
+		/**
+		 * The Studio build this save is drawn from, when it has one. The key is ABSENT on a
+		 * maker-pen save rather than null — the worker emits it only when the save carried one.
+		 */
+		UnityAssetId?: string
 	} | null
 }
 
@@ -364,11 +369,22 @@ async function blobHash(file: File): Promise<string> {
  * The envelope answers HTTP 200 either way and puts the refusal in `error`, so success
  * has to be read from the body rather than the status. `value.room` is the updated room,
  * which the page re-renders from rather than re-fetching the whole list.
+ *
+ * `unityAssetId` goes on the save beside the blob. The worker records it only when it is
+ * sent — a save that names none gets none, it is NOT carried over from the last save — so
+ * keeping a subroom's Studio build across an upload is the caller's job (see
+ * `previousUnityAssetId`).
  */
 async function saveSubRoomBlob(
 	roomId: number,
 	subRoomId: number,
-	input: { filename: string; hash: string; description: string; autoPublish: boolean }
+	input: {
+		filename: string
+		hash: string
+		description: string
+		autoPublish: boolean
+		unityAssetId?: string
+	}
 ): Promise<OwnedRoom> {
 	const res = await call<{
 		success?: boolean
@@ -379,6 +395,7 @@ async function saveSubRoomBlob(
 		authed: true,
 		json: {
 			SubRoomData: { Filename: input.filename, Hash: input.hash },
+			...(input.unityAssetId ? { UnityAssetId: input.unityAssetId } : {}),
 			Description: input.description,
 			AutoPublish: input.autoPublish,
 		},
@@ -389,6 +406,30 @@ async function saveSubRoomBlob(
 	const room = res.value?.room
 	if (!room) throw new Error('The save was recorded but the room came back empty.')
 	return room
+}
+
+/** A `UnityAssetId` is a GUID, in the hyphenated form every save carries it in. */
+const UNITY_ASSET_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i
+
+/**
+ * The `UnityAssetId` of the save a new one builds on, or undefined when that save has none
+ * (or the subroom has never been saved).
+ *
+ * "Builds on" is the worker's own rule for what a save carries forward: the STAGED save
+ * when there is one, otherwise the published `CurrentSave`. The published one arrives
+ * with the room; a staged one is only an id there, so it is read from the save's detail
+ * route — which answers in camelCase, unlike the PascalCase save embedded in the room.
+ */
+async function previousUnityAssetId(roomId: number, sub: SubRoom): Promise<string | undefined> {
+	const stagedId = sub.StagedSubRoomDataSaveId
+	if (stagedId !== null && stagedId !== undefined) {
+		const staged = await call<{ unityAssetId?: string | null }>(
+			`${where().rooms}/rooms/${roomId}/subrooms/${sub.SubRoomId}/saves/${stagedId}`,
+			{ authed: true }
+		)
+		return staged.unityAssetId || undefined
+	}
+	return sub.CurrentSave?.UnityAssetId || undefined
 }
 
 /**
@@ -2678,7 +2719,7 @@ function SubRoomRow({
 					cdnHost={cdnHost}
 				/>
 			)}
-			<BlobUpload roomId={roomId} subRoomId={sub.SubRoomId} onRoomChange={onRoomChange} />
+			<BlobUpload roomId={roomId} sub={sub} onRoomChange={onRoomChange} />
 		</li>
 	)
 }
@@ -2698,18 +2739,23 @@ function SubRoomRow({
  * uploaded file live would be a bigger step than the game's own save takes. Left on by
  * default all the same: someone uploading a blob here is restoring a room, and a restore
  * nobody can see isn't one.
+ *
+ * A save can also name a `UnityAssetId` — the Studio build drawn with the scene. Given
+ * one, the new save carries it; left blank, it keeps the one on the save it builds on, so
+ * replacing a Studio room's scene data doesn't quietly detach its build.
  */
 function BlobUpload({
 	roomId,
-	subRoomId,
+	sub,
 	onRoomChange,
 }: {
 	roomId: number
-	subRoomId: number
+	sub: SubRoom
 	onRoomChange: (room: OwnedRoom) => void
 }) {
 	const [file, setFile] = useState<File | null>(null)
 	const [description, setDescription] = useState('')
+	const [unityAssetId, setUnityAssetId] = useState('')
 	const [publish, setPublish] = useState(true)
 	// Whether to convert the file for this build before storing it. Picking a file sets it
 	// from the extension — on for a `.binpb`, off for a `.room` — and the owner can overrule
@@ -2728,19 +2774,30 @@ function BlobUpload({
 				e.preventDefault()
 				if (!file) return
 				void run(async () => {
+					// Settled before anything is uploaded: a mistyped id is still a string the
+					// worker would store, and the save would point at a build that doesn't exist.
+					const typedAssetId = unityAssetId.trim()
+					if (typedAssetId !== '' && !UNITY_ASSET_ID.test(typedAssetId)) {
+						throw new Error(
+							'A Unity asset ID looks like 22555d14-2918-43f3-94d4-da0c893d96c4. Fix it, or leave it blank.'
+						)
+					}
+					const assetId = typedAssetId || (await previousUnityAssetId(roomId, sub))
 					const blob = await prepareRoomBlob(file, downgrade)
 					const [filename, hash] = await Promise.all([uploadRoomBlob(blob), blobHash(blob)])
 					onRoomChange(
-						await saveSubRoomBlob(roomId, subRoomId, {
+						await saveSubRoomBlob(roomId, sub.SubRoomId, {
 							filename,
 							hash,
 							description: description.trim(),
 							autoPublish: publish,
+							unityAssetId: assetId,
 						})
 					)
 					setFile(null)
 					setDowngrade(false)
 					setDescription('')
+					setUnityAssetId('')
 					if (input.current) input.current.value = ''
 					const uploaded = downgrade ? 'Converted for this build, uploaded' : 'Uploaded'
 					return publish
@@ -2796,6 +2853,17 @@ function BlobUpload({
 					placeholder="Uploaded from the website"
 					maxLength={200}
 					onChange={(e) => setDescription(e.target.value)}
+				/>
+			</label>
+			<label className="blob-upload-note">
+				Unity asset ID<span className="optional">optional</span>
+				<input
+					type="text"
+					value={unityAssetId}
+					placeholder="Same as the previous save"
+					spellCheck={false}
+					autoComplete="off"
+					onChange={(e) => setUnityAssetId(e.target.value)}
 				/>
 			</label>
 			<label className="check">
