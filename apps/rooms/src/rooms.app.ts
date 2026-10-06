@@ -180,7 +180,7 @@ import {
 } from './openapi'
 
 import type { Context } from 'hono'
-import type { RoomBan, RoomBanRecord, RoomPermission } from '@repo/domain'
+import type { Room, RoomBan, RoomBanRecord, RoomPermission } from '@repo/domain'
 import type { MessageReceivedPayload } from '../../notify/src/notification-payloads'
 import type { App, Env } from './context'
 
@@ -257,59 +257,100 @@ interface PresenceView {
 }
 
 /**
- * Room permissions + Photon token the client needs to spawn into a room. The
- * global (Role 0) maker pen is added only for the hardcoded dev accounts, and
- * `RoomInstanceId` is the caller's current instance from presence (null when
- * they aren't in one). `PhotonAccessToken` stays empty — the reference server
- * signs it via `ClientSecurity`, whose secret/algorithm we don't have; our
- * Photon setup accepts an empty token.
+ * The permissions the token table carries for every role, in the order the client has been
+ * seen receiving them. A room's creator may override any of them per subroom and per role
+ * (`PUT …/subrooms/{subRoomId}/permissions`); the table may also carry pairs the creator
+ * added that aren't listed here (`CAN_INVITE`, `MAX_SPAWNED_INVENTIONS`).
+ */
+const BUILD_PERMISSIONS = [
+	'CAN_USE_MAKER_PEN',
+	'CAN_USE_ROOM_RESET_BUTTON',
+	'CAN_USE_DELETE_ALL_BUTTON',
+	'CAN_SAVE_INVENTIONS',
+	'CAN_SPAWN_INVENTIONS',
+	'CAN_USE_PLAY_GIZMOS_TOGGLE',
+] as const
+
+/**
+ * Whether a role may build by default — the value every permission above takes for it when
+ * the creator has stored nothing. Only the room's MANAGERS (co-owner and up) may: a visitor,
+ * a host or a moderator in a room whose creator never opened the permissions screen must not
+ * be able to reset the room, delete everything in it or spawn into it. Serving `True` at
+ * Role 0 to everyone (as this once did) handed every visitor the delete-all button.
+ */
+const buildsByDefault = (role: number): boolean => role >= Role.CoOwner
+
+/**
+ * The caller's role in a room: Creator for its `CreatorAccountId`, otherwise the highest
+ * tier `Roles` names them at, otherwise None — a visitor.
+ */
+function roleIn(room: Room, accountId: number): number {
+	if (room.CreatorAccountId === accountId) return Role.Creator
+	return roomRoles(room)
+		.filter((r) => r.AccountId === accountId)
+		.reduce((best, r) => Math.max(best, r.Role), Role.None as number)
+}
+
+/**
+ * Room permissions + Photon token the client needs to spawn into a room. `RoomInstanceId`
+ * is the caller's current instance from presence (null when they aren't in one).
+ * `PhotonAccessToken` stays empty — the reference server signs it via `ClientSecurity`,
+ * whose secret/algorithm we don't have; our Photon setup accepts an empty token.
  *
- * `overrides` are the permissions the room's creator saved on the subroom the caller is
- * in (see `PUT …/subrooms/{subRoomId}/permissions`). They are matched against the
- * defaults by (`Permission`, `Role`) — the same pair the client addresses an entry by —
- * and win, so a subroom that revokes the Role 0 maker pen revokes it for a dev account
- * standing in it as well.
+ * The table is the CALLER'S: it is built for the role they hold in the room they are
+ * standing in (`role`), from the subroom's stored overrides (`overrides`, see
+ * `PUT …/subrooms/{subRoomId}/permissions`) over the role's defaults. A permission's value
+ * for the caller is the override stored at their own role, else the one stored at the
+ * highest lower role (a grant to "everyone" reaches a host too), else the default — managers
+ * may build, nobody else may. Pairs the creator stored under a role the caller doesn't hold
+ * are not theirs and are left out, so a visitor never sees — or gets — a co-owner's grants.
+ *
+ * Every value is served at Role 0 AND, for a role holder, again at their role, and every row
+ * says `Override: true`: the client has been seen applying Role 0 rows to a visitor, and
+ * which rows it reads for a role holder is not known, so both readings land on the same
+ * values. The global maker pen stays with the hardcoded dev accounts, whatever the room says.
  */
 function photonAccessToken(
 	accountId: number,
 	roomInstanceId: number | null,
+	role: number = Role.None,
 	overrides: RoomPermission[] = []
 ) {
-	const perm = (Permission: string, Role: number, Override: boolean): RoomPermission => ({
-		Override,
+	const perm = (Permission: string, Role: number, Value: string): RoomPermission => ({
+		Override: true,
 		Permission,
 		Role,
 		Type: 0,
-		Value: 'True',
+		Value,
 	})
-	const permissions: RoomPermission[] = [
-		perm('CAN_USE_ROOM_RESET_BUTTON', 0, true),
-		perm('CAN_USE_DELETE_ALL_BUTTON', 0, true),
-		perm('CAN_SAVE_INVENTIONS', 0, true),
-		perm('CAN_SPAWN_INVENTIONS', 0, true),
-		perm('CAN_USE_PLAY_GIZMOS_TOGGLE', 0, true),
-		perm('CAN_USE_MAKER_PEN', 30, false),
-		perm('CAN_USE_ROOM_RESET_BUTTON', 30, true),
-		perm('CAN_USE_DELETE_ALL_BUTTON', 30, true),
-		perm('CAN_SAVE_INVENTIONS', 30, true),
-		perm('CAN_SPAWN_INVENTIONS', 30, true),
-		perm('CAN_USE_PLAY_GIZMOS_TOGGLE', 30, true),
-	]
 
-	if (MAKER_PEN_ACCOUNT_IDS.has(accountId)) {
-		permissions.unshift(perm('CAN_USE_MAKER_PEN', 0, true))
+	// The override that reaches the caller for a permission: their own role's, else the
+	// highest role below theirs that has one.
+	const reaching = (permission: string): RoomPermission | undefined =>
+		overrides
+			.filter((o) => o.Permission === permission && o.Role <= role)
+			.reduce<RoomPermission | undefined>(
+				(best, o) => (best && best.Role > o.Role ? best : o),
+				undefined
+			)
+
+	const names = [...BUILD_PERMISSIONS, ...overrides.map((o) => o.Permission)].filter(
+		(name, i, all) => all.indexOf(name) === i
+	)
+	const values = new Map<string, string>()
+	for (const name of names) {
+		const stored = reaching(name)
+		if (stored !== undefined) values.set(name, stored.Value)
+		else if (BUILD_PERMISSIONS.includes(name as (typeof BUILD_PERMISSIONS)[number])) {
+			values.set(name, buildsByDefault(role) ? 'True' : 'False')
+		}
+		// A creator-added pair stored only under a higher role than the caller's is not theirs.
 	}
+	if (MAKER_PEN_ACCOUNT_IDS.has(accountId)) values.set('CAN_USE_MAKER_PEN', 'True')
 
-	// The subroom's stored table wins, applied LAST and over the dev grant too: a
-	// (Permission, Role) the table already carries is replaced in place — so the order
-	// doesn't shift under the client, and no pair is ever listed twice with two values —
-	// and one it doesn't (e.g. CAN_INVITE) is appended.
-	for (const override of overrides) {
-		const i = permissions.findIndex(
-			(p) => p.Permission === override.Permission && p.Role === override.Role
-		)
-		if (i === -1) permissions.push(override)
-		else permissions[i] = override
+	const permissions: RoomPermission[] = []
+	for (const roleRow of role === Role.None ? [Role.None] : [Role.None, role]) {
+		for (const [name, value] of values) permissions.push(perm(name, roleRow, value))
 	}
 	return {
 		Permissions: permissions,
@@ -319,22 +360,24 @@ function photonAccessToken(
 }
 
 /**
- * Photon access-token handler. Auth-gated: resolves the caller, reads their current
- * room instance from the shared `presence` table (see @repo/domain), and returns the
- * permissions + token.
+ * Photon access-token handler. Auth-gated: resolves the caller, reads their current room
+ * instance from the shared `presence` table (see @repo/domain), works out their role in that
+ * room and the overrides stored on the subroom they are standing in, and returns the
+ * permissions + token. A player in no instance — sitting in the lobby, or an instance
+ * predating subroom tracking — is a visitor with the defaults.
  */
 async function handlePhotonAccessToken(c: Context<App>) {
 	const accountId = await authedAccountId(c)
 	if (accountId === null) return unauthorized(c)
 	const instance = (await getPresence<PresenceView>(c.env.DB, accountId))?.roomInstance
-	// The permission overrides are the ones saved on the subroom the caller is standing in.
-	// A player in no instance — sitting in the lobby, or an instance predating subroom
-	// tracking — gets the default table untouched.
+	const room =
+		typeof instance?.roomId === 'number' ? await getRoomById(c.env.DB, instance.roomId) : null
+	const role = room ? roleIn(room, accountId) : Role.None
 	const overrides =
 		typeof instance?.subRoomId === 'number'
 			? await getSubRoomPermissions(c.env.DB, instance.subRoomId)
 			: []
-	return c.json(photonAccessToken(accountId, instance?.roomInstanceId ?? null, overrides))
+	return c.json(photonAccessToken(accountId, instance?.roomInstanceId ?? null, role, overrides))
 }
 
 /**
@@ -4041,10 +4084,11 @@ const app = new Hono<App>()
 				'always serve `true`. `Value` is a string — usually `True`/`False`, but it is kept',
 				'verbatim, since not every permission’s UI is a True/False picker.',
 				'',
-				'What this feeds is `GET /photon_access_token`: a stored entry replaces the default',
-				'with the same (`Permission`, `Role`) in the table the client applies when it spawns,',
-				'and one naming a pair the defaults don’t carry (e.g. `CAN_INVITE`) is added to it.',
-				'The overrides apply to the subroom the caller is standing in, resolved from presence.',
+				'What this feeds is `GET /photon_access_token`, which builds each player’s table from',
+				'the entries that reach THEIR role in the room: an entry at their role, else one at a',
+				'lower role (a Role 0 grant reaches everyone), over the role’s defaults. One naming a',
+				'pair the defaults don’t carry (e.g. `CAN_INVITE`) is served too. The overrides apply',
+				'to the subroom the caller is standing in, resolved from presence.',
 				'',
 				'Creator-only — co-owners may build in a room but not decide what a role may do.',
 				'The response body is EMPTY: the client doesn’t read one.',
@@ -4575,9 +4619,17 @@ const app = new Hono<App>()
 				'`RoomInstanceId` is the caller’s current instance, read from the shared `presence`',
 				'table (null when they’re in none).',
 				'',
+				'The table is built for the CALLER: their role in the room they are standing in',
+				'(Creator, co-owner, moderator, host, or a visitor) decides each permission’s value —',
+				'the entry the room’s creator stored on that subroom at their role',
+				'(`PUT …/subrooms/{subRoomId}/permissions`), else one stored at a lower role, else the',
+				'default: managers (co-owner and up) may build, nobody else may. Entries stored under',
+				'a role the caller does not hold are left out. Every value is served at Role 0 and,',
+				'for a role holder, again at their role, all with `Override: true`.',
+				'',
 				'`PhotonAccessToken` is always empty: the reference server signs it with a',
 				'secret/algorithm we don’t have, and our Photon setup accepts an empty token. The',
-				'global (Role 0) maker pen is granted only to the hardcoded dev accounts.',
+				'global maker pen is granted only to the hardcoded dev accounts, whatever the table says.',
 			].join('\n'),
 			security: AUTHED,
 			responses: {

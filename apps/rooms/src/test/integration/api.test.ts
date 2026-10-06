@@ -4394,13 +4394,13 @@ describe('rooms endpoints', () => {
 		expect((await SELF.fetch(`${ORIGIN}/photon_access_token`)).status).toBe(401)
 	})
 
-	it('GET /photon_access_token returns permissions + presence instance', async () => {
+	it('GET /photon_access_token gives a VISITOR no build permissions, with their presence instance', async () => {
 		// Seed the caller's presence so RoomInstanceId reflects their current instance.
 		await env.DB.prepare('INSERT OR REPLACE INTO presence (data) VALUES (?1)')
 			.bind(
 				JSON.stringify({
 					accountId: 777,
-					roomInstance: { roomInstanceId: 1000042 },
+					roomInstance: { roomInstanceId: 1000042, roomId: 2, subRoomId: 2 },
 					expiresAt: Math.floor(Date.now() / 1000) + 900,
 				})
 			)
@@ -4408,38 +4408,91 @@ describe('rooms endpoints', () => {
 		const res = await SELF.fetch(`${ORIGIN}/photon_access_token`, { headers: await bearer('777') })
 		expect(res.status).toBe(200)
 		const body = (await res.json()) as {
-			Permissions: Array<{ Permission: string; Role: number }>
+			Permissions: Array<{ Permission: string; Role: number; Override: boolean; Value: string }>
 			PhotonAccessToken: string
 			RoomInstanceId: number | null
 		}
-		expect(body.Permissions.length).toBe(11)
 		expect(body.RoomInstanceId).toBe(1000042)
-		// A non-dev account does NOT get the global (Role 0) maker pen.
-		expect(body.Permissions.some((p) => p.Permission === 'CAN_USE_MAKER_PEN' && p.Role === 0)).toBe(
-			false
-		)
+		expect(body.PhotonAccessToken).toBe('')
+		// 777 holds no role in room 2: one Role 0 row per permission, every one of them False.
+		// Serving True here handed every visitor the delete-all button.
+		expect(body.Permissions.map((p) => p.Permission)).toEqual([
+			'CAN_USE_MAKER_PEN',
+			'CAN_USE_ROOM_RESET_BUTTON',
+			'CAN_USE_DELETE_ALL_BUTTON',
+			'CAN_SAVE_INVENTIONS',
+			'CAN_SPAWN_INVENTIONS',
+			'CAN_USE_PLAY_GIZMOS_TOGGLE',
+		])
+		for (const p of body.Permissions) {
+			expect(p).toMatchObject({ Role: 0, Override: true, Type: 0, Value: 'False' })
+		}
 	})
 
 	it('GET /photon_access_token returns null RoomInstanceId when the caller has no presence', async () => {
 		const res = await SELF.fetch(`${ORIGIN}/photon_access_token`, { headers: await bearer('888') })
 		expect(res.status).toBe(200)
-		expect(((await res.json()) as { RoomInstanceId: number | null }).RoomInstanceId).toBeNull()
+		const body = (await res.json()) as {
+			RoomInstanceId: number | null
+			Permissions: Array<{ Value: string }>
+		}
+		expect(body.RoomInstanceId).toBeNull()
+		// In no room, they are nobody's manager.
+		expect(body.Permissions.every((p) => p.Value === 'False')).toBe(true)
 	})
 
-	it('GET /photon_access_token grants the global maker pen to dev accounts (1/2/3)', async () => {
+	it('GET /photon_access_token gives the room’s MANAGERS every build permission', async () => {
+		// Room 2 is account 1's, with account 2 a co-owner (Role 30).
+		const tableFor = async (accountId: number) => {
+			await env.DB.prepare('INSERT OR REPLACE INTO presence (data) VALUES (?1)')
+				.bind(
+					JSON.stringify({
+						accountId,
+						roomInstance: { roomInstanceId: 1000043, roomId: 2, subRoomId: 2 },
+						expiresAt: Math.floor(Date.now() / 1000) + 900,
+					})
+				)
+				.run()
+			const res = await SELF.fetch(`${ORIGIN}/photon_access_token`, {
+				headers: await bearer(String(accountId)),
+			})
+			return ((await res.json()) as { Permissions: Array<{ Role: number; Value: string }> })
+				.Permissions
+		}
+		// The creator's values are served at Role 0 and again at Role 255, all True; the
+		// co-owner's at 0 and 30. Both readings of the table land on the same values.
+		const creator = await tableFor(1)
+		expect(creator.length).toBe(12)
+		expect(creator.map((p) => p.Role)).toEqual([
+			...Array<number>(6).fill(0),
+			...Array<number>(6).fill(255),
+		])
+		expect(creator.every((p) => p.Value === 'True')).toBe(true)
+		const coOwner = await tableFor(2)
+		expect(coOwner.map((p) => p.Role)).toEqual([
+			...Array<number>(6).fill(0),
+			...Array<number>(6).fill(30),
+		])
+		expect(coOwner.every((p) => p.Value === 'True')).toBe(true)
+		await env.DB.prepare('DELETE FROM presence WHERE account_id IN (1, 2)').run()
+	})
+
+	it('GET /photon_access_token grants the global maker pen to dev accounts (1/2/3), nothing else', async () => {
 		for (const sub of ['1', '2', '3']) {
+			// Out of any room: a visitor with the dev maker pen.
 			const res = await SELF.fetch(`${ORIGIN}/photon_access_token`, { headers: await bearer(sub) })
 			expect(res.status).toBe(200)
 			const body = (await res.json()) as {
-				Permissions: Array<{ Permission: string; Role: number; Override: boolean }>
+				Permissions: Array<{ Permission: string; Role: number; Override: boolean; Value: string }>
 			}
-			// The global maker pen is prepended → first entry, Role 0, Override true.
-			expect(body.Permissions[0]).toMatchObject({
+			expect(body.Permissions[0]).toEqual({
+				Override: true,
 				Permission: 'CAN_USE_MAKER_PEN',
 				Role: 0,
-				Override: true,
+				Type: 0,
+				Value: 'True',
 			})
-			expect(body.Permissions.length).toBe(12)
+			expect(body.Permissions.slice(1).every((p) => p.Value === 'False')).toBe(true)
 		}
 	})
 
@@ -4709,9 +4762,10 @@ describe('rooms endpoints', () => {
 
 	// The permission table a room's creator saves on a subroom, and how it reaches the
 	// client: `PUT …/permissions` stores entries keyed by (Permission, Role), and
-	// `GET /photon_access_token` merges them over its defaults for whoever is standing in
-	// that subroom. Room 2 / subroom 2 is owned by account 1; account 743 is the visitor
-	// whose presence points at it.
+	// `GET /photon_access_token` builds the table for whoever is standing in that subroom,
+	// from the entries that reach THEIR role over the role's defaults. Room 2 / subroom 2 is
+	// owned by account 1, with account 2 a co-owner; 743–747 are visitors whose presence
+	// points at it.
 	describe('subroom permissions', () => {
 		type Permission = { Permission: string; Role: number; Override: boolean; Value: string }
 
@@ -4741,8 +4795,28 @@ describe('rooms endpoints', () => {
 			return ((await res.json()) as { Permissions: Permission[] }).Permissions
 		}
 
-		const entry = (list: Permission[], permission: string, role: number) =>
-			list.find((p) => p.Permission === permission && p.Role === role)
+		/** The value a table serves for a permission (every row of a table agrees). */
+		const valueOf = (list: Permission[], permission: string) => {
+			const values = new Set(list.filter((p) => p.Permission === permission).map((p) => p.Value))
+			expect(values.size).toBeLessThanOrEqual(1)
+			return [...values][0]
+		}
+		// Room 2's seeded co-owner is account 2 — one of the hardcoded dev accounts, whose
+		// global maker pen no table takes away — so the role-holder cases use 748 (a Host)
+		// and 749 (a co-owner), given their roles here.
+		const setRoles = async () => {
+			await env.DB.prepare(
+				`UPDATE room SET data = json_set(data, '$.Roles', json(?1)) WHERE room_id = 2`
+			)
+				.bind(
+					JSON.stringify([
+						{ AccountId: 2, Role: 30 },
+						{ AccountId: 748, Role: 10 },
+						{ AccountId: 749, Role: 30 },
+					])
+				)
+				.run()
+		}
 
 		it('is auth-gated and creator-only', async () => {
 			const body = [
@@ -4777,50 +4851,91 @@ describe('rooms endpoints', () => {
 			expect(await res.text()).toBe('')
 		})
 
-		it('a checked Override replaces the matching default in place', async () => {
-			const before = await permissionsIn(743, 2)
-			expect(before.length).toBe(11)
-			const at = before.findIndex((p) => p.Permission === 'CAN_USE_MAKER_PEN' && p.Role === 30)
-			// The default for this pair is an un-overridden grant.
-			expect(before[at]).toMatchObject({ Override: false, Value: 'True' })
+		it('a Role 0 grant reaches a visitor; a Role 30 grant does not', async () => {
+			// Nothing stored for everyone: the visitor may do nothing.
+			expect(valueOf(await permissionsIn(743, 2), 'CAN_SPAWN_INVENTIONS')).toBe('False')
 
+			// The creator lets everyone spawn inventions in this subroom.
 			expect(
 				(
 					await putPermissions(
 						'/rooms/2/subrooms/2/permissions',
 						[
 							{
-								Permission: 'CAN_USE_MAKER_PEN',
-								Role: 30,
+								Permission: 'CAN_SPAWN_INVENTIONS',
+								Role: 0,
 								Override: true,
 								Type: 0,
-								Value: 'False',
+								Value: 'True',
 							},
 						],
 						'1'
 					)
 				).status
 			).toBe(200)
+			const granted = await permissionsIn(743, 2)
+			expect(valueOf(granted, 'CAN_SPAWN_INVENTIONS')).toBe('True')
+			// Only that one: the rest of the visitor's table is still False, and one row each.
+			expect(valueOf(granted, 'CAN_USE_DELETE_ALL_BUTTON')).toBe('False')
+			expect(granted.length).toBe(6)
 
-			const after = await permissionsIn(743, 2)
-			// Replaced, not appended — and at the same index, so the table doesn't reshuffle.
-			expect(after.length).toBe(11)
-			expect(after[at]).toMatchObject({
-				Permission: 'CAN_USE_MAKER_PEN',
-				Role: 30,
-				Override: true,
-				Value: 'False',
-			})
-
-			// Re-sending the same (Permission, Role) updates that entry rather than adding one.
+			// A grant stored for co-owners is not the visitor's — and nor is it listed for them.
 			await putPermissions(
 				'/rooms/2/subrooms/2/permissions',
-				[{ Permission: 'CAN_USE_MAKER_PEN', Role: 30, Override: true, Type: 0, Value: 'True' }],
+				[{ Permission: 'CAN_INVITE', Role: 30, Override: true, Type: 0, Value: 'True' }],
 				'1'
 			)
-			const changed = await permissionsIn(743, 2)
-			expect(changed.length).toBe(11)
-			expect(changed[at]).toMatchObject({ Override: true, Value: 'True' })
+			const after = await permissionsIn(743, 2)
+			expect(after.find((p) => p.Permission === 'CAN_INVITE')).toBeUndefined()
+			expect(after.length).toBe(6)
+			// The co-owner gets it, at Role 0 and at 30, beside their default grants.
+			await setRoles()
+			const coOwner = await permissionsIn(749, 2)
+			expect(valueOf(coOwner, 'CAN_INVITE')).toBe('True')
+			expect(coOwner.filter((p) => p.Permission === 'CAN_INVITE').map((p) => p.Role)).toEqual([
+				0, 30,
+			])
+		})
+
+		it('a stored entry at the caller’s role beats one below it, and revokes a default', async () => {
+			// Take the maker pen away from co-owners, while everyone may spawn inventions.
+			await putPermissions(
+				'/rooms/2/subrooms/2/permissions',
+				[{ Permission: 'CAN_USE_MAKER_PEN', Role: 30, Override: true, Type: 0, Value: 'False' }],
+				'1'
+			)
+			const coOwner = await permissionsIn(749, 2)
+			expect(valueOf(coOwner, 'CAN_USE_MAKER_PEN')).toBe('False')
+			expect(valueOf(coOwner, 'CAN_SPAWN_INVENTIONS')).toBe('True')
+			// The creator is above Role 30: that entry doesn't reach them.
+			expect(valueOf(await permissionsIn(1, 2), 'CAN_USE_MAKER_PEN')).toBe('True')
+
+			// A Host (Role 10) sits between: the Role 0 grant reaches them, the Role 30
+			// revocation does not, and their own default is no maker pen either way.
+			const host = await permissionsIn(748, 2)
+			expect(host.map((p) => p.Role).filter((r) => r === 10).length).toBe(6)
+			expect(valueOf(host, 'CAN_SPAWN_INVENTIONS')).toBe('True')
+			expect(valueOf(host, 'CAN_USE_MAKER_PEN')).toBe('False')
+			expect(valueOf(host, 'CAN_USE_DELETE_ALL_BUTTON')).toBe('False')
+			// Now the creator opens the delete-all button to hosts and up.
+			await putPermissions(
+				'/rooms/2/subrooms/2/permissions',
+				[
+					{
+						Permission: 'CAN_USE_DELETE_ALL_BUTTON',
+						Role: 10,
+						Override: true,
+						Type: 0,
+						Value: 'True',
+					},
+				],
+				'1'
+			)
+			expect(valueOf(await permissionsIn(748, 2), 'CAN_USE_DELETE_ALL_BUTTON')).toBe('True')
+			// Which reaches a co-owner (above 10) but not a visitor (below it).
+			expect(valueOf(await permissionsIn(749, 2), 'CAN_USE_DELETE_ALL_BUTTON')).toBe('True')
+			expect(valueOf(await permissionsIn(743, 2), 'CAN_USE_DELETE_ALL_BUTTON')).toBe('False')
+			await env.DB.prepare('DELETE FROM presence WHERE account_id = 1').run()
 		})
 
 		it('an unchecked Override erases the entry, back to the default', async () => {
@@ -4845,7 +4960,7 @@ describe('rooms endpoints', () => {
 								Role: 30,
 								Override: false,
 								Type: 0,
-								Value: 'True',
+								Value: 'False',
 							},
 						],
 						'1'
@@ -4853,14 +4968,9 @@ describe('rooms endpoints', () => {
 				).status
 			).toBe(200)
 
-			// The row is gone, and the token serves the default for the pair again.
+			// The row is gone, and the co-owner has their default maker pen again.
 			expect(await stored()).toBe(0)
-			const table = await permissionsIn(743, 2)
-			expect(table.length).toBe(11)
-			expect(entry(table, 'CAN_USE_MAKER_PEN', 30)).toMatchObject({
-				Override: false,
-				Value: 'True',
-			})
+			expect(valueOf(await permissionsIn(749, 2), 'CAN_USE_MAKER_PEN')).toBe('True')
 
 			// Clearing a pair that was never overridden is a no-op, not an insert.
 			await putPermissions(
@@ -4868,31 +4978,21 @@ describe('rooms endpoints', () => {
 				[{ Permission: 'CAN_INVITE', Role: 0, Override: false, Type: 0, Value: 'True' }],
 				'1'
 			)
-			expect((await permissionsIn(743, 2)).length).toBe(11)
+			expect((await permissionsIn(743, 2)).length).toBe(6)
 		})
 
-		it('appends a permission the defaults do not carry, and scopes it to its subroom', async () => {
-			// CAN_INVITE is in none of the defaults, so it lands as a new entry.
-			await putPermissions(
-				'/rooms/2/subrooms/2/permissions',
-				[{ Permission: 'CAN_INVITE', Role: 30, Override: true, Type: 0, Value: 'False' }],
-				'1'
-			)
-			const inSubRoom2 = await permissionsIn(744, 2)
-			expect(inSubRoom2.length).toBe(12)
-			expect(entry(inSubRoom2, 'CAN_INVITE', 30)).toMatchObject({
-				Override: true,
-				Value: 'False',
-			})
-
-			// A different subroom is untouched — the table is per-subroom, not per-room.
-			expect((await permissionsIn(744, 3)).length).toBe(11)
-			// And so is a player in no instance at all.
+		it('scopes the table to its subroom', async () => {
+			// Subroom 2 lets everyone spawn inventions (set above); subroom 3 does not.
+			expect(valueOf(await permissionsIn(744, 2), 'CAN_SPAWN_INVENTIONS')).toBe('True')
+			expect(valueOf(await permissionsIn(744, 3), 'CAN_SPAWN_INVENTIONS')).toBe('False')
+			// And a player in no instance at all is a visitor with the defaults.
 			await env.DB.prepare('DELETE FROM presence WHERE account_id = ?1').bind(744).run()
 			const lobby = await SELF.fetch(`${ORIGIN}/photon_access_token`, {
 				headers: await bearer('744'),
 			})
-			expect(((await lobby.json()) as { Permissions: Permission[] }).Permissions.length).toBe(11)
+			const table = ((await lobby.json()) as { Permissions: Permission[] }).Permissions
+			expect(table.length).toBe(6)
+			expect(table.every((p) => p.Value === 'False')).toBe(true)
 		})
 
 		it('keeps a Value that isn’t True/False verbatim', async () => {
@@ -4903,42 +5003,23 @@ describe('rooms endpoints', () => {
 				[{ Permission: 'MAX_SPAWNED_INVENTIONS', Role: 0, Override: true, Type: 0, Value: '25' }],
 				'1'
 			)
-			expect(entry(await permissionsIn(747, 2), 'MAX_SPAWNED_INVENTIONS', 0)).toMatchObject({
-				Override: true,
-				Value: '25',
-			})
+			expect(valueOf(await permissionsIn(747, 2), 'MAX_SPAWNED_INVENTIONS')).toBe('25')
 		})
 
-		it('applies over the dev accounts’ global maker pen, without listing a pair twice', async () => {
+		it('applies over the dev accounts’ global maker pen', async () => {
+			// Account 3 is one of the hardcoded dev accounts, so it holds the global maker pen
+			// in every room — the one grant a subroom's table doesn't take away.
 			await putPermissions(
 				'/rooms/2/subrooms/2/permissions',
-				[
-					{ Permission: 'CAN_USE_MAKER_PEN', Role: 0, Override: true, Type: 0, Value: 'False' },
-					// The third sample body — a Role 0 grant the defaults already carry.
-					{
-						Permission: 'CAN_USE_DELETE_ALL_BUTTON',
-						Role: 0,
-						Override: true,
-						Type: 0,
-						Value: 'True',
-					},
-				],
+				[{ Permission: 'CAN_USE_MAKER_PEN', Role: 0, Override: true, Type: 0, Value: 'False' }],
 				'1'
 			)
-			// Account 3 is one of the hardcoded dev accounts, so it gets the global (Role 0)
-			// maker pen prepended — which this subroom then revokes. The merge runs last and
-			// replaces it in place, so the pair appears exactly ONCE: a table listing it twice
-			// with two values would leave which one applies up to the client.
 			const devTable = await permissionsIn(3, 2)
-			expect(devTable.filter((p) => p.Permission === 'CAN_USE_MAKER_PEN' && p.Role === 0)).toEqual([
-				{ Override: true, Permission: 'CAN_USE_MAKER_PEN', Role: 0, Type: 0, Value: 'False' },
+			expect(devTable.filter((p) => p.Permission === 'CAN_USE_MAKER_PEN')).toEqual([
+				{ Override: true, Permission: 'CAN_USE_MAKER_PEN', Role: 0, Type: 0, Value: 'True' },
 			])
-			expect(entry(devTable, 'CAN_USE_DELETE_ALL_BUTTON', 0)).toMatchObject({ Value: 'True' })
-
-			// A normal player in the same subroom sees the same revocation.
-			expect(entry(await permissionsIn(745, 2), 'CAN_USE_MAKER_PEN', 0)).toMatchObject({
-				Value: 'False',
-			})
+			// A normal player in the same subroom has none, as before.
+			expect(valueOf(await permissionsIn(745, 2), 'CAN_USE_MAKER_PEN')).toBe('False')
 		})
 
 		it('a cloned subroom inherits the source’s permission table', async () => {
@@ -4950,8 +5031,8 @@ describe('rooms endpoints', () => {
 			const cloneId = Math.max(...room.value.SubRooms.map((s) => s.SubRoomId))
 
 			const inClone = await permissionsIn(746, cloneId)
-			expect(entry(inClone, 'CAN_INVITE', 30)).toMatchObject({ Value: 'False' })
-			expect(entry(inClone, 'CAN_USE_MAKER_PEN', 0)).toMatchObject({ Value: 'False' })
+			expect(valueOf(inClone, 'CAN_SPAWN_INVENTIONS')).toBe('True')
+			expect(valueOf(inClone, 'MAX_SPAWNED_INVENTIONS')).toBe('25')
 		})
 	})
 
