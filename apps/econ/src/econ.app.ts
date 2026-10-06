@@ -149,6 +149,7 @@ import {
 	UgcPurchasableBulkRequest,
 	UgcPurchasableItemList,
 	UNAUTHORIZED_RESPONSE,
+	UpdateActiveConsumableRequest,
 	UpdateObjectiveRequest,
 	UpdateObjectiveResponse,
 	UpdateRoomCurrencyRequest,
@@ -4856,6 +4857,54 @@ const app = new Hono<App>({ strict: false })
 				if (consumed !== null) await pushConsumableRemoved(c, id, consumed)
 			}
 			return c.json({ error: '', success: true, value: null })
+		}
+	)
+
+	// STUB. The client posts `{ Id, IsActive, ActivatedByRoomie }` when a consumable starts
+	// or stops being used — `Id` is the consumable row id, as on `/consume`. Nothing is
+	// stored: the body is read only to log it, and the client ignores the response entirely,
+	// so none is sent.
+	//
+	// What this most likely means: the consumable is IN USE, and marking it so is what keeps
+	// a player from reusing one before it is over (a second Confetti Cannon while the first
+	// is still firing), and `ActivatedByRoomie` says a roommate set it off rather than its
+	// owner. That is a guess from the field names, not observed behaviour, so no row flips
+	// and `/consume` is unchanged. When the client's reading of it is known, this is where
+	// an `is_active` flag on the consumable row (and a refusal on `/consume`) would go.
+	.post(
+		'/api/consumables/v1/updateActive',
+		describeRoute({
+			tags: ['Consumables'],
+			summary: 'Mark a consumable active or inactive (stub)',
+			description: [
+				'STUB. Accepts `{ Id, IsActive, ActivatedByRoomie }` — the client posting that one',
+				'of its consumables has started or stopped being used — and stores nothing. The',
+				'client ignores the response entirely, so this answers an empty 200.',
+				'',
+				'Believed to mark the consumable as IN USE so it cannot be reused before it is over,',
+				'with `ActivatedByRoomie` saying a roommate set it off; that is a guess from the field',
+				'names, and nothing acts on it yet. `/consume` is unaffected.',
+			].join(' '),
+			security: AUTHED,
+			requestBody: jsonBody(UpdateActiveConsumableRequest, 'The consumable and its new state'),
+			responses: {
+				200: { description: 'Empty body — the client ignores the response entirely' },
+				401: UNAUTHORIZED_RESPONSE,
+			},
+		}),
+		async (c) => {
+			const id = await authedId(c)
+			if (id === null) return unauthorized(c)
+			const body = await c.req
+				.json<Record<string, unknown>>()
+				.catch(() => ({}) as Record<string, unknown>)
+			logger.info('consumable updateActive (stub, not stored)', {
+				accountId: id,
+				consumableId: body.Id,
+				isActive: body.IsActive,
+				activatedByRoomie: body.ActivatedByRoomie,
+			})
+			return c.body(null, 200)
 		}
 	)
 

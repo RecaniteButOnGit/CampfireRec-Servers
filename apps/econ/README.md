@@ -43,6 +43,7 @@ missing/invalid). `~` = optional auth: served to anyone, personalised for a vali
 | POST     | `/api/settings/v2/set`                               | ✓    | Persist settings (accept-and-ack)       |
 | GET      | `/api/consumables/v2/getUnlocked`                    | ✓    | Unlocked consumables                    |
 | POST     | `/api/consumables/v1/consume`                        | ✓    | Consume an owned consumable             |
+| POST     | `/api/consumables/v1/updateActive`                   | ✓    | Mark a consumable active (stub, empty)  |
 | GET      | `/api/storefronts/v4/balance/:currencyType`          | ✓    | Currency balance                        |
 | GET      | `/api/storefronts/v3/giftdropstore/:id`              |      | Gift-drop storefront catalog            |
 | POST     | `/api/storefronts/v2/buyItem`                        | ✓    | Buy a storefront item                   |

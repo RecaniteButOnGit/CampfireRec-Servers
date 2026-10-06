@@ -3578,6 +3578,30 @@ describe('econ endpoints', () => {
 		expect(await res.json()).toEqual([])
 	})
 
+	test('POST /api/consumables/v1/updateActive is a stub: auth-gated, stores nothing, answers nothing', async () => {
+		const before = await env.DB.prepare('SELECT * FROM consumable ORDER BY id').all()
+		const body = { Id: 7550, IsActive: true, ActivatedByRoomie: false }
+
+		const anon = await exports.default.fetch(`${ORIGIN}/api/consumables/v1/updateActive`, {
+			method: 'POST',
+			headers: { 'Content-Type': 'application/json' },
+			body: JSON.stringify(body),
+		})
+		expect(anon.status).toBe(401)
+
+		const res = await exports.default.fetch(`${ORIGIN}/api/consumables/v1/updateActive`, {
+			method: 'POST',
+			headers: { ...(await bearer('314')), 'Content-Type': 'application/json' },
+			body: JSON.stringify(body),
+		})
+		expect(res.status).toBe(200)
+		// No body at all: the client ignores the response entirely.
+		expect(await res.text()).toBe('')
+		// Nothing is stored yet.
+		const after = await env.DB.prepare('SELECT * FROM consumable ORDER BY id').all()
+		expect(after.results).toEqual(before.results)
+	})
+
 	test('POST /api/consumables/v1/consume reduces the count and deletes the row at zero', async () => {
 		// Seed account 313 with two Supreme Pizza instances (counts 3 and 1).
 		await grantConsumable(env.DB, 313, 'Supreme Pizza', 3)
@@ -6991,6 +7015,7 @@ describe('econ endpoints', () => {
 			'POST /api/checklist/v1/complete',
 			'POST /api/checklist/v2/complete',
 			'POST /api/consumables/v1/consume',
+			'POST /api/consumables/v1/updateActive',
 			'POST /api/equipment/v1/update',
 			'POST /api/gamerewards/v1/request',
 			'POST /api/itemWishlists/v1/isonwishlist/bulk',

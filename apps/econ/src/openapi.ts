@@ -1257,6 +1257,19 @@ export const ConsumeConsumableRequest = z.object({
 	DeltaCount: z.int().optional().describe('How many to spend; defaults to 1'),
 })
 
+/**
+ * `POST /api/consumables/v1/updateActive` JSON body — the client marking one of its
+ * consumables active or not. Accepted and NOT acted on yet; see the route.
+ */
+export const UpdateActiveConsumableRequest = z.object({
+	Id: z.int().describe('The consumable row id'),
+	IsActive: z.boolean().describe('Whether the consumable is now in use'),
+	ActivatedByRoomie: z
+		.boolean()
+		.optional()
+		.describe('Whether a roommate, rather than the owner, activated it'),
+})
+
 /** `POST /api/avatar/v2/gifts/consume` form body (posted with a trailing slash). */
 export const ConsumeGiftRequest = z.object({
 	Id: z.string().describe('The gift-box id to open'),
