@@ -338,18 +338,22 @@ async function handlePhotonAccessToken(c: Context<App>) {
 }
 
 /**
- * May this caller read the room's saves? The room's creator always may. So may anyone
- * whose live presence puts them IN the room: they are already loading its scene, and the
- * client resolves which version to load — the published one or the creator's latest — from
- * the save list, so refusing everyone but the creator leaves a visitor unable to load what
- * the instance is actually running.
+ * May this caller read the room's saves? The room's creator and its co-owners always may:
+ * they are the ones who write and publish saves (`canManageRoom` gates both), and the
+ * client shows them the save history from the room's settings, wherever they are — a
+ * co-owner refused here sees the buttons and a list that never loads.
  *
- * Presence is the shared `presence` table the `match` heartbeat maintains, so this grant
+ * So may anyone whose live presence puts them IN the room: they are already loading its
+ * scene, and the client resolves which version to load — the published one or the latest —
+ * from the save list, so refusing everyone but the room's managers leaves a visitor unable
+ * to load what the instance is actually running.
+ *
+ * Presence is the shared `presence` table the `match` heartbeat maintains, so that grant
  * lasts only as long as the player is actually there (rows carry an absolute expiry and
- * expired ones don't read back). Co-owners get nothing extra from being co-owners — a
- * co-owner standing in the room passes because of where they are, not what they hold.
+ * expired ones don't read back).
  *
- * The presence read only happens for a non-creator, so the owner's own path stays one query.
+ * The presence read only happens for someone who doesn't manage the room, so the owner's
+ * and a co-owner's path stays one query.
  */
 async function canReadSaves(
 	c: Context<App>,
@@ -357,7 +361,7 @@ async function canReadSaves(
 	roomId: number,
 	accountId: number
 ): Promise<boolean> {
-	if (room.CreatorAccountId === accountId) return true
+	if (canManageRoom(room, accountId)) return true
 	const instance = (await getPresence<PresenceView>(c.env.DB, accountId))?.roomInstance
 	return instance?.roomId === roomId
 }
@@ -3437,7 +3441,8 @@ const app = new Hono<App>()
 	// A subroom's saved-data versions — the room-history / "restore a save" list. Every
 	// save is its own `subroom_save` row (nothing is overwritten), so this is real
 	// history, newest first, paged by skip/take. Auth-gated (401), and readable by the
-	// room's creator or anyone whose presence puts them in the room (see `canReadSaves`).
+	// room's creator, a co-owner, or anyone whose presence puts them in the room (see
+	// `canReadSaves`).
 	.get(
 		'/rooms/:roomId{[0-9]+}/subrooms/:subRoomId{[0-9]+}/saves',
 		describeRoute({
@@ -3451,8 +3456,8 @@ const app = new Hono<App>()
 				'(0 Windows, 2 Android/Quest). `unityAssetVersion` is accepted and ignored.',
 				'',
 				'The list includes STAGED saves that were never published, so it is not public:',
-				'the room’s creator may read it, and so may anyone standing IN the room (their live',
-				'presence says so). Anyone else is a 403. It is what the client reads to resolve',
+				'the room’s creator or a co-owner may read it, and so may anyone standing IN the room',
+				'(their live presence says so). Anyone else is a 403. It is what the client reads to resolve',
 				'“load the latest or the published version?” on entering a private instance — a',
 				'visitor who cannot read it cannot load what the instance is running.',
 				'',
@@ -3525,8 +3530,8 @@ const app = new Hono<App>()
 				'paged wrapper, with no `{ success, error, value }` envelope around it.',
 				'',
 				'Gated exactly like `…/saves`, and for the same reason: the list includes STAGED',
-				'saves that were never published, so it is the room’s creator or anyone whose live',
-				'presence puts them in the room, and anyone else is a 403.',
+				'saves that were never published, so it is the room’s creator, a co-owner, or anyone',
+				'whose live presence puts them in the room, and anyone else is a 403.',
 				'',
 				'`TotalResults` and `TotalCount` carry the same number — the client’s paged DTO and',
 				'the reference disagree on the name, so both are emitted.',
@@ -3588,8 +3593,8 @@ const app = new Hono<App>()
 				'save by guessing an id: a save that belongs elsewhere is a 404, same as an unknown',
 				'one.',
 				'',
-				'Gated like the list it details — the room’s creator, or anyone whose presence puts',
-				'them in the room. A save id resolves whether or not it was ever published, so this',
+				'Gated like the list it details — the room’s creator, a co-owner, or anyone whose',
+				'presence puts them in the room. A save id resolves whether or not it was ever published, so this',
 				'reads unpublished work.',
 			].join(' '),
 			security: AUTHED,

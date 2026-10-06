@@ -118,12 +118,13 @@ inconsistency here without checking the client first.
   `GET …/saves/:saveId` is the detail behind a list row, under the same gate, but in the
   CAMELCASE projection the room save's response uses — not the PascalCase rows the list
   serves. Three shapes of one save; keep them straight.
-- Both save reads (`rooms`: `…/saves` and `…/saves/:saveId`) are auth-gated and readable by
-  the room's CREATOR or by anyone whose live `presence` row puts them in that room — not by
-  co-owners as such (a co-owner passes only by standing there). They list unpublished
-  staged saves, so they aren't public; but a visitor resolves which version an instance is
-  running from this list, so creator-only locks them out of loading the room. The grant
-  expires with the presence row.
+- The save reads (`rooms`: `…/saves`, `…/saves/no_unity_assets` and `…/saves/:saveId`) are
+  auth-gated and readable by the room's creator, a CO-OWNER, or anyone whose live `presence`
+  row puts them in that room. They list unpublished staged saves, so they aren't public; but
+  a co-owner opens the save history from the room's settings without being in the room
+  (creator-only showed them the buttons and a list that 403'd), and a visitor resolves which
+  version an instance is running from this list, so managers-only locks them out of loading
+  the room. The presence grant expires with the presence row.
 - A room save writes ONLY to the subroom and its save row — never to the room. Everything
   the body carries describes that one revision: `Description` is the save comment shown in
   `…/saves`, and `PersistenceVersion`/`InventionUsage` describe the scene just saved (the

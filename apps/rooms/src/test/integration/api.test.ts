@@ -5306,18 +5306,18 @@ describe('rooms endpoints', () => {
 		expect(await empty.json()).toEqual({ Results: [], TotalResults: 0, TotalCount: 0 })
 
 		// The list exposes unpublished saves, so it isn't public: no token → 401, and a
-		// valid token from someone who is neither the creator nor in the room → 403. Account
-		// 2 is a co-owner (Role 30 on the seeded rooms) and is refused too — holding a role
-		// grants nothing here; being in the room does (see below).
+		// valid token from someone who neither manages the room nor is in it → 403.
 		expect((await SELF.fetch(`${ORIGIN}/rooms/2/subrooms/2/saves`)).status).toBe(401)
 		expect(
 			(await SELF.fetch(`${ORIGIN}/rooms/2/subrooms/2/saves`, { headers: await bearer('999') }))
 				.status
 		).toBe(403)
+		// Account 2 is a co-owner (Role 30 on the seeded rooms) and reads it from anywhere:
+		// the client opens the save history from the room's settings, not from inside it.
 		expect(
 			(await SELF.fetch(`${ORIGIN}/rooms/2/subrooms/2/saves`, { headers: await bearer('2') }))
 				.status
-		).toBe(403)
+		).toBe(200)
 
 		// …but a player standing IN the room reads it: the client resolves which version to
 		// load from this list, so a visitor who can't read it can't load the instance.
@@ -5409,7 +5409,7 @@ describe('rooms endpoints', () => {
 		// Same gate as the list it mirrors — it exposes the same unpublished saves.
 		expect((await get(light)).status).toBe(401)
 		expect((await get(light, '999')).status).toBe(403)
-		expect((await get(light, '2')).status).toBe(403)
+		expect((await get(light, '2')).status).toBe(200)
 		await putInRoom(999, 2)
 		expect((await get(light, '999')).status).toBe(200)
 		await clearPresence(999)
@@ -5460,12 +5460,12 @@ describe('rooms endpoints', () => {
 		expect((await get('/rooms/99999/subrooms/2/saves/1', '1')).status).toBe(404)
 		expect((await get('/rooms/2/subrooms/99999/saves/1', '1')).status).toBe(404)
 
-		// Same gate as the list it details: 401 unauthed, 403 for someone who is neither the
-		// creator nor in the room (a co-owner included) — it reads unpublished saves.
+		// Same gate as the list it details: 401 unauthed, 403 for someone who neither manages
+		// the room nor is in it — it reads unpublished saves. A co-owner (account 2) passes.
 		const detail = `/rooms/2/subrooms/2/saves/${row.SubRoomDataSaveId}`
 		expect((await get(detail)).status).toBe(401)
 		expect((await get(detail, '999')).status).toBe(403)
-		expect((await get(detail, '2')).status).toBe(403)
+		expect((await get(detail, '2')).status).toBe(200)
 		// A player standing in the room reads it, for as long as they're there.
 		await putInRoom(999, 2)
 		expect((await get(detail, '999')).status).toBe(200)
