@@ -1,14 +1,16 @@
 import catalog from './construction-catalog.json'
 import { checkRecord, guid, id, nodeType, stable } from './protobuf'
+import published from './published-catalog.json'
+import references from './reference-catalog.json'
 
 import type { RecordData } from './protobuf'
 
 export type ConstructionOptions = {
-	recipe?: string
 	bindings?: Record<string, string>
 	variable?: { name: string; memory_type?: string }
+	configuration?: RecordData
 }
-export type ConstructionRecipe = RecordData & {
+export type ConstructionDefinition = RecordData & {
 	id: string
 	typeId: string
 	nodeGroups: RecordData[]
@@ -17,7 +19,7 @@ export type ConstructionRecipe = RecordData & {
 	sources: string[]
 }
 
-const recipes = (catalog as RecordData).recipes as ConstructionRecipe[]
+const layouts = (catalog as RecordData).layouts as ConstructionDefinition[]
 export const CONSTRUCTION_PROVENANCE = Object.freeze({
 	schemaSha256: catalog.schemaSha256,
 	catalogSha256: catalog.catalogSha256,
@@ -28,7 +30,7 @@ function freeze(value: unknown): void {
 		Object.freeze(value)
 	}
 }
-freeze(recipes)
+freeze(layouts)
 const primitiveKinds: Record<string, string> = {
 	any: 'Any',
 	bool: 'Boolean',
@@ -53,11 +55,12 @@ const payloads = (data: RecordData) =>
 		.filter((name) => nodeType.fields[name]?.id >= 100 && name !== 'color_data')
 		.sort()
 
-/** Canonical recipes contain no source node IDs, geometry or scoped bindings. */
-export class Cv2ChipConstruction {
-	private readonly byType = new Map<string, ConstructionRecipe[]>()
+/** Builds known chip GUIDs from public descriptors. Observations only enrich layouts. */
+export class Cv2ChipFactory {
+	private readonly byType = new Map<string, ConstructionDefinition[]>()
+	private readonly definitions = new Map<string, ConstructionDefinition>()
 	constructor(private readonly isConcreteType: (name: string) => boolean) {
-		for (const recipe of recipes) {
+		for (const recipe of layouts) {
 			const list = this.byType.get(recipe.typeId) ?? []
 			list.push(recipe)
 			this.byType.set(recipe.typeId, list)
@@ -70,22 +73,92 @@ export class Cv2ChipConstruction {
 					(a.id < b.id ? -1 : a.id > b.id ? 1 : 0)
 			)
 		for (const list of this.byType.values()) Object.freeze(list)
+		for (const chip of (published as RecordData).chips) {
+			if (!chip.inPalette) continue
+			const observed = this.list(chip.typeId)[0]
+			const groups = chip.metadata.NodeDescs.map((group: RecordData) => ({
+				name: group.Name,
+				typeParameters: group.ReadonlyTypeParams,
+				inputs: group.Inputs,
+				outputs: group.Outputs,
+			}))
+			const observations = (references as RecordData).chips.filter(
+				(value: RecordData) => value.typeId === chip.typeId
+			)
+			const configurationFields = [
+				...new Set<string>(
+					observations.flatMap((value: RecordData) => Object.keys(value.configuration))
+				),
+			].filter((name) => nodeType.fields[name]?.id >= 100 && !name.startsWith('DEPRECATED_'))
+			const configuration: RecordData = {}
+			const requiredBindings: string[] = []
+			const requiredMetadata: string[] = []
+			for (const name of configurationFields) {
+				const field = nodeType.fields[name]!
+				if (field.resolvedType && 'fields' in field.resolvedType) {
+					// An empty message uses protobuf wire defaults. Never copy a room's
+					// values, GUIDs, resource bindings or configured event descriptors.
+					configuration[name] = {}
+					for (const descriptor of ['node_desc', 'node_descs'])
+						if (
+							field.resolvedType.fields[descriptor] &&
+							observations.every((value: RecordData) => value.configuration[name]?.[descriptor])
+						)
+							requiredMetadata.push(`${name}.${descriptor}`)
+					if (field.resolvedType.fields.output_count)
+						configuration[name].output_count = groups.reduce(
+							(count: number, group: RecordData) => count + group.outputs.length,
+							0
+						)
+					for (const child of Object.values(field.resolvedType.fields))
+						if (
+							!child.name.startsWith('DEPRECATED_') &&
+							child.resolvedType?.fullName === '.core.GuidData' &&
+							observations.every(
+								(value: RecordData) => value.configuration[name]?.[child.name]?.value
+							)
+						)
+							requiredBindings.push(`${name}.${child.name}`)
+				} else if (!field.repeated) configuration[name] = field.defaultValue
+			}
+			const definition: ConstructionDefinition = {
+				id: `chip:${chip.typeId}`,
+				typeId: chip.typeId,
+				groups,
+				nodeGroups: observed
+					? observed.nodeGroups.map((group) => ({
+							first_input_indices: [...group.first_input_indices],
+							inputs: group.inputs.map(() => ({ default_signal_value: {} })),
+						}))
+					: groups.map((group: RecordData) => ({
+							first_input_indices: group.inputs.map((_: unknown, index: number) => index),
+							inputs: group.inputs.map(() => ({ default_signal_value: {} })),
+						})),
+				configuration,
+				configurationFields,
+				requiredBindings,
+				requiredMetadata,
+				variable: configurationFields.includes('variable_node_data'),
+				layoutSource: observed ? 'observed-expansion' : 'published-descriptor',
+				initialization: 'Protobuf wire defaults; not undocumented client factory defaults.',
+				sources: ['official-catalog', ...(observed?.sources ?? [])],
+			}
+			freeze(definition)
+			this.definitions.set(chip.typeId, definition)
+		}
 	}
 	list(typeId: string) {
 		return this.byType.get(typeId) ?? []
 	}
-	get(typeId: string, recipeId?: string): ConstructionRecipe {
-		const known = this.list(typeId)
-		const recipe = recipeId ? known.find((value) => value.id === recipeId) : known[0]
-		if (!recipe)
-			throw new Error(
-				recipeId
-					? `Unknown construction recipe ${recipeId} for chip ${typeId}`
-					: `Chip ${typeId} has no verified canonical construction recipe; missing layout/configuration data cannot be invented`
-			)
-		return recipe
+	supports(typeId: string) {
+		return this.definitions.has(typeId)
 	}
-	bindings(recipe: ConstructionRecipe, bindings: Record<string, string> = {}) {
+	get(typeId: string): ConstructionDefinition {
+		const definition = this.definitions.get(typeId)
+		if (!definition) throw new Error(`Unknown or unavailable published CV2 chip ${typeId}`)
+		return definition
+	}
+	bindings(recipe: ConstructionDefinition, bindings: Record<string, string> = {}) {
 		const parameters = recipe.groups.flatMap((group) =>
 			Object.entries(group.typeParameters).map(([name, constraint]) => ({
 				name,
@@ -118,10 +191,38 @@ export class Cv2ChipConstruction {
 		return bindings
 	}
 	construct(typeId: string, nodeId: string, options: ConstructionOptions = {}) {
-		const recipe = this.get(typeId, options.recipe)
+		const recipe = this.get(typeId)
 		this.bindings(recipe, options.bindings)
+		if (
+			options.configuration !== undefined &&
+			(!options.configuration ||
+				typeof options.configuration !== 'object' ||
+				Array.isArray(options.configuration))
+		)
+			throw new Error('Chip configuration must be a JSON object')
+		const configuration = structuredClone(recipe.configuration)
+		for (const [name, value] of Object.entries(options.configuration ?? {})) {
+			if (!recipe.configurationFields.includes(name))
+				throw new Error(
+					`${name}: no authoritative configuration payload mapping for chip ${typeId}`
+				)
+			configuration[name] = structuredClone(value)
+		}
+		for (const required of recipe.requiredBindings) {
+			const [field, name] = required.split('.')
+			if (!configuration[field!]?.[name!])
+				throw new Error(`${required}: explicit valid scoped binding required`)
+			if (id(configuration[field!][name!]) === '0'.repeat(32))
+				throw new Error(`${required}: binding cannot be empty`)
+		}
+		for (const required of recipe.requiredMetadata) {
+			const [field, name] = required.split('.')
+			const value = configuration[field!]?.[name!]
+			if (!value || (Array.isArray(value) ? !value.length : !Object.keys(value).length))
+				throw new Error(`${required}: authoritative configured port metadata required`)
+		}
 		const data: RecordData = {
-			...structuredClone(recipe.configuration),
+			...configuration,
 			node_id: guid(nodeId),
 			node_type: guid(typeId),
 			node_groups: structuredClone(recipe.nodeGroups),
@@ -138,15 +239,19 @@ export class Cv2ChipConstruction {
 		} else if (options.variable)
 			throw new Error('Variable configuration is only valid for variable chips')
 		checkRecord(nodeType, data)
-		return { recipe, data }
+		return { definition: recipe, data }
 	}
-	match(node: RecordData): ConstructionRecipe | null {
+	match(node: RecordData): ConstructionDefinition | null {
 		let typeId: string
 		try {
 			typeId = id(node.node_type)
 		} catch {
 			return null
 		}
+		const definition = this.definitions.get(typeId)
+		if (!definition) return null
+		if (stable(layout(definition.nodeGroups)) === stable(layout(node.node_groups ?? [])))
+			return definition
 		return (
 			this.list(typeId).find(
 				(recipe) =>
@@ -166,6 +271,15 @@ export class Cv2ChipConstruction {
 		if (!recipe) return null
 		const desc = recipe.groups[group]
 		if (!desc) throw new Error(`Port group ${group} does not exist`)
+		if (direction === 'outputs') {
+			for (const name of recipe.configurationFields ?? []) {
+				const count = node[name]?.output_count
+				if (count !== undefined && (count !== desc.outputs.length || index >= count))
+					throw new Error(
+						'Configured output count differs from the published descriptor; unknown port expansion cannot be invented'
+					)
+			}
+		}
 		let order = index
 		if (direction === 'inputs') {
 			const ports = recipe.nodeGroups[group]

@@ -10,7 +10,7 @@ const stable = (value) => {
 	return JSON.stringify(value)
 }
 
-/** Canonical construction recipes, derived from exact GUID/descriptor/layout evidence. */
+/** Optional layout enrichment from exact GUID/descriptor/expansion evidence. */
 export function generateConstructionCatalog(published, references) {
 	const chips = new Map(published.chips.map((chip) => [chip.typeId, chip]))
 	const recipes = new Map()
@@ -57,7 +57,7 @@ export function generateConstructionCatalog(published, references) {
 				valid = false
 			return {
 				first_input_indices: indices,
-				inputs: inputs.map((input) => {
+				inputs: inputs.map((input, portIndex) => {
 					const signal = input.default_signal_value ?? {}
 					if (
 						Object.keys(input).some((name) => name !== 'default_signal_value') ||
@@ -79,7 +79,16 @@ export function generateConstructionCatalog(published, references) {
 										: 0,
 						])
 					)
-					return { default_signal_value: zero }
+					const descriptor =
+						groups[index].Inputs[indices.findLastIndex((start) => start <= portIndex)]
+					const generic =
+						descriptor &&
+						Object.keys(groups[index].ReadonlyTypeParams).some((name) =>
+							descriptor.ReadonlyType.split(/[^A-Za-z0-9_]+/).includes(name)
+						)
+					// Generic types are inferred from concrete wires. Retaining a
+					// source string/int tag would incorrectly force the source's type.
+					return { default_signal_value: generic ? {} : zero }
 				}),
 			}
 		})
@@ -107,6 +116,6 @@ export function generateConstructionCatalog(published, references) {
 		formatVersion: 1,
 		schemaSha256: references.schemaSha256,
 		catalogSha256: published.source.sha256,
-		recipes: [...recipes.values()].sort((a, b) => a.id.localeCompare(b.id)),
+		layouts: [...recipes.values()].sort((a, b) => a.id.localeCompare(b.id)),
 	}
 }

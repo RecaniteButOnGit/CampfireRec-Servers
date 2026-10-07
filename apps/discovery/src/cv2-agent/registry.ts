@@ -1,6 +1,6 @@
 import protobuf from 'protobufjs/light.js'
 
-import { CONSTRUCTION_PROVENANCE, Cv2ChipConstruction } from './construction'
+import { CONSTRUCTION_PROVENANCE, Cv2ChipFactory } from './construction'
 import { nodeType, root, stable } from './protobuf'
 import published from './published-catalog.json'
 import references from './reference-catalog.json'
@@ -79,7 +79,7 @@ export class Cv2DefinitionRegistry {
 	private readonly searchable = new Map<string, string>()
 	private readonly variants = new Map<string, RecordData[]>()
 	readonly info: Readonly<RecordData>
-	readonly construction = new Cv2ChipConstruction((name) => {
+	readonly construction = new Cv2ChipFactory((name) => {
 		const type = this.getType(name)
 		return Boolean(
 			type && type.scope === 'global' && !('genericExpression' in type && type.genericExpression)
@@ -201,19 +201,15 @@ export class Cv2DefinitionRegistry {
 				configurationFields,
 				observedVariantCount: observations.length,
 				instantiation: {
-					supportedFromDefinitionAlone: this.construction.list(entry.typeId).length > 0,
-					constructionIds: this.construction.list(entry.typeId).map((recipe) => recipe.id),
-					requires: this.construction.list(entry.typeId).length
-						? 'Use the canonical registry recipe; generic bindings need concrete wire evidence, variables need a fresh name. No target-room chip instance is needed.'
-						: 'No verified canonical recipe is available for this chip; missing configuration/layout cannot be invented.',
+					supportedFromDefinitionAlone: this.construction.supports(entry.typeId),
+					requires:
+						'Use the registry chip factory. Generic bindings need concrete wire evidence, variables need a fresh name, and configured event/object chips need explicit valid bindings. No recipe or target-room instance is required.',
 				},
 				completeness: {
 					complete: false,
 					missing: [
 						'factoryDefaults',
-						...(this.construction.list(entry.typeId).length
-							? []
-							: ['serializedInstantiationTemplate', 'configuredPortArity']),
+						...(this.construction.list(entry.typeId).length ? [] : ['configuredPortArity']),
 						...(groups.some((group: RecordData) => Object.keys(group.typeParameters).length)
 							? ['concreteGenericBindings']
 							: []),
@@ -362,8 +358,8 @@ export class Cv2DefinitionRegistry {
 			),
 			publishedChipCount: catalog.chips.length,
 			paletteChipCount: catalog.chips.filter((v: RecordData) => v.inPalette).length,
-			constructibleChipCount: catalog.chips.filter(
-				(v: RecordData) => this.construction.list(v.typeId).length
+			constructibleChipCount: catalog.chips.filter((v: RecordData) =>
+				this.construction.supports(v.typeId)
 			).length,
 			provenance: {
 				officialCatalog: catalog.source,
@@ -375,7 +371,7 @@ export class Cv2DefinitionRegistry {
 				'Full catalog includes hidden/development chips; check availability.inPublishedPalette.',
 				'Catalog descriptor order does not determine expanded/variadic wire indices.',
 				'Reference-save configurations/events/types are observations, not universal defaults or target-room bindings.',
-				'Canonical recipes construct supported chips with fresh IDs and verified port layouts independently of target-room instances. Unsupported layouts/bindings and entity topology remain rejected.',
+				'The generic factory constructs published palette chip types directly from descriptors and protobuf defaults. Observed layouts only enrich expansion indices. Configured bindings and entity topology still require validation.',
 			],
 		})
 	}

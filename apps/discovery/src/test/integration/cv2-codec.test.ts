@@ -6,6 +6,19 @@ import { RoomDocument } from '../../cv2-agent/room'
 import { RoomWorkspace } from '../../cv2-agent/workspace'
 
 describe('CV2 codec in the Worker runtime', () => {
+	it('constructs canonical chips in an empty graph with static codecs and fresh identities', () => {
+		const bytes = roomType
+			.encode(
+				roomType.fromObject({ circuit_v2_data: { root: { graph_id: guid('11'.repeat(16)) } } })
+			)
+			.finish()
+		const workspace = new RoomWorkspace(new RoomDocument(bytes)),
+			path = [...workspace.files.keys()][0]!
+		workspace.createChip(path, 0, 'Get Local Player', 'player')
+		const result = workspace.compile()
+		expect(result.diff.chipsCreated).toBe(1)
+		expect(new RoomWorkspace(new RoomDocument(result.bytes)).nodes.size).toBe(1)
+	})
 	it('shares the global catalog in empty rooms without runtime code generation', () => {
 		const bytes = roomType.encode(roomType.fromObject({ activity_id: 'Empty room' })).finish()
 		const workspace = new RoomWorkspace(new RoomDocument(bytes))

@@ -53,7 +53,7 @@ ports remain instance-specific; event receivers of one type can have different
 ports. Missing definitions are reported explicitly. No chip behavior is inferred
 from an unrelated protobuf field name.
 
-Compilation checks fields/scalars/enums, identity, known templates, references,
+Compilation checks fields/scalars/enums, identity, registry definitions, references,
 input structure, port direction and compatibility where a connection changes.
 Chip configuration variants and opaque legacy port metadata remain fixed to their
 verified saved representation; another chip's protobuf payload cannot be substituted.
@@ -101,21 +101,34 @@ Catalog `runtimeGuid` uses standard C# GUID text; `typeId` is the byte-order-cor
 `8b533ccb-643a-491d-982c-94417ce99954` becomes serialized
 `cb3c538b3a641d49982c94417ce99954`. Removing dashes is not a valid conversion.
 
-Every entry exposes provenance, scope and missing information. Published descriptor
-order does not determine expanded/variadic wire indices or configured event ports.
-The official export omits complete serialized creation templates and chip defaults.
-Knowing a chip exists therefore does not by itself authorize instantiation: the
-compiler still requires verified target-room templates and concrete serialized
-instance ports. The existing rejection of fabricated chips, ports, types and
-configuration variants remains intact. An empty room can search all definitions
-but may still require an additional creation/template adapter to build a circuit.
+Every entry exposes provenance, scope and missing information. `Cv2ChipFactory` in
+`construction.ts` builds every published palette chip type from its known GUID and
+descriptor groups, assigning fresh IDs and initializing protobuf messages. The
+factory shares the registry cache; construction needs neither a recipe nor a
+matching chip in the target room. `get_chip_construction` reports the input layout,
+generic constraints, mapped payload fields and required scoped bindings;
+`create_chip` inserts the fresh instance into a revision-checked virtual graph.
+Raw IR additions use this same factory. Template and recipe selector directives
+are removed from the language and agent tools.
+
+Inputs use protobuf wire defaults, not guessed client factory settings. Public
+descriptors supply one input per descriptor; reference layouts optionally enrich
+known variadic expansion indices. Published output descriptors supply output order;
+unknown additional configured ports remain unavailable. Mapped configuration
+messages start empty, with protobuf defaults; output-count fields derive from the
+published output descriptors. Variables need an explicit name and memory mode.
+Generic bindings need compatible concrete wires so runtime inference agrees.
+Configured events and object chips need valid scoped bindings and authoritative
+port metadata; source-save IDs are never copied. Configuration JSON can supply
+known payload fields, but cannot substitute another chip's payload. Hidden/development
+chips, unknown GUIDs, invented ports/types and opaque signal encodings remain rejected.
 
 ## Supported edits and current limits
 
 - Existing chips can have their names, typed constants and configuration edited
   when the save supplies the corresponding representation.
-- Legacy saves without entity topology support creating chips from known templates
-  and editing connections when both endpoints have serialized type descriptions.
+- Legacy saves without entity topology support factory creation even in empty graph
+  containers, and wiring using published descriptors or verified instance metadata.
 - Saves with `CircuitRootData.entities` contain a second authoritative topology.
   Chip/connection creation and deletion are deliberately rejected for those saves;
   an adapter for the entity ID allocators and bindings is still required. Existing

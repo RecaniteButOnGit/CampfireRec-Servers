@@ -99,5 +99,5 @@ writeFileSync(
 	JSON.stringify(constructionCatalog) + '\n'
 )
 console.info(
-	`Canonical construction: ${constructionCatalog.recipes.length} recipes for ${new Set(constructionCatalog.recipes.map((r) => r.typeId)).size} chip types`
+	`Optional layout enrichment: ${constructionCatalog.layouts.length} layouts for ${new Set(constructionCatalog.layouts.map((r) => r.typeId)).size} chip types`
 )

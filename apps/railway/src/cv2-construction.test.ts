@@ -1,7 +1,6 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
 
 import { runAgent } from '../../discovery/src/cv2-agent/agent'
-import catalog from '../../discovery/src/cv2-agent/construction-catalog.json'
 import { parse, serialize } from '../../discovery/src/cv2-agent/language'
 import {
 	decode,
@@ -12,11 +11,12 @@ import {
 	nodeType,
 	roomType,
 } from '../../discovery/src/cv2-agent/protobuf'
+import catalog from '../../discovery/src/cv2-agent/published-catalog.json'
 import { getCv2DefinitionRegistry } from '../../discovery/src/cv2-agent/registry'
 import { RoomDocument } from '../../discovery/src/cv2-agent/room'
 import { RoomWorkspace } from '../../discovery/src/cv2-agent/workspace'
 
-import type { ConstructionRecipe } from '../../discovery/src/cv2-agent/construction'
+import type { ConstructionDefinition } from '../../discovery/src/cv2-agent/construction'
 import type { RecordData } from '../../discovery/src/cv2-agent/protobuf'
 
 const registry = getCv2DefinitionRegistry()
@@ -53,7 +53,6 @@ function create(
 		ws.files.get(graph)!.revision,
 		type,
 		label,
-		undefined,
 		bindings,
 		undefined,
 		variable
@@ -81,7 +80,7 @@ function connect(
 	}
 	ws.patch(graph, file.revision, [{ old: file.text, new: serialize(script) }])
 }
-function bindings(recipe: ConstructionRecipe) {
+function bindings(recipe: ConstructionDefinition) {
 	return Object.fromEntries(
 		recipe.groups.flatMap((group) =>
 			Object.entries(group.typeParameters)
@@ -104,13 +103,20 @@ function bindings(recipe: ConstructionRecipe) {
 }
 afterEach(() => vi.restoreAllMocks())
 
-describe('registry-backed canonical CV2 chip construction', () => {
-	it('creates every supported recipe as fresh protobuf objects without a target-room template or scoped source IDs', () => {
-		expect(registry.info.constructibleChipCount).toBe(232)
-		for (const value of catalog.recipes) {
-			const recipe = value as ConstructionRecipe
+describe('generic registry-backed CV2 chip factory', () => {
+	it('provides every published palette chip without a recipe and round trips fresh ordinary chip objects', () => {
+		expect(registry.info.constructibleChipCount).toBe(1147)
+		let created = 0
+		for (const value of catalog.chips.filter((chip) => chip.inPalette)) {
+			const recipe = registry.construction.get(value.typeId)
+			expect(recipe.id).toBe(`chip:${value.typeId}`)
+			if (
+				recipe.requiredBindings.length ||
+				recipe.requiredMetadata.length ||
+				Object.keys(bindings(recipe)).length
+			)
+				continue
 			const options = {
-				recipe: recipe.id,
 				bindings: bindings(recipe),
 				...(recipe.variable
 					? { variable: { name: 'Fresh Variable', memory_type: 'Instance' } }
@@ -125,13 +131,10 @@ describe('registry-backed canonical CV2 chip construction', () => {
 			expect(a.data.node_groups).toEqual(recipe.nodeGroups)
 			const encoded = nodeType.encode(nodeType.fromObject(a.data)).finish()
 			expect(id(decode(nodeType, encoded).node_id)).toBe('22'.repeat(16))
-			expect(
-				Object.keys(a.data).some((name) => /event|graph_node|board_bus|invention/.test(name))
-			).toBe(false)
-			expect(Object.isFrozen(registry.construction.get(recipe.typeId, recipe.id).nodeGroups)).toBe(
-				true
-			)
+			expect(Object.isFrozen(registry.construction.get(recipe.typeId).nodeGroups)).toBe(true)
+			created++
 		}
+		expect(created).toBeGreaterThan(800)
 	})
 	it('materializes an empty graph and constructs/wires grounded-state logic, retaining unrelated bytes', () => {
 		const ws = workspace(),
@@ -231,8 +234,7 @@ describe('registry-backed canonical CV2 chip construction', () => {
 	it('rejects nonexistent chips, unverified layouts, ports, incompatible wires and scoped bindings', () => {
 		const ws = workspace()
 		expect(() => create(ws, 'InventedChip', 'fake')).toThrow('Unknown CV2')
-		expect(() => create(ws, 'Event Receiver', 'event')).toThrow('no verified canonical')
-		expect(() => create(ws, 'Player Right Hand Position', 'hand')).toThrow('no verified canonical')
+		expect(() => create(ws, 'Event Receiver', 'event')).toThrow('explicit valid scoped binding')
 		create(ws, 'Get Local Player', 'player')
 		create(ws, 'Player Get Is Grounded', 'grounded')
 		connect(ws, 'new:player', 5, 'new:grounded', 0)
@@ -251,23 +253,101 @@ describe('registry-backed canonical CV2 chip construction', () => {
 		const script = parse(file.text, graph)
 		script.nodes[0].data.event_receiver_node_data = {}
 		ws.patch(graph, file.revision, [{ old: file.text, new: serialize(script) }])
-		expect(() => ws.compile()).toThrow('configuration variant cannot be added')
+		expect(() => ws.compile()).toThrow('no authoritative configuration payload mapping')
 		const withEntities = new RoomWorkspace(new RoomDocument(room([], true)))
 		expect(() => create(withEntities, 'Player Get Is Grounded', 'grounded')).toThrow(
 			'entity topology adapter'
 		)
-		const known = registry.getChip('Player Get Is Grounded')!
+		expect(() => registry.construction.get('ff'.repeat(16))).toThrow('Unknown or unavailable')
+	})
+	it('creates and wires hand-motion and velocity chips that have no reference layout or target instance', () => {
+		const ws = workspace()
+		const velocityType = '75ca5e1b7e0eff4a8adcc5e043cac29e'
+		for (const name of [
+			'Player Right Hand Position',
+			velocityType,
+			'Player Set Physics Velocity',
+		]) {
+			const chip = registry.getChip(name)!
+			expect(registry.construction.list(chip.typeId)).toHaveLength(0)
+			expect(registry.construction.get(chip.typeId).layoutSource).toBe('published-descriptor')
+		}
+		create(ws, 'Get Local Player', 'player')
+		create(ws, 'Player Right Hand Position', 'hand')
+		create(ws, velocityType, 'add_velocity', { T: 'Player' })
+		create(ws, 'Player Set Physics Velocity', 'set_velocity')
+		connect(ws, 'new:player', 0, 'new:hand', 0, 'hand_target')
+		connect(ws, 'new:player', 0, 'new:add_velocity', 1, 'add_target')
+		connect(ws, 'new:player', 0, 'new:set_velocity', 1, 'set_target')
+		connect(ws, 'new:hand', 0, 'new:add_velocity', 3, 'direction')
+		connect(ws, 'new:hand', 0, 'new:set_velocity', 2, 'velocity')
+		const compiled = ws.compile()
+		expect(compiled.diff).toMatchObject({ chipsCreated: 4, connectionsAdded: 5 })
+		const saved = new RoomWorkspace(new RoomDocument(compiled.bytes))
+		expect(saved.nodes.size).toBe(4)
+		expect(saved.compile().bytes).toEqual(compiled.bytes)
+	})
+	it('accepts explicit verified event configuration but rejects foreign event IDs and invented descriptors', () => {
+		const typeId = registry.getChip('Event Receiver')!.typeId
+		const eventId = 'ab'.repeat(16)
+		const descriptor = { name: 'Known Event', outputs: [{ name: 'Exec', type: { kind: 'Exec' } }] }
+		const seed = registry.construction.construct(typeId, 'ac'.repeat(16), {
+			configuration: {
+				event_receiver_node_data: { event_id: guid(eventId), node_desc: descriptor },
+			},
+		}).data
+		const ws = workspace([seed]),
+			graph = path(ws)
+		ws.createChip(graph, 0, typeId, 'receiver', {}, undefined, undefined, {
+			event_receiver_node_data: { event_id: guid(eventId), node_desc: descriptor },
+		})
+		expect(ws.compile().diff.chipsCreated).toBe(1)
+		const foreign = workspace([seed])
+		foreign.createChip(path(foreign), 0, typeId, 'foreign', {}, undefined, undefined, {
+			event_receiver_node_data: { event_id: guid('ad'.repeat(16)), node_desc: descriptor },
+		})
+		expect(() => foreign.compile()).toThrow('authoritative metadata')
+		const invented = workspace([seed])
+		invented.createChip(path(invented), 0, typeId, 'invented', {}, undefined, undefined, {
+			event_receiver_node_data: {
+				event_id: guid(eventId),
+				node_desc: {
+					...descriptor,
+					outputs: [...descriptor.outputs, { name: 'Imaginary', type: { kind: 'Single' } }],
+				},
+			},
+		})
+		expect(() => invented.compile()).toThrow('authoritative metadata')
+	})
+	it('keeps the no-invention checks for descriptor-built inputs, types and removed selectors', () => {
+		const ws = workspace()
+		create(ws, 'Player Right Hand Position', 'hand')
+		const graph = path(ws),
+			file = ws.files.get(graph)!
+		const script = parse(file.text, graph)
+		script.nodes[0].data.node_groups[0].inputs.push({ default_signal_value: {} })
+		ws.patch(graph, file.revision, [{ old: file.text, new: serialize(script) }])
+		expect(() => ws.compile()).toThrow('cannot be invented')
 		expect(() =>
-			registry.construction.get(known.typeId, `canonical:${known.typeId}:ffffffffffffffff`)
-		).toThrow('Unknown construction recipe')
+			parse(
+				file.text.replace(
+					'    field node_groups',
+					'    template = "' + 'aa'.repeat(16) + '"\n    field node_groups'
+				),
+				graph
+			)
+		).toThrow('expected field')
+		expect(() => registry.construction.construct('ff'.repeat(16), '22'.repeat(16))).toThrow(
+			'Unknown or unavailable'
+		)
 	})
 	it('creates, wires, validates, inspects and finishes an empty-room agent run through canonical tools', async () => {
 		const ws = workspace(),
 			graph = path(ws),
 			calls: RecordData[] = []
-		const common = { graph, recipe: null, name: null, bindings: [], variable: null }
+		const common = { graph, configuration: null, name: null, bindings: [], variable: null }
 		const steps = [
-			['get_chip_construction', { type: 'Get Local Player', recipe: null }],
+			['get_chip_construction', { type: 'Get Local Player' }],
 			['create_chip', { ...common, revision: 0, type: 'Get Local Player', label: 'player' }],
 			[
 				'create_chip',

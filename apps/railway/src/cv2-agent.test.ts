@@ -16,6 +16,7 @@ import {
 	stable,
 	update,
 } from '../../discovery/src/cv2-agent/protobuf'
+import { getCv2DefinitionRegistry } from '../../discovery/src/cv2-agent/registry'
 import { equalBytes, RoomDocument } from '../../discovery/src/cv2-agent/room'
 import { commitSave, saveComment, snapshot } from '../../discovery/src/cv2-agent/saves'
 import { RoomWorkspace } from '../../discovery/src/cv2-agent/workspace'
@@ -209,13 +210,13 @@ describe('lossless CV2 compiler', () => {
 		ws.patch(path, 0, edits)
 		expect(() => ws.compile()).toThrow(message)
 	})
-	it('creates a chip from a known template, assigns a unique ID, and places it nearby', () => {
+	it('creates a known registry chip, assigns a unique ID, and places it nearby', () => {
 		const ws = workspace(),
 			path = sourcePath(ws)
 		ws.patch(path, 0, [
 			{
 				old: '\n}\n',
-				new: `\n  @id("new:extra") chip "${ids.sourceType}" {\n    template = "${ids.source}"\n    field node_name = "New source"\n  }\n}\n`,
+				new: `\n  @id("new:extra") chip "${getCv2DefinitionRegistry().getChip('Get Local Player')!.typeId}" {\n    field node_name = "New source"\n  }\n}\n`,
 			},
 		])
 		const compiled = ws.compile(),
@@ -453,6 +454,80 @@ function response(name: string, args: unknown) {
 }
 
 describe('CV2AGENT integration and save commits', () => {
+	it('commits canonical chip creation on an empty graph without any room template', async () => {
+		const { db, env, blobs } = await setup(),
+			ctx = new NodeExecutionContext()
+		const bytes = new Uint8Array(
+			roomType
+				.encode(
+					roomType.fromObject({
+						activity_id: 'Preserve geometry',
+						circuit_v2_data: {
+							version: 'V80UnbindMisconfiguredEventSenders',
+							root: { graph_id: guid(ids.graph) },
+						},
+					})
+				)
+				.finish()
+		)
+		blobs.set('room/original.room', bytes)
+		const ws = workspace(bytes),
+			path = [...ws.files.keys()][0]!
+		const steps = [
+			[
+				'create_chip',
+				{
+					graph: path,
+					revision: 0,
+					type: 'Player Get Is Grounded',
+					label: 'grounded',
+					configuration: null,
+					name: null,
+					bindings: [],
+					variable: null,
+				},
+			],
+			['validate_graph', { graph: path }],
+			['validate_room', {}],
+			['get_diff', {}],
+			['finish', {}],
+		] as const
+		let calls = 0
+		vi.spyOn(globalThis, 'fetch').mockImplementation(async () => {
+			const [name, args] = steps[calls++]!
+			return response(name, args)
+		})
+		vi.spyOn(console, 'info').mockImplementation(() => {})
+		try {
+			const res = await request(
+				'CV2AGENT[Room:"AgentTest",Prompt:"Create a grounded chip"]8254TOKEN"token-test-secret"',
+				env,
+				ctx
+			)
+			const run = ((await res.json()) as any[])[0].id
+			await ctx.drain()
+			expect(
+				await db
+					.prepare('SELECT state,final_save_id FROM cv2_agent_run WHERE run_id=?1')
+					.bind(run)
+					.first()
+			).toEqual({ state: 'done', final_save_id: 2 })
+			expect(calls).toBe(5)
+			const afterSave = JSON.parse(
+				(await db
+					.prepare('SELECT data FROM subroom_save WHERE sub_room_data_save_id=2')
+					.first<any>())!.data
+			)
+			const after = workspace(blobs.get(`room/${afterSave.DataBlob}`)!)
+			expect(after.nodes.size).toBe(1)
+			expect([...after.nodes.values()][0].data.node_type).toEqual(
+				guid(after.registry.getChip('Player Get Is Grounded')!.typeId)
+			)
+			expect(blobs.get('room/original.room')).toEqual(bytes)
+		} finally {
+			db.close()
+		}
+	})
 	it('starts the agent with global definitions even when a valid room has no chips', async () => {
 		const { db, env, blobs, put } = await setup(),
 			ctx = new NodeExecutionContext()

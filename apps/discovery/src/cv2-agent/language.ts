@@ -6,8 +6,6 @@ export type ScriptNode = {
 	id: string
 	type: string
 	data: RecordData
-	template?: string
-	registry?: string
 	bindings?: Record<string, string>
 	line: number
 }
@@ -31,14 +29,15 @@ Layout is preserved outside these scripts; new chips receive nearby positions au
 Do not assume a GUID is a chip name. get_chip_definition returns available actual metadata.
 Port group IDs and port IDs are zero-based indices, not guessed labels.
 New chips use @id("new:label"). The compiler constructs them from the global registry.
-Use get_chip_construction or create_chip to obtain a canonical recipe and its initialized fields.
-An optional registry = "canonical:<type ID>:<recipe ID>" line selects a verified layout.
+Use get_chip_construction or create_chip to obtain the definition and initialized protobuf fields.
+No recipe, construction selector, or existing chip template is required.
 Generic chips require bindings = {"T":"float"}, using names/constraints from the definition.
 Bindings must be backed by concrete connections so runtime type inference agrees; never guess types.
 Variable chips require field variable_node_data = {"name":"FreshName","memory_type":"Instance"}.
 New variable names declare graph-scoped storage; conflicting types/memory modes are rejected.
-An existing template = "chip GUID" line remains supported for compatibility.
-Registry-backed ports use verified descriptor order and saved expansion indices.
+Registry ports use published descriptor order, enriched by observed expansion indices when available.
+Unobserved chips use one input per published descriptor; unknown expanded ports cannot be invented.
+Initial values use protobuf wire defaults; undocumented client defaults are not assumed.
 New wire keys use "new:label". Endpoint node GUID values can use "new:label" until compiled.
 Entity-based saves contain a second authoritative topology. Topology changes to those saves
 are rejected until that format has a verified topology adapter. Existing chip field edits work.
@@ -53,8 +52,6 @@ export function serialize(script: Script): string {
 	]
 	for (const node of [...script.nodes].sort((a, b) => (a.id < b.id ? -1 : a.id > b.id ? 1 : 0))) {
 		lines.push(`  @id(${JSON.stringify(node.id)}) chip ${JSON.stringify(node.type)} {`)
-		if (node.template) lines.push(`    template = ${JSON.stringify(node.template)}`)
-		if (node.registry) lines.push(`    registry = ${JSON.stringify(node.registry)}`)
 		if (node.bindings) lines.push(`    bindings = ${stable(node.bindings)}`)
 		for (const name of Object.keys(node.data).sort())
 			lines.push(`    field ${name} = ${stable(node.data[name])}`)
@@ -85,29 +82,15 @@ export function parse(source: string, path: string): Script {
 				current = null
 				continue
 			}
-			const match = /^    (field ([A-Za-z_][A-Za-z0-9_]*)|template|registry|bindings) = (.+)$/.exec(
-				line
-			)
-			if (!match) fail('expected field, template, registry, bindings or closing brace')
+			const match = /^    (field ([A-Za-z_][A-Za-z0-9_]*)|bindings) = (.+)$/.exec(line)
+			if (!match) fail('expected field, bindings or closing brace')
 			let value: unknown
 			try {
 				value = JSON.parse(match![3]!)
 			} catch {
 				fail('invalid JSON value')
 			}
-			if (match![1] === 'template') {
-				if (current.template || typeof value !== 'string' || !/^[a-f0-9]{32}$/.test(value))
-					fail('invalid or duplicate template')
-				current.template = value as string
-			} else if (match![1] === 'registry') {
-				if (
-					current.registry ||
-					typeof value !== 'string' ||
-					!/^canonical:[a-f0-9]{32}:[a-f0-9]{16}$/.test(value)
-				)
-					fail('invalid or duplicate registry recipe')
-				current.registry = value as string
-			} else if (match![1] === 'bindings') {
+			if (match![1] === 'bindings') {
 				if (
 					current.bindings ||
 					!value ||

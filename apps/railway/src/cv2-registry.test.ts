@@ -198,7 +198,7 @@ describe('authoritative global CV2 registry', () => {
 		expect(workspace.chipDefinition(groundedType).globalDefinition!.name).toBe(
 			'Player Get Is Grounded'
 		)
-		expect(() => workspace.compile()).toThrow('known template')
+		expect(() => workspace.compile()).toThrow('existing types are immutable')
 		expect(file.text).toContain(groundedType)
 	})
 	it('makes the global tools usable throughout an empty-room model run with bounded context', async () => {

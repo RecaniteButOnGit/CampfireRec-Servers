@@ -75,6 +75,9 @@ function port(
 	const desc = descriptions(node)[group]
 	let descIndex = index
 	if (direction === 'inputs') {
+		const inputGroup = node.node_groups?.[group]
+		if (inputGroup && index >= (inputGroup.inputs?.length ?? 0))
+			throw new Error(`Input port ${group}.${index} does not exist`)
 		const indices: number[] = node.node_groups?.[group]?.first_input_indices ?? []
 		if (indices.length) {
 			descIndex = indices.findLastIndex((start) => start <= index)
@@ -369,20 +372,20 @@ export class RoomWorkspace {
 			totalInstances: examples.length,
 		}
 	}
-	chipConstruction(type: string, recipeId?: string) {
+	chipConstruction(type: string) {
 		const chip = this.registry.getChip(type)
 		if (!chip) throw new Error(`Unknown CV2 chip ${type}`)
-		return this.registry.construction.get(chip.typeId, recipeId)
+		return this.registry.construction.get(chip.typeId)
 	}
 	createChip(
 		path: string,
 		revision: number,
 		type: string,
 		label: string,
-		recipeId?: string,
 		bindings: Record<string, string> = {},
 		name?: string,
-		variable?: { name: string; memory_type?: string }
+		variable?: { name: string; memory_type?: string },
+		configuration?: RecordData
 	) {
 		if (!/^[A-Za-z][A-Za-z0-9_-]{0,63}$/.test(label)) throw new Error('Invalid new chip label')
 		if (this.document.hasEntities)
@@ -393,11 +396,11 @@ export class RoomWorkspace {
 		const key = `new:${label}`
 		if ([...this.files.values()].some((file) => file.script.nodes.some((node) => node.id === key)))
 			throw new Error(`Duplicate chip label ${label}`)
-		const { data, recipe } = this.registry.construction.construct(
-			chip.typeId,
-			this.resolveId(key),
-			{ recipe: recipeId, bindings, variable }
-		)
+		const { data } = this.registry.construction.construct(chip.typeId, this.resolveId(key), {
+			bindings,
+			variable,
+			configuration,
+		})
 		if (name !== undefined) data.node_name = name
 		const script = {
 			...file.script,
@@ -406,7 +409,6 @@ export class RoomWorkspace {
 				{
 					id: key,
 					type: chip.typeId,
-					registry: recipe.id,
 					bindings: Object.keys(bindings).length ? bindings : undefined,
 					data: editableData(data),
 					line: 0,
@@ -418,7 +420,6 @@ export class RoomWorkspace {
 			...this.patch(path, revision, [{ old: file.text, new: next }]),
 			id: key,
 			typeId: chip.typeId,
-			recipe: recipe.id,
 		}
 	}
 	typeDefinition(name: string) {
@@ -431,7 +432,7 @@ export class RoomWorkspace {
 			'/room/docs/language.md': LANGUAGE,
 			'/room/docs/types.md': stable(root.lookupEnum('circuits.TypeKind').values),
 			'/room/docs/chips.md':
-				'Global definitions are available even in empty rooms: search_chips, search_types, search_definitions, get_chip_definition, get_type_definition, get_event_definition, get_registry_info and get_chip_variants. Search global definitions before declaring a chip unavailable. Catalog GUIDs are standard GUID text; typeId is the exact serialized byte hex used in scripts. Published descriptor ordering differs from configured/variadic wire indices. Instance ports and scoped event/variable bindings require target-room metadata. Incomplete entries cannot authorize invented chips, ports, defaults or templates.',
+				'Global definitions are available even in empty rooms: search_chips, search_types, search_definitions, get_chip_definition, get_type_definition, get_event_definition, get_registry_info and get_chip_variants. Use get_chip_construction and create_chip: the generic registry factory constructs published chip GUIDs from descriptor ports and protobuf wire defaults. No recipe or target-room chip template is required. Reference layouts only enrich expansion indices. Generic bindings need concrete connections. typeId is the serialized byte hex used in scripts. Scoped event/object bindings need explicit valid metadata. Unknown configured/expanded ports and opaque byte encodings cannot be invented.',
 		}
 		const local = Object.entries(docs)
 			.flatMap(([path, text]) =>
@@ -481,23 +482,20 @@ export class RoomWorkspace {
 					throw new Error(`${path}:${node.line}: ${text}`)
 				}
 				if (nodes.has(node.id)) fail('duplicate chip ID across virtual graphs')
-				const original = this.nodes.get(node.id),
-					template = node.template ? this.nodes.get(node.template) : undefined
+				const original = this.nodes.get(node.id)
 				if (!original && !node.id.startsWith('new:'))
 					fail('existing chip IDs cannot be changed or fabricated')
 				if (original && original.graph !== script.graph)
 					fail('chips cannot be moved between saved graph containers')
-				let base = original ?? template
-				if (node.template && node.registry)
-					fail('choose a registry recipe or a room template, not both')
-				if (original && (node.template || node.registry))
-					fail('existing chips cannot change their construction source')
-				if (!base && !node.template) {
+				let base = original
+				if (!base) {
 					try {
 						const built = this.registry.construction.construct(node.type, this.resolveId(node.id), {
-							recipe: node.registry,
 							bindings: node.bindings,
 							variable: node.data.variable_node_data,
+							configuration: Object.fromEntries(
+								Object.entries(node.data).filter(([name]) => nodeType.fields[name]?.id >= 100)
+							),
 						})
 						base = {
 							graph: script.graph,
@@ -509,12 +507,12 @@ export class RoomWorkspace {
 					}
 				}
 				if (!base || nodeTypeId(base.data) !== node.type)
-					fail('chip type must match a known template; existing types are immutable')
+					fail('chip type must match the registry definition; existing types are immutable')
 				if (
 					!original &&
 					(base!.data.graph_node_data || base!.data.invention_data || base!.data.board_bus_data)
 				)
-					fail('new chips cannot clone graph/object/invention bindings')
+					fail('new graph/object/invention chips require a verified container binding adapter')
 				if (Object.keys(node.data).some((key) => OMIT.has(key)))
 					fail('chip identity, type and layout are managed by the compiler')
 				const next: RecordData = { ...base!.data, ...node.data }
@@ -526,10 +524,9 @@ export class RoomWorkspace {
 					if (!base!.data.node_id) fail('new chips require typed GUID serialization')
 					next.node_id = guid(this.resolveId(node.id))
 					delete next.DEPRECATED_node_id
-					const anchor = template
-						? base!.data.transform_data
-						: ([...this.nodes.values()].find((known) => known.graph === script.graph)?.data
-								.transform_data ?? base!.data.transform_data)
+					const anchor =
+						[...this.nodes.values()].find((known) => known.graph === script.graph)?.data
+							.transform_data ?? base!.data.transform_data
 					const position = anchor?.local_position ?? {},
 						placement = [...this.newIds.keys()].indexOf(node.id)
 					next.transform_data = {
@@ -572,7 +569,44 @@ export class RoomWorkspace {
 					validateInputs(base!.data, next, node.bindings)
 					if (stable(descriptions(base!.data)) !== stable(descriptions(next)))
 						throw new Error('Port definitions cannot be fabricated or rewritten')
-					this.validateReferences(base!.data, next, script.graph)
+					if (!original) {
+						for (const [name, payload] of Object.entries(next)) {
+							if (!payload || typeof payload !== 'object') continue
+							const configured = payload.node_desc
+								? [payload.node_desc]
+								: (payload.node_descs ?? [])
+							for (const desc of configured) {
+								if (
+									![...this.nodes.values()].some((known) =>
+										Object.entries(known.data).some(
+											([knownName, knownPayload]) =>
+												knownPayload &&
+												typeof knownPayload === 'object' &&
+												name === knownName &&
+												stable(payload.event_id) === stable(knownPayload.event_id) &&
+												descriptions({ payload: knownPayload }).some(
+													(value) => stable(value) === stable(desc)
+												)
+										)
+									)
+								)
+									throw new Error(
+										'Configured port definitions require authoritative metadata in this save'
+									)
+							}
+						}
+					}
+					this.validateReferences(
+						original
+							? base!.data
+							: {
+									node_id: next.node_id,
+									node_type: next.node_type,
+									variable_node_data: next.variable_node_data,
+								},
+						next,
+						script.graph
+					)
 					checkRecord(nodeType, next)
 				} catch (error) {
 					fail(error instanceof Error ? error.message : 'Invalid chip')
@@ -906,7 +940,7 @@ export class RoomWorkspace {
 				if (!before.nodes.some((n) => n.id === node.id)) {
 					diff.chipsCreated++
 					parts.push(
-						`+ chip ${node.id} type ${node.type} construction ${node.registry ?? node.template ?? 'canonical registry'}\n+ bindings ${stable(node.bindings ?? {})}\n+ configuration ${stable(node.data)}`
+						`+ chip ${node.id} type ${node.type} construction registry factory\n+ bindings ${stable(node.bindings ?? {})}\n+ configuration ${stable(node.data)}`
 					)
 				}
 			for (const edge of before.edges)
