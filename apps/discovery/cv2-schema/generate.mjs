@@ -5,6 +5,7 @@ import { fileURLToPath } from 'node:url'
 import { unzipSync } from 'fflate'
 import protobuf from 'protobufjs'
 
+import { generateConstructionCatalog } from './construction-catalog.mjs'
 import { generatePublishedCatalog } from './published-catalog.mjs'
 import { generateReferenceCatalog } from './reference-catalog.mjs'
 
@@ -79,11 +80,24 @@ writeFileSync(
 	) + '\n'
 )
 console.info(`Generated ${fileURLToPath(output)}`)
+const referenceCatalog = generateReferenceCatalog(root, schemaSha256)
+const publishedCatalog = generatePublishedCatalog()
+// Node layouts are a generation input; omit the duplicate full layouts from
+// the searchable observation artifact consumed by the runtime.
+const { nodeLayouts: _nodeLayouts, ...referenceMetadata } = referenceCatalog
 writeFileSync(
 	new URL('../src/cv2-agent/reference-catalog.json', import.meta.url),
-	JSON.stringify(generateReferenceCatalog(root, schemaSha256)) + '\n'
+	JSON.stringify(referenceMetadata) + '\n'
 )
 writeFileSync(
 	new URL('../src/cv2-agent/published-catalog.json', import.meta.url),
-	JSON.stringify(generatePublishedCatalog()) + '\n'
+	JSON.stringify(publishedCatalog) + '\n'
+)
+const constructionCatalog = generateConstructionCatalog(publishedCatalog, referenceCatalog)
+writeFileSync(
+	new URL('../src/cv2-agent/construction-catalog.json', import.meta.url),
+	JSON.stringify(constructionCatalog) + '\n'
+)
+console.info(
+	`Canonical construction: ${constructionCatalog.recipes.length} recipes for ${new Set(constructionCatalog.recipes.map((r) => r.typeId)).size} chip types`
 )

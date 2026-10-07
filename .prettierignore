@@ -20,5 +20,6 @@ worker-configuration.d.ts
 apps/discovery/src/cv2-agent/schema.json
 apps/discovery/src/cv2-agent/generated-codecs.js
 apps/discovery/src/cv2-agent/reference-catalog.json
+apps/discovery/src/cv2-agent/construction-catalog.json
 apps/discovery/src/cv2-agent/published-catalog.json
 apps/discovery/cv2-schema/upstream/circuitsv2*.json

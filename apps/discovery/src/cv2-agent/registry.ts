@@ -1,5 +1,6 @@
 import protobuf from 'protobufjs/light.js'
 
+import { CONSTRUCTION_PROVENANCE, Cv2ChipConstruction } from './construction'
 import { nodeType, root, stable } from './protobuf'
 import published from './published-catalog.json'
 import references from './reference-catalog.json'
@@ -78,8 +79,19 @@ export class Cv2DefinitionRegistry {
 	private readonly searchable = new Map<string, string>()
 	private readonly variants = new Map<string, RecordData[]>()
 	readonly info: Readonly<RecordData>
+	readonly construction = new Cv2ChipConstruction((name) => {
+		const type = this.getType(name)
+		return Boolean(
+			type && type.scope === 'global' && !('genericExpression' in type && type.genericExpression)
+		)
+	})
 
 	constructor() {
+		if (
+			CONSTRUCTION_PROVENANCE.schemaSha256 !== samples.schemaSha256 ||
+			CONSTRUCTION_PROVENANCE.catalogSha256 !== catalog.source.sha256
+		)
+			throw new Error('Canonical CV2 catalog is stale; regenerate it with cv2-schema/generate.mjs')
 		for (const sample of samples.chips) {
 			const variants = this.variants.get(sample.typeId) ?? []
 			variants.push(freeze(sample))
@@ -189,16 +201,19 @@ export class Cv2DefinitionRegistry {
 				configurationFields,
 				observedVariantCount: observations.length,
 				instantiation: {
-					supportedFromDefinitionAlone: false,
-					requires:
-						'A verified serialized template in the target room; catalog port ordering is descriptor ordering, not configured wire arity.',
+					supportedFromDefinitionAlone: this.construction.list(entry.typeId).length > 0,
+					constructionIds: this.construction.list(entry.typeId).map((recipe) => recipe.id),
+					requires: this.construction.list(entry.typeId).length
+						? 'Use the canonical registry recipe; generic bindings need concrete wire evidence, variables need a fresh name. No target-room chip instance is needed.'
+						: 'No verified canonical recipe is available for this chip; missing configuration/layout cannot be invented.',
 				},
 				completeness: {
 					complete: false,
 					missing: [
-						'serializedInstantiationTemplate',
-						'chipDefaults',
-						'configuredPortArity',
+						'factoryDefaults',
+						...(this.construction.list(entry.typeId).length
+							? []
+							: ['serializedInstantiationTemplate', 'configuredPortArity']),
 						...(groups.some((group: RecordData) => Object.keys(group.typeParameters).length)
 							? ['concreteGenericBindings']
 							: []),
@@ -347,6 +362,9 @@ export class Cv2DefinitionRegistry {
 			),
 			publishedChipCount: catalog.chips.length,
 			paletteChipCount: catalog.chips.filter((v: RecordData) => v.inPalette).length,
+			constructibleChipCount: catalog.chips.filter(
+				(v: RecordData) => this.construction.list(v.typeId).length
+			).length,
 			provenance: {
 				officialCatalog: catalog.source,
 				protobufSha256: samples.schemaSha256,
@@ -357,7 +375,7 @@ export class Cv2DefinitionRegistry {
 				'Full catalog includes hidden/development chips; check availability.inPublishedPalette.',
 				'Catalog descriptor order does not determine expanded/variadic wire indices.',
 				'Reference-save configurations/events/types are observations, not universal defaults or target-room bindings.',
-				'Compiler still requires verified target-room templates and concrete serialized ports; a registry entry does not bypass validation.',
+				'Canonical recipes construct supported chips with fresh IDs and verified port layouts independently of target-room instances. Unsupported layouts/bindings and entity topology remain rejected.',
 			],
 		})
 	}

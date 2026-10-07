@@ -82,8 +82,8 @@ describe('authoritative global CV2 registry', () => {
 		expect(add.groups[0].typeParameters).toEqual({ T: '(int | float | Vector3)' })
 		expect(add.inputs[0].generic).toBe(true)
 		expect(add.completeness.missing).toContain('concreteGenericBindings')
-		expect(chip.completeness.missing).toContain('chipDefaults')
-		expect(chip.instantiation.supportedFromDefinitionAlone).toBe(false)
+		expect(chip.completeness.missing).toContain('factoryDefaults')
+		expect(chip.instantiation.supportedFromDefinitionAlone).toBe(true)
 		expect(chip.inputs[0]).not.toHaveProperty('defaultValue')
 	})
 	it('searches capabilities absent from the target room and supports deterministic bounded pagination', () => {

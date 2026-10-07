@@ -67,7 +67,8 @@ function port(
 	node: RecordData,
 	direction: 'inputs' | 'outputs',
 	group: number,
-	index: number
+	index: number,
+	bindings: Record<string, string> = {}
 ): RecordData | null {
 	if (!Number.isInteger(group) || !Number.isInteger(index) || group < 0 || index < 0)
 		throw new Error('Port indices must be nonnegative integers')
@@ -83,7 +84,11 @@ function port(
 	}
 	if (desc && !desc[direction]?.[descIndex])
 		throw new Error(`${direction} port ${group}.${index} does not exist`)
-	return desc?.[direction]?.[descIndex]?.type ?? null
+	return (
+		desc?.[direction]?.[descIndex]?.type ??
+		getCv2DefinitionRegistry().construction.port(node, direction, group, index, bindings)?.type ??
+		null
+	)
 }
 function compatible(source: RecordData, target: RecordData): boolean {
 	if (stable(source) === stable(target)) return true
@@ -110,7 +115,11 @@ function immutableOpaque(before: unknown, after: unknown, path: string): void {
 		throw new Error(`${path}: signal backing_bytes encoding is opaque; changing it is unsupported`)
 }
 
-function validateInputs(before: RecordData, after: RecordData): void {
+function validateInputs(
+	before: RecordData,
+	after: RecordData,
+	bindings: Record<string, string> = {}
+): void {
 	const oldGroups = before.node_groups ?? [],
 		newGroups = after.node_groups ?? []
 	if (oldGroups.length !== newGroups.length)
@@ -137,14 +146,25 @@ function validateInputs(before: RecordData, after: RecordData): void {
 				throw new Error(`Input ${group}.${index}: signal backing_bytes encoding is opaque`)
 			if (oldSignal.DEPRECATED_type_kind !== signal.DEPRECATED_type_kind)
 				throw new Error(`Input ${group}.${index}: serialized signal type cannot be changed`)
-			const declared = port(after, 'inputs', group, index)
+			const declared = port(after, 'inputs', group, index, bindings)
 			const oldKinds = Object.keys(oldSignal).filter((key) => signalKinds[key]),
 				newKinds = Object.keys(signal).filter((key) => signalKinds[key])
 			if (!declared && stable(oldKinds) !== stable(newKinds))
 				throw new Error(
 					`Input ${group}.${index}: type is unavailable; preserve the existing signal representation`
 				)
-			if (declared && newKinds.some((key) => signalKinds[key] !== declared.kind))
+			if (
+				declared &&
+				newKinds.some(
+					(key) =>
+						signalKinds[key] !== declared.kind &&
+						!(
+							key === 'DEPRECATED_int32_backing_bytes' &&
+							oldKinds.includes(key) &&
+							['Int32', 'Boolean', 'Single'].includes(declared.kind)
+						)
+				)
+			)
 				throw new Error(
 					`Input ${group}.${index}: constant expects ${declared.kind}, received ${newKinds.map((key) => signalKinds[key]).join(', ')}`
 				)
@@ -216,6 +236,8 @@ export class RoomWorkspace {
 			if (a !== b) parents.set(a < b ? b : a, a < b ? a : b)
 		}
 		const components = new Map<string, Script>()
+		if (!chips.length)
+			components.set(graph.id, { graph: graph.id, component: graph.id, nodes: [], edges: [] })
 		for (const chip of chips) {
 			const component = find(nodeId(chip))
 			const script = components.get(component) ?? {
@@ -347,6 +369,58 @@ export class RoomWorkspace {
 			totalInstances: examples.length,
 		}
 	}
+	chipConstruction(type: string, recipeId?: string) {
+		const chip = this.registry.getChip(type)
+		if (!chip) throw new Error(`Unknown CV2 chip ${type}`)
+		return this.registry.construction.get(chip.typeId, recipeId)
+	}
+	createChip(
+		path: string,
+		revision: number,
+		type: string,
+		label: string,
+		recipeId?: string,
+		bindings: Record<string, string> = {},
+		name?: string,
+		variable?: { name: string; memory_type?: string }
+	) {
+		if (!/^[A-Za-z][A-Za-z0-9_-]{0,63}$/.test(label)) throw new Error('Invalid new chip label')
+		if (this.document.hasEntities)
+			throw new Error('This save needs an entity topology adapter before chip creation')
+		const file = this.file(path),
+			chip = this.registry.getChip(type)
+		if (!chip) throw new Error(`Unknown CV2 chip ${type}`)
+		const key = `new:${label}`
+		if ([...this.files.values()].some((file) => file.script.nodes.some((node) => node.id === key)))
+			throw new Error(`Duplicate chip label ${label}`)
+		const { data, recipe } = this.registry.construction.construct(
+			chip.typeId,
+			this.resolveId(key),
+			{ recipe: recipeId, bindings, variable }
+		)
+		if (name !== undefined) data.node_name = name
+		const script = {
+			...file.script,
+			nodes: [
+				...file.script.nodes,
+				{
+					id: key,
+					type: chip.typeId,
+					registry: recipe.id,
+					bindings: Object.keys(bindings).length ? bindings : undefined,
+					data: editableData(data),
+					line: 0,
+				},
+			],
+		}
+		const next = serialize(script)
+		return {
+			...this.patch(path, revision, [{ old: file.text, new: next }]),
+			id: key,
+			typeId: chip.typeId,
+			recipe: recipe.id,
+		}
+	}
 	typeDefinition(name: string) {
 		const type = this.registry.getType(name)
 		if (!type) throw new Error(`Unknown CV2 or protobuf type ${name}`)
@@ -413,7 +487,27 @@ export class RoomWorkspace {
 					fail('existing chip IDs cannot be changed or fabricated')
 				if (original && original.graph !== script.graph)
 					fail('chips cannot be moved between saved graph containers')
-				const base = original ?? template
+				let base = original ?? template
+				if (node.template && node.registry)
+					fail('choose a registry recipe or a room template, not both')
+				if (original && (node.template || node.registry))
+					fail('existing chips cannot change their construction source')
+				if (!base && !node.template) {
+					try {
+						const built = this.registry.construction.construct(node.type, this.resolveId(node.id), {
+							recipe: node.registry,
+							bindings: node.bindings,
+							variable: node.data.variable_node_data,
+						})
+						base = {
+							graph: script.graph,
+							data: built.data,
+							bytes: new Uint8Array(nodeType.encode(nodeType.fromObject(built.data)).finish()),
+						}
+					} catch (error) {
+						fail(error instanceof Error ? error.message : 'Canonical chip construction failed')
+					}
+				}
 				if (!base || nodeTypeId(base.data) !== node.type)
 					fail('chip type must match a known template; existing types are immutable')
 				if (
@@ -432,10 +526,20 @@ export class RoomWorkspace {
 					if (!base!.data.node_id) fail('new chips require typed GUID serialization')
 					next.node_id = guid(this.resolveId(node.id))
 					delete next.DEPRECATED_node_id
-					const position = base!.data.transform_data?.local_position ?? {}
+					const anchor = template
+						? base!.data.transform_data
+						: ([...this.nodes.values()].find((known) => known.graph === script.graph)?.data
+								.transform_data ?? base!.data.transform_data)
+					const position = anchor?.local_position ?? {},
+						placement = [...this.newIds.keys()].indexOf(node.id)
 					next.transform_data = {
 						...base!.data.transform_data,
-						local_position: { ...position, x: (position.x ?? 0) + 0.3 * (this.newIds.size + 1) },
+						local_rotation: anchor?.local_rotation ?? { w: 1 },
+						local_position: {
+							...position,
+							x: (position.x ?? 0) + 0.5 * ((placement % 8) + 1),
+							y: (position.y ?? 0) + 0.35 * Math.floor(placement / 8),
+						},
 					}
 				}
 				try {
@@ -460,7 +564,12 @@ export class RoomWorkspace {
 							)
 					}
 					immutableOpaque(base!.data, next, 'chip')
-					validateInputs(base!.data, next)
+					if (node.bindings) {
+						const recipe = this.registry.construction.match(next)
+						if (!recipe) throw new Error('Generic bindings require a verified registry port layout')
+						this.registry.construction.bindings(recipe, node.bindings)
+					}
+					validateInputs(base!.data, next, node.bindings)
 					if (stable(descriptions(base!.data)) !== stable(descriptions(next)))
 						throw new Error('Port definitions cannot be fabricated or rewritten')
 					this.validateReferences(base!.data, next, script.graph)
@@ -478,6 +587,13 @@ export class RoomWorkspace {
 				topologyChanged = true
 			}
 		const resolvedNodes = new Map([...nodes.values()].map((node) => [nodeId(node.data), node]))
+		const genericLinks = new Map<string, Set<string>>(),
+			genericAnchors = new Set<string>()
+		const parameterKey = (node: { data: RecordData }, name: string) =>
+			`${nodeId(node.data)}:${name}`
+		for (const node of nodes.values())
+			for (const name of Object.keys(node.script.bindings ?? {}))
+				genericLinks.set(parameterKey(node, name), new Set())
 		for (const graph of this.document.graphs.values()) {
 			const graphScripts = parsed.filter((item) => item.script.graph === graph.id)
 			const originalEdges = graphScripts.flatMap(({ file }) => parse(file.original, '').edges)
@@ -525,8 +641,8 @@ export class RoomWorkspace {
 				)
 					fail('endpoints must resolve within this saved graph')
 				const changed = !before || stable(before.data) !== stable(next)
-				if (changed) {
-					topologyChanged = true
+				if (changed || sourceNode!.script.bindings || targetNode!.script.bindings) {
+					if (changed) topologyChanged = true
 					if (Object.keys(next).some((key) => key.startsWith('DEPRECATED_')))
 						fail(
 							'legacy GUID port wiring is opaque; new connections require modern typed port indices'
@@ -536,17 +652,19 @@ export class RoomWorkspace {
 							sourceNode!.data,
 							'outputs',
 							next.src_port_group_id ?? 0,
-							next.src_port_id ?? 0
+							next.src_port_id ?? 0,
+							sourceNode!.script.bindings
 						)
 						const input = port(
 							targetNode!.data,
 							'inputs',
 							next.dst_port_group_id ?? 0,
-							next.dst_port_id ?? 0
+							next.dst_port_id ?? 0,
+							targetNode!.script.bindings
 						)
 						if (!output || !input)
 							throw new Error(
-								'port type is unavailable in save metadata; cannot safely add this connection'
+								'port type is unavailable in instance metadata or canonical registry layout; cannot safely add this connection'
 							)
 						if (!compatible(output, input))
 							throw new Error(
@@ -556,13 +674,74 @@ export class RoomWorkspace {
 						fail(error instanceof Error ? error.message : 'Invalid ports')
 					}
 				}
+				// A compiler-only binding must agree with a concrete circuit connection;
+				// otherwise the runtime has no evidence from which to infer that type.
+				if (sourceNode!.script.bindings || targetNode!.script.bindings) {
+					const sourcePort = this.registry.construction.port(
+						sourceNode!.data,
+						'outputs',
+						next.src_port_group_id ?? 0,
+						next.src_port_id ?? 0,
+						sourceNode!.script.bindings
+					)
+					const targetPort = this.registry.construction.port(
+						targetNode!.data,
+						'inputs',
+						next.dst_port_group_id ?? 0,
+						next.dst_port_id ?? 0,
+						targetNode!.script.bindings
+					)
+					const sourceParameters =
+						sourcePort?.parameters.filter((name) =>
+							Object.hasOwn(sourceNode!.script.bindings ?? {}, name)
+						) ?? []
+					const targetParameters =
+						targetPort?.parameters.filter((name) =>
+							Object.hasOwn(targetNode!.script.bindings ?? {}, name)
+						) ?? []
+					if (sourceParameters.length > 1 || targetParameters.length > 1)
+						fail('multi-parameter port inference is unsupported')
+					if (sourceParameters.length && targetParameters.length) {
+						const a = parameterKey(sourceNode!, sourceParameters[0]),
+							b = parameterKey(targetNode!, targetParameters[0])
+						genericLinks.get(a)!.add(b)
+						genericLinks.get(b)!.add(a)
+					} else if (sourceParameters.length || targetParameters.length) {
+						const concrete = sourceParameters.length
+							? port(
+									targetNode!.data,
+									'inputs',
+									next.dst_port_group_id ?? 0,
+									next.dst_port_id ?? 0,
+									targetNode!.script.bindings
+								)
+							: port(
+									sourceNode!.data,
+									'outputs',
+									next.src_port_group_id ?? 0,
+									next.src_port_id ?? 0,
+									sourceNode!.script.bindings
+								)
+						if (concrete && concrete.kind !== 'Any')
+							genericAnchors.add(
+								sourceParameters.length
+									? parameterKey(sourceNode!, sourceParameters[0])
+									: parameterKey(targetNode!, targetParameters[0])
+							)
+					}
+				}
 				const inputKey = `${target!}:${next.dst_port_group_id ?? 0}:${next.dst_port_id ?? 0}`
 				// Preserve existing execution fan-in; new data fan-in is ambiguous.
 				if (
 					seenInputs.has(inputKey) &&
 					(changed || seenInputs.get(inputKey)) &&
-					port(targetNode!.data, 'inputs', next.dst_port_group_id ?? 0, next.dst_port_id ?? 0)
-						?.kind !== 'Exec'
+					port(
+						targetNode!.data,
+						'inputs',
+						next.dst_port_group_id ?? 0,
+						next.dst_port_id ?? 0,
+						targetNode!.script.bindings
+					)?.kind !== 'Exec'
 				)
 					fail('input already has a data connection')
 				seenInputs.set(inputKey, changed || seenInputs.get(inputKey) === true)
@@ -602,6 +781,40 @@ export class RoomWorkspace {
 				parts.push(messageField(5, raw))
 			const next = join(parts)
 			if (!equalBytes(next, graph.bytes)) graphs.set(graph.id, next)
+		}
+		const resolvedParameters = new Set(genericAnchors),
+			queue = [...genericAnchors]
+		for (let cursor = 0; cursor < queue.length; cursor++)
+			for (const next of genericLinks.get(queue[cursor]) ?? [])
+				if (!resolvedParameters.has(next)) {
+					resolvedParameters.add(next)
+					queue.push(next)
+				}
+		for (const key of genericLinks.keys())
+			if (!resolvedParameters.has(key))
+				throw new Error(
+					`Generic binding ${key} has no concrete connection for runtime type inference`
+				)
+		const variables = new Map<string, string>()
+		for (const node of nodes.values()) {
+			const variable = node.data.variable_node_data
+			if (!variable) continue
+			const key = `${node.graph}:${variable.name}`,
+				signature = `${nodeTypeId(node.data)}:${variable.memory_type ?? 'Instance'}`
+			if (
+				variables.has(key) &&
+				variables.get(key) !== signature &&
+				[...nodes.values()].some(
+					(other) =>
+						other.graph === node.graph &&
+						other.data.variable_node_data?.name === variable.name &&
+						other.script.id.startsWith('new:')
+				)
+			)
+				throw new Error(
+					`New variable ${variable.name} conflicts with an existing type or memory mode in this graph`
+				)
+			variables.set(key, signature)
 		}
 		if (topologyChanged && this.document.hasEntities)
 			throw new Error(
@@ -693,7 +906,7 @@ export class RoomWorkspace {
 				if (!before.nodes.some((n) => n.id === node.id)) {
 					diff.chipsCreated++
 					parts.push(
-						`+ chip ${node.id} type ${node.type} template ${node.template}\n+ configuration ${stable(node.data)}`
+						`+ chip ${node.id} type ${node.type} construction ${node.registry ?? node.template ?? 'canonical registry'}\n+ bindings ${stable(node.bindings ?? {})}\n+ configuration ${stable(node.data)}`
 					)
 				}
 			for (const edge of before.edges)

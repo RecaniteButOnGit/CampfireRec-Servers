@@ -30,6 +30,7 @@ export function generateReferenceCatalog(root, schemaSha256) {
 			})),
 	]
 	const chips = new Map(),
+		nodeLayouts = new Map(),
 		namedTypes = new Map(),
 		events = new Map()
 	const provenance = []
@@ -74,6 +75,14 @@ export function generateReferenceCatalog(root, schemaSha256) {
 						inputCount: group.inputs?.length ?? 0,
 					}))
 					add(chips, { typeId, configuration, inputGroups })
+					// Construction consumes only identity-free, typed, known storage fields.
+					// Keep the full port layout here; a separate generator rejects scoped
+					// bindings, deprecated layouts and opaque signal payloads.
+					add(nodeLayouts, {
+						typeId,
+						configuration,
+						nodeGroups: data.node_groups ?? [],
+					})
 				}
 			}
 			if (type.fullName === '.circuits.NamedTypeData' && data.name && data.type)
@@ -103,6 +112,7 @@ export function generateReferenceCatalog(root, schemaSha256) {
 		chips: sorted(chips),
 		namedTypes: sorted(namedTypes),
 		events: sorted(events),
+		nodeLayouts: sorted(nodeLayouts),
 	}
 	console.info(
 		`Reference metadata: ${catalog.chips.length} chip variants, ${catalog.namedTypes.length} named types, ${catalog.events.length} events from ${sources.length} bundled rooms (${fileURLToPath(directory)})`
