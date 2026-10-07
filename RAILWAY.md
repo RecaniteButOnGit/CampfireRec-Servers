@@ -69,7 +69,7 @@ The CV2 discovery chip can request `/sections/pagesource/AIRequest[Prompt:"Hello
 
 The discovery service also accepts `EscapeesImport[...]` and `EscapeesImportProgress[...]` page sources. It stages a map in the CDN bucket, converts its volumes in a background task and records the new private room for `RRUser`. The scheduler resumes interrupted imports each minute. Apply the discovery migration when updating the server; command and response details are in [the discovery README](apps/discovery/README.md).
 
-The discovery service also accepts `CounterAdd8254TOKEN"<RRTOKEN value>"` and `CounterGet8254TOKEN"<RRTOKEN value>"`. They share one persistent SQLite counter and return its updated or current value in the section's `id` and `sourceMetadata`. The counter starts at 0; the discovery migration creates it.
+The discovery service also accepts `CounterAdd8254TOKEN"<RRTOKEN value>"` and `CounterGet8254TOKEN"<RRTOKEN value>"`. Either command can include `[Anticache:"..."]` before `8254TOKEN`; the value is ignored. They share one persistent SQLite counter and return its updated or current value in the section's `id` and `sourceMetadata`. The counter starts at 0; the discovery migration creates it.
 
 The related feature follows the upstream behavior when an optional integration is absent. In particular, web signup requires Turnstile when enabled, Meta nonce login needs the Meta secret, Discord benefits need their credentials, and image signing uses the existing optional configuration.
 Web password signup is disabled by default in Recflare's current auth and website code. Set `PASSWORD_SIGNUP=on` alongside the Turnstile keys to offer it on Railway. Platform signup in the game remains available.
@@ -87,6 +87,12 @@ For local development, a first path segment selects the service and is removed b
 The `www` React SPA is built as ordinary Vite static files. Other static asset bindings read only their designated `static` directories. All service API routes stay in the existing Worker app modules.
 
 ## Scheduled jobs
+
+CV2 Agent runs use the existing `OPENAIKEY` and `RRTOKEN`. The discovery scheduler
+recovers queued runs and expires interrupted runs every minute. Watch
+`[CV2 Agent][cv2agent_...]` in the Railway console for progress. The command,
+save staging policy and compiler limits are documented in
+[apps/discovery/CV2_AGENT.md](apps/discovery/CV2_AGENT.md).
 
 The single application process runs the existing scheduled handlers automatically on UTC time:
 

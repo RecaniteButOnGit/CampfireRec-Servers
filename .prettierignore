@@ -16,3 +16,6 @@ vite.config.ts.timestamp*
 vitest.config.ts.timestamp*
 worker-configuration.d.ts
 .agents/skills/**
+# Generated authoritative protobuf schema/codecs; regenerate with cv2-schema/generate.mjs.
+apps/discovery/src/cv2-agent/schema.json
+apps/discovery/src/cv2-agent/generated-codecs.js

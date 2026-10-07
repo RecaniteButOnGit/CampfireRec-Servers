@@ -5,7 +5,8 @@ import { useWorkersLogger } from 'workers-tagged-logger'
 import { withCleanSpec, withNotFound, withOnError } from '@repo/hono-helpers'
 
 import { authorizedToken, handleAIRequest, parseTokenSuffix } from './ai-request'
-import { counterAdd, counterGet, counterResponse } from './counter'
+import { counterAdd, counterGet, counterResponse, counterToken } from './counter'
+import { agentResponse, cv2AgentStatus, resumeCV2Agents, startCV2Agent } from './cv2-agent'
 import { escapeesImportProgress, importResponse, resumeEscapeesImports, startEscapeesImport } from './escapees-import'
 import {
 	DiscoverySections,
@@ -129,12 +130,18 @@ const app = new Hono<App>()
 				'',
 				'`Ping8254TOKEN"..."` returns one section with `id` and `sourceMetadata` set to',
 				'`Pong` when the trailing token matches `RRTOKEN`.',
-				'`CounterAdd8254TOKEN"..."` atomically adds one to a persistent shared counter;',
-				'`CounterGet8254TOKEN"..."` reads it. Both return the number as text in `id`',
-				'and `sourceMetadata`. The counter starts at 0.',
+				'`CounterAdd[Anticache:"..."]8254TOKEN"..."` atomically adds one to a persistent',
+				'shared counter; `CounterGet[Anticache:"..."]8254TOKEN"..."` reads it. The',
+				'`Anticache` value is ignored, and the bracketed field is optional. Both return',
+				'the number as text in `id` and `sourceMetadata`. The counter starts at 0.',
 				'`AIRequest[Prompt:"...",Model:"gpt-6-luna",SystemPrompt:"...",Reasoning:"none"]8254TOKEN"..."`',
 				'returns the model text in those same two fields when `OPENAIKEY` is configured and',
 				'the trailing token matches `RRTOKEN`.',
+				'`CV2AGENT[Room:"...",Prompt:"...",SubRoom:"...",RequestId:"..."]8254TOKEN"..."`',
+				'starts a background GPT-6.1 Sol circuit edit and returns its run ID. SubRoom and',
+				'RequestId are optional. `CV2AGENTSTATUS[Run:"cv2agent_..."]8254TOKEN"..."`',
+				'returns queued/running, done:Save:<id>, or an explicit error. New saves follow',
+				'the usual room staging policy. URL-encode the whole command.',
 				'`EscapeesImport[Map:"...",User:"...",Password:"...",RRUser:"..."]8254TOKEN"..."`',
 				'returns `received` after validation or a user-friendly `Error:<message>`. Import runs in',
 				'the background. `EscapeesImportProgress[Map:"..."]8254TOKEN"..."` returns 0–100,',
@@ -171,11 +178,23 @@ const app = new Hono<App>()
 			if (type.startsWith('CounterAdd') || type.startsWith('CounterGet')) {
 				c.header('Cache-Control', 'no-store')
 				const name = type.startsWith('CounterAdd') ? 'CounterAdd' : 'CounterGet'
-				if (!(await authorizedToken(parseTokenSuffix(type.slice(name.length)), c.env))) {
+				if (!(await authorizedToken(counterToken(type, name), c.env))) {
 					return c.body(null, 401)
 				}
 				const value = name === 'CounterAdd' ? await counterAdd(c.env) : await counterGet(c.env)
 				return c.json(counterResponse(value))
+			}
+			if (type.startsWith('CV2AGENT')) {
+				c.header('Cache-Control', 'no-store')
+				const query = new URL(c.req.url).search
+				const queryText = query && !type.includes(']8254TOKEN')
+					? new URLSearchParams(`value=${query.slice(1).replaceAll('&', '%26').replaceAll('+', '%2B')}`).get('value')
+					: null
+				const command = queryText === null ? type : `${type}?${queryText}`
+				const result = type.startsWith('CV2AGENTSTATUS')
+					? await cv2AgentStatus(command, c.env)
+					: await startCV2Agent(command, c.env, task => c.executionCtx.waitUntil(task))
+				return result === null ? c.body(null, 401) : c.json(agentResponse(result))
 			}
 			if (type.startsWith('AIRequest')) {
 				c.header('Cache-Control', 'no-store')
@@ -247,6 +266,7 @@ export { app }
 
 export const scheduled: ExportedHandlerScheduledHandler<App['Bindings']> = (_controller, env, ctx) => {
 	ctx.waitUntil(resumeEscapeesImports(env))
+	ctx.waitUntil(resumeCV2Agents(env))
 }
 
 export default { fetch: app.fetch, scheduled } satisfies ExportedHandler<App['Bindings']>

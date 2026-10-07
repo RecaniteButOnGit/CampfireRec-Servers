@@ -51,12 +51,16 @@ One counter is shared by all callers and stored in the discovery database. It st
 ```text
 CounterAdd8254TOKEN"shared_token"
 CounterGet8254TOKEN"shared_token"
+CounterAdd[Anticache:"{0}"]8254TOKEN"shared_token"
+CounterGet[Anticache:"{0}"]8254TOKEN"shared_token"
 ```
 
 `CounterAdd` increases the value by exactly one and returns the new value. `CounterGet`
 returns the current value without changing it. Read the number from the response section's
-`id` or `sourceMetadata`. Both commands require `RRTOKEN`; an absent or incorrect token
-returns HTTP 401. Apply the discovery database migrations before serving requests.
+`id` or `sourceMetadata`. The optional `Anticache` string is ignored by the server; it
+lets Rec Room request a distinct page source name. Both commands require `RRTOKEN`;
+an absent or incorrect token returns HTTP 401. Apply the discovery database migrations
+before serving requests.
 
 ## CV2 Escapees map imports
 
@@ -86,6 +90,14 @@ worker needs its D1 migration applied, R2 bucket binding and scheduled trigger; 
 runs the same migration and recovery job. `ESCAPEES_API_URL` can override the game API
 URL for development. The provided DB read API key is not used by this runtime feature.
 For a standalone Cloudflare discovery Worker, set `RRTOKEN` as a Worker secret.
+
+## CV2 Agent
+
+`CV2AGENT[Room:"...",Prompt:"..."]8254TOKEN"..."` starts a background GPT-6.1 Sol
+edit of the latest room save's CV2 circuits. It returns a run ID; poll with
+`CV2AGENTSTATUS[Run:"cv2agent_..."]8254TOKEN"..."`. See [CV2_AGENT.md](CV2_AGENT.md)
+for the text format, optional subroom/idempotency fields, conflict handling,
+Railway setup, tests and supported-format limits.
 
 ## API documentation
 

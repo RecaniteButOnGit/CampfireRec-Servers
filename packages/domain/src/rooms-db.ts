@@ -1926,6 +1926,66 @@ export async function saveSubRoomData(
 }
 
 /**
+ * Append an isolated editor's result with an atomic compare-and-swap against the
+ * history head AND live/staged pointers. A failed comparison creates no save row.
+ * Carries all asset/version metadata forward from the editor's actual base save.
+ */
+export async function appendSubRoomSaveIfLatest(
+	db: D1Database,
+	roomId: number,
+	subRoomId: number,
+	accountId: number,
+	base: SubRoomDataSave,
+	expected: { latest: number; current: number | null; staged: number | null; runId?: string },
+	input: { dataBlob: string; dataBlobHash: string; description: string; publish: boolean }
+): Promise<SubRoomDataSave | null> {
+	const createdAt = new Date().toISOString()
+	const save: SubRoomDataSave = {
+		...base,
+		DataBlob: input.dataBlob,
+		DataBlobHash: input.dataBlobHash,
+		Description: input.description,
+		SavedByAccountId: accountId,
+		CreatedAt: createdAt,
+	}
+	const result = await db.batch([
+		db.prepare(`INSERT INTO subroom_save (sub_room_id, data)
+		 SELECT ?1, ?2 FROM subroom s WHERE s.sub_room_id = ?1 AND s.room_id = ?3
+		 AND s.current_save_id IS ?4 AND s.staged_save_id IS ?5
+		 AND (SELECT MAX(sub_room_data_save_id) FROM subroom_save WHERE sub_room_id = ?1) = ?6
+		 ${expected.runId ? "AND EXISTS (SELECT 1 FROM cv2_agent_run WHERE run_id=?7 AND state='running' AND deadline_at>?8)" : ''}
+		 RETURNING sub_room_data_save_id`)
+			.bind(
+				subRoomId,
+				serializeSubRoomSave(save),
+				roomId,
+				expected.current,
+				expected.staged,
+				expected.latest,
+				...(expected.runId ? [expected.runId, createdAt] : [])
+			),
+		db.prepare(`UPDATE subroom SET
+		 ${input.publish ? 'current_save_id' : 'staged_save_id'} =
+		 (SELECT sub_room_data_save_id FROM subroom_save WHERE sub_room_id = ?1 AND json_extract(data, '$.DataBlob') = ?2),
+		 ${input.publish ? 'staged_save_id = NULL,' : ''}
+		 data = json_set(data, '$.DataSavedAt', ?3)
+		 WHERE sub_room_id = ?1 AND EXISTS
+		 (SELECT 1 FROM subroom_save WHERE sub_room_id = ?1 AND json_extract(data, '$.DataBlob') = ?2)`)
+			.bind(subRoomId, input.dataBlob, createdAt),
+		...(expected.runId
+			? [db.prepare(`UPDATE cv2_agent_run SET state='done',error=NULL,updated_at=?3,
+		 final_save_id=(SELECT sub_room_data_save_id FROM subroom_save WHERE sub_room_id=?2 AND json_extract(data, '$.DataBlob')=?4)
+		 WHERE run_id=?1 AND EXISTS (SELECT 1 FROM subroom_save WHERE sub_room_id=?2 AND json_extract(data, '$.DataBlob')=?4)`)
+				.bind(expected.runId, subRoomId, createdAt, input.dataBlob)]
+			: []),
+	])
+	const row = result[0]?.results?.[0] as { sub_room_data_save_id: number } | undefined
+	return row
+		? { ...save, SubRoomDataSaveId: row.sub_room_data_save_id, SubRoomId: subRoomId }
+		: null
+}
+
+/**
  * Publish one of a subroom's saves by id: make it the `current_save_id` players load.
  * This is the manual step every non-dorm room save waits on ({@link saveSubRoomData}
  * only stages). Because it takes an explicit id it doubles as restore-a-save — the id
@@ -2623,13 +2683,6 @@ async function attachSubRooms(db: D1Database, rooms: Room[]): Promise<void> {
 	for (const room of rooms) {
 		const subRooms = byRoom.get(Number(room.RoomId)) ?? []
 		room.SubRooms = subRooms
-		// SuperRoomData is a room-wide blob. Older saves recorded its upload key only
-		// on the subroom, leaving the room loader with no metadata filename. Project
-		// the newest available key onto the room response so existing rooms can load it.
-		const latest = subRooms
-			.filter((sub) => typeof sub.RoomDataBlob === 'string' && sub.RoomDataBlob !== '')
-			.sort((a, b) => String(b.DataSavedAt ?? '').localeCompare(String(a.DataSavedAt ?? '')))[0]
-		if (latest) room.RoomDataBlob = latest.RoomDataBlob
 	}
 }
 

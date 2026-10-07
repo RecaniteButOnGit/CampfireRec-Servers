@@ -1,0 +1,5 @@
+{
+	"archive": "RR_ProtobufDefinitions.zip",
+	"sha256": "a8b72109bd62e8e102747d4750ee3b746b94b13c90abd455b89562c6ed635c75",
+	"generator": "protobufjs 8.8.0; keepCase=true"
+}

@@ -78,9 +78,13 @@ export function createRouter(runtime: RailwayEnvironment, databasePing: () => bo
         let decodedSource = source
         try { decodedSource = decodeURIComponent(source) } catch { /* Keep the raw path. */ }
         const tokenIndex = decodedSource.indexOf('8254TOKEN')
-        const label = decodedSource.startsWith('AIRequest') ? 'AIRequest'
+        const label = decodedSource.startsWith('CV2AGENTSTATUS') ? 'CV2AGENTSTATUS'
+			: decodedSource.startsWith('CV2AGENT') ? 'CV2AGENT'
+			: decodedSource.startsWith('AIRequest') ? 'AIRequest'
 			: decodedSource.startsWith('EscapeesImportProgress') ? 'EscapeesImportProgress'
 			: decodedSource.startsWith('EscapeesImport') ? 'EscapeesImport'
+			: decodedSource.startsWith('CounterAdd') ? 'CounterAdd'
+			: decodedSource.startsWith('CounterGet') ? 'CounterGet'
 			: tokenIndex === -1 ? source : decodedSource.slice(0, tokenIndex)
         console.info(`[discovery/pagesource] ${label}`)
       }

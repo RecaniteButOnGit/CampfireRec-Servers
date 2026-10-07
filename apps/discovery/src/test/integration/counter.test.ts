@@ -5,8 +5,9 @@ import { app } from '../../discovery.app'
 
 const TOKEN = 'counter-test-token'
 
-function request(name: 'CounterAdd' | 'CounterGet', token = TOKEN) {
-	const command = `${name}8254TOKEN${JSON.stringify(token)}`
+function request(name: 'CounterAdd' | 'CounterGet', token = TOKEN, anticache?: string) {
+	const argument = anticache === undefined ? '' : `[Anticache:${JSON.stringify(anticache)}]`
+	const command = `${name}${argument}8254TOKEN${JSON.stringify(token)}`
 	return app.fetch(
 		new Request(`https://discovery.example.com/sections/pagesource/${encodeURIComponent(command)}`),
 		{ ...env, RRTOKEN: { get: async () => TOKEN } } as never,
@@ -14,8 +15,8 @@ function request(name: 'CounterAdd' | 'CounterGet', token = TOKEN) {
 	)
 }
 
-async function value(name: 'CounterAdd' | 'CounterGet') {
-	const response = await request(name)
+async function value(name: 'CounterAdd' | 'CounterGet', anticache?: string) {
+	const response = await request(name, TOKEN, anticache)
 	expect(response.status).toBe(200)
 	expect(response.headers.get('Cache-Control')).toBe('no-store')
 	const sections = (await response.json()) as Array<Record<string, unknown>>
@@ -51,9 +52,19 @@ describe('CV2 counter page sources', () => {
 		expect(await value('CounterGet')).toBe(2)
 	})
 
+	it('ignores the optional Anticache value for both commands', async () => {
+		expect(await value('CounterGet', '{0}')).toBe(0)
+		expect(await value('CounterAdd', 'first-request')).toBe(1)
+		expect(await value('CounterGet', 'different-request')).toBe(1)
+		expect(await value('CounterAdd', '{0}')).toBe(2)
+		expect(await value('CounterGet', 'another-request')).toBe(2)
+	})
+
 	it('requires the shared token for reads and writes', async () => {
 		expect((await request('CounterAdd', 'wrong')).status).toBe(401)
 		expect((await request('CounterGet', 'wrong')).status).toBe(401)
+		expect((await request('CounterAdd', 'wrong', '{0}')).status).toBe(401)
+		expect((await request('CounterGet', 'wrong', '{0}')).status).toBe(401)
 		const bare = await app.fetch(
 			new Request('https://discovery.example.com/sections/pagesource/CounterAdd'),
 			{ ...env, RRTOKEN: { get: async () => TOKEN } } as never,

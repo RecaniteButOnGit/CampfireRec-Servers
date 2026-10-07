@@ -1,6 +1,21 @@
+import { parseEnvelope, parseFields, parseTokenSuffix } from './ai-request'
+
 import type { App } from './context'
 
 type Env = App['Bindings']
+type CounterName = 'CounterAdd' | 'CounterGet'
+
+const ANTICACHE_FIELDS = new Set(['Anticache'])
+
+/** Accept the original no-argument command and the CV2 cache-busting form. */
+export function counterToken(command: string, name: CounterName): string | null {
+	const suffix = command.slice(name.length)
+	if (!suffix.startsWith('[')) return parseTokenSuffix(suffix)
+	const envelope = parseEnvelope(command, `${name}[`)
+	if (!envelope) return null
+	const fields = parseFields(envelope.body, ANTICACHE_FIELDS)
+	return fields && Object.hasOwn(fields, 'Anticache') ? envelope.token : null
+}
 
 /** A page-source section whose readable text is the current counter value. */
 export function counterResponse(value: number) {

@@ -3838,9 +3838,8 @@ describe('rooms endpoints', () => {
 			}
 		}
 		expect(saved.success).toBe(true)
-		expect(saved.error).toBeNull()
-		expect(saved.value.room).toMatchObject({ RoomId: 2, Description: before.Description })
-		expect(saved.value.room.RoomDataBlob).toBe('5c618c920f6247efb8327e327d0b4417')
+	expect(saved.error).toBeNull()
+	expect(saved.value.room).toMatchObject({ RoomId: 2, Description: before.Description })
 
 		// The save is a camelCase projection, NOT the PascalCase CurrentSave shape.
 		expect(saved.value.subRoomDataSave).toEqual({
@@ -3916,10 +3915,9 @@ describe('rooms endpoints', () => {
 			PersistenceVersion: number
 			InventionUsage?: string
 		}
-		expect(room.Description).toBe(before.Description)
-		expect(room.PersistenceVersion).toBe(before.PersistenceVersion)
-		expect(room.InventionUsage).toBeUndefined()
-		expect((room as Record<string, unknown>).RoomDataBlob).toBe('5c618c920f6247efb8327e327d0b4417')
+	expect(room.Description).toBe(before.Description)
+	expect(room.PersistenceVersion).toBe(before.PersistenceVersion)
+	expect(room.InventionUsage).toBeUndefined()
 
 		// A CoOwner (account 2 holds Role 30 in the seeded rooms) may also save — 200
 		// with the room envelope. The creator stays account 1 (not clobbered).

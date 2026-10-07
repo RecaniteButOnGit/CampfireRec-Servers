@@ -1,5 +1,5 @@
 import { createHash } from 'node:crypto'
-import { mkdtempSync, rmSync } from 'node:fs'
+import { mkdtempSync, readFileSync, rmSync } from 'node:fs'
 import { createServer } from 'node:http'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -49,7 +49,7 @@ describe('SQLite D1 adapter and migrations', () => {
   it('applies source migrations once and persists across reopen', async () => {
     const path = join(temp(), 'recflare.sqlite')
     const first = new SQLiteD1(path)
-    expect(migrate(first)).toBe(115)
+    expect(migrate(first)).toBe(120)
     expect(await first.prepare('SELECT value FROM cv2_counter WHERE id = 1').first('value')).toBe(0)
     expect(await first.prepare('UPDATE cv2_counter SET value = value + 1 WHERE id = 1 RETURNING value').first('value')).toBe(1)
     const rro = await first.prepare(
@@ -88,6 +88,28 @@ describe('SQLite D1 adapter and migrations', () => {
       expect(second.ping()).toBe(true)
       expect(await second.prepare('SELECT value FROM cv2_counter WHERE id = 1').first('value')).toBe(1)
     } finally { second.close() }
+  })
+
+  it('moves legacy subroom metadata keys to the room without replacing newer room data', async () => {
+    const db = new SQLiteD1(':memory:')
+    try {
+      migrate(db)
+      await db.prepare('INSERT INTO room (data) VALUES (?1)')
+        .bind(JSON.stringify({ RoomId: 99001, DataBlob: null })).run()
+      await db.prepare('INSERT INTO room (data) VALUES (?1)')
+        .bind(JSON.stringify({ RoomId: 99002, DataBlob: 'current-key', DataBlobHash: 'current-hash' })).run()
+      for (const roomId of [99001, 99002]) {
+        for (const [key, savedAt] of [['older-key', '2026-10-01'], ['newer-key', '2026-10-02']]) {
+          await db.prepare('INSERT INTO subroom (room_id, data) VALUES (?1, ?2)')
+            .bind(roomId, JSON.stringify({ RoomDataBlob: key, DataSavedAt: savedAt })).run()
+        }
+      }
+      db.sqlite.exec(readFileSync(join(import.meta.dirname, '../../rooms/migrations/0031_room_data_blob.sql'), 'utf8'))
+      const legacy = await db.prepare('SELECT data FROM room WHERE room_id = ?1').bind(99001).first<string>('data')
+      const current = await db.prepare('SELECT data FROM room WHERE room_id = ?1').bind(99002).first<string>('data')
+      expect(JSON.parse(legacy!)).toMatchObject({ DataBlob: 'newer-key', DataBlobHash: null })
+      expect(JSON.parse(current!)).toMatchObject({ DataBlob: 'current-key', DataBlobHash: 'current-hash' })
+    } finally { db.close() }
   })
 })
 
@@ -283,6 +305,11 @@ describe('routing, health and compatibility', () => {
         const nested = await route(new Request('https://discovery.example.test/sections/pagesource/hello%20world/again'))
         expect(nested.status).toBe(404)
         expect(log).toHaveBeenCalledWith('[discovery/pagesource] hello%20world/again')
+        const counter = 'CounterGet[Anticache:"unique-request"]8254TOKEN"wrong"'
+        const counterResponse = await route(new Request(`https://discovery.example.test/sections/pagesource/${encodeURIComponent(counter)}`))
+        expect(counterResponse.status).toBe(401)
+        expect(log).toHaveBeenCalledWith('[discovery/pagesource] CounterGet')
+        expect(JSON.stringify(log.mock.calls)).not.toContain('unique-request')
       } finally { log.mockRestore() }
       runtime.hub.db.close()
     } finally { db.close(); process.env = prior }
