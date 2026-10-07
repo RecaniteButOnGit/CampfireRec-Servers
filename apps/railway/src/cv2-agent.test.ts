@@ -453,6 +453,41 @@ function response(name: string, args: unknown) {
 }
 
 describe('CV2AGENT integration and save commits', () => {
+	it('starts the agent with global definitions even when a valid room has no chips', async () => {
+		const { db, env, blobs, put } = await setup(),
+			ctx = new NodeExecutionContext()
+		blobs.set(
+			'room/original.room',
+			new Uint8Array(roomType.encode(roomType.fromObject({ activity_id: 'Empty room' })).finish())
+		)
+		const calls: any[] = []
+		vi.spyOn(globalThis, 'fetch').mockImplementation(async (_, init) => {
+			calls.push(JSON.parse(init!.body as string))
+			return calls.length === 1
+				? response('get_chip_definition', { type: 'Player Get Is Grounded' })
+				: response('abort', { reason: 'No verified serialized creation template' })
+		})
+		vi.spyOn(console, 'info').mockImplementation(() => {})
+		try {
+			await request(
+				'CV2AGENT[Room:"AgentTest",Prompt:"double jump"]8254TOKEN"token-test-secret"',
+				env,
+				ctx
+			)
+			await ctx.drain()
+			expect(await db.prepare('SELECT state,error FROM cv2_agent_run').first()).toMatchObject({
+				state: 'failed',
+				error: expect.stringContaining('No verified serialized creation template'),
+			})
+			expect(calls).toHaveLength(2)
+			const result = JSON.parse(calls[1].input.at(-1).output)
+			expect(result.globalDefinition.name).toBe('Player Get Is Grounded')
+			expect(result.totalInstances).toBe(0)
+			expect(put).not.toHaveBeenCalled()
+		} finally {
+			db.close()
+		}
+	})
 	it('authenticates before room access or OpenAI and rejects missing prompts', async () => {
 		const { db, env } = await setup()
 		try {

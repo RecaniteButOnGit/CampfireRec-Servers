@@ -2,7 +2,6 @@ import { LANGUAGE, parse, serialize } from './language'
 import {
 	checkRecord,
 	decode,
-	definition,
 	edgeType,
 	fields,
 	guid,
@@ -14,6 +13,7 @@ import {
 	stable,
 	update,
 } from './protobuf'
+import { getCv2DefinitionRegistry } from './registry'
 import { equalBytes, nodeId, nodeTypeId, RoomDocument, sourceId, targetId } from './room'
 
 import type { Script, ScriptNode } from './language'
@@ -153,6 +153,7 @@ function validateInputs(before: RecordData, after: RecordData): void {
 }
 
 export class RoomWorkspace {
+	readonly registry = getCv2DefinitionRegistry()
 	readonly files = new Map<string, File>()
 	readonly nodes = new Map<string, Node>()
 	readonly newIds = new Map<string, string>()
@@ -328,11 +329,14 @@ export class RoomWorkspace {
 	}
 
 	chipDefinition(type: string) {
-		const examples = [...this.nodes].filter(([, node]) => nodeTypeId(node.data) === type)
-		if (!examples.length) throw new Error(`Chip type ${type} is not known in this save`)
+		const globalDefinition = this.registry.getChip(type)
+		const typeId = globalDefinition?.typeId ?? type
+		const examples = [...this.nodes].filter(([, node]) => nodeTypeId(node.data) === typeId)
+		if (!globalDefinition && !examples.length) throw new Error(`Unknown CV2 chip ${type}`)
 		return {
-			type,
-			schema: definition(nodeType),
+			type: typeId,
+			globalDefinition,
+			configurationSchema: 'circuits_v2.CircuitNodeData',
 			instances: examples.slice(0, 8).map(([key, node]) => ({
 				id: key,
 				name: node.data.node_name ?? '',
@@ -344,18 +348,18 @@ export class RoomWorkspace {
 		}
 	}
 	typeDefinition(name: string) {
-		const type = root.lookup(name)
-		if (!type) throw new Error(`Unknown protobuf type ${name}`)
-		return type.toJSON()
+		const type = this.registry.getType(name)
+		if (!type) throw new Error(`Unknown CV2 or protobuf type ${name}`)
+		return type
 	}
 	docs(query: string) {
 		const docs = {
 			'/room/docs/language.md': LANGUAGE,
 			'/room/docs/types.md': stable(root.lookupEnum('circuits.TypeKind').values),
 			'/room/docs/chips.md':
-				'Chip definitions are generated from this save. Search chip names/metadata with search_graphs and retrieve actual instance definitions with get_chip_definition. A GUID identifies a type; protobuf fields alone do not define its behavior.',
+				'Global definitions are available even in empty rooms: search_chips, search_types, search_definitions, get_chip_definition, get_type_definition, get_event_definition, get_registry_info and get_chip_variants. Search global definitions before declaring a chip unavailable. Catalog GUIDs are standard GUID text; typeId is the exact serialized byte hex used in scripts. Published descriptor ordering differs from configured/variadic wire indices. Instance ports and scoped event/variable bindings require target-room metadata. Incomplete entries cannot authorize invented chips, ports, defaults or templates.',
 		}
-		return Object.entries(docs)
+		const local = Object.entries(docs)
 			.flatMap(([path, text]) =>
 				text
 					.split('\n')
@@ -366,6 +370,10 @@ export class RoomWorkspace {
 					)
 			)
 			.slice(0, 40)
+		return {
+			documentation: local,
+			globalDefinitions: this.registry.searchDefinitions(query, 'all', 0, 20),
+		}
 	}
 
 	private resolveId(key: string): string {

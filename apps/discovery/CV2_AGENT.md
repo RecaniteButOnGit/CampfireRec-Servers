@@ -46,10 +46,10 @@ original wire ordering and untouched layout/geometry bytes survive compilation.
 The runner verifies a byte-for-byte baseline round trip before contacting OpenAI.
 
 The agent can list, search and read graph sections, search documentation, retrieve
-chip/type definitions, apply exact revision-checked patches, validate graphs and
-the room, inspect the diff, and finish or abort. Chip references come from the
-save's actual type GUIDs, instance metadata and serialized port descriptions.
-Definitions are instance-specific; event receivers of one type can have different
+chip/type/event definitions, apply exact revision-checked patches, validate graphs
+and the room, inspect the diff, and finish or abort. Every run also has the global
+registry described below, including runs on valid saves with no chips. Configured
+ports remain instance-specific; event receivers of one type can have different
 ports. Missing definitions are reported explicitly. No chip behavior is inferred
 from an unrelated protobuf field name.
 
@@ -60,6 +60,55 @@ verified saved representation; another chip's protobuf payload cannot be substit
 Finalization requires validation and diff inspection after the last patch.
 The model uses a tool loop with encrypted continuity and automatic Responses
 compaction at 24,000 tokens. The decoded room is never put into the model context.
+
+## Global CV2 definition registry
+
+`src/cv2-agent/registry.ts` exposes `Cv2DefinitionRegistry` through the lazy,
+process/Worker-isolate singleton `getCv2DefinitionRegistry()`. All workspaces share
+immutable indexes; target-room observations never alter global knowledge. No
+metadata is downloaded or regenerated during an AI run. Deployment with regenerated
+artifacts replaces the cache when its underlying sources change.
+
+The pinned [official CircuitsV2Resources export](https://tyleo-rec.github.io/CircuitsV2Resources/)
+provides 1,328 chip GUIDs, names, descriptions, descriptor groups, ordered input/output
+ports, execution/data distinctions, type names, generic constraints, filters and
+availability metadata. Its normal palette contains 1,147 chips; the full export
+also contains hidden/development entries, which are explicitly identified. The
+catalog describes its export version, so existence in this catalog does not
+guarantee availability in a particular Campfire client version or room mode.
+
+The protobuf schema supplies configuration fields/numbers, message dependencies,
+enum values, type structures, variable memory modes, event structures and storage
+defaults. Field numbers are never treated as chip type identifiers. Chip-to-payload
+associations are included only where bundled saves contain that exact serialized
+type GUID and payload. Five checked-in rooms contribute observed configurations,
+port descriptions, arity and scoped event definitions. These observations are
+separate from published chip definitions and are never promoted to chip defaults
+or universal built-in event IDs. Matching concrete descriptors can associate a
+published type name with an observed serialized type; unmatched identities remain
+explicitly unknown.
+
+Registry methods include `getChip(idOrName)`, `searchChips`, `getType`, `searchTypes`,
+`getEvent`, `getDefinition`, `searchDefinitions` and `getChipVariants`. Searches
+support category filters, deterministic pagination and `*` enumeration, with at
+most 50 results per page. Agent tools expose these methods plus `get_registry_info`.
+`get_chip_definition` returns global knowledge and separate target-room instances;
+it accepts public names, definition IDs, standard GUID text or serialized hex IDs.
+Agents are instructed to search globally before declaring a chip unavailable.
+
+Catalog `runtimeGuid` uses standard C# GUID text; `typeId` is the byte-order-correct
+16-byte hex used in scripts. For example, Event Receiver's catalog GUID
+`8b533ccb-643a-491d-982c-94417ce99954` becomes serialized
+`cb3c538b3a641d49982c94417ce99954`. Removing dashes is not a valid conversion.
+
+Every entry exposes provenance, scope and missing information. Published descriptor
+order does not determine expanded/variadic wire indices or configured event ports.
+The official export omits complete serialized creation templates and chip defaults.
+Knowing a chip exists therefore does not by itself authorize instantiation: the
+compiler still requires verified target-room templates and concrete serialized
+instance ports. The existing rejection of fabricated chips, ports, types and
+configuration variants remains intact. An empty room can search all definitions
+but may still require an additional creation/template adapter to build a circuit.
 
 ## Supported edits and current limits
 
@@ -73,8 +122,9 @@ compaction at 24,000 tokens. The decoded room is never put into the model contex
   chip field edits preserve that topology. This is not yet a universal CV2 compiler.
 - Opaque `backing_bytes`, deprecated GUID port wiring, arbitrary port arity changes,
   new saved graph containers and invented chip types are unsupported. The supplied
-  protobuf definitions describe storage, not every built-in chip's runtime behavior
-  or every signal byte encoding. The agent must abort requests requiring those.
+  protobuf definitions describe storage, and the global catalog supplies built-in
+  descriptors; neither completely specifies every serialized instantiation or
+  signal byte encoding. The agent must abort requests requiring missing details.
 - The latest history save is used, including staged work. A missing/invalid scene
   blob fails explicitly. Raw `PersistedRoomData` scenes up to 32 MiB are supported;
   compressed/encrypted exports need a verified envelope adapter.
@@ -110,10 +160,19 @@ secrets are required beyond the existing `OPENAIKEY` and `RRTOKEN`.
 
 `cv2-schema/RR_ProtobufDefinitions.zip` is the user-supplied authoritative archive.
 `cv2-schema/source.json` records its SHA-256. `cv2-schema/generate.mjs` regenerates
-the reflection schema and static codecs; run `node apps/discovery/cv2-schema/generate.mjs`
+the reflection schema, static codecs, `published-catalog.json` and
+`reference-catalog.json`; run `node apps/discovery/cv2-schema/generate.mjs`
 from the repository root. Codecs are compiled ahead of time because Workers forbid
 runtime code generation. Only message types reachable from `PersistedRoomData`
 need executable codecs; full metadata remains searchable through type tools.
+
+`cv2-schema/upstream/` retains both official exports and their MIT license, pinned
+to commit `d4dc2523506862a46844e4c6064bcc2cbc2a08bb`. Its source manifest records the
+repository and paths; generated catalog provenance records both export hashes and
+all reference-save hashes. To update it, replace the exports with files from a
+chosen upstream commit, update the source manifest's commit, regenerate, and review
+the resulting definitions. These are generated catalogs, not manually maintained
+chip lists. No secret or new deployment environment variable is needed.
 
 `apps/railway/src/cv2-agent.test.ts` covers round trips, unknown fields, isolation,
 stable IDs/layout, invalid scripts/types/ports, patches, validation gates, repair
@@ -122,6 +181,10 @@ Set `CV2_NATIVE_ROOM` to the path of an exported raw `persisted_room_data.origin
 to run the native-room regression in addition to the portable fixtures. The
 discovery codec integration test also exercises encoding inside the Worker runtime.
 Model calls in automated tests are mocked; no paid live OpenAI run is performed.
+`apps/railway/src/cv2-registry.test.ts` additionally checks the complete official
+catalog, GUID byte ordering, typed/generic ports, schema enums/configuration,
+pagination, scoped observations, source hashes, cache sharing, empty-room tools and
+preservation of the compiler's no-invention rule.
 
 The Responses tool loop and automatic compaction follow OpenAI's
 [function calling](https://developers.openai.com/api/docs/guides/function-calling)

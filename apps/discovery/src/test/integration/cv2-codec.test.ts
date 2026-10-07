@@ -1,10 +1,20 @@
 import { describe, expect, it } from 'vitest'
 
 import { guid, roomType } from '../../cv2-agent/protobuf'
+import { getCv2DefinitionRegistry } from '../../cv2-agent/registry'
 import { RoomDocument } from '../../cv2-agent/room'
 import { RoomWorkspace } from '../../cv2-agent/workspace'
 
 describe('CV2 codec in the Worker runtime', () => {
+	it('shares the global catalog in empty rooms without runtime code generation', () => {
+		const bytes = roomType.encode(roomType.fromObject({ activity_id: 'Empty room' })).finish()
+		const workspace = new RoomWorkspace(new RoomDocument(bytes))
+		expect(workspace.registry).toBe(getCv2DefinitionRegistry())
+		expect(
+			workspace.chipDefinition('Player Get Is Grounded').globalDefinition!.outputs[0].type
+		).toBe('bool')
+		expect(workspace.registry.searchChips('hand velocity').total).toBeGreaterThan(0)
+	})
 	it('uses statically generated codecs to round trip without runtime code generation', () => {
 		const bytes = roomType
 			.encode(

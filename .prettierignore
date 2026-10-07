@@ -19,3 +19,6 @@ worker-configuration.d.ts
 # Generated authoritative protobuf schema/codecs; regenerate with cv2-schema/generate.mjs.
 apps/discovery/src/cv2-agent/schema.json
 apps/discovery/src/cv2-agent/generated-codecs.js
+apps/discovery/src/cv2-agent/reference-catalog.json
+apps/discovery/src/cv2-agent/published-catalog.json
+apps/discovery/cv2-schema/upstream/circuitsv2*.json

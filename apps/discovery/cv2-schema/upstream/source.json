@@ -1,0 +1,8 @@
+{
+	"repository": "https://github.com/tyleo-rec/CircuitsV2Resources",
+	"commit": "d4dc2523506862a46844e4c6064bcc2cbc2a08bb",
+	"catalogPath": "misc/circuitsv2.full.json",
+	"palettePath": "misc/circuitsv2.json",
+	"license": "MIT",
+	"officialResources": "https://tyleo-rec.github.io/CircuitsV2Resources/"
+}

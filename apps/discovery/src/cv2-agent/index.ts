@@ -166,8 +166,9 @@ export async function runCV2Agent(env: Env, runId: string): Promise<void> {
 		const bytes = await loadSave(env, base.save),
 			workspace = new RoomWorkspace(new RoomDocument(bytes))
 		log(`Found ${workspace.nodes.size} CV2 chips and ${workspace.files.size} disconnected graphs`)
-		if (!workspace.nodes.size)
-			throw new AgentFailure('Room save contains no supported CV2 chip graphs')
+		log(
+			`Global registry: ${workspace.registry.info.publishedChipCount} published chips; schema ${workspace.registry.info.provenance.protobufSha256}`
+		)
 		if (!equalBytes(workspace.compile().bytes, bytes))
 			throw new AgentFailure('Baseline CV2 round-trip failed')
 		log('Baseline round-trip passed; starting GPT-6.1 Sol agent')

@@ -5,6 +5,9 @@ import { fileURLToPath } from 'node:url'
 import { unzipSync } from 'fflate'
 import protobuf from 'protobufjs'
 
+import { generatePublishedCatalog } from './published-catalog.mjs'
+import { generateReferenceCatalog } from './reference-catalog.mjs'
+
 const archive = readFileSync(new URL('./RR_ProtobufDefinitions.zip', import.meta.url))
 const root = new protobuf.Root()
 protobuf.parse(
@@ -25,6 +28,7 @@ if (!root.lookup('google.protobuf.Timestamp')) {
 	)
 }
 root.resolveAll()
+const schemaSha256 = createHash('sha256').update(archive).digest('hex')
 const output = new URL('../src/cv2-agent/schema.json', import.meta.url)
 writeFileSync(output, JSON.stringify(root.toJSON()) + '\n')
 // Workers prohibit runtime eval. Compile protobufjs codecs here, while retaining
@@ -67,7 +71,7 @@ writeFileSync(
 	JSON.stringify(
 		{
 			archive: 'RR_ProtobufDefinitions.zip',
-			sha256: createHash('sha256').update(archive).digest('hex'),
+			sha256: schemaSha256,
 			generator: 'protobufjs 8.8.0; keepCase=true',
 		},
 		null,
@@ -75,3 +79,11 @@ writeFileSync(
 	) + '\n'
 )
 console.info(`Generated ${fileURLToPath(output)}`)
+writeFileSync(
+	new URL('../src/cv2-agent/reference-catalog.json', import.meta.url),
+	JSON.stringify(generateReferenceCatalog(root, schemaSha256)) + '\n'
+)
+writeFileSync(
+	new URL('../src/cv2-agent/published-catalog.json', import.meta.url),
+	JSON.stringify(generatePublishedCatalog()) + '\n'
+)
