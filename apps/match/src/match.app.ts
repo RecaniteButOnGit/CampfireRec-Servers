@@ -35,6 +35,7 @@ import {
 	hasRoomInviteTo,
 	InviteMode,
 	isClubMember,
+	isMatchmakingPolicy,
 	isPlayerBannedFromRoom,
 	MatchmakingErrorCode,
 	MessageType,
@@ -49,6 +50,7 @@ import {
 	roomRoles,
 	setPresence,
 	setRoomInstanceInProgress,
+	setRoomInstanceMatchmakingPolicy,
 	setRoomInstancePrivate,
 	subRoomDataBlob,
 } from '@repo/domain'
@@ -88,6 +90,7 @@ import {
 	MatchmakeRoomRequest,
 	MatchmakeRoomV2Request,
 	MatchmakeV2Response,
+	MatchPolicyRequest,
 	NotifyDisconnectRequest,
 	PlayerDto,
 	QosRegion,
@@ -1164,9 +1167,11 @@ async function readCorrelationId(c: Context<App>): Promise<string> {
 }
 
 /**
- * How the instance is matched into, echoed on every v2 instance. The reference server
- * sends 0 and this server has no policy to express, so it is a constant — kept as a
- * named field rather than dropped, because the client's decoder wants the key.
+ * How the instance is matched into, echoed on every v2 instance. The stored policy
+ * (`PUT /roominstance/:id/matchpolicy`) is not threaded through to the wire instance,
+ * which is rebuilt from the room; a matchmake only ever lands in an instance that is not
+ * `Ignore`, so this echoes Default. Kept as a named field rather than dropped, because
+ * the client's decoder wants the key.
  */
 const DEFAULT_MATCHMAKING_POLICY = 0
 
@@ -3307,6 +3312,56 @@ const app = new Hono<App>()
 
 			const instance = await setRoomInstanceInProgress(c.env.DB, instanceId, inProgress)
 			if (!instance) return c.body(null, 404)
+			return c.body(null, 200)
+		}
+	)
+
+	// How matchmaking treats this instance (`policy=0|1|2`: Default, Avoid, Ignore —
+	// see MatchmakingPolicy). Gated on STANDING IN the instance rather than owning the
+	// room: whoever is in a session decides whether more players should be matched into
+	// it, the way in-progress is set by whoever starts the game. `Ignore` drops the
+	// instance from both reuse searches; invites, room codes and the owner's session
+	// picker still reach it. Empty ack.
+	.put(
+		'/roominstance/:id/matchpolicy',
+		describeRoute({
+			tags: ['Room instance'],
+			summary: 'Set an instance’s matchmaking policy',
+			description: [
+				'Sets the instance’s `matchmakingPolicy`: 0 Default (matchmaking places players in',
+				'it), 1 Avoid (it ranks behind every Default instance), 2 Ignore (matchmaking never',
+				'places anyone in it; invites, room codes and the owner’s session picker still do).',
+				'Players already inside are unaffected. Auth-gated and gated to a caller whose live',
+				'presence puts them IN this instance (403 otherwise) — not the room’s owner. Body is',
+				'`policy=<0|1|2>`; anything else is a 400. Empty ack.',
+			].join(' '),
+			security: AUTHED,
+			requestBody: form(MatchPolicyRequest, 'The policy'),
+			parameters: [{ name: 'id', in: 'path', required: true, schema: { type: 'string' } }],
+			responses: {
+				200: EMPTY_OK,
+				400: { description: '`policy` missing or not 0, 1 or 2 (empty body)' },
+				401: UNAUTHORIZED_RESPONSE,
+				403: { description: 'The caller is not in this instance (empty body)' },
+				404: { description: 'Non-numeric id or no such instance (empty body)' },
+			},
+		}),
+		async (c) => {
+			const id = await authedId(c)
+			if (id === null) return unauthorized(c)
+
+			const instanceId = Number.parseInt(c.req.param('id'), 10)
+			if (Number.isNaN(instanceId)) return c.body(null, 404)
+
+			const body = await c.req.parseBody().catch(() => ({}) as Record<string, unknown>)
+			const policy = typeof body.policy === 'string' ? Number.parseInt(body.policy, 10) : Number.NaN
+			if (!isMatchmakingPolicy(policy)) return c.body(null, 400)
+
+			if (!(await getRoomInstance(c.env.DB, instanceId))) return c.body(null, 404)
+			const presence = await getPresence<RoomInstance>(c.env.DB, id)
+			if (presence?.roomInstance?.roomInstanceId !== instanceId) return c.body(null, 403)
+
+			await setRoomInstanceMatchmakingPolicy(c.env.DB, instanceId, policy)
 			return c.body(null, 200)
 		}
 	)

@@ -2531,6 +2531,73 @@ describe('auth-gated endpoints', () => {
 		expect(target?.playerIds).toEqual([42, 43])
 	})
 
+	test('PUT /roominstance/:id/matchpolicy is set from inside, and Ignore stops matchmaking into it', async () => {
+		// Room 77 subroom 34 — public, 10 seats, nobody's — so whoever stands in an instance
+		// is the one who may set its policy, and matchmaking reuses the oldest open one.
+		const spawn = async (player: string): Promise<number> => {
+			const res = await exports.default.fetch(`${ORIGIN}/matchmake/room/77/34`, {
+				method: 'POST',
+				headers: await bearer(player),
+			})
+			return ((await res.json()) as { roomInstance: { roomInstanceId: number } }).roomInstance
+				.roomInstanceId
+		}
+		const setPolicy = async (instanceId: number | string, policy: string, player?: string) =>
+			exports.default.fetch(`${ORIGIN}/roominstance/${instanceId}/matchpolicy`, {
+				method: 'PUT',
+				headers: {
+					...(player ? await bearer(player) : {}),
+					'Content-Type': 'application/x-www-form-urlencoded',
+				},
+				body: new URLSearchParams({ policy }).toString(),
+			})
+		const policyOf = async (instanceId: number) =>
+			(
+				await env.DB.prepare('SELECT matchmaking_policy AS p FROM room_instance WHERE id = ?1')
+					.bind(instanceId)
+					.first<{ p: number }>()
+			)?.p
+
+		const a = await spawn('4201')
+		expect(await policyOf(a)).toBe(0)
+
+		// No token → 401. Unknown instance → 404. A bad policy → 400, before any lookup.
+		expect((await setPolicy(a, '2')).status).toBe(401)
+		expect((await setPolicy(9999999, '2', '4201')).status).toBe(404)
+		expect((await setPolicy(a, '7', '4201')).status).toBe(400)
+		expect((await setPolicy(a, 'Ignore', '4201')).status).toBe(400)
+		// A player who is not standing in the instance → 403, however they relate to the room.
+		expect((await setPolicy(a, '2', '4299')).status).toBe(403)
+		expect(await policyOf(a)).toBe(0)
+
+		// The player inside sets Ignore (the client's body is `policy=2`): empty ack, stored.
+		const set = await setPolicy(a, '2', '4201')
+		expect(set.status).toBe(200)
+		expect(await set.text()).toBe('')
+		expect(await policyOf(a)).toBe(2)
+
+		// Excluded from matchmaking entirely: the next player gets a different instance even
+		// though A is open and has nine free seats. The one inside stays put.
+		const b = await spawn('4202')
+		expect(b).not.toBe(a)
+		expect(b).toBeGreaterThan(a)
+		// B's occupant cannot touch A's policy either.
+		expect((await setPolicy(a, '0', '4202')).status).toBe(403)
+
+		// Back to Default, A is the oldest open instance again and is reused.
+		expect((await setPolicy(a, '0', '4201')).status).toBe(200)
+		expect(await spawn('4203')).toBe(a)
+
+		// Avoid keeps A joinable but ranks it behind B, the only Default instance.
+		expect((await setPolicy(a, '1', '4201')).status).toBe(200)
+		expect(await policyOf(a)).toBe(1)
+		expect(await spawn('4204')).toBe(b)
+		// With B set to Ignore too, Avoid is still better than nothing: A is reused rather
+		// than a third instance opened.
+		expect((await setPolicy(b, '2', '4202')).status).toBe(200)
+		expect(await spawn('4205')).toBe(a)
+	})
+
 	test('POST /roominstance/:id/markprivate closes the instance, owner-only', async () => {
 		// Room 77 subroom 34 — its own instance, so marking it private can't affect the
 		// instances the other tests matchmake into.
@@ -3770,6 +3837,7 @@ describe('auth-gated endpoints', () => {
 			'PUT /player/photonregionpings',
 			'PUT /player/statusvisibility',
 			'PUT /roominstance/{id}/inprogress',
+			'PUT /roominstance/{id}/matchpolicy',
 		])
 
 		// Every operation carries a summary — a path present but undescribed is not
