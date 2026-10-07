@@ -4063,9 +4063,11 @@ const app = new Hono<App>()
 	// body is a JSON ARRAY of the entries to change, keyed by (Permission, Role): `Override`
 	// is the client's checkbox, so true stores the entry for that pair and false clears it
 	// back to the default. The stored table then overwrites the matching defaults in
-	// `GET /photon_access_token`. Auth-gated (401) and creator-only (403), like the other
-	// subroom mutations. Answers an EMPTY 200 — the client fires this and re-reads nothing,
-	// so there is no envelope to match.
+	// `GET /photon_access_token`. Auth-gated (401) and gated to the room's MANAGERS — its
+	// creator or a co-owner (403), the same `canManageRoom` the other room-admin writes
+	// take; a creator-only check here locked out co-owners the client shows the screen to,
+	// and an owner whose room names them in `Roles` rather than `CreatorAccountId`. Answers
+	// an EMPTY 200 — the client fires this and re-reads nothing, so there is no envelope.
 	.put(
 		'/rooms/:roomId{[0-9]+}/subrooms/:subRoomId{[0-9]+}/permissions',
 		describeRoute({
@@ -4090,8 +4092,8 @@ const app = new Hono<App>()
 				'pair the defaults don’t carry (e.g. `CAN_INVITE`) is served too. The overrides apply',
 				'to the subroom the caller is standing in, resolved from presence.',
 				'',
-				'Creator-only — co-owners may build in a room but not decide what a role may do.',
-				'The response body is EMPTY: the client doesn’t read one.',
+				'Gated to the room’s managers — its creator or a co-owner (`canManageRoom`), as the',
+				'other room-admin writes are. The response body is EMPTY: the client doesn’t read one.',
 			].join('\n'),
 			security: AUTHED,
 			parameters: [roomIdParam, subRoomIdParam],
@@ -4113,7 +4115,7 @@ const app = new Hono<App>()
 			// Scoped through the room so a subroom id from another room can't be written.
 			const room = await getRoomById(c.env.DB, roomId)
 			if (!room || !findSubRoom(room, subRoomId)) return c.notFound()
-			if (room.CreatorAccountId !== accountId) return c.body(null, 403)
+			if (!canManageRoom(room, accountId)) return c.body(null, 403)
 
 			const permissions = parseRoomPermissions(await c.req.json().catch(() => null))
 			await setSubRoomPermissions(c.env.DB, subRoomId, permissions)

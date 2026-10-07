@@ -4818,19 +4818,24 @@ describe('rooms endpoints', () => {
 				.run()
 		}
 
-		it('is auth-gated and creator-only', async () => {
+		it('is auth-gated and open to the room’s managers only', async () => {
 			const body = [
 				{ Permission: 'CAN_SAVE_INVENTIONS', Role: 30, Override: false, Type: 0, Value: 'True' },
 			]
 			// No token → 401.
 			expect((await putPermissions('/rooms/2/subrooms/2/permissions', body)).status).toBe(401)
-			// A valid token that isn't the room's creator → 403.
+			// A valid token that isn't the room's creator or a co-owner → 403.
 			expect((await putPermissions('/rooms/2/subrooms/2/permissions', body, '999')).status).toBe(
 				403
 			)
-			// Not even a co-owner: account 2 holds Role 30 on the seeded rooms. Co-owners may
-			// build in a room but don't decide what a role may do.
-			expect((await putPermissions('/rooms/2/subrooms/2/permissions', body, '2')).status).toBe(403)
+			// A co-owner may: account 2 holds Role 30 on the seeded rooms. (This body clears a
+			// pair that was never stored, so it changes nothing.)
+			expect((await putPermissions('/rooms/2/subrooms/2/permissions', body, '2')).status).toBe(200)
+			// A Host (a lower tier) may not.
+			await setRoles()
+			expect((await putPermissions('/rooms/2/subrooms/2/permissions', body, '748')).status).toBe(
+				403
+			)
 			// Unknown room / unknown subroom → 404.
 			expect((await putPermissions('/rooms/99999/subrooms/2/permissions', body, '1')).status).toBe(
 				404
