@@ -2747,7 +2747,9 @@ export async function getSubRoomSaveById(
  * this permission overridden in this subroom?") plus a True/False picker for the value.
  * Unchecking it means "fall back to the default", so an entry arriving with
  * `Override: false` DELETES the stored row rather than storing anything. Every stored
- * entry is therefore an override, and reads always serve `Override: true`.
+ * entry is therefore an override and reads back `Override: true` at its own role; the
+ * `false` rows in a manager's token table are defaults the `rooms` worker fills in around
+ * them, never stored.
  */
 export interface RoomPermission {
 	Permission: string

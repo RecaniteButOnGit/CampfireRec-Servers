@@ -1023,7 +1023,12 @@ export const BakedUnityAssetBulkList = z.array(BakedUnityAssetBulkDto)
 
 /** One entry of the permission table the client applies when it spawns into a room. */
 export const RoomPermissionDto = z.object({
-	Override: z.boolean().describe('Always true on an entry that came from a subroom’s overrides'),
+	Override: z
+		.boolean()
+		.describe(
+			'True on an entry the room’s creator stored on the subroom at this role; false on a ' +
+				'default or inherited cell of a manager’s table. Always true on a non-manager’s rows'
+		),
 	Permission: z.string().describe('e.g. `CAN_USE_MAKER_PEN`, `CAN_SAVE_INVENTIONS`'),
 	Role: z.int().describe('The role tier the permission applies to (0 = everyone)'),
 	Type: z.int(),
@@ -1039,10 +1044,11 @@ export const RoomPermissionDto = z.object({
  * secret/algorithm we don't have, and our Photon setup accepts an empty token. The
  * global (Role 0) maker pen is granted only to the hardcoded dev accounts.
  *
- * `Permissions` is the default table with the overrides stored on the subroom the caller
- * is standing in merged over it (see
- * `PUT /rooms/{roomId}/subrooms/{subRoomId}/permissions`): an override replaces the
- * default with the same (`Permission`, `Role`), and one naming a new pair is appended.
+ * `Permissions` is built from the overrides stored on the subroom the caller is standing in
+ * (see `PUT /rooms/{roomId}/subrooms/{subRoomId}/permissions`). A manager (creator or
+ * co-owner) gets a row per (`Permission`, `Role`) for every role tier — what the permissions
+ * screen reads back cell by cell; everyone else gets only the values that reach their own
+ * role, at Role 0 and at their role.
  */
 export const PhotonAccessTokenDto = z.object({
 	Permissions: z.array(RoomPermissionDto),

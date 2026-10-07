@@ -4456,24 +4456,24 @@ describe('rooms endpoints', () => {
 			const res = await SELF.fetch(`${ORIGIN}/photon_access_token`, {
 				headers: await bearer(String(accountId)),
 			})
-			return ((await res.json()) as { Permissions: Array<{ Role: number; Value: string }> })
-				.Permissions
+			return (
+				(await res.json()) as {
+					Permissions: Array<{ Role: number; Override: boolean; Value: string }>
+				}
+			).Permissions
 		}
-		// The creator's values are served at Role 0 and again at Role 255, all True; the
-		// co-owner's at 0 and 30. Both readings of the table land on the same values.
-		const creator = await tableFor(1)
-		expect(creator.length).toBe(12)
-		expect(creator.map((p) => p.Role)).toEqual([
-			...Array<number>(6).fill(0),
-			...Array<number>(6).fill(255),
-		])
-		expect(creator.every((p) => p.Value === 'True')).toBe(true)
-		const coOwner = await tableFor(2)
-		expect(coOwner.map((p) => p.Role)).toEqual([
-			...Array<number>(6).fill(0),
-			...Array<number>(6).fill(30),
-		])
-		expect(coOwner.every((p) => p.Value === 'True')).toBe(true)
+		// A manager gets the WHOLE table — a row per permission for every role tier, grouped
+		// by role — because the permissions screen reads each cell from the row at exactly
+		// that role. Nothing is stored on subroom 2 here, so every row is a default
+		// (`Override: false`): co-owner and creator rows True, the rest False.
+		const roles = [0, 10, 20, 30, 255]
+		for (const table of [await tableFor(1), await tableFor(2)]) {
+			expect(table.length).toBe(30)
+			expect(table.map((p) => p.Role)).toEqual(roles.flatMap((r) => Array<number>(6).fill(r)))
+			for (const p of table) {
+				expect(p).toMatchObject({ Override: false, Value: p.Role >= 30 ? 'True' : 'False' })
+			}
+		}
 		await env.DB.prepare('DELETE FROM presence WHERE account_id IN (1, 2)').run()
 	})
 
@@ -4795,12 +4795,22 @@ describe('rooms endpoints', () => {
 			return ((await res.json()) as { Permissions: Permission[] }).Permissions
 		}
 
-		/** The value a table serves for a permission (every row of a table agrees). */
-		const valueOf = (list: Permission[], permission: string) => {
-			const values = new Set(list.filter((p) => p.Permission === permission).map((p) => p.Value))
+		/**
+		 * The value a non-manager's table serves for a permission (every row of theirs
+		 * agrees), or the value a manager's table serves at one role (`at`): the cell the
+		 * permissions screen draws for that pair.
+		 */
+		const valueOf = (list: Permission[], permission: string, at?: number) => {
+			const rows = list.filter(
+				(p) => p.Permission === permission && (at === undefined || p.Role === at)
+			)
+			const values = new Set(rows.map((p) => p.Value))
 			expect(values.size).toBeLessThanOrEqual(1)
 			return [...values][0]
 		}
+		/** One cell of a manager's table, as the permissions screen reads it. */
+		const cell = (list: Permission[], permission: string, at: number) =>
+			list.find((p) => p.Permission === permission && p.Role === at)
 		// Room 2's seeded co-owner is account 2 — one of the hardcoded dev accounts, whose
 		// global maker pen no table takes away — so the role-holder cases use 748 (a Host)
 		// and 749 (a co-owner), given their roles here.
@@ -4917,13 +4927,69 @@ describe('rooms endpoints', () => {
 			const after = await permissionsIn(743, 2)
 			expect(after.find((p) => p.Permission === 'CAN_INVITE')).toBeUndefined()
 			expect(after.length).toBe(6)
-			// The co-owner gets it, at Role 0 and at 30, beside their default grants.
+			// The co-owner is a manager and reads the whole table: that entry at its own role
+			// with `Override: true`, inherited (`false`) by the creator above it, and absent
+			// below it where nothing reaches — a pair the defaults don't carry has no cell.
 			await setRoles()
 			const coOwner = await permissionsIn(749, 2)
-			expect(valueOf(coOwner, 'CAN_INVITE')).toBe('True')
+			expect(cell(coOwner, 'CAN_INVITE', 30)).toMatchObject({ Override: true, Value: 'True' })
+			expect(cell(coOwner, 'CAN_INVITE', 255)).toMatchObject({ Override: false, Value: 'True' })
 			expect(coOwner.filter((p) => p.Permission === 'CAN_INVITE').map((p) => p.Role)).toEqual([
-				0, 30,
+				30, 255,
 			])
+			// And the Role 0 grant stored above: its own cell overridden, every tier above
+			// inheriting it — except Role 30, where the envelope test stored its own entry.
+			expect(cell(coOwner, 'CAN_SPAWN_INVENTIONS', 0)).toMatchObject({ Override: true })
+			expect(cell(coOwner, 'CAN_SPAWN_INVENTIONS', 30)).toMatchObject({ Override: true })
+			for (const at of [10, 20, 255]) {
+				expect(cell(coOwner, 'CAN_SPAWN_INVENTIONS', at)).toMatchObject({
+					Override: false,
+					Value: 'True',
+				})
+			}
+		})
+
+		it('serves a manager every role’s row, so a Host grant reads back at Role 10', async () => {
+			// The creator switches a permission on for hosts. Served only at Role 0 and the
+			// creator's own role (as this once was), the Host cell had no row to read and the
+			// switch snapped back to the default every time.
+			await putPermissions(
+				'/rooms/2/subrooms/2/permissions',
+				[{ Permission: 'CAN_SELF_REVIVE', Role: 10, Override: true, Type: 0, Value: 'True' }],
+				'1'
+			)
+			const creator = await permissionsIn(1, 2)
+			expect(cell(creator, 'CAN_SELF_REVIVE', 10)).toEqual({
+				Override: true,
+				Permission: 'CAN_SELF_REVIVE',
+				Role: 10,
+				Type: 0,
+				Value: 'True',
+			})
+			// Nothing reaches "everyone", so there is no Role 0 cell; the tiers above inherit.
+			expect(cell(creator, 'CAN_SELF_REVIVE', 0)).toBeUndefined()
+			expect(cell(creator, 'CAN_SELF_REVIVE', 255)).toMatchObject({
+				Override: false,
+				Value: 'True',
+			})
+			// A default cell is NOT an override — otherwise un-checking it could never stick.
+			expect(cell(creator, 'CAN_USE_DELETE_ALL_BUTTON', 10)).toMatchObject({
+				Override: false,
+				Value: 'False',
+			})
+			// The host themself (not a manager) gets only their own rows, at 0 and 10.
+			const host = await permissionsIn(748, 2)
+			expect(host.filter((p) => p.Permission === 'CAN_SELF_REVIVE').map((p) => p.Role)).toEqual([
+				0, 10,
+			])
+			expect(valueOf(host, 'CAN_SELF_REVIVE')).toBe('True')
+			await putPermissions(
+				'/rooms/2/subrooms/2/permissions',
+				[{ Permission: 'CAN_SELF_REVIVE', Role: 10, Override: false, Type: 0, Value: 'True' }],
+				'1'
+			)
+			expect(cell(await permissionsIn(1, 2), 'CAN_SELF_REVIVE', 10)).toBeUndefined()
+			await env.DB.prepare('DELETE FROM presence WHERE account_id = 1').run()
 		})
 
 		it('a stored entry at the caller’s role beats one below it, and revokes a default', async () => {
@@ -4934,10 +5000,14 @@ describe('rooms endpoints', () => {
 				'1'
 			)
 			const coOwner = await permissionsIn(749, 2)
-			expect(valueOf(coOwner, 'CAN_USE_MAKER_PEN')).toBe('False')
-			expect(valueOf(coOwner, 'CAN_SPAWN_INVENTIONS')).toBe('True')
-			// The creator is above Role 30: that entry doesn't reach them.
-			expect(valueOf(await permissionsIn(1, 2), 'CAN_USE_MAKER_PEN')).toBe('True')
+			expect(cell(coOwner, 'CAN_USE_MAKER_PEN', 30)).toMatchObject({
+				Override: true,
+				Value: 'False',
+			})
+			expect(cell(coOwner, 'CAN_SPAWN_INVENTIONS', 30)).toMatchObject({ Value: 'True' })
+			// The revocation reaches the creator's cell too (the highest lower role with an
+			// entry) — but account 1 is a dev account, whose own-role maker pen nothing takes.
+			expect(valueOf(await permissionsIn(1, 2), 'CAN_USE_MAKER_PEN', 255)).toBe('True')
 
 			// A Host (Role 10) sits between: the Role 0 grant reaches them, the Role 30
 			// revocation does not, and their own default is no maker pen either way.
@@ -4962,7 +5032,8 @@ describe('rooms endpoints', () => {
 			)
 			expect(valueOf(await permissionsIn(748, 2), 'CAN_USE_DELETE_ALL_BUTTON')).toBe('True')
 			// Which reaches a co-owner (above 10) but not a visitor (below it).
-			expect(valueOf(await permissionsIn(749, 2), 'CAN_USE_DELETE_ALL_BUTTON')).toBe('True')
+			expect(valueOf(await permissionsIn(749, 2), 'CAN_USE_DELETE_ALL_BUTTON', 30)).toBe('True')
+			expect(valueOf(await permissionsIn(749, 2), 'CAN_USE_DELETE_ALL_BUTTON', 0)).toBe('False')
 			expect(valueOf(await permissionsIn(743, 2), 'CAN_USE_DELETE_ALL_BUTTON')).toBe('False')
 			await env.DB.prepare('DELETE FROM presence WHERE account_id = 1').run()
 		})
@@ -4997,9 +5068,13 @@ describe('rooms endpoints', () => {
 				).status
 			).toBe(200)
 
-			// The row is gone, and the co-owner has their default maker pen again.
+			// The row is gone, and the co-owner has their default maker pen again — a default
+			// cell, no longer an override.
 			expect(await stored()).toBe(0)
-			expect(valueOf(await permissionsIn(749, 2), 'CAN_USE_MAKER_PEN')).toBe('True')
+			expect(cell(await permissionsIn(749, 2), 'CAN_USE_MAKER_PEN', 30)).toMatchObject({
+				Override: false,
+				Value: 'True',
+			})
 
 			// Clearing a pair that was never overridden is a no-op, not an insert.
 			await putPermissions(
