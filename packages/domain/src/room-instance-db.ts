@@ -292,6 +292,54 @@ export async function setRoomInstancePrivate(
 }
 
 /**
+ * How matchmaking treats an instance (`matchmakingPolicy`). Set by whoever is standing
+ * in it via `PUT /roominstance/:id/matchpolicy` (the `match` worker).
+ */
+export const MatchmakingPolicy = {
+	/** Normal matchmaking — the instance accepts new players. */
+	Default: 0,
+	/** Deprioritise this instance; matchmaking sends players elsewhere when it can. */
+	Avoid: 1,
+	/** Exclude this instance from matchmaking entirely. */
+	Ignore: 2,
+} as const
+
+/** Whether a number names a {@link MatchmakingPolicy}. */
+export function isMatchmakingPolicy(value: number): boolean {
+	return Object.values(MatchmakingPolicy).includes(value as 0 | 1 | 2)
+}
+
+/**
+ * Set an instance's `matchmakingPolicy`, rewriting the JSON blob (the generated
+ * `matchmaking_policy` column follows it). Returns the updated DTO, or null when the
+ * instance doesn't exist.
+ *
+ * `Ignore` (2) takes the instance out of both reuse searches ({@link getJoinableInstance}
+ * and {@link getSharedPrivateInstance}) — nobody matchmakes into it again until the policy
+ * is lowered; `Avoid` (1) ranks it behind every `Default` instance. Direct joins (an
+ * invite, a room code, the owner picking a session) are not matchmaking and are unaffected,
+ * and everyone already inside stays.
+ */
+export async function setRoomInstanceMatchmakingPolicy(
+	db: D1Database,
+	id: number,
+	policy: number
+): Promise<RoomInstanceDto | null> {
+	const row = await db
+		.prepare('SELECT data FROM room_instance WHERE id = ?1')
+		.bind(id)
+		.first<{ data: string }>()
+	if (!row) return null
+	const stored = parse(row.data)
+	stored.matchmakingPolicy = policy
+	await db
+		.prepare('UPDATE room_instance SET data = ?1 WHERE id = ?2')
+		.bind(JSON.stringify(stored), id)
+		.run()
+	return toDto(stored)
+}
+
+/**
  * Recompute an instance's `isFull` flag from live match presence: full once the
  * number of players currently present in the instance reaches its `maxCapacity`
  * (capacity 0 — unset — is never full). Rewrites the JSON blob (the generated
@@ -379,9 +427,10 @@ export async function deleteEmptyRoomInstances(
 
 /**
  * The oldest joinable public instance of a room (not private, not full, joins
- * enabled, not already in progress) that is running `gameVersion`, or null when
- * there's none to join. Used by matchmaking to reuse an existing instance before
- * creating a new one.
+ * enabled, not already in progress, not set to `Ignore`) that is running `gameVersion`,
+ * or null when there's none to join. Used by matchmaking to reuse an existing instance
+ * before creating a new one. An instance set to `Avoid` is a candidate, but ranks behind
+ * every `Default` one however old it is (see {@link MatchmakingPolicy}).
  *
  * The build is part of the search, not a detail of it — which is why it's a required
  * argument rather than an optional filter a caller can forget. Two builds in one Photon
@@ -424,8 +473,9 @@ export async function getJoinableInstance(
 			`SELECT data FROM room_instance
 			 WHERE room_id = ?1 AND game_version = ?2
 			   AND is_private = 0 AND is_full = 0 AND join_disabled = 0
-			   AND is_in_progress = 0 ${filters.join(' ')}
-			 ORDER BY id LIMIT 1`
+			   AND is_in_progress = 0
+			   AND matchmaking_policy != ${MatchmakingPolicy.Ignore} ${filters.join(' ')}
+			 ORDER BY matchmaking_policy, id LIMIT 1`
 		)
 		.bind(...binds)
 		.first<{ data: string }>()
@@ -444,8 +494,9 @@ export async function getJoinableInstance(
  *
  * Scoped like the public search: by subroom (separate places) and by build (a session
  * belongs to one client version; another build's session reads as nothing to join and the
- * caller opens one beside it). Full instances are skipped — there is nothing to put a
- * player into — and `excludeInstanceId` drops the one the caller is already standing in,
+ * caller opens one beside it). Full instances and ones set to `Ignore` are skipped — there
+ * is nothing to put a player into, or its people asked that nobody be matched in — and
+ * `excludeInstanceId` drops the one the caller is already standing in,
  * because the client keys its room transition off a CHANGING instance id and hangs when
  * handed the same one back.
  *
@@ -472,7 +523,8 @@ export async function getSharedPrivateInstance(
 		.prepare(
 			`SELECT data FROM room_instance
 			 WHERE room_id = ?1 AND game_version = ?2 AND sub_room_id = ?3
-			   AND is_private = 1 AND is_full = 0 ${exclude}
+			   AND is_private = 1 AND is_full = 0
+			   AND matchmaking_policy != ${MatchmakingPolicy.Ignore} ${exclude}
 			 ORDER BY (
 			   SELECT COUNT(*) FROM presence
 			    WHERE presence.room_instance_id = room_instance.id AND presence.expires_at > ?4

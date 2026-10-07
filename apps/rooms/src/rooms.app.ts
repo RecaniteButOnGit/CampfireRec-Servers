@@ -40,6 +40,7 @@ import {
 	getRoomBans,
 	getRoomById,
 	getRoomByName,
+	getRoomExperience,
 	getRoomsByCreator,
 	getRoomsByIds,
 	getSimilarRooms,
@@ -50,6 +51,7 @@ import {
 	getSubRoomSaves,
 	getTrendingRooms,
 	getVisitedRooms,
+	incrementRoomExperience,
 	inviteRoomRole,
 	isMissingStudioAssetTable,
 	isPlayerBannedFromRoom,
@@ -64,6 +66,7 @@ import {
 	removeRoomRole,
 	Role,
 	roomNameRejection,
+	roomProgression,
 	roomRoles,
 	saveSubRoomData,
 	searchRooms,
@@ -72,6 +75,7 @@ import {
 	setRoomImage,
 	setRoomLeaderboard,
 	setRoomName,
+	setRoomProgression,
 	setRoomRole,
 	setSubRoomPermissions,
 	sha256HexToBase64,
@@ -112,6 +116,8 @@ import {
 	CuratedPlaylists,
 	DescriptionRequest,
 	DormRoomId,
+	ExperienceIncrementRequest,
+	ExperienceRequest,
 	FeaturedRoomGroupDto,
 	FORBIDDEN_RESPONSE,
 	form,
@@ -150,6 +156,7 @@ import {
 	RoomEnvelope,
 	RoomExperience,
 	RoomExperiencePlayer,
+	RoomExperiencePlayerEnvelope,
 	roomIdParam,
 	RoomLookup,
 	RoomPascalEnvelope,
@@ -1023,6 +1030,9 @@ function leaderboardEnvelope(c: Context<App>, error: string | null = null) {
 	return c.json({ Success: error === null, Error: error, error_id: null })
 }
 
+/** The same bare envelope for the room progression write (`POST /rooms/:id/experience`). */
+const experienceEnvelope = leaderboardEnvelope
+
 /** Rooms created/owned by the authed caller (shared by the createdby routes). */
 async function ownedRooms(c: Context<App>) {
 	const accountId = await authedAccountId(c)
@@ -1043,19 +1053,6 @@ async function ownedRoomsExcludingDorm(c: Context<App>) {
 
 /** Suggestions `/rooms/autocomplete_search` returns when the client names no `take`. */
 const DEFAULT_SUGGESTION_COUNT = 10
-
-/**
- * The XP settings every room reports (`GET /rooms/{roomId}/experience`). Constants because
- * nothing stores them per room and nothing enforces them: the `api` worker's progression
- * grants XP without a room-scoped daily cap, so these are what the client is told, not a
- * limit this server applies.
- *
- * Disabled, which is the honest answer here — no room awards XP. `DailyLimit` is kept at
- * the reference's number rather than zeroed: it is the cap that WOULD apply, and the client
- * reads both keys whatever `Enabled` says.
- */
-const ROOM_XP_ENABLED = false
-const ROOM_XP_DAILY_LIMIT = 1000
 
 const app = new Hono<App>()
 	.use(
@@ -4504,14 +4501,9 @@ const app = new Hono<App>()
 	)
 
 	// A room's XP settings — whether players earn experience there and how much of it counts
-	// toward their day. Fixed values, the same for every room: progression lives in the `api`
-	// worker and applies no per-room daily cap, so there is nothing room-scoped to read and
-	// nothing here enforces the number. It is what the client displays and meters against.
-	//
-	// A bare two-key object, no `{ success, error, value }` envelope, and no auth — nothing
-	// in the answer is per-player (`experience/player` below is the per-player half). The
-	// room isn't looked up either: the answer would be the same for a room that doesn't
-	// exist, so a lookup would only add a way to fail.
+	// toward their day. Stored on the room blob by the POST below; a room that was never
+	// configured is off with a 0 cap. A bare two-key object, no envelope, and no auth —
+	// nothing in the answer is per-player (`experience/player` below is that half).
 	.get(
 		'/rooms/:roomId{[0-9]+}/experience',
 		describeRoute({
@@ -4519,33 +4511,172 @@ const app = new Hono<App>()
 			summary: 'A room’s XP settings',
 			description: [
 				'Whether players earn XP in the room (`Enabled`) and how much of it counts toward a',
-				'day (`DailyLimit`), as a bare two-key object. Fixed values, and `Enabled` is FALSE —',
-				'no room awards XP here. Progression is the `api` worker’s and applies no per-room',
-				'cap, so nothing is stored per room and nothing enforces the limit; the client is what',
-				'reads it. No auth: the answer is the same for every caller and every room.',
+				'day (`DailyLimit`), as a bare two-key object — the `progressionEnabled` and',
+				'`progressionDailyLimit` the room’s owner set with `POST /rooms/{roomId}/experience`.',
+				'A room that was never configured is off with a 0 cap. No auth: the answer is the',
+				'same for every caller. 404 for a room that does not exist.',
 			].join(' '),
 			parameters: [roomIdParam],
-			responses: { 200: json(RoomExperience, 'The room’s XP settings — always the same') },
+			responses: {
+				200: json(RoomExperience, 'The room’s XP settings'),
+				404: { description: 'No such room' },
+			},
 		}),
-		(c) => c.json({ Enabled: ROOM_XP_ENABLED, DailyLimit: ROOM_XP_DAILY_LIMIT })
+		async (c) => {
+			const roomId = Number.parseInt(c.req.param('roomId'), 10)
+			const room = await getRoomById(c.env.DB, roomId)
+			if (!room) return c.body(null, 404)
+			return c.json(roomProgression(room))
+		}
 	)
 
-	// The caller's per-room experience/progression. Stub → empty list.
+	// Turn a room's progression on or off and set its daily cap. Auth-gated (401) and
+	// owner/co-owner-only (403), like the leaderboard write, and answers the same bare
+	// `{ Success, Error, error_id }` envelope. Body is the client's .NET-style form:
+	// `enabled=True&dailyLimit=1000`.
+	.post(
+		'/rooms/:roomId{[0-9]+}/experience',
+		describeRoute({
+			tags: ['Room settings'],
+			summary: 'Set a room’s XP settings',
+			description: [
+				'Sets `progressionEnabled` and `progressionDailyLimit` on the room, which',
+				'`GET /rooms/{roomId}/experience` reads back as `Enabled`/`DailyLimit`. Owner or',
+				'co-owner only (403 otherwise). `enabled` is the client’s `True`/`False` string —',
+				'anything but a `true` reads false; `dailyLimit` is an integer, and a missing or',
+				'non-numeric one is 0.',
+				'',
+				'Answers a bare `{ Success, Error, error_id }` — PascalCase with a lowercase',
+				'`error_id`, like the leaderboard write, carrying no entity. An unknown room is a',
+				'rejection envelope, not a 404.',
+			].join('\n'),
+			security: AUTHED,
+			parameters: [roomIdParam],
+			requestBody: form(ExperienceRequest, 'The room’s XP settings'),
+			responses: {
+				200: json(LeaderboardResultEnvelope, 'Stored, or a rejection with `Success: false`'),
+				401: UNAUTHORIZED_RESPONSE,
+				403: FORBIDDEN_RESPONSE,
+			},
+		}),
+		async (c) => {
+			const accountId = await authedAccountId(c)
+			if (accountId === null) return unauthorized(c)
+
+			const roomId = Number.parseInt(c.req.param('roomId'), 10)
+			const room = await getRoomById(c.env.DB, roomId)
+			if (!room) return experienceEnvelope(c, 'This room does not exist!')
+			if (!canManageRoom(room, accountId)) return c.body(null, 403)
+
+			const body = (await c.req.parseBody().catch(() => ({}))) as Record<string, unknown>
+			const enabled = typeof body.enabled === 'string' && body.enabled.toLowerCase() === 'true'
+			const dailyLimit =
+				typeof body.dailyLimit === 'string' ? Number.parseInt(body.dailyLimit, 10) : Number.NaN
+
+			await setRoomProgression(c.env.DB, roomId, enabled, Number.isNaN(dailyLimit) ? 0 : dailyLimit)
+			return experienceEnvelope(c)
+		}
+	)
+
+	// The caller's experience in this room: the `room_xp` row for (room, caller), with the
+	// room's switch echoed so the client knows whether what it earns here counts. A player
+	// with no row is 0 XP — reading never writes a row. `ConcurrencyCode` is a GUID minted
+	// per response; it only travels in requests and is not stored.
 	.get(
 		'/rooms/:roomId{[0-9]+}/experience/player',
 		describeRoute({
 			tags: ['Rooms'],
 			summary: 'The caller’s per-room experience',
 			description: [
-				'Per-room experience/progression for the calling player. Nothing tracks any yet, so',
-				'this is an empty list — which the client reads as “no progress in this room”, where',
-				'a 404 would stall the room load. No auth: the answer is the same for every caller',
-				'until something writes here.',
+				'The calling player’s XP in this room (`Experience`), the room’s `Enabled` echoed as',
+				'`RoomExperienceEnabled`, and a `ConcurrencyCode` GUID minted for this response (not',
+				'stored). A player who has earned nothing here reads as 0 — no row is written on a read.',
+				'Auth-gated (401); 404 for a room that does not exist.',
 			].join(' '),
+			security: AUTHED,
 			parameters: [roomIdParam],
-			responses: { 200: json(RoomExperiencePlayer, 'An empty list') },
+			responses: {
+				200: json(RoomExperiencePlayer, 'The caller’s experience in the room'),
+				401: UNAUTHORIZED_RESPONSE,
+				404: { description: 'No such room' },
+			},
 		}),
-		(c) => c.json([])
+		async (c) => {
+			const accountId = await authedAccountId(c)
+			if (accountId === null) return unauthorized(c)
+
+			const roomId = Number.parseInt(c.req.param('roomId'), 10)
+			const room = await getRoomById(c.env.DB, roomId)
+			if (!room) return c.body(null, 404)
+
+			return c.json({
+				RoomExperienceEnabled: roomProgression(room).Enabled,
+				Experience: await getRoomExperience(c.env.DB, roomId, accountId),
+				ConcurrencyCode: crypto.randomUUID(),
+			})
+		}
+	)
+
+	// Add to the caller's XP in this room. Auth-gated (401), 404 for no such room. Body is
+	// the client's form `increment=2500&concurrencyCode=<guid>`; the code is accepted and
+	// ignored (nothing is stored to check it against). Answers the read's DTO — with the
+	// NEW total and a fresh code — WRAPPED in the leaderboard write's `{ Value, Success,
+	// Error, error_id }` envelope; the read serves it bare. The room's switch and daily cap
+	// are not enforced here — the increment lands whatever they say.
+	.post(
+		'/rooms/:roomId{[0-9]+}/experience/player',
+		describeRoute({
+			tags: ['Rooms'],
+			summary: 'Add to the caller’s per-room experience',
+			description: [
+				'Adds `increment` to the calling player’s XP in this room, creating their `room_xp`',
+				'row on the first write, and answers the read’s DTO with the new total and a fresh',
+				'`ConcurrencyCode`, wrapped in `{ Value, Success, Error, error_id }` — the read serves',
+				'it bare. The posted `concurrencyCode` is accepted and ignored.',
+				'A missing or non-numeric `increment` adds 0. Neither the room’s `Enabled` nor its',
+				'`DailyLimit` is enforced. Auth-gated (401); 404 for a room that does not exist.',
+			].join(' '),
+			security: AUTHED,
+			parameters: [roomIdParam],
+			requestBody: form(ExperienceIncrementRequest, 'The XP to add'),
+			responses: {
+				200: json(
+					RoomExperiencePlayerEnvelope,
+					'The caller’s experience in the room, after the add'
+				),
+				401: UNAUTHORIZED_RESPONSE,
+				404: { description: 'No such room' },
+			},
+		}),
+		async (c) => {
+			const accountId = await authedAccountId(c)
+			if (accountId === null) return unauthorized(c)
+
+			const roomId = Number.parseInt(c.req.param('roomId'), 10)
+			const room = await getRoomById(c.env.DB, roomId)
+			if (!room) return c.body(null, 404)
+
+			const body = (await c.req.parseBody().catch(() => ({}))) as Record<string, unknown>
+			const increment =
+				typeof body.increment === 'string' ? Number.parseInt(body.increment, 10) : Number.NaN
+
+			const experience = await incrementRoomExperience(
+				c.env.DB,
+				roomId,
+				accountId,
+				Number.isNaN(increment) ? 0 : increment
+			)
+			return c.json({
+				Value: {
+					RoomExperienceEnabled: roomProgression(room).Enabled,
+					Experience: experience,
+					ConcurrencyCode: crypto.randomUUID(),
+				},
+				Success: true,
+				Error: null,
+				error_id: null,
+			})
+		}
 	)
 
 	// Single room by id. 404 when the room isn't in D1. A Studio save's

@@ -856,6 +856,45 @@ export async function setRoomDescription(
 		.run()
 }
 
+/** A room's progression settings, as `GET /rooms/:id/experience` serves them. */
+export interface RoomProgression {
+	Enabled: boolean
+	DailyLimit: number
+}
+
+/**
+ * Read a room's progression settings off its blob: `progressionEnabled` and
+ * `progressionDailyLimit`. A room that has never had them set reads as off with a 0 cap.
+ */
+export function roomProgression(room: Room): RoomProgression {
+	const limit = room.progressionDailyLimit
+	return {
+		Enabled: room.progressionEnabled === true,
+		DailyLimit: typeof limit === 'number' && Number.isFinite(limit) ? limit : 0,
+	}
+}
+
+/**
+ * Set a room's progression settings in place (the caller checks ownership first). These
+ * are `progressionEnabled` / `progressionDailyLimit` on the blob; the per-player XP is in
+ * `room_xp` (see room-xp-db.ts).
+ */
+export async function setRoomProgression(
+	db: D1Database,
+	roomId: number,
+	enabled: boolean,
+	dailyLimit: number
+): Promise<void> {
+	await db
+		.prepare(
+			`UPDATE room
+			 SET data = json_set(data, '$.progressionEnabled', json(?2), '$.progressionDailyLimit', ?3)
+			 WHERE room_id = ?1`
+		)
+		.bind(roomId, enabled ? 'true' : 'false', dailyLimit)
+		.run()
+}
+
 /** Set a room's Name in place (the caller checks ownership + name uniqueness first). */
 export async function setRoomName(db: D1Database, roomId: number, name: string): Promise<void> {
 	await db

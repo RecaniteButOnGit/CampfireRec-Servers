@@ -22,6 +22,7 @@ import {
 	ROOM_INSTANCE_SCHEMA_DDL,
 	ROOM_INVITE_SCHEMA_DDL,
 	ROOM_SCHEMA_DDL,
+	ROOM_XP_SCHEMA_DDL,
 	seedRoomWithSubRooms,
 	sha256HexToBase64,
 	STUDIO_UNITY_ASSET_SCHEMA_DDL,
@@ -132,6 +133,8 @@ beforeAll(async () => {
 	for (const stmt of ROOM_INVITE_SCHEMA_DDL) await env.DB.prepare(stmt).run()
 	// Baked unity asset bundles — what `POST /unity_assets/baked/bulk` serves.
 	for (const stmt of UNITY_ASSET_SCHEMA_DDL) await env.DB.prepare(stmt).run()
+	// Per-room XP — what `GET /rooms/:id/experience/player` reads.
+	for (const stmt of ROOM_XP_SCHEMA_DDL) await env.DB.prepare(stmt).run()
 	// Seed each room and split its subrooms into the subroom table (mirrors 0007's backfill).
 	for (const r of importRooms) await seedRoomWithSubRooms(env.DB, r as Record<string, unknown>)
 
@@ -199,14 +202,6 @@ describe('rooms endpoints', () => {
 			error_id: null,
 			error: null,
 		})
-	})
-
-	// Stub. Registered (not 404) matters more than the body: the client asks for this on
-	// room entry, and an unregistered path stalls the load rather than erroring visibly.
-	it('GET /rooms/:id/experience/player returns [] for any room', async () => {
-		const res = await SELF.fetch(`${ORIGIN}/rooms/92/experience/player`)
-		expect(res.status).toBe(200)
-		expect(await res.json()).toEqual([])
 	})
 
 	// Stub, same reasoning: the profile asks for a showcase for any player, and an
@@ -548,25 +543,16 @@ describe('rooms endpoints', () => {
 		await env.DB.prepare('DELETE FROM room WHERE room_id BETWEEN 30401 AND 30407').run()
 	})
 
-	it('GET /rooms/:roomId/experience serves the fixed XP settings, no auth', async () => {
+	it('GET /rooms/:roomId/experience serves the room’s stored XP settings, no auth', async () => {
 		const res = await SELF.fetch(`${ORIGIN}/rooms/2/experience`)
 		expect(res.status).toBe(200)
-		// A bare two-key object — no `{ success, error, value }` envelope around it. Disabled:
-		// no room awards XP here, and DailyLimit is the cap that would apply if one did.
-		expect(await res.json()).toEqual({ Enabled: false, DailyLimit: 1000 })
+		// A bare two-key object — no `{ success, error, value }` envelope around it. A room
+		// nobody has configured is off with a 0 cap.
+		expect(await res.json()).toEqual({ Enabled: false, DailyLimit: 0 })
 
-		// Nothing is stored per room, so every room answers the same — including one that
-		// doesn't exist, which is never looked up.
-		expect(await (await SELF.fetch(`${ORIGIN}/rooms/77/experience`)).json()).toEqual({
-			Enabled: false,
-			DailyLimit: 1000,
-		})
-		expect(await (await SELF.fetch(`${ORIGIN}/rooms/99999/experience`)).json()).toEqual({
-			Enabled: false,
-			DailyLimit: 1000,
-		})
-
-		// The id is digits-only, like the other room-scoped routes.
+		// A room that doesn't exist is a 404, and the id is digits-only like the other
+		// room-scoped routes.
+		expect((await SELF.fetch(`${ORIGIN}/rooms/99999/experience`)).status).toBe(404)
 		expect((await SELF.fetch(`${ORIGIN}/rooms/abc/experience`)).status).toBe(404)
 	})
 
@@ -2719,6 +2705,110 @@ describe('rooms endpoints', () => {
 
 		// Clean up the surviving rows so this test leaves no trace.
 		await env.DB.prepare('DELETE FROM room_leaderboard WHERE room_id IN (2, 3)').run()
+	})
+
+	it('POST /rooms/:id/experience sets a room’s progression, which the GETs read back', async () => {
+		// RecCenter (room 2) is owned by account 1, with account 2 as co-owner.
+		const getXp = async (roomId: number, sub?: string) =>
+			SELF.fetch(`${ORIGIN}/rooms/${roomId}/experience/player`, {
+				headers: sub ? await bearer(sub) : {},
+			})
+		// The real client body, verbatim.
+		const body = { enabled: 'True', dailyLimit: '1000' }
+		// The same bare envelope as the leaderboard write.
+		const OK = { Success: true, Error: null, error_id: null }
+
+		// No token → 401; a valid token but no role on the room → 403.
+		expect((await postForm('/rooms/2/experience', body)).status).toBe(401)
+		expect((await postForm('/rooms/2/experience', body, '999')).status).toBe(403)
+		// Unknown room → failure envelope, not a 404.
+		expect(await (await postForm('/rooms/99999/experience', body, '1')).json()).toEqual({
+			Success: false,
+			Error: 'This room does not exist!',
+			error_id: null,
+		})
+
+		// The owner turns it on, and the room-level GET reads it back as a bare pair.
+		const ok = await postForm('/rooms/2/experience', body, '1')
+		expect(ok.status).toBe(200)
+		expect(await ok.json()).toEqual(OK)
+		expect(await (await SELF.fetch(`${ORIGIN}/rooms/2/experience`)).json()).toEqual({
+			Enabled: true,
+			DailyLimit: 1000,
+		})
+		// It lands on the room blob under the names the room DTO carries.
+		const room = (await (await SELF.fetch(`${ORIGIN}/rooms/2`)).json()) as Record<string, unknown>
+		expect(room).toMatchObject({ progressionEnabled: true, progressionDailyLimit: 1000 })
+
+		// The per-player read is auth-gated, 404 for no such room, and echoes the switch. A
+		// player with no XP recorded here is 0 — and nothing is written by reading. The
+		// `ConcurrencyCode` is a GUID minted per response, not stored.
+		expect((await getXp(2)).status).toBe(401)
+		expect((await getXp(99999, '999')).status).toBe(404)
+		const fresh = (await (await getXp(2, '999')).json()) as {
+			RoomExperienceEnabled: boolean
+			Experience: number
+			ConcurrencyCode: string
+		}
+		expect(fresh).toMatchObject({ RoomExperienceEnabled: true, Experience: 0 })
+		expect(fresh.ConcurrencyCode).toMatch(/^[0-9a-f-]{36}$/)
+		expect(
+			await env.DB.prepare('SELECT 1 FROM room_xp WHERE room_id = 2 AND player_id = 999').first()
+		).toBeNull()
+
+		// The increment write creates the row on first use and answers the read's DTO with the
+		// new total, wrapped in the leaderboard write's envelope — the read serves it bare. The
+		// real client body, verbatim; the code is accepted and ignored.
+		const add = { increment: '2500', concurrencyCode: '79e10fb4-1956-4251-b482-9f21d76c3776' }
+		const addXp = async (roomId: number, fields: Record<string, string>, sub: string) =>
+			(await (await postForm(`/rooms/${roomId}/experience/player`, fields, sub)).json()) as {
+				Value: { RoomExperienceEnabled: boolean; Experience: number; ConcurrencyCode: string }
+				Success: boolean
+				Error: string | null
+				error_id: string | null
+			}
+		expect((await postForm('/rooms/2/experience/player', add)).status).toBe(401)
+		expect((await postForm('/rooms/99999/experience/player', add, '999')).status).toBe(404)
+		const added = await addXp(2, add, '999')
+		expect(added).toMatchObject({
+			Value: { RoomExperienceEnabled: true, Experience: 2500 },
+			Success: true,
+			Error: null,
+			error_id: null,
+		})
+		expect(added.Value.ConcurrencyCode).toMatch(/^[0-9a-f-]{36}$/)
+		// It accumulates, per (room, player); the read serves the running total.
+		expect((await addXp(2, { increment: '250' }, '999')).Value.Experience).toBe(2750)
+		expect((await addXp(3, { increment: '1' }, '999')).Value.Experience).toBe(1)
+		expect(await (await getXp(2, '999')).json()).toMatchObject({
+			RoomExperienceEnabled: true,
+			Experience: 2750,
+		})
+		// A missing increment adds nothing.
+		expect((await addXp(2, {}, '999')).Value.Experience).toBe(2750)
+
+		// A stored row serves its XP.
+		await env.DB.prepare('UPDATE room_xp SET xp = 1250 WHERE room_id = 2 AND player_id = 999').run()
+		expect(await (await getXp(2, '999')).json()).toMatchObject({
+			RoomExperienceEnabled: true,
+			Experience: 1250,
+		})
+
+		// The co-owner may turn it off; `enabled` parses case-insensitively, and a missing
+		// or non-numeric `dailyLimit` is 0. Off is echoed to the per-player read.
+		expect(await (await postForm('/rooms/2/experience', { enabled: 'false' }, '2')).json()).toEqual(
+			OK
+		)
+		expect(await (await SELF.fetch(`${ORIGIN}/rooms/2/experience`)).json()).toEqual({
+			Enabled: false,
+			DailyLimit: 0,
+		})
+		expect(await (await getXp(2, '999')).json()).toMatchObject({
+			RoomExperienceEnabled: false,
+			Experience: 1250,
+		})
+
+		await env.DB.prepare('DELETE FROM room_xp WHERE player_id = 999').run()
 	})
 
 	it('POST /rooms/:id/bans takes a reason and a duration', async () => {
@@ -5841,6 +5931,8 @@ describe('rooms endpoints', () => {
 			'POST /rooms/bulk',
 			'POST /rooms/{roomId}/bans',
 			'POST /rooms/{roomId}/clone',
+			'POST /rooms/{roomId}/experience',
+			'POST /rooms/{roomId}/experience/player',
 			'POST /rooms/{roomId}/leaderboards/{leaderboardId}',
 			'POST /rooms/{roomId}/subrooms',
 			'POST /rooms/{roomId}/subrooms/{subRoomId}/clone',

@@ -395,15 +395,32 @@ export const SearchSuggestions = z
 
 /**
  * `GET /rooms/{roomId}/experience` — whether players earn XP in a room and how much of it
- * counts in a day. A bare two-key object, no envelope.
- *
- * Nothing here meters per-room XP: progression is the `api` worker's, and it applies no
- * room-scoped daily cap. So this is the config the client reads, not a limit this server
- * enforces — the same answer for every room.
+ * counts in a day. A bare two-key object, no envelope. Read off the room blob
+ * (`progressionEnabled` / `progressionDailyLimit`), which `POST /rooms/{roomId}/experience`
+ * sets; a room that has never been configured is off with a 0 cap.
  */
 export const RoomExperience = z.object({
-	Enabled: z.boolean().describe('Whether XP is earned in the room at all. Always false here'),
+	Enabled: z.boolean().describe('Whether XP is earned in the room at all'),
 	DailyLimit: z.int().describe('XP from this room that counts toward a player’s day'),
+})
+
+/** `POST /rooms/{roomId}/experience/player` — add XP to the caller’s total in the room. */
+export const ExperienceIncrementRequest = z.object({
+	increment: z.string().describe('XP to add, as an integer; a missing or non-numeric one adds 0'),
+	concurrencyCode: z
+		.string()
+		.optional()
+		.describe(
+			'The GUID from the last read. Accepted and ignored — nothing is stored to check it against'
+		),
+})
+
+/** `POST /rooms/{roomId}/experience` — the client’s .NET-style form body. */
+export const ExperienceRequest = z.object({
+	enabled: z.string().describe('`True` / `False`'),
+	dailyLimit: z
+		.string()
+		.describe('XP from this room that counts toward a player’s day, as an integer'),
 })
 
 /**
@@ -1074,12 +1091,27 @@ export const PlayerDataRequest = z.object({
 })
 
 /**
- * `GET /rooms/{roomId}/experience/player` — the caller's per-room experience/progression
- * entries. Stubbed empty; the element shape is unknown until something stores one.
+ * `GET /rooms/{roomId}/experience/player` — the caller's experience in this room, from the
+ * `room_xp` row for (room, caller). No row is 0 XP. `ConcurrencyCode` is minted per
+ * response, not stored.
  */
-export const RoomExperiencePlayer = z
-	.array(z.unknown())
-	.describe('Always empty — no per-room experience is tracked')
+export const RoomExperiencePlayer = z.object({
+	RoomExperienceEnabled: z.boolean().describe('The room’s `Enabled`, echoed'),
+	Experience: z.int().describe('XP the caller has earned in this room; 0 when none is recorded'),
+	ConcurrencyCode: z.string().describe('A GUID minted for this response; not stored'),
+})
+
+/**
+ * What `POST /rooms/{roomId}/experience/player` answers: the read’s DTO wrapped in the
+ * leaderboard write’s bare envelope — PascalCase `Success`/`Error` with a lowercase
+ * `error_id` — with `Value` first. The read serves the DTO BARE; only the write wraps it.
+ */
+export const RoomExperiencePlayerEnvelope = z.object({
+	Value: RoomExperiencePlayer.describe('The caller’s experience in the room, after the add'),
+	Success: z.boolean(),
+	Error: z.string().nullable().describe('Null on success'),
+	error_id: z.string().nullable().describe('Null. Lowercase, unlike its siblings'),
+})
 
 /**
  * `GET /showcase/{playerId}` — the rooms a player showcases on their profile. Stubbed
