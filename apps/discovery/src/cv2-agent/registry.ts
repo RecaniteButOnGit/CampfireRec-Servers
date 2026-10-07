@@ -1,5 +1,6 @@
 import protobuf from 'protobufjs/light.js'
 
+import { AGENT_LIMITS } from './agent-config'
 import { CONSTRUCTION_PROVENANCE, Cv2ChipFactory } from './construction'
 import { nodeType, root, stable } from './protobuf'
 import published from './published-catalog.json'
@@ -77,6 +78,7 @@ export class Cv2DefinitionRegistry {
 	private readonly chips = new Map<string, Cv2Definition>()
 	private readonly names = new Map<string, Set<string>>()
 	private readonly searchable = new Map<string, string>()
+	private readonly searchNames = new Map<string, string[]>()
 	private readonly variants = new Map<string, RecordData[]>()
 	readonly info: Readonly<RecordData>
 	readonly construction = new Cv2ChipFactory((name) => {
@@ -381,6 +383,7 @@ export class Cv2DefinitionRegistry {
 		freeze(value)
 		this.definitions.set(value.id, value)
 		this.searchable.set(value.id, normalize(stable(value)))
+		this.searchNames.set(value.id, [value.name, ...aliases].map(normalize))
 		for (const name of [value.id, value.name, ...aliases]) {
 			const matches = this.names.get(key(name)) ?? new Set<string>()
 			matches.add(value.id)
@@ -435,10 +438,10 @@ export class Cv2DefinitionRegistry {
 			note: 'Observed source-save configurations and arity only. Not defaults or templates for instantiation; event/object/variable references are source-save scoped.',
 		}
 	}
-	searchChips(query: string, offset = 0, limit = 20) {
+	searchChips(query: string, offset = 0, limit: number = AGENT_LIMITS.searchResults) {
 		return this.searchDefinitions(query, 'chips', offset, limit)
 	}
-	searchTypes(query: string, offset = 0, limit = 20) {
+	searchTypes(query: string, offset = 0, limit: number = AGENT_LIMITS.searchResults) {
 		return this.searchDefinitions(query, 'types', offset, limit)
 	}
 	private page(offset: number, limit: number) {
@@ -455,35 +458,109 @@ export class Cv2DefinitionRegistry {
 		query: string,
 		category: DefinitionCategory | 'all' = 'all',
 		offset = 0,
-		limit = 20
+		limit: number = AGENT_LIMITS.searchResults
 	) {
 		this.page(offset, limit)
 		if (!query.trim() || query.length > 200)
 			throw new Error('Registry query must contain 1–200 characters; use * to list definitions')
 		const tokens = query === '*' ? [] : normalize(query).split(' ').filter(Boolean)
 		if (query !== '*' && !tokens.length) throw new Error('Registry query needs a word or *')
-		const matches = [...this.definitions.values()]
-			.filter(
-				(value) =>
-					(category === 'all' || value.category === category) &&
-					tokens.every((token) => this.searchable.get(value.id)!.includes(token))
+		const phrase = normalize(query)
+		const score = (value: Cv2Definition) => {
+			const names = this.searchNames.get(value.id)!
+			const name = normalize(value.name)
+			const ports = normalize(stable([value.inputs ?? [], value.outputs ?? []]))
+			const description = normalize(
+				typeof value.description === 'string' ? value.description : stable(value.description ?? '')
 			)
-			.sort((a, b) => compare(a.name, b.name) || compare(a.id, b.id))
+			return (
+				(names.includes(phrase) ? 1000 : 0) +
+				(names.some((name) => name.startsWith(phrase)) ? 200 : 0) +
+				(tokens.every((token) => name.includes(token)) ? 100 : 0) +
+				tokens.reduce(
+					(n, token) =>
+						n +
+						(name.split(' ').includes(token) ? 30 : name.includes(token) ? 20 : 0) +
+						(ports.includes(token) ? 6 : 0) +
+						(description.includes(token) ? 3 : 0),
+					0
+				) +
+				(value.availability?.inPublishedPalette ? 2 : 0)
+			)
+		}
+		const matches = [...this.definitions.values()].filter(
+			(value) =>
+				(category === 'all' || value.category === category) &&
+				tokens.every((token) => this.searchable.get(value.id)!.includes(token))
+		)
+		const scores = new Map(matches.map((value) => [value.id, tokens.length ? score(value) : 0]))
+		matches.sort(
+			(a, b) =>
+				scores.get(b.id)! - scores.get(a.id)! || compare(a.name, b.name) || compare(a.id, b.id)
+		)
 		return {
 			total: matches.length,
 			offset,
 			nextOffset: offset + limit < matches.length ? offset + limit : null,
-			definitions: matches.slice(offset, offset + limit).map((value) => ({
-				id: value.id,
-				name: value.name,
-				category: value.category,
-				scope: value.scope,
-				typeId: value.typeId ?? null,
-				description: typeof value.description === 'string' ? value.description.slice(0, 500) : null,
-				availability: value.availability ?? null,
-				completeness: value.completeness,
-			})),
+			definitions: matches.slice(offset, offset + limit).map((value) => this.preview(value)),
+			getDetails: 'Use get_definition with an id, or the specific chip/type/event get tool.',
 		}
+	}
+	private preview(value: Cv2Definition) {
+		const types = (ports: RecordData[]) =>
+			[
+				...new Set<string>(
+					ports.map((port) =>
+						(typeof port.type === 'string'
+							? port.type
+							: (port.serializedType?.kind ?? port.type?.kind ?? '?')
+						).slice(0, 80)
+					)
+				),
+			].slice(0, 4)
+		return {
+			id: value.id,
+			name: value.name.slice(0, 100),
+			category: value.category,
+			scope: value.scope,
+			...(value.typeId ? { typeId: value.typeId } : {}),
+			...(value.inputs ? { inputs: types(value.inputs) } : {}),
+			...(value.outputs ? { outputs: types(value.outputs) } : {}),
+			...(value.availability && !value.availability.inPublishedPalette ? { hidden: true } : {}),
+		}
+	}
+	/** Suggestions are candidates, never an implicit correction or authorization. */
+	closestMatches(query: string, category: DefinitionCategory | 'all' = 'all') {
+		const folded = (text: string) => normalize(text).replace(/\s+/g, '')
+		const requested = folded(query)
+		if (!requested) return []
+		const pairs = (text: string) =>
+			new Set(Array.from({ length: Math.max(0, text.length - 1) }, (_, i) => text.slice(i, i + 2)))
+		const wanted = pairs(requested)
+		const score = (value: Cv2Definition) =>
+			Math.max(
+				...this.searchNames.get(value.id)!.map((name) => {
+					const candidate = folded(name),
+						found = pairs(candidate)
+					return candidate === requested
+						? 3
+						: (candidate.startsWith(requested) || requested.startsWith(candidate) ? 1 : 0) +
+								(2 * [...wanted].filter((pair) => found.has(pair)).length) /
+									Math.max(1, wanted.size + found.size)
+				})
+			)
+		return [...this.definitions.values()]
+			.filter((value) => category === 'all' || value.category === category)
+			.map((value) => ({ value, score: score(value) }))
+			.filter((item) => item.score >= 0.3)
+			.sort(
+				(a, b) =>
+					b.score - a.score ||
+					compare(a.value.name, b.value.name) ||
+					compare(a.value.id, b.value.id)
+			)
+			.slice(0, AGENT_LIMITS.lookupSuggestions)
+			.map(({ value }) => this.preview(value))
 	}
 }
 

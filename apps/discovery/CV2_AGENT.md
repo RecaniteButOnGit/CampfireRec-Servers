@@ -59,7 +59,7 @@ Chip configuration variants and opaque legacy port metadata remain fixed to thei
 verified saved representation; another chip's protobuf payload cannot be substituted.
 Finalization requires validation and diff inspection after the last patch.
 The model uses a tool loop with encrypted continuity and automatic Responses
-compaction at 24,000 tokens. The decoded room is never put into the model context.
+compaction at 16,000 tokens. The decoded room is never put into the model context.
 
 ## Global CV2 definition registry
 
@@ -90,8 +90,14 @@ explicitly unknown.
 
 Registry methods include `getChip(idOrName)`, `searchChips`, `getType`, `searchTypes`,
 `getEvent`, `getDefinition`, `searchDefinitions` and `getChipVariants`. Searches
-support category filters, deterministic pagination and `*` enumeration, with at
-most 50 results per page. Agent tools expose these methods plus `get_registry_info`.
+support category filters, ranked deterministic pagination and `*` enumeration.
+Search previews contain IDs, names, scope and short input/output type lists;
+they omit schemas, construction payloads and detailed metadata. Searches default
+to eight candidates. Internal registry calls allow explicit pages of 50; model-facing
+tools allow at most ten and bound previews to 1,400 estimated text tokens.
+Document searches combine at most three short excerpts with five registry candidates.
+`read_cv2_doc` retrieves a selected document section. Agent tools expose these
+methods plus `get_registry_info`.
 `get_chip_definition` returns global knowledge and separate target-room instances;
 it accepts public names, definition IDs, standard GUID text or serialized hex IDs.
 Agents are instructed to search globally before declaring a chip unavailable.
@@ -160,14 +166,38 @@ Railway logs use `[CV2 Agent][<run>]` for tool activity, files, compiler attempt
 validation errors, token usage, latency, conflict checks, duration and final save
 ID. They do not print credentials, upstream error bodies or model reasoning.
 Workspace objects are run-local and released when execution returns; run status
-records remain for polling. Runs are bounded to 60 model calls, 250,000 cumulative
-tokens, five failed validation attempts and a 15-minute deadline. The discovery
+records remain for polling. `agent-config.ts` centralizes independent limits:
+30 model calls (including standalone compaction), 60 tool calls, 15 uncached registry
+searches, 60,000 generated output tokens, 48,000 live-context tokens, five failed
+validation attempts and the existing 15-minute deadline. Repeated input tokens
+are measured for usage reporting and never charged against generated-work limits.
+Text/tool/context estimates are explicitly labeled; actual input/output/cache usage
+comes from the API. Ciphertext size is not used as a rendered token estimate.
+The discovery
 scheduler recovers queued runs and expires interrupted runs. Long model runs are
 intended for Railway; standalone Worker `waitUntil` lifetime limits still apply.
 
 Apply `discovery/migrations/0004_cv2_agent.sql` before enabling the command.
 Railway's existing startup migration runner applies it automatically. No new
 secrets are required beyond the existing `OPENAIKEY` and `RRTOKEN`.
+
+`retrieval.ts` keeps normalized search caches, authoritative fetched definitions,
+graph revisions, selected-definition references, compiler errors and diff summaries
+in run state. Repeated searches return compact cached candidate references; repeated
+definition gets reuse canonical IDs across aliases and return a cached handle.
+Consumed search previews become short receipts on later requests. Old definition
+payloads become references after four turns. `list_loaded_definitions` lists handles;
+`read_cached_result` reloads authoritative text in character pages after compaction.
+Oversized tool results are cached intact and returned as bounded pages with a
+continuation offset, rather than silently truncated. A paginated diff must be read
+completely before finalization; paging preserves the existing diff-review gate.
+The run cache itself is bounded.
+Server compaction retains encrypted continuity. At 28,000 estimated live text tokens,
+standalone compaction is a fallback; its entire canonical returned window is retained.
+Edits remain in the workspace, and compiler errors/diff state accompany later calls.
+Each run logs a usage summary on success or failure, including cache hits, input,
+cached input, generated output, estimated tool payloads, peak context, model/tool
+calls, compiler attempts and duration. Hidden reasoning content is never logged.
 
 ## Schema provenance and tests
 
@@ -198,6 +228,11 @@ Model calls in automated tests are mocked; no paid live OpenAI run is performed.
 catalog, GUID byte ordering, typed/generic ports, schema enums/configuration,
 pagination, scoped observations, source hashes, cache sharing, empty-room tools and
 preservation of the compiler's no-invention rule.
+`apps/railway/src/cv2-context.test.ts` covers bounded/ranked searches, normalized
+cache hits, canonical definition deduplication, compact lookup suggestions, lossless
+large-result pagination, a run with 480,000 repeated input tokens, compiler repair
+and finalization across compaction, and independent runaway limits. These are mocked
+model workflows, not live VR gameplay or paid OpenAI tests.
 
 The Responses tool loop and automatic compaction follow OpenAI's
 [function calling](https://developers.openai.com/api/docs/guides/function-calling)

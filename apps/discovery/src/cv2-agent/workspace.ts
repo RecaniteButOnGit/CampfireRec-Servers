@@ -1,3 +1,4 @@
+import { AGENT_LIMITS } from './agent-config'
 import { LANGUAGE, parse, serialize } from './language'
 import {
 	checkRecord,
@@ -427,27 +428,46 @@ export class RoomWorkspace {
 		if (!type) throw new Error(`Unknown CV2 or protobuf type ${name}`)
 		return type
 	}
-	docs(query: string) {
-		const docs = {
+	private documents(): Record<string, string> {
+		return {
 			'/room/docs/language.md': LANGUAGE,
 			'/room/docs/types.md': stable(root.lookupEnum('circuits.TypeKind').values),
 			'/room/docs/chips.md':
 				'Global definitions are available even in empty rooms: search_chips, search_types, search_definitions, get_chip_definition, get_type_definition, get_event_definition, get_registry_info and get_chip_variants. Use get_chip_construction and create_chip: the generic registry factory constructs published chip GUIDs from descriptor ports and protobuf wire defaults. No recipe or target-room chip template is required. Reference layouts only enrich expansion indices. Generic bindings need concrete connections. typeId is the serialized byte hex used in scripts. Scoped event/object bindings need explicit valid metadata. Unknown configured/expanded ports and opaque byte encodings cannot be invented.',
 		}
-		const local = Object.entries(docs)
-			.flatMap(([path, text]) =>
-				text
-					.split('\n')
-					.flatMap((line, index) =>
-						line.toLowerCase().includes(query.toLowerCase())
-							? [{ path, line: index + 1, text: line }]
-							: []
-					)
-			)
-			.slice(0, 40)
+	}
+	docs(query: string) {
+		const local = Object.entries(this.documents()).flatMap(([path, text]) =>
+			text
+				.split('\n')
+				.flatMap((line, index) =>
+					line.toLowerCase().includes(query.toLowerCase())
+						? [{ path, line: index + 1, text: line.slice(0, 160) }]
+						: []
+				)
+		)
 		return {
-			documentation: local,
-			globalDefinitions: this.registry.searchDefinitions(query, 'all', 0, 20),
+			documentation: local.slice(0, 3),
+			documentMatches: local.length,
+			globalDefinitions: this.registry.searchDefinitions(
+				query,
+				'all',
+				0,
+				AGENT_LIMITS.searchResults - 3
+			),
+			getDetails:
+				'Use read_cv2_doc(path, start, count) for documentation or get_definition(id) for a candidate.',
+		}
+	}
+	readDoc(path: string, start: number, count: number) {
+		const doc = this.documents()[path]
+		if (doc === undefined) throw new Error(`Unknown CV2 document ${path}`)
+		const lines = doc.split('\n')
+		return {
+			path,
+			start,
+			totalLines: lines.length,
+			text: lines.slice(start - 1, start - 1 + count).join('\n'),
 		}
 	}
 
