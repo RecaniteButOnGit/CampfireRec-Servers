@@ -2302,6 +2302,24 @@ describe('econ endpoints', () => {
 			expect([await tokens(1), await tokens(7402)]).toEqual([1555, 100])
 			expect(await drainFrames()).toEqual([])
 
+			// A co-owner (account 2 on room 2511) takes from the shop for free too. The client
+			// shows them the offer at no cost and posts `RequestedPrice=0` — which a stranger
+			// is refused for above — so their price is not checked: 0 and the real one both go
+			// through, nobody is charged, the owner is not paid, and no frame is sent.
+			await setTokens(2, 50)
+			const coOwner = (await (await purchase('2', offerId, 444, 0)).json()) as typeof gratis
+			expect(coOwner.Value.CurrencyBalanceResponse.Balance).toBe(444)
+			expect(coOwner.Value.TokenBalanceResponse.Balance).toBe(50)
+			const coOwnerAgain = (await (await purchase('2', offerId, 444, 555)).json()) as typeof gratis
+			expect(coOwnerAgain.Value.CurrencyBalanceResponse.Balance).toBe(888)
+			expect(coOwnerAgain.Value.TokenBalanceResponse.Balance).toBe(50)
+			// The amount still has to be the offer's, manager or not.
+			expect(await (await purchase('2', offerId, 1, 0)).json()).toEqual(
+				refused('Requested amount does not match')
+			)
+			expect([await tokens(1), await tokens(2)]).toEqual([1555, 50])
+			expect(await drainFrames()).toEqual([])
+
 			await env.DB.prepare('DELETE FROM room_balance WHERE currency_id IN (?1, ?2)')
 				.bind(sold.CurrencyId, other.CurrencyId)
 				.run()

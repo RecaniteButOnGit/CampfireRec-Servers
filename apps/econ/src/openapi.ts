@@ -1142,7 +1142,11 @@ export const AwardRoomCurrencyResultList = z.array(AwardRoomCurrencyResult)
 export const PurchaseRoomCurrencyRequest = z.object({
 	PurchaseOfferId: z.string().describe('The offer — a `CurrencyPurchaseOfferId`'),
 	RequestedAmount: z.string().describe('How much room currency; must equal the offer’s'),
-	RequestedPrice: z.string().describe('What it costs in tokens; must equal the offer’s'),
+	RequestedPrice: z
+		.string()
+		.describe(
+			'What it costs in tokens; must equal the offer’s, except for the room’s owner and co-owners, who are shown 0 and pay nothing'
+		),
 })
 
 /**

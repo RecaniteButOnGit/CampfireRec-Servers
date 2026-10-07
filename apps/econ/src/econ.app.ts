@@ -4500,7 +4500,9 @@ const app = new Hono<App>({ strict: false })
 				'drew it is refused rather than sold at numbers the player did not see.',
 				'',
 				'The tokens are paid to the room’s OWNER (its `CreatorAccountId`), as a room-key sale',
-				'is; an owner buying from their own shop, and a free offer, move no tokens.',
+				'is. The room’s owner and co-owners (the `canManageRoom` set) take from their own shop',
+				'for free: the client shows them the offer at no cost and posts `RequestedPrice=0`, so',
+				'their posted price is not checked and no tokens move. A free offer moves none either.',
 				'',
 				'Answers the `{ Value, Success, Error, error_id }` envelope the room-currency writes',
 				'use. `Value` is BOTH balances the purchase moved, each a RESULTING total:',
@@ -4547,15 +4549,24 @@ const app = new Hono<App>({ strict: false })
 			if (int(body.RequestedAmount) !== offer.CurrencyAmount) {
 				return refuse('Requested amount does not match')
 			}
-			if (int(body.RequestedPrice) !== offer.Price) return refuse('Requested price does not match')
 
 			const ownerId = await getRoomOwnerId(c.env.DB, roomId)
 			if (ownerId === null) return refuse('Purchase offer is not available')
 
-			// The owner paying themselves would be a debit and a credit of the same tokens.
+			// The room's owner and co-owners take from their own shop for free: the client
+			// shows THEM the offer at no cost and posts `RequestedPrice=0`, so holding a
+			// contributor to the offer's price refused every purchase they made. Nobody is
+			// charged — the owner paying themselves would be a debit and a credit of the same
+			// tokens, and a co-owner is building the shop, not buying from it — so the posted
+			// price is not checked for them at all; everyone else must have seen the real one.
+			const canManage = (await canManageRoomById(c.env.DB, roomId, id)) === true
+			if (!canManage && int(body.RequestedPrice) !== offer.Price) {
+				return refuse('Requested price does not match')
+			}
+
 			const startingTokens = intVar(c.env.STARTING_TOKENS, DEFAULT_STARTING_TOKENS)
 			const tokens = CurrencyType.RecCenterTokens
-			const charged = offer.Price > 0 && ownerId !== id
+			const charged = offer.Price > 0 && !canManage
 			// Charged FIRST, and atomically: a buyer who cannot pay is handed nothing.
 			if (charged && !(await spendCurrency(c.env.DB, id, tokens, offer.Price, startingTokens))) {
 				return refuse('Not enough tokens')
