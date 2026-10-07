@@ -855,8 +855,9 @@ export const MoveSubRoomRequest = z.object({
  * A room in the PascalCase `{ Value, Success, Error, error_id }` envelope — the same mixed
  * casing the unprefixed isBanned check has ({@link IsBannedPascalEnvelope}), NOT the
  * lowercase `{ success, error, value }` most room mutations answer. The newer settings
- * routes (the subroom move, the max-player calculation mode) answer this one; the client
- * decodes them with a different reader, so the two are kept apart deliberately.
+ * routes (the subroom move, the max-player calculation mode, the subroom permissions)
+ * answer this one; the client decodes them with a different reader, so the two are kept
+ * apart deliberately.
  */
 export const RoomPascalEnvelope = z.object({
 	Value: RoomDto.nullable().describe('The room as it now stands; null on a rejection'),

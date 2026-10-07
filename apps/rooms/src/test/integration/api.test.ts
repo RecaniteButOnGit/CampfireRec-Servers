@@ -4818,42 +4818,66 @@ describe('rooms endpoints', () => {
 				.run()
 		}
 
+		type Envelope = {
+			Value: { RoomId: number; SubRooms: unknown[] } | null
+			Success: boolean
+			Error: string | null
+			error_id: null
+		}
+		const refusal = async (res: Response): Promise<string | null> => {
+			expect(res.status).toBe(200)
+			const env = (await res.json()) as Envelope
+			expect(env.Success).toBe(false)
+			expect(env.Value).toBeNull()
+			expect(env.error_id).toBeNull()
+			return env.Error
+		}
+
 		it('is auth-gated and open to the room’s managers only', async () => {
 			const body = [
 				{ Permission: 'CAN_SAVE_INVENTIONS', Role: 30, Override: false, Type: 0, Value: 'True' },
 			]
 			// No token → 401.
 			expect((await putPermissions('/rooms/2/subrooms/2/permissions', body)).status).toBe(401)
-			// A valid token that isn't the room's creator or a co-owner → 403.
-			expect((await putPermissions('/rooms/2/subrooms/2/permissions', body, '999')).status).toBe(
-				403
-			)
+			// A valid token that isn't the room's creator or a co-owner → a `Success: false`
+			// rejection, as the other PascalCase-envelope routes answer.
+			expect(
+				await refusal(await putPermissions('/rooms/2/subrooms/2/permissions', body, '999'))
+			).toBe('You are not the owner of this room!')
 			// A co-owner may: account 2 holds Role 30 on the seeded rooms. (This body clears a
 			// pair that was never stored, so it changes nothing.)
 			expect((await putPermissions('/rooms/2/subrooms/2/permissions', body, '2')).status).toBe(200)
 			// A Host (a lower tier) may not.
 			await setRoles()
-			expect((await putPermissions('/rooms/2/subrooms/2/permissions', body, '748')).status).toBe(
-				403
-			)
-			// Unknown room / unknown subroom → 404.
-			expect((await putPermissions('/rooms/99999/subrooms/2/permissions', body, '1')).status).toBe(
-				404
-			)
+			expect(
+				await refusal(await putPermissions('/rooms/2/subrooms/2/permissions', body, '748'))
+			).toBe('You are not the owner of this room!')
+			// Unknown room / unknown subroom.
+			expect(
+				await refusal(await putPermissions('/rooms/99999/subrooms/2/permissions', body, '1'))
+			).toBe('This room does not exist!')
 			// A subroom id belonging to another room doesn't resolve either.
-			expect((await putPermissions('/rooms/2/subrooms/9999/permissions', body, '1')).status).toBe(
-				404
-			)
+			expect(
+				await refusal(await putPermissions('/rooms/2/subrooms/9999/permissions', body, '1'))
+			).toBe('This subroom does not exist!')
 		})
 
-		it('answers an empty 200 — the client reads no body', async () => {
+		it('answers the whole room in the PascalCase `{ Value, Success, Error, error_id }` envelope', async () => {
 			const res = await putPermissions(
 				'/rooms/2/subrooms/2/permissions',
 				[{ Permission: 'CAN_SPAWN_INVENTIONS', Role: 30, Override: true, Type: 0, Value: 'True' }],
 				'1'
 			)
 			expect(res.status).toBe(200)
-			expect(await res.text()).toBe('')
+			const env = (await res.json()) as Envelope
+			expect(env.Success).toBe(true)
+			expect(env.Error).toBeNull()
+			expect(env.error_id).toBeNull()
+			// `Value` is the same Room DTO `GET /rooms/2` serves — subrooms re-attached and all.
+			const room = (await (
+				await SELF.fetch(`${ORIGIN}/rooms/2`, { headers: await bearer('1') })
+			).json()) as Envelope['Value']
+			expect(env.Value).toEqual(room)
 		})
 
 		it('a Role 0 grant reaches a visitor; a Role 30 grant does not', async () => {

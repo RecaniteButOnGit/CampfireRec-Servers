@@ -4067,7 +4067,12 @@ const app = new Hono<App>()
 	// creator or a co-owner (403), the same `canManageRoom` the other room-admin writes
 	// take; a creator-only check here locked out co-owners the client shows the screen to,
 	// and an owner whose room names them in `Roles` rather than `CreatorAccountId`. Answers
-	// an EMPTY 200 — the client fires this and re-reads nothing, so there is no envelope.
+	// the whole ROOM under `Value` in the PascalCase `{ Value, Success, Error, error_id }`
+	// envelope — the same reader the subroom move and max-player mode routes feed, and the
+	// same Room DTO `GET /rooms/{id}` serves (the permissions themselves aren't on it). A
+	// rejection is HTTP 200 with `Success: false` and the message in `Error`; only a
+	// missing token is a 401. This once answered an empty 200, which the client's reader
+	// couldn't decode.
 	.put(
 		'/rooms/:roomId{[0-9]+}/subrooms/:subRoomId{[0-9]+}/permissions',
 		describeRoute({
@@ -4093,33 +4098,40 @@ const app = new Hono<App>()
 				'to the subroom the caller is standing in, resolved from presence.',
 				'',
 				'Gated to the room’s managers — its creator or a co-owner (`canManageRoom`), as the',
-				'other room-admin writes are. The response body is EMPTY: the client doesn’t read one.',
+				'other room-admin writes are. Answers the whole ROOM under `Value` in the PascalCase',
+				'`{ Value, Success, Error, error_id }` envelope — the same Room DTO `GET /rooms/{id}`',
+				'serves (the permission table itself is not part of it), and the same envelope the',
+				'subroom move and `max_player_calculation_mode` answer, NOT the lowercase',
+				'`{ success, error, value }` the other subroom mutations use. A rejection is HTTP 200',
+				'with `Success: false`, `Value: null` and the message in `Error`; only a missing',
+				'token is a 401.',
 			].join('\n'),
 			security: AUTHED,
 			parameters: [roomIdParam, subRoomIdParam],
 			requestBody: jsonBody(SubRoomPermissionsRequest, 'The permission entries to set'),
 			responses: {
-				200: { description: 'Stored (empty body)' },
-				401: UNAUTHORIZED_RESPONSE,
-				403: FORBIDDEN_RESPONSE,
-				404: { description: 'No such room or subroom' },
+				200: json(RoomPascalEnvelope, 'The room, or a rejection with `Success: false`'),
+				401: { description: 'No bearer token (empty body)' },
 			},
 		}),
 		async (c) => {
 			const accountId = await authedAccountId(c)
-			if (accountId === null) return unauthorized(c)
+			if (accountId === null) return c.body(null, 401)
+			const refuse = (error: string) =>
+				c.json({ Value: null, Success: false, Error: error, error_id: null })
 
 			const roomId = Number.parseInt(c.req.param('roomId'), 10)
 			const subRoomId = Number.parseInt(c.req.param('subRoomId'), 10)
 
 			// Scoped through the room so a subroom id from another room can't be written.
 			const room = await getRoomById(c.env.DB, roomId)
-			if (!room || !findSubRoom(room, subRoomId)) return c.notFound()
-			if (!canManageRoom(room, accountId)) return c.body(null, 403)
+			if (!room) return refuse('This room does not exist!')
+			if (!findSubRoom(room, subRoomId)) return refuse('This subroom does not exist!')
+			if (!canManageRoom(room, accountId)) return refuse('You are not the owner of this room!')
 
 			const permissions = parseRoomPermissions(await c.req.json().catch(() => null))
 			await setSubRoomPermissions(c.env.DB, subRoomId, permissions)
-			return c.body(null, 200)
+			return c.json({ Value: room, Success: true, Error: null, error_id: null })
 		}
 	)
 
