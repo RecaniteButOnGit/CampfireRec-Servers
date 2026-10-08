@@ -106,6 +106,16 @@ it('lists no cloud builds for a room', async () => {
 	expect(await res.json()).toEqual({ results: [], totalResults: 0 })
 })
 
+it('serves a stubbed cloud build rate limit config', async () => {
+	const res = await SELF.fetch('https://example.com/cloud-builds/get-rate-limit-config')
+	expect(res.status).toBe(200)
+	expect(await res.json()).toEqual({
+		maxBuildsPerHour: 100,
+		maxConcurrentBuilds: 10,
+		cooldownSeconds: 0,
+	})
+})
+
 describe('GET /collaboration/owners-in-room', () => {
 	const roomId = 1106
 	const subRoomId = 22941

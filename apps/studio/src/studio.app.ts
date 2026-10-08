@@ -178,6 +178,19 @@ const app = new Hono<App>()
 	// Local Windows + Android bundles from the editor button under Upload.
 	.post('/cloud-builds/from-editor', (c) => postLocalCloudBuild(c))
 
+	// Studio asks how often it may request cloud builds. Stubbed: this server
+	// never queues a real cloud build (every build is local, see from-editor),
+	// so the numbers are permissive placeholders. The field names are an
+	// ASSUMPTION — what the editor reads from this response has not been
+	// observed; adjust once it has.
+	.get('/cloud-builds/get-rate-limit-config', (c) =>
+		c.json({
+			maxBuildsPerHour: 100,
+			maxConcurrentBuilds: 10,
+			cooldownSeconds: 0,
+		})
+	)
+
 	// Who of this room's co-owners is standing in this subroom right now. Studio
 	// shows them as "Co-owners in Room" and reads a Result<List<int>>: `success`
 	// must be true and `error` null, or the editor throws; `value` is those
