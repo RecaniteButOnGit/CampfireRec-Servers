@@ -9,6 +9,7 @@ import { exports } from 'cloudflare:workers'
 import { beforeAll, describe, expect, test } from 'vitest'
 
 import {
+	getAccount,
 	getOwnedInventionIds,
 	getPendingGifts,
 	getProgression,
@@ -6944,43 +6945,164 @@ describe('econ endpoints', () => {
 		expect(res.status).toBe(401)
 	})
 
-	test('GET /api/influencerpartnerprogram/influencer answers a bare 0', async () => {
-		const res = await exports.default.fetch(
-			`${ORIGIN}/api/influencerpartnerprogram/influencer?accountId=220`,
-			{ headers: await bearer('206') }
-		)
+	test('POST /api/influencerpartnerprogram/support picks the ONE influencer the caller supports', async () => {
+		const seed = async (accountId: number, isInfluencer: boolean) => {
+			await env.DB.prepare('INSERT OR IGNORE INTO account (data) VALUES (?1)')
+				.bind(JSON.stringify({ accountId, username: `Support${accountId}`, isInfluencer }))
+				.run()
+		}
+		await seed(8201, true)
+		await seed(8202, true)
+		await seed(8203, false) // a player, not an influencer
+		await seed(8204, false) // the supporter
+		const support = async (body: string, sub = '8204') =>
+			exports.default.fetch(`${ORIGIN}/api/influencerpartnerprogram/support`, {
+				method: 'POST',
+				headers: { ...(await bearer(sub)), 'content-type': 'application/x-www-form-urlencoded' },
+				body,
+			})
+		const my = async (sub = '8204') => {
+			const res = await exports.default.fetch(
+				`${ORIGIN}/api/influencerpartnerprogram/myinfluencer`,
+				{
+					headers: await bearer(sub),
+				}
+			)
+			expect(res.status).toBe(200)
+			return res.text()
+		}
+
+		// Nobody picked yet: a bare 0, the whole body.
+		expect(await my()).toBe('0')
+
+		// The raw form body the client posts. The reply is a bare status envelope — no `Value`;
+		// the pick is read back from `…/myinfluencer`.
+		const res = await support('influencerAccountId=8201')
 		expect(res.status).toBe(200)
-		// The tier is the WHOLE body — a bare number, not `{ Tier: 0 }` or a string. 0 is
-		// "not an influencer", which every account is here.
 		expect(res.headers.get('content-type')).toContain('application/json')
-		expect(await res.text()).toBe('0')
+		expect(await res.json()).toEqual({ Success: true, Error: null, error_id: null })
+		expect(await my()).toBe('8201')
+		expect((await getAccount(env.DB, 8204))?.supportedInfluencerId).toBe(8201)
 
-		// Any account, the caller's own included, gets the same answer.
-		const self = await exports.default.fetch(
-			`${ORIGIN}/api/influencerpartnerprogram/influencer?accountId=206`,
+		// One pick per player: posting again REPLACES it.
+		expect((await support('influencerAccountId=8202')).status).toBe(200)
+		expect(await my()).toBe('8202')
+
+		// Only an influencer can be supported, and not oneself. Each refusal is a 400 that
+		// leaves the pick alone.
+		expect((await support('influencerAccountId=8203')).status).toBe(400) // not an influencer
+		expect((await support('influencerAccountId=99999999')).status).toBe(400) // no such account
+		expect((await support('influencerAccountId=8204')).status).toBe(400) // oneself
+		expect((await support('influencerAccountId=8201', '8201')).status).toBe(400) // an influencer, oneself
+		expect((await support('influencerAccountId=nope')).status).toBe(400)
+		expect((await support('')).status).toBe(400)
+		expect(await my()).toBe('8202')
+
+		// Anyone can read anyone's pick, as the same bare number.
+		const theirs = await exports.default.fetch(
+			`${ORIGIN}/api/influencerpartnerprogram/influencer?accountId=8204`,
 			{ headers: await bearer('206') }
 		)
-		expect(await self.json()).toBe(0)
+		expect(theirs.status).toBe(200)
+		expect(await theirs.text()).toBe('8202')
 	})
 
-	test('GET /api/influencerpartnerprogram/myinfluencer answers a bare 0', async () => {
-		// The `my` form takes the account from the token instead of a query parameter, and
-		// answers the same tier in the same shape.
-		const res = await exports.default.fetch(`${ORIGIN}/api/influencerpartnerprogram/myinfluencer`, {
-			headers: await bearer('206'),
-		})
+	test('POST /api/influencerpartnerprogram/remove unsets the pick it names', async () => {
+		for (const [accountId, isInfluencer] of [
+			[8211, true],
+			[8212, true],
+			[8213, false],
+		] as const) {
+			await env.DB.prepare('INSERT OR IGNORE INTO account (data) VALUES (?1)')
+				.bind(JSON.stringify({ accountId, username: `Remove${accountId}`, isInfluencer }))
+				.run()
+		}
+		const post = async (path: 'support' | 'remove', body: string, sub = '8213') =>
+			exports.default.fetch(`${ORIGIN}/api/influencerpartnerprogram/${path}`, {
+				method: 'POST',
+				headers: { ...(await bearer(sub)), 'content-type': 'application/x-www-form-urlencoded' },
+				body,
+			})
+		const my = async () => {
+			const res = await exports.default.fetch(
+				`${ORIGIN}/api/influencerpartnerprogram/myinfluencer`,
+				{ headers: await bearer('8213') }
+			)
+			return res.text()
+		}
+
+		expect((await post('support', 'influencerAccountId=8211')).status).toBe(200)
+		expect(await my()).toBe('8211')
+
+		// Naming someone other than the current pick is a no-op success: the pick stays.
+		const other = await post('remove', 'influencerAccountId=8212')
+		expect(other.status).toBe(200)
+		expect(await other.json()).toEqual({ Success: true, Error: null, error_id: null })
+		expect(await my()).toBe('8211')
+
+		// Naming the current pick clears it: the same envelope, and `…/myinfluencer` is 0
+		// again. The field is DROPPED from the account, not written as 0.
+		const res = await post('remove', 'influencerAccountId=8211')
 		expect(res.status).toBe(200)
-		expect(await res.text()).toBe('0')
+		expect(res.headers.get('content-type')).toContain('application/json')
+		expect(await res.json()).toEqual({ Success: true, Error: null, error_id: null })
+		expect(await my()).toBe('0')
+		const account = await getAccount(env.DB, 8213)
+		expect(account).not.toBeNull()
+		expect('supportedInfluencerId' in account!).toBe(false)
+
+		// Removing with nothing picked is also a no-op success.
+		expect((await post('remove', 'influencerAccountId=8211')).status).toBe(200)
+		expect(await my()).toBe('0')
+
+		// A body that names no integer is a 400.
+		expect((await post('remove', 'influencerAccountId=nope')).status).toBe(400)
+		expect((await post('remove', '')).status).toBe(400)
+
+		// Unauthenticated is a 401.
+		const anon = await exports.default.fetch(`${ORIGIN}/api/influencerpartnerprogram/remove`, {
+			method: 'POST',
+			headers: { 'content-type': 'application/x-www-form-urlencoded' },
+			body: 'influencerAccountId=8211',
+		})
+		expect(anon.status).toBe(401)
 	})
 
-	test('the influencer tier routes 401 without a bearer token', async () => {
+	test('GET /api/influencerpartnerprogram/influencer answers 0 for nobody, 400 for no accountId', async () => {
+		// An account that has picked nobody, and one that does not exist, both support nobody.
+		for (const accountId of ['206', '99999999']) {
+			const res = await exports.default.fetch(
+				`${ORIGIN}/api/influencerpartnerprogram/influencer?accountId=${accountId}`,
+				{ headers: await bearer('206') }
+			)
+			expect(res.status, accountId).toBe(200)
+			// The id is the WHOLE body — a bare number, not `{ Id: 0 }` or a string.
+			expect(res.headers.get('content-type')).toContain('application/json')
+			expect(await res.text()).toBe('0')
+		}
+		for (const query of ['', '?accountId=', '?accountId=abc']) {
+			const res = await exports.default.fetch(
+				`${ORIGIN}/api/influencerpartnerprogram/influencer${query}`,
+				{ headers: await bearer('206') }
+			)
+			expect(res.status, query).toBe(400)
+		}
+	})
+
+	test('the influencer support routes 401 without a bearer token', async () => {
 		// Auth is checked before anything is answered, so an unauthenticated caller is told
-		// that rather than handed a tier.
-		for (const path of ['influencer', 'myinfluencer']) {
+		// that rather than handed an id.
+		for (const path of ['influencer?accountId=206', 'myinfluencer']) {
 			const res = await exports.default.fetch(`${ORIGIN}/api/influencerpartnerprogram/${path}`)
 			expect(res.status, path).toBe(401)
 			expect(await res.text()).toBe('')
 		}
+		const post = await exports.default.fetch(`${ORIGIN}/api/influencerpartnerprogram/support`, {
+			method: 'POST',
+			headers: { 'content-type': 'application/x-www-form-urlencoded' },
+			body: 'influencerAccountId=8201',
+		})
+		expect(post.status).toBe(401)
 	})
 
 	test('GET /api/makerai/checkfreetrialeligibility answers a bare false', async () => {
@@ -7187,6 +7309,8 @@ describe('econ endpoints', () => {
 			'POST /api/consumables/v1/updateActive',
 			'POST /api/equipment/v1/update',
 			'POST /api/gamerewards/v1/request',
+			'POST /api/influencerpartnerprogram/remove',
+			'POST /api/influencerpartnerprogram/support',
 			'POST /api/itemWishlists/v1/isonwishlist/bulk',
 			'POST /api/itemWishlists/v1/wishlist/add',
 			'POST /api/itemWishlists/v1/wishlist/remove',

@@ -235,16 +235,42 @@ export const InfluencerIdsResponse = z.object({
 })
 
 /**
- * `GET /api/influencerpartnerprogram/influencer` and `…/myinfluencer` — one account's
- * standing in the partner program.
+ * `GET /api/influencerpartnerprogram/influencer` and `…/myinfluencer` — the account id of
+ * the influencer an account supports.
  *
- * A BARE NUMBER, not an object: the body is the literal `0`, which is the "not an
- * influencer" tier. Nobody on this server is one, so 0 is the answer for every account, the
- * caller's own included.
+ * A BARE NUMBER, not an object: the body is the literal id, or `0` when the account
+ * supports nobody. The write (`POST …/support`) does NOT answer in this shape; see
+ * `SupportInfluencerResponse`.
  */
-export const InfluencerTierResponse = z
-	.literal(0)
-	.describe('The account’s partner tier. Always 0 — nobody here is an influencer')
+export const SupportedInfluencerResponse = z
+	.int()
+	.describe('The account id of the influencer this account supports; 0 for nobody')
+
+/** `POST /api/influencerpartnerprogram/support` — the influencer the caller picks. */
+export const SupportInfluencerBody = z.object({
+	influencerAccountId: z
+		.int()
+		.describe('The account id of the influencer to support. Must be flagged `isInfluencer`'),
+})
+
+/** `POST /api/influencerpartnerprogram/remove` — the influencer the caller stops supporting. */
+export const RemoveInfluencerBody = z.object({
+	influencerAccountId: z
+		.int()
+		.describe('The account id of the influencer to stop supporting — the caller’s current pick'),
+})
+
+/**
+ * The reply to `POST /api/influencerpartnerprogram/support` and `…/remove` — a bare
+ * `{ Success, Error, error_id }` status envelope with NO `Value`: the pick is read back from
+ * `…/myinfluencer`, not from this reply. The same mixed casing as `RoomCurrencyEnvelope`
+ * (PascalCase `Success`/`Error` beside a lowercase `error_id`), minus the payload.
+ */
+export const SupportInfluencerResponse = z.object({
+	Success: z.boolean().describe('Always true — every refusal is an empty 400 instead'),
+	Error: z.null().describe('Always null'),
+	error_id: z.null().describe('Always null. Present as a key, and lowercase'),
+})
 
 /**
  * `GET /api/incentivizedreferrals/progress` — how far the caller has got with the

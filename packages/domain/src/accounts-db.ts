@@ -139,6 +139,15 @@ export interface Account {
 	 */
 	isInfluencer?: boolean
 	/**
+	 * The ONE influencer this account supports in the partner program — the `accountId` of
+	 * an account flagged `isInfluencer`, chosen by the player via econ's
+	 * `POST /api/influencerpartnerprogram/support` and read back by `…/myinfluencer` (their
+	 * own) and `…/influencer?accountId=` (anyone's). Absent means nobody, which those routes
+	 * serve as 0. Re-posting replaces the pick; nothing here records the history. Not in any
+	 * account DTO: the two econ reads are the only surface.
+	 */
+	supportedInfluencerId?: number
+	/**
 	 * Whether this account is a SANDBOX account — served out of the sandbox Tachyon pool
 	 * rather than the live one (`match` `GET /player/connection-info`). Operator-set only;
 	 * absent/false means the live pool.

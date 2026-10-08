@@ -18,6 +18,7 @@ import {
 	listInfluencerIds,
 	ownsInvention,
 	setOutfit,
+	updateAccount,
 } from '@repo/domain'
 import { intVar, logger, withCleanSpec, withNotFound, withOnError } from '@repo/hono-helpers'
 import { validateAndGetAccountId, validateAndGetPlus, validateAndGetVersion } from '@repo/jwt'
@@ -113,7 +114,6 @@ import {
 	form,
 	GameRewardRequest,
 	InfluencerIdsResponse,
-	InfluencerTierResponse,
 	IsOnWishlistBulkRequest,
 	IsOnWishlistBulkResponse,
 	ItemPurchaseInfoList,
@@ -133,6 +133,7 @@ import {
 	PurchaseRoomKeyWithCurrencyRequest,
 	PurchaseRoomKeyWithCurrencyResponse,
 	ReferralProgressResponse,
+	RemoveInfluencerBody,
 	RoomConsumableDto,
 	RoomConsumableEnvelope,
 	RoomCurrencyDto,
@@ -148,6 +149,9 @@ import {
 	SaveOutfitRequest,
 	SaveOutfitV4Response,
 	SubscriptionResponse,
+	SupportedInfluencerResponse,
+	SupportInfluencerBody,
+	SupportInfluencerResponse,
 	UgcPurchasableBulkRequest,
 	UgcPurchasableItemList,
 	UNAUTHORIZED_RESPONSE,
@@ -732,11 +736,17 @@ async function pushBalancePurchase(
 }
 
 /**
- * The influencer partner tier every account has here — the "not an influencer" one. It is
- * the whole body of both `/api/influencerpartnerprogram/influencer` and `…/myinfluencer`,
- * served as a bare number rather than wrapped in anything.
+ * The influencer an account supports in the partner program, as its reads serve it — the
+ * `supportedInfluencerId` on the account, or 0 for nobody (and for an account that does not
+ * exist, which supports nobody too). The whole body of `/api/influencerpartnerprogram/influencer`,
+ * `…/myinfluencer`, served as a bare number rather than wrapped in anything; the `…/support`
+ * and `…/remove` writes answer a status envelope instead. The stored id is served as-is: it was an influencer when picked, and a later
+ * revoke of their flag drops them from `…/influencers` but not from their supporters.
  */
-const NOT_AN_INFLUENCER = 0
+async function supportedInfluencer(db: D1Database, accountId: number): Promise<number> {
+	const account = await getAccount(db, accountId)
+	return account?.supportedInfluencerId ?? 0
+}
 
 /**
  * Whether the caller holds a Rec Room Plus subscription — the ONE definition, shared by
@@ -6746,74 +6756,157 @@ const app = new Hono<App>({ strict: false })
 		}
 	)
 
-	// One account's standing in the influencer partner program. NOBODY here has one: this
-	// server runs no such program, so the answer is the literal `0` — the "not an influencer"
-	// tier — for every account.
+	// The influencer one account SUPPORTS in the partner program, by account id — every
+	// player picks one (`…/support` below), and this is how anyone reads anyone's pick.
 	//
 	// A BARE NUMBER is the whole body, like `…/makerai/checkfreetrialeligibility`'s bare
-	// `false`, not a number wrapped in an object. This used to answer 404 with an empty body;
-	// the tier is what the client actually reads.
-	//
-	// `accountId` names the account being asked about. It makes no difference to the answer
-	// while nobody is an influencer, but it is read rather than ignored so this stays the
-	// question it looks like — the caller's own standing is `…/myinfluencer` below.
+	// `false`, not a number wrapped in an object; 0 is "supports nobody", which is also what
+	// an account that does not exist answers. The caller's own pick is `…/myinfluencer`.
 	.get(
 		'/api/influencerpartnerprogram/influencer',
 		describeRoute({
 			tags: ['Econ'],
-			summary: 'An account’s influencer partner program tier',
+			summary: 'The influencer an account supports',
 			description: [
-				'The partner tier of the account named by `accountId`, as a BARE NUMBER — the whole',
-				'body is `0`, not an object around it. Always 0: this server runs no partner program,',
-				'so no account is an influencer. Auth-gated; a missing or invalid token is a 401.',
+				'The account id of the influencer the account named by `accountId` supports, as a',
+				'BARE NUMBER — the whole body is the id, not an object around it; `0` when they',
+				'support nobody (or no such account exists). Auth-gated; a missing or invalid token',
+				'is a 401. A missing or non-numeric `accountId` is a 400.',
 			].join(' '),
 			security: AUTHED,
 			parameters: [
 				{
 					name: 'accountId',
 					in: 'query',
-					required: false,
-					description: 'The account being asked about. Every account answers 0.',
+					required: true,
+					description: 'The account being asked about.',
 					schema: { type: 'integer' },
 				},
 			],
 			responses: {
-				200: json(InfluencerTierResponse, 'The account’s tier — always 0'),
+				200: json(SupportedInfluencerResponse, 'The supported influencer’s id, or 0'),
+				400: { description: '`accountId` missing or not an integer (empty body)' },
 				401: UNAUTHORIZED_RESPONSE,
 			},
 		}),
 		async (c) => {
 			const id = await authedId(c)
 			if (id === null) return unauthorized(c)
-			return c.json(NOT_AN_INFLUENCER)
+			const accountId = Number.parseInt(c.req.query('accountId') ?? '', 10)
+			if (!Number.isInteger(accountId)) return c.body(null, 400)
+			return c.json(await supportedInfluencer(c.env.DB, accountId))
 		}
 	)
 
 	// The same question about the CALLER — the `my` form, which names no account because the
-	// token already does. Same bare `0`, for the same reason: nobody here is an influencer.
+	// token already does. Same bare number, same 0 for nobody.
 	//
 	// Its own route rather than an alias of the one above, because the two differ in who they
-	// are about; they agree today only because the answer is currently the same for everyone.
+	// are about.
 	.get(
 		'/api/influencerpartnerprogram/myinfluencer',
 		describeRoute({
 			tags: ['Econ'],
-			summary: 'The caller’s influencer partner program tier',
+			summary: 'The influencer the caller supports',
 			description: [
-				'The caller’s own partner tier — the `my` form of the route above, taking the account',
-				'from the token rather than a query parameter. A BARE NUMBER, always `0`: this server',
-				'runs no partner program. Auth-gated; a missing or invalid token is a 401.',
+				'The account id of the influencer the caller supports — the `my` form of the route',
+				'above, taking the account from the token rather than a query parameter. A BARE',
+				'NUMBER; `0` when they support nobody. Auth-gated; a missing or invalid token is a 401.',
 			].join(' '),
 			security: AUTHED,
 			responses: {
-				200: json(InfluencerTierResponse, 'The caller’s tier — always 0'),
+				200: json(SupportedInfluencerResponse, 'The supported influencer’s id, or 0'),
 				401: UNAUTHORIZED_RESPONSE,
 			},
 		}),
 		async (c) => {
 			const id = await authedId(c)
 			if (id === null) return unauthorized(c)
-			return c.json(NOT_AN_INFLUENCER)
+			return c.json(await supportedInfluencer(c.env.DB, id))
+		}
+	)
+
+	// Pick the influencer the caller supports: `influencerAccountId=<id>`, form-encoded. ONE
+	// per player, stored on the account as `supportedInfluencerId`; posting again replaces
+	// the pick. The id has to name an account currently flagged `isInfluencer` — anything
+	// else, the caller's own id included, is a 400 and changes nothing. The reply is a bare
+	// `{ Success, Error, error_id }` status envelope — no `Value`: the client reads the pick
+	// back from `…/myinfluencer` rather than from this reply.
+	.post(
+		'/api/influencerpartnerprogram/support',
+		describeRoute({
+			tags: ['Econ'],
+			summary: 'Pick the influencer the caller supports',
+			description: [
+				'Set the ONE influencer the caller supports in the partner program, replacing any',
+				'earlier pick. `influencerAccountId` must name an account that is currently an',
+				'influencer (listed by `…/influencers`); the caller cannot support themselves. The',
+				'reply is a `{ Success, Error, error_id }` status envelope with no `Value`; read the',
+				'new pick back from `…/myinfluencer`.',
+			].join(' '),
+			security: AUTHED,
+			requestBody: form(SupportInfluencerBody, 'The influencer to support'),
+			responses: {
+				200: json(SupportInfluencerResponse, 'The pick was recorded'),
+				400: {
+					description:
+						'`influencerAccountId` missing, not an integer, the caller’s own id, or not an influencer (empty body)',
+				},
+				401: UNAUTHORIZED_RESPONSE,
+			},
+		}),
+		async (c) => {
+			const id = await authedId(c)
+			if (id === null) return unauthorized(c)
+			const body = (await c.req.parseBody().catch(() => ({}))) as Record<string, unknown>
+			const raw = body.influencerAccountId
+			const influencerId = Number.parseInt(typeof raw === 'string' ? raw : '', 10)
+			if (!Number.isInteger(influencerId) || influencerId === id) return c.body(null, 400)
+			const influencer = await getAccount(c.env.DB, influencerId)
+			if (influencer?.isInfluencer !== true) return c.body(null, 400)
+			await updateAccount(c.env.DB, id, { supportedInfluencerId: influencerId })
+			return c.json({ Success: true, Error: null, error_id: null })
+		}
+	)
+
+	// Stop supporting an influencer: `influencerAccountId=<id>`, form-encoded, the same body
+	// as `…/support`. The field is UNSET on the account (dropped from the JSON, not written
+	// as 0), so `…/myinfluencer` goes back to 0. The id has to be an integer (else 400), but
+	// it only has to NAME THE CURRENT PICK to do anything: naming anyone else — a stale pick
+	// from before a `…/support` that replaced it, or nobody at all — is a no-op that still
+	// answers success, like a wishlist remove of something not listed. Guarding on the match
+	// keeps a stale client from clearing a pick it never saw.
+	.post(
+		'/api/influencerpartnerprogram/remove',
+		describeRoute({
+			tags: ['Econ'],
+			summary: 'Stop supporting an influencer',
+			description: [
+				'Clear the influencer the caller supports in the partner program. `influencerAccountId`',
+				'names the current pick; the field is unset and `…/myinfluencer` answers 0 again.',
+				'An id that is not the current pick changes nothing and still answers success. The',
+				'reply is the same `{ Success, Error, error_id }` status envelope as `…/support`.',
+			].join(' '),
+			security: AUTHED,
+			requestBody: form(RemoveInfluencerBody, 'The influencer to stop supporting'),
+			responses: {
+				200: json(SupportInfluencerResponse, 'The pick was cleared (or was not this one)'),
+				400: { description: '`influencerAccountId` missing or not an integer (empty body)' },
+				401: UNAUTHORIZED_RESPONSE,
+			},
+		}),
+		async (c) => {
+			const id = await authedId(c)
+			if (id === null) return unauthorized(c)
+			const body = (await c.req.parseBody().catch(() => ({}))) as Record<string, unknown>
+			const raw = body.influencerAccountId
+			const influencerId = Number.parseInt(typeof raw === 'string' ? raw : '', 10)
+			if (!Number.isInteger(influencerId)) return c.body(null, 400)
+			if ((await supportedInfluencer(c.env.DB, id)) === influencerId) {
+				// `undefined` wins the spread in updateAccount and JSON.stringify drops the key.
+				await updateAccount(c.env.DB, id, { supportedInfluencerId: undefined })
+			}
+			return c.json({ Success: true, Error: null, error_id: null })
 		}
 	)
 
