@@ -371,6 +371,48 @@ export async function refreshInstanceFullness(
 }
 
 /**
+ * Restamp the `maxCapacity` of every live instance of a subroom and recompute each one's
+ * `isFull` against it. Called by the subroom settings write (`modifySubRoom`), which is
+ * the ONE place a subroom's `MaxPlayers` changes after creation.
+ *
+ * An instance's `maxCapacity` is a copy of the subroom's cap taken when the instance was
+ * created, and it is what everything enforces — the fullness recompute, the join
+ * searches' `is_full` filter, the served DTO. It is a copy rather than a live read
+ * because the instance is read on every matchmake, heartbeat and presence fan-out, and
+ * a subroom lookup on each of those is D1 cost paid for a setting that changes rarely.
+ * So the copy is invalidated at the write instead: without this, an owner who raised
+ * the cap mid-session found the running instance still refusing players at the old
+ * number until it was torn down. Returns the number of instances rewritten.
+ */
+export async function resyncInstanceCapacity(
+	db: D1Database,
+	roomId: number,
+	subRoomId: number,
+	maxCapacity: number,
+	now = Math.floor(Date.now() / 1000)
+): Promise<number> {
+	const { results } = await db
+		.prepare('SELECT data FROM room_instance WHERE room_id = ?1 AND sub_room_id = ?2')
+		.bind(roomId, subRoomId)
+		.all<{ data: string }>()
+	let rewritten = 0
+	for (const row of results) {
+		const stored = parse(row.data)
+		const count = await countPlayersInInstance(db, stored.roomInstanceId, now)
+		const isFull = maxCapacity > 0 && count >= maxCapacity
+		if (stored.maxCapacity === maxCapacity && stored.isFull === isFull) continue
+		stored.maxCapacity = maxCapacity
+		stored.isFull = isFull
+		await db
+			.prepare('UPDATE room_instance SET data = ?1 WHERE id = ?2')
+			.bind(JSON.stringify(stored), stored.roomInstanceId)
+			.run()
+		rewritten++
+	}
+	return rewritten
+}
+
+/**
  * How long (s) a room instance is left alone after it's created, even with nobody in
  * it. Every path that creates an instance writes the creator's presence in the same
  * request, so an empty instance is normally already abandoned — but the two writes

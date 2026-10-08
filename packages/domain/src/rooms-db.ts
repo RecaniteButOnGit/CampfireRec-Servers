@@ -20,6 +20,7 @@
 import { bindPlaceholders, chunkForBinds, MAX_BOUND_PARAMS } from './d1-binds'
 import { Accessibility, Role } from './enums'
 import { countPlayersByRoom } from './presence-db'
+import { resyncInstanceCapacity } from './room-instance-db'
 import {
 	bakedStudioUnityAssets,
 	isMissingStudioAssetTable,
@@ -1876,6 +1877,10 @@ export interface ModifySubRoomInput {
  * (the fields the client's subroom `modify` form carries). Only the supplied fields
  * are changed; the subroom row is updated in the `subroom` table. Returns the updated
  * (hydrated) room, or null when the room or subroom doesn't exist.
+ *
+ * A changed `MaxPlayers` is pushed onto the subroom's LIVE instances too (see
+ * {@link resyncInstanceCapacity}): each instance carries a copy of the cap it enforces,
+ * and this is the write that makes that copy stale.
  */
 export async function modifySubRoom(
 	db: D1Database,
@@ -1888,8 +1893,10 @@ export async function modifySubRoom(
 
 	if (input.name !== undefined) sub.Name = input.name
 	if (input.accessibility !== undefined) sub.Accessibility = input.accessibility
+	const capacityChanged = input.maxPlayers !== undefined && input.maxPlayers !== sub.MaxPlayers
 	if (input.maxPlayers !== undefined) sub.MaxPlayers = input.maxPlayers
 	await updateSubRoom(db, sub)
+	if (capacityChanged) await resyncInstanceCapacity(db, roomId, subRoomId, input.maxPlayers!)
 
 	return getRoomById(db, roomId)
 }

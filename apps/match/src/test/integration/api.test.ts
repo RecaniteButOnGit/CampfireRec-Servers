@@ -14,6 +14,7 @@ import {
 	EMPTY_INSTANCE_GRACE_SECONDS,
 	GAME_VERSION,
 	getRoomInstance,
+	modifySubRoom,
 	PRESENCE_SCHEMA_DDL,
 	ROOM_INSTANCE_SCHEMA_DDL,
 	ROOM_INVITE_SCHEMA_DDL,
@@ -2128,6 +2129,34 @@ describe('auth-gated endpoints', () => {
 		// RecCenter (RoomId 2, MaxPlayers 12): one player does not fill it.
 		const instanceId = await matchmakeInto('2', '822')
 		expect((await getRoomInstance(env.DB, instanceId))?.isFull).toBe(false)
+	})
+
+	test('raising a subroom’s MaxPlayers admits players into the running instance', async () => {
+		// A room with a cap of 1 and its own id, so no other test’s instances of SoloRoom
+		// are candidates here.
+		await seedRoomWithSubRooms(env.DB, {
+			RoomId: 5101,
+			Name: 'GrowingRoom',
+			IsDorm: false,
+			Accessibility: 1,
+			SubRooms: [{ SubRoomId: 5101, UnitySceneId: RECCENTER_SCENE, MaxPlayers: 1 }],
+		} as unknown as Record<string, unknown>)
+		const first = await matchmakeInto('5101', '830')
+		expect((await getRoomInstance(env.DB, first))?.isFull).toBe(true)
+
+		// The owner raises the cap in the subroom’s settings while the instance is live
+		// (what the `rooms` worker’s subroom settings route calls). The instance carries
+		// its own copy of the cap, so the write has to reach the running instance.
+		await modifySubRoom(env.DB, 5101, 5101, { maxPlayers: 2 })
+		const second = await matchmakeInto('5101', '831')
+		expect(second).toBe(first)
+
+		// And the served instance follows the subroom: 2 of 2 now, full again.
+		const instance = await getRoomInstance(env.DB, first)
+		expect(instance).toMatchObject({ maxCapacity: 2, isFull: true })
+		expect(await countPlayersInInstance(env.DB, first)).toBe(2)
+		const third = await matchmakeInto('5101', '832')
+		expect(third).not.toBe(first)
 	})
 
 	test('leaving a full instance clears its full flag', async () => {
