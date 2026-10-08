@@ -374,6 +374,25 @@ export async function getExpiredPresenceInstanceIds(
 }
 
 /**
+ * The players whose presence rows have expired — the players about to be purged by
+ * {@link deleteExpiredPresence}. Read BEFORE the purge: once the rows are gone nothing
+ * remembers who lapsed, and their friends are owed the same offline
+ * SubscriptionUpdatePresence a logout sends (the lapse IS their logout, just one the
+ * client never got to post). Includes lobby (null-instance) presence — a player idle
+ * in the lobby who stops heartbeating has gone offline too.
+ */
+export async function getExpiredPresenceAccountIds(
+	db: D1Database,
+	now = nowSeconds()
+): Promise<number[]> {
+	const { results } = await db
+		.prepare('SELECT account_id AS id FROM presence WHERE expires_at <= ?1 ORDER BY account_id')
+		.bind(now)
+		.all<{ id: number }>()
+	return results.map((r) => r.id)
+}
+
+/**
  * Purge expired presence rows — housekeeping only, since reads already ignore them
  * (and `INSERT OR REPLACE` keeps a single row per account, so the table is bounded
  * by account count). Returns the number of rows removed.

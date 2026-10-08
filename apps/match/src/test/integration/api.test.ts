@@ -2161,6 +2161,48 @@ describe('auth-gated endpoints', () => {
 		expect((await getRoomInstance(env.DB, solo))?.isFull).toBe(false)
 	})
 
+	test('the cron sweep tells a lapsed player’s friends they went offline, as a logout does', async () => {
+		type Batch = {
+			playerIds: number[]
+			notificationType: number | string
+			data: { playerId: number; isOnline: boolean; roomInstance: Record<string, unknown> | null }
+		}
+		const hub = () => env.RECFLARE_NOTIFICATIONS_HUB.getByName('global')
+		const sent = async (): Promise<Batch[]> =>
+			(await (await hub().fetch('http://do/all')).json()) as Batch[]
+
+		// 825 is friends with 826; 827 has no friends and lapses alongside.
+		await env.DB.prepare(
+			'INSERT INTO relationship (requester_id, target_id, relationship_type) VALUES (?1, ?2, ?3)'
+		)
+			.bind(825, 826, 3)
+			.run()
+		await seedPresence(825, nowSeconds() - 10)
+		await seedPresence(827, nowSeconds() - 10)
+		await hub().fetch('http://do/all', { method: 'DELETE' })
+
+		const ctx = createExecutionContext()
+		await scheduled(createScheduledController(), env, ctx)
+		await waitOnExecutionContext(ctx)
+
+		// Exactly one frame: the friend of the lapsed player, carrying the offline
+		// snapshot — the same frame `POST /player/logout` sends. The friendless player
+		// produces none.
+		const batch = await sent()
+		expect(batch).toHaveLength(1)
+		expect(batch[0]!.playerIds).toEqual([826])
+		expect(batch[0]!.notificationType).toBe('PresenceUpdate') // SubscriptionUpdatePresence
+		expect(batch[0]!.data).toMatchObject({ playerId: 825, isOnline: false, roomInstance: null })
+		expect(await countPresenceRows(825)).toBe(0)
+
+		// A second sweep has nothing lapsed → nothing sent.
+		await hub().fetch('http://do/all', { method: 'DELETE' })
+		const ctx2 = createExecutionContext()
+		await scheduled(createScheduledController(), env, ctx2)
+		await waitOnExecutionContext(ctx2)
+		expect(await sent()).toEqual([])
+	})
+
 	test('records an `online` stat sample of the live presence count on each run', async () => {
 		await env.DB.prepare('DELETE FROM stat').run()
 		const before = (await env.DB.prepare('SELECT COUNT(*) AS n FROM presence WHERE expires_at > ?1')
