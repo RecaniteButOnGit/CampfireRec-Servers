@@ -5697,28 +5697,65 @@ describe('rooms endpoints', () => {
 
 		// Pick a real save off the history the previous test paged.
 		const list = (await (await get('/rooms/2/subrooms/2/saves', '1')).json()) as {
-			Results: Array<{ SubRoomDataSaveId: number; DataBlob: string; Description: string }>
+			Results: Array<{
+				SubRoomDataSaveId: number
+				DataBlob: string
+				Description: string
+				PersistenceVersion: number
+				UgcSubVersion: number
+			}>
 		}
 		const row = list.Results[0]!
 
 		const res = await get(`/rooms/2/subrooms/2/saves/${row.SubRoomDataSaveId}`, '1')
 		expect(res.status).toBe(200)
-		// The camelCase projection the room save returns — NOT the PascalCase row the list
-		// serves. Same field set, exactly: no persistence/OM/UGC versions, no asset arrays.
-		expect(await res.json()).toEqual({
-			subRoomDataSaveId: row.SubRoomDataSaveId,
-			subRoomId: 2,
-			unityAssetId: null,
-			unityAsset: null,
-			unityAssetHash: null,
-			dataBlob: row.DataBlob,
-			dataBlobHash: null,
-			savedByAccountId: expect.any(Number),
-			savedOnPlatform: 0,
-			savedOnDeviceClass: 0,
-			description: row.Description,
-			createdAt: expect.any(String),
+		// A PascalCase row like the list serves — NOT the camelCase projection the room save
+		// returns (served that, the client showed a save with every value missing). Its
+		// bundle fields are the detail's own: top-level `UnityAsset`/`UnityAssetHash`, no
+		// `Tags`, and `UnityAssetId` present-and-null rather than omitted.
+		const detailRow = (await res.json()) as Record<string, unknown>
+		expect(Object.keys(detailRow)).toEqual([
+			'UnitySubAssets',
+			'ReferencedUnityAssets',
+			'UnityAsset',
+			'UnityAssetHash',
+			'SubRoomDataSaveId',
+			'SubRoomId',
+			'UnityAssetId',
+			'ReferencedUnityAssetIds',
+			'DataBlob',
+			'DataBlobHash',
+			'PersistenceVersion',
+			'OMVersion',
+			'SavedByAccountId',
+			'SavedOnPlatform',
+			'SavedOnDeviceClass',
+			'Description',
+			'ModerationState',
+			'CreatedAt',
+			'UgcSubVersion',
+		])
+		expect(detailRow).toMatchObject({
+			UnitySubAssets: [],
+			ReferencedUnityAssets: [],
+			UnityAsset: null,
+			UnityAssetHash: null,
+			SubRoomDataSaveId: row.SubRoomDataSaveId,
+			SubRoomId: 2,
+			UnityAssetId: null,
+			ReferencedUnityAssetIds: [],
+			DataBlob: row.DataBlob,
+			DataBlobHash: null,
+			SavedByAccountId: expect.any(Number),
+			SavedOnPlatform: 0,
+			SavedOnDeviceClass: 0,
+			Description: row.Description,
+			ModerationState: 0,
+			CreatedAt: expect.any(String),
 		})
+		// The versions come off the row, not the room save's trimmed projection.
+		expect(detailRow.PersistenceVersion).toBe(row.PersistenceVersion)
+		expect(detailRow.UgcSubVersion).toBe(row.UgcSubVersion)
 
 		// Unknown save, and a save that exists but belongs to ANOTHER subroom (ids are
 		// global, so an unscoped lookup would happily resolve this one) — both 404.
@@ -6158,15 +6195,28 @@ describe('studio room bundles', () => {
 			{ headers: await bearer('1') }
 		)
 		expect(detail.status).toBe(200)
-		expect(await detail.json()).toMatchObject({ unityAsset: winName, unityAssetHash: winHash })
+		// The detail lifts the Windows bundle to the top level when no target is named, and
+		// names every bundle the client's way — `UnityAsset`/`UnityAssetHash`, not the stored
+		// `Filename`/`Hash`.
+		expect(await detail.json()).toMatchObject({
+			UnityAsset: winName,
+			UnityAssetHash: winHash,
+			UnitySubAssets: [
+				{ UnityAssetId: ASSET, UnityAsset: winName, UnityAssetHash: winHash },
+				{ UnityAssetId: ASSET, UnityAsset: androidName, UnityAssetHash: androidHash },
+			],
+		})
 
 		const questDetail = await SELF.fetch(
 			`${ORIGIN}/rooms/9901/subrooms/99011/saves/${current.SubRoomDataSaveId}?unityAssetTarget=2`,
 			{ headers: await bearer('1') }
 		)
 		expect(await questDetail.json()).toMatchObject({
-			unityAsset: androidName,
-			unityAssetHash: androidHash,
+			UnityAsset: androidName,
+			UnityAssetHash: androidHash,
+			UnitySubAssets: [
+				{ UnityAssetId: ASSET, UnityAsset: androidName, UnityAssetHash: androidHash },
+			],
 		})
 
 		const light = await SELF.fetch(`${ORIGIN}/rooms/9901/subrooms/99011/saves/no_unity_assets`, {
@@ -6181,7 +6231,11 @@ describe('studio room bundles', () => {
 			`${ORIGIN}/rooms/9902/subrooms/99021/saves/${makerDetailId}`,
 			{ headers: await bearer('1') }
 		)
-		expect(await makerDetail.json()).toMatchObject({ unityAsset: null, unityAssetHash: null })
+		expect(await makerDetail.json()).toMatchObject({
+			UnityAsset: null,
+			UnityAssetHash: null,
+			UnitySubAssets: [],
+		})
 	})
 })
 

@@ -170,7 +170,7 @@ import {
 	ShowcasedRooms,
 	stringQuery,
 	SubRoomAccessibilityRequest,
-	SubRoomDataSaveResponseDto,
+	SubRoomDataSaveDetailDto,
 	subRoomIdParam,
 	SubRoomPermissionsRequest,
 	SubRoomSavesNoUnityAssetsPage,
@@ -990,6 +990,62 @@ function toSaveWithoutUnityAssets(save: Record<string, unknown>) {
 	const str = (v: unknown) => (typeof v === 'string' ? v : null)
 	const num = (v: unknown) => (typeof v === 'number' ? v : null)
 	return {
+		SubRoomDataSaveId: num(save.SubRoomDataSaveId),
+		SubRoomId: num(save.SubRoomId),
+		UnityAssetId: str(save.UnityAssetId),
+		ReferencedUnityAssetIds: Array.isArray(save.ReferencedUnityAssetIds)
+			? save.ReferencedUnityAssetIds
+			: [],
+		DataBlob: str(save.DataBlob) ?? '',
+		DataBlobHash: str(save.DataBlobHash),
+		PersistenceVersion: num(save.PersistenceVersion) ?? 0,
+		OMVersion: num(save.OMVersion) ?? 0,
+		SavedByAccountId: num(save.SavedByAccountId),
+		SavedOnPlatform: num(save.SavedOnPlatform) ?? 0,
+		SavedOnDeviceClass: num(save.SavedOnDeviceClass) ?? 0,
+		Description: str(save.Description) ?? '',
+		ModerationState: num(save.ModerationState) ?? 0,
+		CreatedAt: str(save.CreatedAt) ?? '',
+		UgcSubVersion: num(save.UgcSubVersion) ?? 0,
+	}
+}
+
+/**
+ * One save as `GET …/subrooms/:sid/saves/:saveId` answers it — the PascalCase row the
+ * `…/saves` list serves, NOT the camelCase `subRoomDataSave` the room save that created
+ * it returned (an earlier version served that, and the client rendered a save whose
+ * values were all missing). Two things differ from the list row, both observed against
+ * the reference:
+ *
+ * - Each `UnitySubAssets` entry is `{ UnityAssetId, UnityAsset, UnityAssetHash }` — the
+ *   stored `Filename`/`Hash` under the names the client's save-detail decoder reads —
+ *   and the save's own main bundle is lifted to top-level `UnityAsset`/`UnityAssetHash`
+ *   (the named target's, Windows when none was named; both null for a maker-pen save).
+ * - No `Tags`, and `UnityAssetId` is always present (null when the save carried none).
+ *
+ * Built key by key like {@link toSaveWithoutUnityAssets}, for the same reason.
+ */
+function toSaveDetail(save: Record<string, unknown>, target: number | null) {
+	const str = (v: unknown) => (typeof v === 'string' ? v : null)
+	const num = (v: unknown) => (typeof v === 'number' ? v : null)
+	const main = pickBakedBundle(save, target)
+	const bundles = (Array.isArray(save.UnitySubAssets) ? save.UnitySubAssets : []).filter(
+		(item): item is Record<string, unknown> =>
+			typeof item === 'object' &&
+			item !== null &&
+			(target === null || (item as { Target?: unknown }).Target === target)
+	)
+	return {
+		UnitySubAssets: bundles.map((row) => ({
+			UnityAssetId: str(row.UnityAssetId),
+			UnityAsset: str(row.Filename),
+			UnityAssetHash: str(row.Hash),
+		})),
+		ReferencedUnityAssets: Array.isArray(save.ReferencedUnityAssets)
+			? save.ReferencedUnityAssets
+			: [],
+		UnityAsset: main?.filename ?? null,
+		UnityAssetHash: main?.hash ?? null,
 		SubRoomDataSaveId: num(save.SubRoomDataSaveId),
 		SubRoomId: num(save.SubRoomId),
 		UnityAssetId: str(save.UnityAssetId),
@@ -3670,20 +3726,34 @@ const app = new Hono<App>()
 			tags: ['Subrooms'],
 			summary: 'One of a subroom’s saves by id',
 			description: [
-				'A single save, in the SAME camelCase projection the room save that created it',
-				'returned — not the PascalCase rows `…/saves` lists. Save ids are globally',
-				'unique but resolved scoped to the subroom, so one subroom cannot read another’s',
-				'save by guessing an id: a save that belongs elsewhere is a 404, same as an unknown',
-				'one.',
+				'A single save as a PascalCase row like the ones `…/saves` lists — NOT the camelCase',
+				'`subRoomDataSave` the room save that created it returned (served that way, the',
+				'client showed a save with every value missing). It differs from the list row in',
+				'how it names bundles: each `UnitySubAssets` entry is `{ UnityAssetId, UnityAsset,',
+				'UnityAssetHash }`, the save’s main bundle is lifted to top-level `UnityAsset`/',
+				'`UnityAssetHash` (null for a maker-pen save), and there is no `Tags`. An integer',
+				'`unityAssetTarget` picks which target’s bundles those are (0 Windows, 2',
+				'Android/Quest); none named means every bundle in the list and Windows on top.',
+				'Save ids are globally unique but resolved scoped to the subroom, so one subroom',
+				'cannot read another’s save by guessing an id: a save that belongs elsewhere is a',
+				'404, same as an unknown one.',
 				'',
 				'Gated like the list it details — the room’s creator, a co-owner, or anyone whose',
 				'presence puts them in the room. A save id resolves whether or not it was ever published, so this',
 				'reads unpublished work.',
 			].join(' '),
 			security: AUTHED,
-			parameters: [roomIdParam, subRoomIdParam, saveIdParam],
+			parameters: [
+				roomIdParam,
+				subRoomIdParam,
+				saveIdParam,
+				stringQuery(
+					'unityAssetTarget',
+					'When an integer, the bundles are that target’s only (0 Windows, 2 Android/Quest)'
+				),
+			],
 			responses: {
-				200: json(SubRoomDataSaveResponseDto, 'The save'),
+				200: json(SubRoomDataSaveDetailDto, 'The save'),
 				401: UNAUTHORIZED_RESPONSE,
 				403: FORBIDDEN_RESPONSE,
 				404: { description: 'No such room, subroom, or save on that subroom' },
@@ -3704,7 +3774,7 @@ const app = new Hono<App>()
 			if (!(await canReadSaves(c, room, roomId, accountId))) return c.body(null, 403)
 
 			const save = await getSubRoomSaveById(c.env.DB, subRoomId, saveId)
-			return save ? c.json(toSaveResponse(save, unityAssetTargetQuery(c))) : c.notFound()
+			return save ? c.json(toSaveDetail(save, unityAssetTargetQuery(c))) : c.notFound()
 		}
 	)
 

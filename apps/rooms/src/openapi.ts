@@ -175,10 +175,10 @@ export const LoadScreenDto = z.object({
  * no moderation state, no asset arrays; but `unityAsset`/`unityAssetHash`/`dataBlobHash`
  * that `CurrentSave` doesn't show). The two are deliberately not unified.
  *
- * Also what `GET …/subrooms/{subRoomId}/saves/{saveId}` answers — one save fetched by id
- * is the same thing the save that created it returned, so both go through
- * `toSaveResponse`. Note the `…/saves` LIST is the third shape here: it serves the raw
- * PascalCase rows ({@link SubRoomDataSaveDto}), not this.
+ * ONLY the room save answers this. `GET …/subrooms/{subRoomId}/saves/{saveId}` once did
+ * too, and the client rendered that save with every value missing: the detail is a
+ * PascalCase row ({@link SubRoomDataSaveDetailDto}), like the `…/saves` LIST serves
+ * ({@link SubRoomDataSaveDto}).
  */
 export const SubRoomDataSaveResponseDto = z.object({
 	subRoomDataSaveId: z.int(),
@@ -959,6 +959,51 @@ export const SubRoomSavesPage = z.object({
  * here, null when the save carried none, where the full row emits it only when it did.
  */
 export const SubRoomDataSaveNoUnityAssetsDto = z.object({
+	SubRoomDataSaveId: z.int(),
+	SubRoomId: z.int(),
+	UnityAssetId: z.string().nullable().describe('Null unless the save carried one'),
+	ReferencedUnityAssetIds: z.array(z.string()).describe('Always empty — we record none'),
+	DataBlob: z.string().describe('The scene-data key the client downloads from the CDN'),
+	DataBlobHash: z.string().nullable(),
+	PersistenceVersion: z.int(),
+	OMVersion: z.int(),
+	SavedByAccountId: z.int().nullable(),
+	SavedOnPlatform: z.int().describe('0 — the save request carries no platform'),
+	SavedOnDeviceClass: z.int().describe('0 — the save request carries no device class'),
+	Description: z.string().describe('The save comment; empty string when none'),
+	ModerationState: z.int(),
+	CreatedAt: z.string(),
+	UgcSubVersion: z.int(),
+})
+
+/**
+ * One save as `GET …/subrooms/{subRoomId}/saves/{saveId}` answers it — the PascalCase row
+ * of {@link SubRoomDataSaveDto}, with its bundles named the way the client's save-detail
+ * decoder reads them: each `UnitySubAssets` entry is `{ UnityAssetId, UnityAsset,
+ * UnityAssetHash }` rather than `Filename`/`Hash`, and the save's own main bundle is
+ * lifted to top-level `UnityAsset`/`UnityAssetHash`. No `Tags`; `UnityAssetId` is always
+ * present, null when the save carried none. NOT the camelCase
+ * {@link SubRoomDataSaveResponseDto} the room save returns — served that, the client
+ * showed a save with every value missing.
+ */
+export const SubRoomDataSaveDetailDto = z.object({
+	UnitySubAssets: z
+		.array(
+			z.object({
+				UnityAssetId: z.string().nullable(),
+				UnityAsset: z.string().nullable().describe('The bundle filename, from the CDN'),
+				UnityAssetHash: z.string().nullable().describe('Base64 SHA-256 of the bundle'),
+			})
+		)
+		.describe('Main Studio bundles for this save; empty for a maker-pen save'),
+	ReferencedUnityAssets: z.array(z.unknown()).describe('Always empty'),
+	UnityAsset: z
+		.string()
+		.nullable()
+		.describe(
+			'The main bundle for the named target (Windows when none); null for a maker-pen save'
+		),
+	UnityAssetHash: z.string().nullable().describe('Base64 SHA-256 of `UnityAsset`; null with it'),
 	SubRoomDataSaveId: z.int(),
 	SubRoomId: z.int(),
 	UnityAssetId: z.string().nullable().describe('Null unless the save carried one'),

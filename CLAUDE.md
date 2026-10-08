@@ -115,9 +115,13 @@ inconsistency here without checking the client first.
   `StagedSubRoomDataSaveId` carries no subroom context), and nothing is overwritten, so
   `…/saves` is real history and `publish_save` doubles as restore-a-save. There
   is no `GET …/subrooms/:sid/data`; only the POST (the room save) exists on that path.
-  `GET …/saves/:saveId` is the detail behind a list row, under the same gate, but in the
-  CAMELCASE projection the room save's response uses — not the PascalCase rows the list
-  serves. Three shapes of one save; keep them straight.
+  `GET …/saves/:saveId` is the detail behind a list row, under the same gate, and a
+  PASCALCASE row like the list serves — NOT the camelCase projection the room save's
+  response uses (served that, the client showed a save with every value missing). It
+  differs from the list row only in how it names bundles: each `UnitySubAssets` entry is
+  `{ UnityAssetId, UnityAsset, UnityAssetHash }`, the main bundle is lifted to top-level
+  `UnityAsset`/`UnityAssetHash`, and there is no `Tags`. Three shapes of one save; keep
+  them straight.
 - The save reads (`rooms`: `…/saves`, `…/saves/no_unity_assets` and `…/saves/:saveId`) are
   auth-gated and readable by the room's creator, a CO-OWNER, or anyone whose live `presence`
   row puts them in that room. They list unpublished staged saves, so they aren't public; but
