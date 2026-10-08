@@ -1071,9 +1071,17 @@ export const CreatePurchaseOfferRequest = z.object({
 	Order: z.string().optional().describe('Where it sits in the shop; defaults to 0'),
 })
 
+/** `POST /api/roomcurrencies/v1/deletePurchaseOffer` — form-encoded. */
+export const DeletePurchaseOfferRequest = z.object({
+	PurchaseOfferId: z
+		.string()
+		.describe('The offer to take down, by its `CurrencyPurchaseOfferId` (any letter case)'),
+})
+
 /**
- * The envelope the create-offer endpoint answers in — the same
- * `{ Value, Success, Error, error_id }` the currency writes use, with the offer in `Value`.
+ * The envelope the create- and delete-offer endpoints answer in — the same
+ * `{ Value, Success, Error, error_id }` the currency writes use, with the offer (as created,
+ * or as it stood when removed) in `Value`.
  */
 export const RoomCurrencyPurchaseOfferEnvelope = z.object({
 	Value: RoomCurrencyPurchaseOfferDto.nullable(),

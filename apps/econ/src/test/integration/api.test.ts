@@ -2079,6 +2079,123 @@ describe('econ endpoints', () => {
 			])
 		})
 
+		test('POST deletePurchaseOffer takes one offer out of its shop, gated to the room', async () => {
+			type Offer = {
+				CurrencyPurchaseOfferId: string
+				CurrencyId: string
+				Order: number
+				Name: string
+				CurrencyAmount: number
+				Price: number
+				ModifiedAt: string
+			}
+			type Envelope = {
+				Value: Offer | null
+				Success: boolean
+				Error: string | null
+				error_id: null
+			}
+			const post = async (path: string, fields: Record<string, string>, sub: string | null) =>
+				exports.default.fetch(`${ORIGIN}${path}`, {
+					method: 'POST',
+					headers: {
+						'Content-Type': 'application/x-www-form-urlencoded',
+						...(sub === null ? {} : await bearer(sub)),
+					},
+					body: new URLSearchParams(fields),
+				})
+			const addOffer = async (currencyId: string, name: string, order: number) =>
+				(
+					(await (
+						await post(
+							'/api/roomcurrencies/v1/createPurchaseOffer',
+							{
+								CurrencyId: currencyId,
+								Name: name,
+								Amount: '5',
+								Price: '50',
+								Order: String(order),
+							},
+							'1'
+						)
+					).json()) as Envelope
+				).Value!
+			const remove = (offerId: string, sub: string | null) =>
+				post('/api/roomcurrencies/v1/deletePurchaseOffer', { PurchaseOfferId: offerId }, sub)
+			const shopOf = async (currencyId: string) =>
+				(
+					(await (
+						await exports.default.fetch(
+							`${ORIGIN}/api/roomcurrencies/v1/getPurchaseOffersBatch?ids=${currencyId}`
+						)
+					).json()) as Array<{ PurchaseOffers: Offer[] }>
+				)[0].PurchaseOffers.map((o) => o.Name)
+			const refused = {
+				Value: null,
+				Success: false,
+				Error: 'Failed to delete purchase offer',
+				error_id: null,
+			}
+
+			// Two shops in room 2511, so the delete has to find the right one from the id alone.
+			const shopped = (await envOf(await create({ ...body, Name: 'Shopped' }, await bearer('1'))))
+				.Value!
+			const other = (await envOf(await create({ ...body, Name: 'Other' }, await bearer('1'))))
+				.Value!
+			const first = await addOffer(shopped.CurrencyId, 'First', 0)
+			const second = await addOffer(shopped.CurrencyId, 'Second', 1)
+			const third = await addOffer(shopped.CurrencyId, 'Third', 2)
+			const elsewhere = await addOffer(other.CurrencyId, 'Elsewhere', 0)
+
+			// No token → 401; a valid token with no standing in the room → 403, and the offer
+			// stays. An id no shop lists, or none at all, is a refusal in the envelope.
+			expect((await remove(second.CurrencyPurchaseOfferId, null)).status).toBe(401)
+			expect((await remove(second.CurrencyPurchaseOfferId, '999')).status).toBe(403)
+			expect(await shopOf(shopped.CurrencyId)).toEqual(['First', 'Second', 'Third'])
+			for (const id of [crypto.randomUUID(), '']) {
+				const res = await remove(id, '1')
+				expect(res.status).toBe(200)
+				expect(await res.json()).toEqual(refused)
+			}
+
+			// The co-owner removes the middle one: the answer is the offer as it stood, the
+			// shop keeps its neighbours in order, and the other currency's shop is untouched.
+			const res = await remove(second.CurrencyPurchaseOfferId, '2')
+			expect(res.status).toBe(200)
+			expect(await res.json()).toEqual({
+				Value: second,
+				Success: true,
+				Error: null,
+				error_id: null,
+			})
+			expect(await shopOf(shopped.CurrencyId)).toEqual(['First', 'Third'])
+			expect(await shopOf(other.CurrencyId)).toEqual(['Elsewhere'])
+			// What is left is still what the create wrote, not a re-encoding of it.
+			expect(
+				(await (
+					await exports.default.fetch(
+						`${ORIGIN}/api/roomcurrencies/v1/getPurchaseOffersBatch?ids=${shopped.CurrencyId}`
+					)
+				).json()) as Array<{ PurchaseOffers: Offer[] }>
+			).toEqual([{ CurrencyId: shopped.CurrencyId, PurchaseOffers: [first, third] }])
+
+			// Gone means gone: a second delete is the unknown-id refusal. The id matches in any
+			// letter case, like the purchase's lookup.
+			expect(await (await remove(second.CurrencyPurchaseOfferId, '1')).json()).toEqual(refused)
+			expect(
+				(
+					(await (
+						await remove(third.CurrencyPurchaseOfferId.toUpperCase(), '1')
+					).json()) as Envelope
+				).Value?.Name
+			).toBe('Third')
+			// Emptying a shop leaves it an empty shop, still listed.
+			await remove(first.CurrencyPurchaseOfferId, '1')
+			expect(await shopOf(shopped.CurrencyId)).toEqual([])
+			expect(await shopOf(other.CurrencyId)).toEqual(['Elsewhere'])
+			expect(elsewhere.Name).toBe('Elsewhere')
+		})
+
 		test('POST createCurrency pushes RoomCurrencyCreated to the room and the creator', async () => {
 			// Two players standing in 2511, one somewhere else, and one whose presence lapsed.
 			const now = Math.floor(Date.now() / 1000)
@@ -7048,6 +7165,7 @@ describe('econ endpoints', () => {
 			'POST /api/roomcurrencies/v1/awardCurrency/bulk',
 			'POST /api/roomcurrencies/v1/createCurrency',
 			'POST /api/roomcurrencies/v1/createPurchaseOffer',
+			'POST /api/roomcurrencies/v1/deletePurchaseOffer',
 			'POST /api/roomcurrencies/v1/updateCurrency',
 			'POST /api/roomkeys/v1/awardbulk',
 			'POST /api/roomkeys/v1/create',

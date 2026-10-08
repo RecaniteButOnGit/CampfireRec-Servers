@@ -106,6 +106,7 @@ import {
 	CreateRoomCurrencyRequest,
 	CreateRoomKeyRequest,
 	CustomAvatarItemsResponse,
+	DeletePurchaseOfferRequest,
 	EquipmentUpdateRequest,
 	ErrorResponse,
 	form,
@@ -170,6 +171,7 @@ import {
 	awardRoomCurrency,
 	createPurchaseOffer,
 	createRoomCurrency,
+	deletePurchaseOffer,
 	findPurchaseOffer,
 	getPurchaseOffers,
 	getRoomBalance,
@@ -348,6 +350,7 @@ const HUB_INSTANCE = 'global'
 const CREATE_CURRENCY_FAILED = 'Failed to create currency'
 const UPDATE_CURRENCY_FAILED = 'Failed to update currency'
 const CREATE_OFFER_FAILED = 'Failed to create purchase offer'
+const DELETE_OFFER_FAILED = 'Failed to delete purchase offer'
 const SAVE_CONSUMABLE_FAILED = 'Failed to save consumable'
 /**
  * `Status` on the room-key create's `{ Status, RoomKey }` reply. 0 is the observed success
@@ -415,8 +418,8 @@ function roomConsumableEnvelope(c: Context<App>, value: RoomConsumable | null, e
 }
 
 /**
- * The create-offer envelope — the same `{ Value, Success, Error, error_id }` shape again,
- * carrying one purchase offer.
+ * The create- and delete-offer envelope — the same `{ Value, Success, Error, error_id }`
+ * shape again, carrying one purchase offer.
  */
 function purchaseOfferEnvelope(
 	c: Context<App>,
@@ -4208,6 +4211,64 @@ const app = new Hono<App>({ strict: false })
 				Order: int(body.Order, 0),
 			})
 			return purchaseOfferEnvelope(c, offer)
+		}
+	)
+
+	// Take a purchase offer down. Auth-gated (401) and gated to the creator or a co-owner of
+	// the room that minted the currency the offer sells (403). The body names ONLY the offer,
+	// so the currency — and through it the room — is found by walking the shops for the id;
+	// nothing about the caller's whereabouts is consulted.
+	.post(
+		'/api/roomcurrencies/v1/deletePurchaseOffer',
+		describeRoute({
+			tags: ['Econ'],
+			summary: 'Remove a purchase offer from a room currency',
+			description: [
+				'Removes the offer named by `PurchaseOfferId` (its `CurrencyPurchaseOfferId`) from',
+				'whichever currency’s shop lists it. Form-encoded (`PurchaseOfferId=…`). The body',
+				'names nothing else: the currency, and the room that gates the delete, are found',
+				'from the offer.',
+				'',
+				'Gated to the creator or a co-owner of the room that minted the currency. A valid',
+				'token from anyone else is a 403. Answers the same',
+				'`{ Value, Success, Error, error_id }` envelope the create answers in, with the',
+				'offer as it stood when removed in `Value`, or a 200 carrying `Success: false` when',
+				'no shop lists that id. What the client does with `Value` here is an assumption —',
+				'only the create’s reply has been observed.',
+			].join('\n'),
+			security: AUTHED,
+			requestBody: form(DeletePurchaseOfferRequest, 'The offer to remove'),
+			responses: {
+				200: json(
+					RoomCurrencyPurchaseOfferEnvelope,
+					'The offer as removed, or a rejection with `Success: false`'
+				),
+				401: UNAUTHORIZED_RESPONSE,
+				403: { description: 'Not the creator or a co-owner of the minting room (empty body)' },
+			},
+		}),
+		async (c) => {
+			const accountId = await authedId(c)
+			if (accountId === null) return unauthorized(c)
+
+			const body = (await c.req.parseBody().catch(() => ({}))) as Record<string, unknown>
+			const purchaseOfferId = (
+				typeof body.PurchaseOfferId === 'string' ? body.PurchaseOfferId : ''
+			).trim()
+			if (purchaseOfferId === '') return purchaseOfferEnvelope(c, null, DELETE_OFFER_FAILED)
+
+			// Found BEFORE it is removed, because the find is what says which room gates the
+			// delete: an unknown id is a refusal, and a known one is somebody's to refuse.
+			const found = await findPurchaseOffer(c.env.DB, purchaseOfferId)
+			if (!found) return purchaseOfferEnvelope(c, null, DELETE_OFFER_FAILED)
+
+			const canManage = await canManageRoomById(c.env.DB, found.RoomId, accountId)
+			if (canManage === null) return purchaseOfferEnvelope(c, null, DELETE_OFFER_FAILED)
+			if (!canManage) return c.body(null, 403)
+
+			const removed = await deletePurchaseOffer(c.env.DB, purchaseOfferId)
+			if (!removed) return purchaseOfferEnvelope(c, null, DELETE_OFFER_FAILED)
+			return purchaseOfferEnvelope(c, removed.Offer)
 		}
 	)
 
