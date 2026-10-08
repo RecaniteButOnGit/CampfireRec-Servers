@@ -15,6 +15,7 @@ import {
 	grantInvention,
 	levelReward,
 	levelsReached,
+	listInfluencerIds,
 	ownsInvention,
 	setOutfit,
 } from '@repo/domain'
@@ -6703,22 +6704,24 @@ const app = new Hono<App>({ strict: false })
 
 	// Everyone in the influencer partner program, by account id — the list the client keeps
 	// so it can badge an influencer wherever they turn up, rather than asking per player.
+	// Membership is the account's `isInfluencer` flag (`runx admin grant-influencer`), read
+	// through the `is_influencer` generated column's partial index so the account table is
+	// never scanned.
 	//
-	// Empty: no programme runs here, so there is nobody to list. Note this is the LIST
-	// counterpart of the single-account check below, and the two answer very differently —
-	// that one 404s to say "not an influencer", this one is a 200 carrying an empty list,
-	// because "nobody is" is a complete answer to "who is?".
-	//
-	// `take` is accepted and ignored; there is nothing to page through.
+	// Paged in shape only: the client asks for `take=1000` and this server will not have
+	// that many, so the whole list is one page and `ContinuationToken` is always null. `take`
+	// is accepted and ignored. Note this is the LIST counterpart of the single-account tier
+	// check below, which still answers 0 for everyone.
 	.get(
 		'/api/influencerpartnerprogram/influencers',
 		describeRoute({
 			tags: ['Econ'],
 			summary: 'Every influencer in the partner program',
 			description: [
-				'The account ids in the influencer partner program, as `{ InfluencerIds }` — an object',
-				'around the list, not a bare array. Always empty here: no programme runs on this',
-				'server. `take` is accepted and ignored, there being nothing to page.',
+				'The account ids in the influencer partner program — every account flagged',
+				'`isInfluencer` — as `{ InfluencerIds, ContinuationToken }`: an object around the',
+				'list, not a bare array. Served whole: `take` is accepted and ignored, and',
+				'`ContinuationToken` is always null.',
 			].join(' '),
 			security: AUTHED,
 			parameters: [
@@ -6726,19 +6729,20 @@ const app = new Hono<App>({ strict: false })
 					name: 'take',
 					in: 'query',
 					required: false,
-					description: 'How many ids to return. Accepted and ignored.',
+					description: 'How many ids to return. Accepted and ignored — the list is served whole.',
 					schema: { type: 'integer' },
 				},
 			],
 			responses: {
-				200: json(InfluencerIdsResponse, 'The influencer ids — always empty'),
+				200: json(InfluencerIdsResponse, 'The influencer ids, lowest first'),
 				401: UNAUTHORIZED_RESPONSE,
 			},
 		}),
 		async (c) => {
 			const id = await authedId(c)
 			if (id === null) return unauthorized(c)
-			return c.json({ InfluencerIds: [] })
+			const InfluencerIds = await listInfluencerIds(c.env.DB)
+			return c.json({ InfluencerIds, ContinuationToken: null })
 		}
 	)
 

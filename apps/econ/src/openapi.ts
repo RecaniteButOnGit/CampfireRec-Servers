@@ -222,12 +222,16 @@ export const RRPlusSignUpBonus = z.object({
 /**
  * `GET /api/influencerpartnerprogram/influencers` — the ids of every influencer in the
  * partner program, which the client uses to badge them wherever they appear. An object
- * around the list, not a bare array.
+ * around the list, not a bare array. `ContinuationToken` is the paging cursor; always null
+ * here, the whole list fitting in one page.
  */
 export const InfluencerIdsResponse = z.object({
 	InfluencerIds: z
 		.array(z.int())
-		.describe('Account ids in the partner program. Empty — no programme runs here'),
+		.describe('Account ids in the partner program — every account flagged `isInfluencer`'),
+	ContinuationToken: z
+		.null()
+		.describe('Paging cursor for the next page. Always null — the list is served whole'),
 })
 
 /**

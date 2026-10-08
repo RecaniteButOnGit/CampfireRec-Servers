@@ -18,6 +18,7 @@ import {
 	PROGRESSION_SCHEMA_DDL,
 	RECEIVED_GIFT_SCHEMA_DDL,
 	ROOM_SCHEMA_DDL,
+	updateAccount,
 } from '@repo/domain'
 import { PlatformType } from '@repo/domain/src/enums'
 
@@ -6894,15 +6895,48 @@ describe('econ endpoints', () => {
 		expect(await res.text()).toBe('')
 	})
 
-	test('GET /api/influencerpartnerprogram/influencers lists nobody', async () => {
+	test('GET /api/influencerpartnerprogram/influencers lists every isInfluencer account', async () => {
+		const seed = async (accountId: number, isInfluencer: boolean | undefined) => {
+			await env.DB.prepare('INSERT OR IGNORE INTO account (data) VALUES (?1)')
+				.bind(
+					JSON.stringify({
+						accountId,
+						username: `Influencer${accountId}`,
+						...(isInfluencer === undefined ? {} : { isInfluencer }),
+					})
+				)
+				.run()
+		}
+		await seed(8103, true)
+		await seed(8101, true)
+		await seed(8102, false) // explicitly not one
+		await seed(8104, undefined) // flag never set
+
 		const res = await exports.default.fetch(
 			`${ORIGIN}/api/influencerpartnerprogram/influencers?take=1000`,
 			{ headers: await bearer('207') }
 		)
 		expect(res.status).toBe(200)
 		// An object around the list, not a bare array — unlike its single-account siblings
-		// below, whose whole body is a bare tier number.
-		expect(await res.json()).toEqual({ InfluencerIds: [] })
+		// below, whose whole body is a bare tier number. Lowest id first; the whole list is
+		// one page, so the continuation token is null rather than absent.
+		expect(await res.json()).toEqual({ InfluencerIds: [8101, 8103], ContinuationToken: null })
+
+		// The list is read through the `is_influencer` generated column's partial index
+		// (auth migration 0012), so the mirrored schema has to carry it — and the planner
+		// has to pick it over a scan of the account table.
+		const plan = await env.DB.prepare(
+			'EXPLAIN QUERY PLAN SELECT account_id FROM account WHERE is_influencer = 1 ORDER BY account_id'
+		).all<{ detail: string }>()
+		expect(plan.results.map((r) => r.detail).join('\n')).toContain('idx_account_is_influencer')
+
+		// Revoking drops the account from the list on the next read — no cache in between.
+		await updateAccount(env.DB, 8103, { isInfluencer: false })
+		const after = await exports.default.fetch(
+			`${ORIGIN}/api/influencerpartnerprogram/influencers?take=1000`,
+			{ headers: await bearer('207') }
+		)
+		expect(await after.json()).toEqual({ InfluencerIds: [8101], ContinuationToken: null })
 	})
 
 	test('GET /api/influencerpartnerprogram/influencers 401s without a bearer token', async () => {

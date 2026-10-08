@@ -295,11 +295,16 @@ async function roleFilterAnswer(c: Context<App>, role: 'developer' | 'moderator'
  *
  * `betastudio` rides on the account's `hasStudio` flag, and developer does not imply it.
  * RecFlare Studio treats that exact claim as Full access, which is what lets the editor
- * upload; staff set the flag from the website. Order is stable so tokens are
- * deterministic: screenshare, developer, moderator, junior, then betastudio.
+ * upload; staff set the flag from the website. `influencer` rides on `isInfluencer`
+ * (`runx admin grant-influencer`) and lives only in the token — no `/role/*` lookup
+ * answers it. Order is stable so tokens are deterministic: screenshare, developer,
+ * moderator, junior, betastudio, then influencer.
  */
 function accountRoles(
-	account: Pick<Account, 'isDeveloper' | 'isModerator' | 'isJunior' | 'hasStudio'> | null
+	account: Pick<
+		Account,
+		'isDeveloper' | 'isModerator' | 'isJunior' | 'hasStudio' | 'isInfluencer'
+	> | null
 ): string[] {
 	const roles = ['screenshare']
 	if (!account) return roles
@@ -307,6 +312,7 @@ function accountRoles(
 	if (account.isModerator) roles.push('moderator')
 	if (account.isJunior) roles.push('junior')
 	if (account.hasStudio) roles.push('betastudio')
+	if (account.isInfluencer) roles.push('influencer')
 	return roles
 }
 

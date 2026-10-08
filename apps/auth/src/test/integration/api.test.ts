@@ -895,6 +895,29 @@ describe('auth worker routes', () => {
 		expect(payload.scope).not.toContain('rn.privilege')
 	})
 
+	test('POST /connect/token stamps the influencer role for an isInfluencer account', async () => {
+		await env.DB.prepare('INSERT OR IGNORE INTO account (data) VALUES (?1)')
+			.bind(
+				JSON.stringify({
+					accountId: 95,
+					username: 'InfluencerPlayer',
+					passwordHash: await hashPassword(LOGIN_PASSWORD),
+					isInfluencer: true,
+				})
+			)
+			.run()
+		const payload = await tokenFor(`account_id=95&password=${LOGIN_PASSWORD}`)
+		expect(payload.role).toEqual(
+			expect.arrayContaining(['gameClient', 'screenshare', 'influencer'])
+		)
+		expect(payload.role).not.toContain('developer')
+
+		// Off the flag, off the token — no other flag implies it.
+		await updateAccount(env.DB, 95, { isInfluencer: false })
+		const revoked = await tokenFor(`account_id=95&password=${LOGIN_PASSWORD}`)
+		expect(revoked.role).not.toContain('influencer')
+	})
+
 	test('POST /connect/token 400s when no account_id is posted (never defaults to 1)', async () => {
 		const res = await exports.default.fetch(`${ORIGIN}/connect/token`, { method: 'POST' })
 		expect(res.status).toBe(400)

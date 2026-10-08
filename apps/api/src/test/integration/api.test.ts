@@ -3671,6 +3671,55 @@ describe('public endpoints', () => {
 		expect(await miss.json()).toEqual([])
 	})
 
+	test('GET /api/inventions/v2/search with `@username` lists that player’s published inventions', async () => {
+		await env.DB.prepare('INSERT OR IGNORE INTO account (data) VALUES (?1)')
+			.bind(JSON.stringify({ accountId: 8082, username: 'DJDevin' }))
+			.run()
+		const invention = (id: number, creator: number, name: string): SavedInvention =>
+			({
+				InventionId: id,
+				ReplicationId: crypto.randomUUID(),
+				CreatorPlayerId: creator,
+				Name: name,
+				Description: '',
+				ImageName: '',
+				CurrentVersionNumber: 1,
+				CurrentVersion: { InventionId: id, VersionNumber: 1, BlobName: '' },
+				IsPublished: true,
+				HideFromPlayer: false,
+				CreatedAt: `2026-07-${String(id - 100).padStart(2, '0')}T00:00:00Z`,
+			}) as unknown as SavedInvention
+		for (const inv of [
+			invention(111, 8082, 'Devin Sofa'),
+			invention(112, 8082, 'Devin Lamp'),
+			// Another creator mentioning the name is NOT this player's invention.
+			{ ...invention(113, 8083, 'Tribute to @djdevin'), Description: 'by @djdevin' },
+			// Unpublished and hidden ones stay private, even to a search for the creator.
+			{ ...invention(114, 8082, 'Devin Draft'), IsPublished: false },
+			{ ...invention(115, 8082, 'Devin Hidden'), HideFromPlayer: true },
+		]) {
+			await env.DB.prepare('INSERT INTO invention (data) VALUES (?1)')
+				.bind(JSON.stringify(inv))
+				.run()
+		}
+		const ids = async (value: string): Promise<number[]> => {
+			const res = await exports.default.fetch(
+				`${ORIGIN}/api/inventions/v2/search?value=${encodeURIComponent(value)}&skip=0&take=100`
+			)
+			expect(res.status).toBe(200)
+			return ((await res.json()) as SavedInvention[]).map((i) => i.InventionId)
+		}
+
+		// The player's published inventions, newest first; the username is case-insensitive.
+		expect(await ids('@djdevin')).toEqual([112, 111])
+		expect(await ids('@DJDevin')).toEqual([112, 111])
+		// Further terms narrow within that player's inventions.
+		expect(await ids('@djdevin lamp')).toEqual([112])
+		// An unknown player is nothing — not a text search for the literal "@nobody".
+		expect(await ids('@nobody')).toEqual([])
+		expect(await ids('@')).toEqual([])
+	})
+
 	test('GET /api/inventions/v2/search filters and pages in SQL, and does not search tags', async () => {
 		const published = (id: number, name: string, description: string, tags: string[]) =>
 			({

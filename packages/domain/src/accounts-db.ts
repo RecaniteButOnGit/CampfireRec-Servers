@@ -15,13 +15,14 @@ import { bindPlaceholders, chunkForBinds } from './d1-binds'
 
 /**
  * Schema DDL — the head schema, i.e. what the table looks like after every migration
- * (0001_accounts + 0002_avatar + 0009_account_has_plus, sans seed INSERTs; 0004 added a
- * `platform_id` generated column and 0008 dropped it again, so it appears here in neither
- * form).
+ * (0001_accounts + 0002_avatar + 0009_account_has_plus + 0012_account_is_influencer, sans
+ * seed INSERTs; 0004 added a `platform_id` generated column and 0008 dropped it again, so it
+ * appears here in neither form).
  *
  * `has_plus` mirrors the blob's `hasPlus` so the operator's Plus token reload can find every
  * subscriber through its partial index instead of scanning every account's JSON. It is 1 for
  * JSON true, 0 for false and NULL when the key is absent; the index holds only the 1s.
+ * `is_influencer` does the same for `isInfluencer`, for econ's influencer list.
  */
 export const SCHEMA_DDL: string[] = [
 	`CREATE TABLE IF NOT EXISTS account (
@@ -29,11 +30,13 @@ export const SCHEMA_DDL: string[] = [
 		avatar TEXT,
 		account_id INTEGER GENERATED ALWAYS AS (json_extract(data, '$.accountId')) VIRTUAL,
 		username_lower TEXT GENERATED ALWAYS AS (lower(json_extract(data, '$.username'))) VIRTUAL,
-		has_plus INTEGER GENERATED ALWAYS AS (json_extract(data, '$.hasPlus')) VIRTUAL
+		has_plus INTEGER GENERATED ALWAYS AS (json_extract(data, '$.hasPlus')) VIRTUAL,
+		is_influencer INTEGER GENERATED ALWAYS AS (json_extract(data, '$.isInfluencer')) VIRTUAL
 	)`,
 	`CREATE UNIQUE INDEX IF NOT EXISTS idx_accounts_account_id ON account (account_id)`,
 	`CREATE INDEX IF NOT EXISTS idx_accounts_username_lower ON account (username_lower)`,
 	`CREATE INDEX IF NOT EXISTS idx_account_has_plus ON account (has_plus) WHERE has_plus = 1`,
+	`CREATE INDEX IF NOT EXISTS idx_account_is_influencer ON account (is_influencer) WHERE is_influencer = 1`,
 ]
 
 /** Client-facing account shape (camelCase, exactly as the client's AccountDTO). */
@@ -127,6 +130,14 @@ export interface Account {
 	 * `runx admin grant-moderator`. Absent/false means no role.
 	 */
 	isModerator?: boolean
+	/**
+	 * Whether this account holds the influencer role. It rides in the token's `role` claim
+	 * (as `influencer`) and puts the account in econ's influencer partner program list
+	 * (`GET /api/influencerpartnerprogram/influencers`, via {@link listInfluencerIds}) —
+	 * there is no `/role/influencer/:id` lookup. Operator-granted only, via
+	 * `runx admin grant-influencer`. Absent/false means no role.
+	 */
+	isInfluencer?: boolean
 	/**
 	 * Whether this account is a SANDBOX account — served out of the sandbox Tachyon pool
 	 * rather than the live one (`match` `GET /player/connection-info`). Operator-set only;
@@ -423,6 +434,20 @@ export async function getAccountsByIds(db: D1Database, ids: number[]): Promise<A
 		)
 	)
 	return parseAll(pages.flatMap((page) => page.results))
+}
+
+/**
+ * The id of every account flagged `isInfluencer`, lowest id first — the whole influencer
+ * partner program, which econ serves to every client on launch. Through the `is_influencer`
+ * generated column and its partial index (auth migration 0012): the predicate must stay
+ * exactly `is_influencer = 1` for the index to apply, and the index holds only those rows,
+ * so this never scans the account table. Only the ids are read; the blob is not parsed.
+ */
+export async function listInfluencerIds(db: D1Database): Promise<number[]> {
+	const { results } = await db
+		.prepare(`SELECT account_id FROM account WHERE is_influencer = 1 ORDER BY account_id`)
+		.all<{ account_id: number }>()
+	return results.map((r) => r.account_id)
 }
 
 /**
