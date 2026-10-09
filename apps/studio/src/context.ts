@@ -10,11 +10,12 @@ export type Env = SharedHonoEnv & {
 	JWT_SECRET: SecretsStoreSecret
 	// Shared `recflare` D1. Room ownership lives in the `room` blob (the `rooms`
 	// worker owns that schema) and who is standing where lives in `presence`.
-	// This worker migrates its own cloud-build tables (`studio_cloud_build`,
-	// `studio_unity_asset_file`) and only reads the room tables.
+	// This worker migrates its own cloud-build table (`studio_cloud_build`), writes
+	// each bundle it stores as a row of the rooms worker's `unity_asset`, and only
+	// reads the room tables.
 	DB: D1Database
 	// Shared `recflare-cdn` bucket. Local Studio builds land under
-	// `studio-room-bundles/`. The same bucket name the rooms and cdn workers bind.
+	// `room/studio/<roomId>/`. The same bucket name the rooms and cdn workers bind.
 	CDN_ASSETS: R2Bucket
 }
 

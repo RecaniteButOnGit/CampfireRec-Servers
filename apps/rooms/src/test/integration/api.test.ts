@@ -24,8 +24,7 @@ import {
 	ROOM_SCHEMA_DDL,
 	ROOM_XP_SCHEMA_DDL,
 	seedRoomWithSubRooms,
-	sha256HexToBase64,
-	STUDIO_UNITY_ASSET_SCHEMA_DDL,
+	STUDIO_CLOUD_BUILD_SCHEMA_DDL,
 	SUBROOM_SCHEMA_DDL,
 	UNITY_ASSET_SCHEMA_DDL,
 } from '@repo/domain'
@@ -6006,17 +6005,16 @@ describe('rooms endpoints', () => {
 	})
 })
 
-// A Rec Room Studio build is a unity asset on the save. The game loads the scene from
-// `CurrentSave.DataBlob` and the bundles from `UnitySubAssets`. Maker-pen saves stay
-// empty arrays, and a missing studio table must not fail the room read.
+// A Rec Room Studio build is a unity asset on the save: `unity_asset` rows the studio
+// worker wrote. The game loads the scene from `CurrentSave.DataBlob` and the bundles from
+// `UnitySubAssets`. Maker-pen saves stay empty arrays, and a missing studio cloud-build
+// table must not fail the room read.
 describe('studio room bundles', () => {
 	const ASSET = '11111111-2222-4333-8444-555555555555'
-	const WIN_HEX = 'e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855'
-	const ANDROID_HEX = 'ca978112ca1bbdcafac231b39a23dc4da786eff8147c4e72b9807785afee48bb'
-	const winName = publicStudioBundleFilename(ASSET, 'windows', 'main')
-	const androidName = publicStudioBundleFilename(ASSET, 'android', 'main')
-	const winHash = sha256HexToBase64(WIN_HEX)
-	const androidHash = sha256HexToBase64(ANDROID_HEX)
+	const winName = publicStudioBundleFilename(9901, ASSET, 'windows', 'main')
+	const androidName = publicStudioBundleFilename(9901, ASSET, 'android', 'main')
+	const winHash = '47DEQpj8HBSa+/TImW+5JCeuQeRkm5NMpJWZG3hSuFU='
+	const androidHash = 'ypeBEsobvcr6wjGzmiPcTaeG7/gUfE5yuYB3ha/uSLs='
 
 	const save = (unityAssetId?: string) => ({
 		UnitySubAssets: [],
@@ -6038,8 +6036,8 @@ describe('studio room bundles', () => {
 	})
 
 	async function reset() {
-		await env.DB.prepare('DROP TABLE IF EXISTS studio_unity_asset_file').run()
 		await env.DB.prepare('DROP TABLE IF EXISTS studio_cloud_build').run()
+		await env.DB.prepare('DELETE FROM unity_asset WHERE unity_asset_id = ?1').bind(ASSET).run()
 		await env.DB.prepare('DELETE FROM subroom_save WHERE sub_room_id IN (99011, 99021)').run()
 		await env.DB.prepare('DELETE FROM subroom WHERE room_id IN (9901, 9902)').run()
 		await env.DB.prepare('DELETE FROM room WHERE room_id IN (9901, 9902)').run()
@@ -6080,7 +6078,7 @@ describe('studio room bundles', () => {
 	}
 
 	async function storeFiles() {
-		for (const sql of STUDIO_UNITY_ASSET_SCHEMA_DDL) await env.DB.prepare(sql).run()
+		for (const sql of STUDIO_CLOUD_BUILD_SCHEMA_DDL) await env.DB.prepare(sql).run()
 		await env.DB.prepare(
 			`INSERT INTO studio_cloud_build
 				 (cloud_build_id, room_id, sub_room_id, sub_room_data_save_id, unity_asset_id,
@@ -6090,22 +6088,19 @@ describe('studio room bundles', () => {
 		)
 			.bind(ASSET)
 			.run()
-		const insert = async (platform: string, kind: string, filename: string, sha256: string) => {
-			await env.DB.prepare(
-				`INSERT INTO studio_unity_asset_file
-					 (unity_asset_id, platform, kind, filename, sha256, byte_length, r2_key)
-					 VALUES (?1, ?2, ?3, ?4, ?5, 4, ?6)`
+		const insert = (target: number, kind: 'main' | 'stripped', filename: string, hash: string) =>
+			putUnityAsset(
+				env.DB,
+				{ UnityAssetId: ASSET, Target: target, Version: 1, Filename: filename, Hash: hash },
+				kind
 			)
-				.bind(ASSET, platform, kind, filename, sha256, `studio-room-bundles/${filename}`)
-				.run()
-		}
-		await insert('windows', 'main', winName, WIN_HEX)
-		await insert('android', 'main', androidName, ANDROID_HEX)
+		await insert(0, 'main', winName, winHash)
+		await insert(2, 'main', androidName, androidHash)
 		await insert(
-			'windows',
+			0,
 			'stripped',
-			publicStudioBundleFilename(ASSET, 'windows', 'stripped'),
-			WIN_HEX
+			publicStudioBundleFilename(9901, ASSET, 'windows', 'stripped'),
+			winHash
 		)
 	}
 

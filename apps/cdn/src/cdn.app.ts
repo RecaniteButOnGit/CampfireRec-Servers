@@ -354,10 +354,11 @@ const app = new Hono<App>()
 	)
 
 	// Rec Room Studio room bundles. The filename is the one a room save or
-	// `GET …/unityasset` advertises. The bytes live under the key the studio upload
-	// wrote (`studio-room-bundles/…`), which is not the URL, so this looks the name
-	// up. Reads stay unauthenticated, same as `/avatar/` and `/room/`. HEAD is the
-	// editor's "already uploaded?" check: 200 exists, 404 does not.
+	// `GET …/unityasset` advertises — the R2 key itself (`studio/<roomId>/…`), as
+	// `unity_asset.filename` records it. Only a recorded filename is served, so this
+	// checks the table before streaming the key. Reads stay unauthenticated, same as
+	// `/avatar/` and `/room/`. HEAD is the editor's "already uploaded?" check: 200
+	// exists, 404 does not.
 	.on(
 		'HEAD',
 		'/unityasset/:filename{.+}',
@@ -365,7 +366,7 @@ const app = new Hono<App>()
 			tags: ['Assets'],
 			summary: 'Check that a Rec Room Studio room bundle exists',
 			description: [
-				'200 when `filename` names exactly one stored Studio bundle, 404 otherwise. The',
+				'200 when `filename` names a stored Studio bundle, 404 otherwise. The',
 				'Studio editor treats this HEAD as “already uploaded?” before it downloads the bytes',
 				'with GET. No body.',
 			].join(' '),
@@ -386,12 +387,9 @@ const app = new Hono<App>()
 			description: [
 				'Streams the Studio asset bundle stored for `filename`. The name comes from a',
 				'room save’s `UnitySubAssets` (or from `GET /rooms/{roomId}/subrooms/{subRoomId}/unityasset`',
-				'on the rooms worker). The object itself lives at the R2 key the studio upload',
-				'recorded, so this route looks the filename up rather than using it as the key.',
-				'',
-				'A filename that matches more than one stored bundle is a 404, so two rooms that',
-				'uploaded the same basename cannot be served as each other. A missing studio table',
-				'is the same 404. The worker does not interpret the bytes.',
+				'on the rooms worker) and is the R2 key the studio upload stored the bytes under.',
+				'Only a filename recorded in `unity_asset` is served: anything else is a 404, as is',
+				'a missing table. The worker does not interpret the bytes.',
 			].join(' '),
 			parameters: [
 				keyParam('filename', 'The bundle filename from the room save.', true),
@@ -403,20 +401,19 @@ const app = new Hono<App>()
 	)
 
 /**
- * The R2 key for a Studio bundle filename. Null when the name is unknown, ambiguous,
- * or the studio tables have not been migrated yet.
+ * The R2 key for a Studio bundle filename — the filename itself, once `unity_asset` says
+ * a build is stored under it. Null when no build is, or the table has not been migrated
+ * yet (the rooms worker owns it).
  */
 async function unityAssetR2Key(db: D1Database, filename: string): Promise<string | null> {
 	try {
-		// Same lookup as `@repo/domain` `findStudioUnityAssetByFilename`. Inlined so this
-		// worker does not take a dependency on the domain package. More than one row is a
-		// miss: two rooms must not be served each other's bundle.
-		const { results } = await db
-			.prepare(`SELECT r2_key FROM studio_unity_asset_file WHERE filename = ?1`)
+		// Inlined rather than imported so this worker does not take a dependency on the
+		// domain package.
+		const row = await db
+			.prepare(`SELECT 1 AS stored FROM unity_asset WHERE filename = ?1 LIMIT 1`)
 			.bind(filename)
-			.all<{ r2_key: string }>()
-		if (results.length !== 1) return null
-		return results[0]!.r2_key
+			.first<{ stored: number }>()
+		return row ? filename : null
 	} catch (err) {
 		const message = err instanceof Error ? err.message : String(err)
 		if (message.toLowerCase().includes('no such table')) return null
@@ -476,8 +473,8 @@ app.get(
 						'`application/octet-stream`; the worker never interprets what it hands back. Reads',
 						'are unauthenticated — a caller needs the exact key, which only comes from an',
 						'authenticated call to another worker. `/unityasset/{filename}` is a Studio room',
-						'bundle: the filename is looked up in `studio_unity_asset_file` and the stored R2',
-						'key is streamed. `HEAD` on that path is 200 when exactly one bundle has the name.',
+						'bundle: the filename is the R2 key, streamed once `unity_asset` records it.',
+						'`HEAD` on that path is 200 when a bundle is stored under the name.',
 						'',
 						'This worker only READS. Uploads go through the `storage` worker, which writes the',
 						'same bucket, and images are served by `img` rather than from here.',

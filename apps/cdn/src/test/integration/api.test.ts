@@ -286,33 +286,35 @@ describe('cdn endpoints', () => {
 		expect(res.status).toBe(404)
 	})
 
-	test('GET and HEAD /unityasset/:filename stream one stored studio bundle', async () => {
-		await env.DB.prepare('DROP TABLE IF EXISTS studio_unity_asset_file').run()
+	test('GET and HEAD /unityasset/:filename stream a stored studio bundle', async () => {
+		await env.DB.prepare('DROP TABLE IF EXISTS unity_asset').run()
 		const absent = await exports.default.fetch(`${ORIGIN}/unityasset/not-stored.assetbundle`)
 		expect(absent.status).toBe(404)
 
+		// The rooms worker's table (UNITY_ASSET_SCHEMA_DDL in @repo/domain), inlined like
+		// the route's own lookup is.
 		await env.DB.prepare(
-			`CREATE TABLE IF NOT EXISTS studio_unity_asset_file (
+			`CREATE TABLE IF NOT EXISTS unity_asset (
 				unity_asset_id TEXT NOT NULL,
-				platform TEXT NOT NULL,
-				kind TEXT NOT NULL,
+				target INTEGER NOT NULL,
+				version INTEGER NOT NULL,
+				kind TEXT NOT NULL DEFAULT 'main',
 				filename TEXT NOT NULL,
-				sha256 TEXT NOT NULL,
-				byte_length INTEGER NOT NULL,
-				r2_key TEXT NOT NULL,
-				PRIMARY KEY (unity_asset_id, platform, kind)
+				hash TEXT NOT NULL,
+				PRIMARY KEY (unity_asset_id, target, version, kind)
 			)`
 		).run()
-		const filename = 'abc111.windows.main.assetbundle'
-		const key = `studio-room-bundles/asset-a/windows/main/${filename}`
-		const insert = (unityAssetId: string, r2Key: string) =>
-			env.DB.prepare(
-				`INSERT INTO studio_unity_asset_file
-				 (unity_asset_id, platform, kind, filename, sha256, byte_length, r2_key)
-				 VALUES (?1, 'windows', 'main', ?2, 'ab', 4, ?3)`
-			).bind(unityAssetId, filename, r2Key)
-		await insert('asset-a', key).run()
-		await env.CDN_ASSETS.put(key, new Uint8Array([1, 2, 3, 4]))
+		// The filename IS the R2 key.
+		const filename = 'studio/20930/abc111.windows.main.assetbundle'
+		await env.DB.prepare(
+			`INSERT INTO unity_asset (unity_asset_id, target, version, kind, filename, hash)
+			 VALUES ('asset-a', 0, 1, 'main', ?1, 'n2SnR+G5fxMfq7a0Rylsm28CAeefs8U1bmx36JtqgGo=')`
+		)
+			.bind(filename)
+			.run()
+		await env.CDN_ASSETS.put(filename, new Uint8Array([1, 2, 3, 4]))
+		// A key in the bucket that no row records is not served.
+		await env.CDN_ASSETS.put('studio/20930/unrecorded.assetbundle', new Uint8Array([9]))
 
 		const res = await exports.default.fetch(`${ORIGIN}/unityasset/${filename}`)
 		expect(res.status).toBe(200)
@@ -325,10 +327,11 @@ describe('cdn endpoints', () => {
 		expect(await head.arrayBuffer()).toEqual(new ArrayBuffer(0))
 
 		expect((await exports.default.fetch(`${ORIGIN}/unityasset/other.assetbundle`)).status).toBe(404)
+		expect(
+			(await exports.default.fetch(`${ORIGIN}/unityasset/studio/20930/unrecorded.assetbundle`))
+				.status
+		).toBe(404)
 		expect((await exports.default.fetch(`${ORIGIN}/unityasset/a..b`)).status).toBe(400)
-
-		await insert('asset-b', `studio-room-bundles/asset-b/windows/main/${filename}`).run()
-		expect((await exports.default.fetch(`${ORIGIN}/unityasset/${filename}`)).status).toBe(404)
 	})
 
 	test('GET /openapi.json documents every route', async () => {

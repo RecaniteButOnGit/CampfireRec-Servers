@@ -18,9 +18,10 @@ Objects are keyed by prefix — `sigs/` (anti-cheat signatures), `room/` (saved 
 scenes, and room images by their bare `ImageName`), `invention/` (invention data), `data/`
 (generic client uploads), `avatar/` (custom avatar item assetbundles) — and served as `application/octet-stream`; the worker never interprets what it hands back.
 `/unityasset/{filename}` is the exception: a Rec Room Studio room bundle is stored under
-`studio-room-bundles/`, and the route looks the filename up in `studio_unity_asset_file`
-(the studio worker owns that table) before streaming the same way. `HEAD` on that path is
-200 when exactly one bundle has the name.
+`studio/<roomId>/` (the game's own `unity/<roomId>/` layout, under another prefix), its key
+recorded as the filename of a `unity_asset` row (the rooms worker owns that table; the
+studio worker writes the rows), and the route serves only a filename that table records.
+`HEAD` on that path is 200 when a bundle is stored under the name.
 Reads are unauthenticated: a caller needs the exact key, which only comes from an
 authenticated call to another worker.
 

@@ -5,8 +5,9 @@
 	"compatibility_date": "2026-06-16",
 	"compatibility_flags": ["nodejs_compat"],
 	// Shared `recflare` D1. Room co-owners come off the `room` blob and who is in a
-	// subroom comes off `presence` (other workers own those tables). This worker
-	// owns the cloud-build tables, migrated from `migrations/`; its own
+	// subroom comes off `presence` (other workers own those tables), and a stored
+	// bundle is a row of the rooms worker's `unity_asset`. This worker owns the
+	// cloud-build table, migrated from `migrations/`; its own
 	// migrations_table keeps that history separate from the other workers'
 	// migrations on the shared database. The "local" placeholder is replaced with
 	// RECFLARE_D1 at deploy time.
@@ -20,7 +21,7 @@
 		}
 	],
 	// Shared `recflare-cdn` R2 bucket (also bound by `rooms` / `cdn` / `storage`).
-	// Local Studio asset bundles live here under `studio-room-bundles/`.
+	// Local Studio asset bundles live here under `room/studio/<roomId>/`.
 	// bucket_name is a literal, so nothing is spliced at deploy time.
 	"r2_buckets": [
 		{

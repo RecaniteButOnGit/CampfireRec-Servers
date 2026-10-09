@@ -7,7 +7,7 @@ page is WWW `/device`. This worker answers the editor's build list, stores a
 locally built Windows and Android bundle pair, and answers the co-owner
 presence list. It does not serve the bundle bytes. A stored build is loaded from
 Rooms (`CurrentSave.UnitySubAssets`, and `GET /rooms/{roomId}/subrooms/{subRoomId}/unityasset`)
-and from the CDN at `GET /unityasset/{filename}`.
+and from the bucket at `/room/{filename}`.
 
 | Method | Path                            | Purpose                                                                                                                                                                                                                                                                                                                               |
 | ------ | ------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
@@ -37,10 +37,12 @@ pnpm turbo deploy
 
 ### Migrate
 
-This worker owns `studio_cloud_build` and `studio_unity_asset_file` on the shared
-`recflare` database (`migrations/`, tracked in its own `d1_migrations_studio` table).
-Deploying does not apply them; the cdn worker reads `studio_unity_asset_file` and
-answers 404 for every Studio bundle until this has run.
+This worker owns `studio_cloud_build` on the shared `recflare` database (`migrations/`,
+tracked in its own `d1_migrations_studio` table). The bundles themselves are rows of the
+rooms worker's `unity_asset` (one per platform and kind: target 0 Windows / 2 Android,
+`studio/<roomId>/<name>.assetbundle` as `filename` — the bytes sit at `room/<filename>` in
+the bucket, the prefix the client adds — base64 SHA-256 as `hash`), so a stored build needs
+the rooms migrations too. Deploying does not apply either.
 
 ```sh
 just migrate -F studio             # remote

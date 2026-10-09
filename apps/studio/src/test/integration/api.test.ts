@@ -1,9 +1,14 @@
 import { adminSecretsStore, env, SELF } from 'cloudflare:test'
 import { beforeAll, describe, expect, it } from 'vitest'
 
-import { PRESENCE_SCHEMA_DDL, ROOM_SCHEMA_DDL, setPresence, SUBROOM_SCHEMA_DDL } from '@repo/domain'
-
-import { STUDIO_CLOUD_BUILD_SCHEMA_DDL } from '../../local-builds'
+import {
+	PRESENCE_SCHEMA_DDL,
+	ROOM_SCHEMA_DDL,
+	setPresence,
+	STUDIO_CLOUD_BUILD_SCHEMA_DDL,
+	SUBROOM_SCHEMA_DDL,
+	UNITY_ASSET_SCHEMA_DDL,
+} from '@repo/domain'
 
 import type { Env } from '../../context'
 
@@ -90,6 +95,8 @@ async function standIn(
 beforeAll(async () => {
 	await adminSecretsStore(env.JWT_SECRET).create(TEST_SECRET)
 	for (const stmt of STUDIO_CLOUD_BUILD_SCHEMA_DDL) await env.DB.prepare(stmt).run()
+	// `unity_asset` is the rooms worker's table; a build writes one row per bundle into it.
+	for (const stmt of UNITY_ASSET_SCHEMA_DDL) await env.DB.prepare(stmt).run()
 })
 
 it('response with hello world', async () => {
@@ -357,30 +364,33 @@ describe('local cloud builds', () => {
 			completed_at: first.value.startedAt,
 		})
 
+		// Each bundle is a `unity_asset` row: target 0 Windows / 2 Android, its kind, the R2
+		// key as the filename, and the base64 SHA-256 of the bytes as the hash.
 		const { results: files } = await env.DB.prepare(
-			`SELECT platform, kind, filename, byte_length, r2_key
-			 FROM studio_unity_asset_file WHERE unity_asset_id = ?1
-			 ORDER BY platform, kind`
+			`SELECT target, version, kind, filename, hash
+			 FROM unity_asset WHERE unity_asset_id = ?1
+			 ORDER BY target, kind`
 		)
 			.bind(first.value.unityAssetId)
-			.all<{
-				platform: string
-				kind: string
-				filename: string
-				byte_length: number
-				r2_key: string
-			}>()
+			.all<{ target: number; version: number; kind: string; filename: string; hash: string }>()
 		const publicName = (platform: string, kind: string) =>
-			`${first.value.unityAssetId.replace(/-/g, '')}.${platform}.${kind}.assetbundle`
+			`studio/${LOCAL_ROOM}/${first.value.unityAssetId.replace(/-/g, '')}.${platform}.${kind}.assetbundle`
 		expect(
-			files.map((file) => [file.platform, file.kind, file.filename, file.byte_length])
+			files.map((file) => [file.target, file.version, file.kind, file.filename, file.hash])
 		).toEqual([
-			['android', 'main', publicName('android', 'main'), 2],
-			['windows', 'main', publicName('windows', 'main'), 4],
-			['windows', 'stripped', publicName('windows', 'stripped'), 3],
+			[0, 1, 'main', publicName('windows', 'main'), 'n2SnR+G5fxMfq7a0Rylsm28CAeefs8U1bmx36JtqgGo='],
+			[
+				0,
+				1,
+				'stripped',
+				publicName('windows', 'stripped'),
+				'ZqZ1cVH47lXbEncWx+Pc4L6AdLZOIO2lQuXB5GypxB4=',
+			],
+			[2, 1, 'main', publicName('android', 'main'), 'xCUiEotJGT3ozUXY91ic1+CF5l8ThkDVfUSC5fcYliM='],
 		])
-		const win = files.find((file) => file.platform === 'windows' && file.kind === 'main')
-		const stored = await env.CDN_ASSETS.get(win!.r2_key)
+		const win = files.find((file) => file.target === 0 && file.kind === 'main')
+		// The bytes sit under `room/` — the prefix the client adds to the filename.
+		const stored = await env.CDN_ASSETS.get(`room/${win!.filename}`)
 		expect(stored).not.toBeNull()
 		expect([...new Uint8Array(await stored!.arrayBuffer())]).toEqual([1, 2, 3, 4])
 
@@ -477,16 +487,13 @@ describe('local cloud builds', () => {
 		expect(created.success).toBe(true)
 
 		const { results: files } = await env.DB.prepare(
-			`SELECT platform, byte_length, r2_key FROM studio_unity_asset_file
-			 WHERE unity_asset_id = ?1 AND kind = 'main' ORDER BY platform`
+			`SELECT target, filename FROM unity_asset
+			 WHERE unity_asset_id = ?1 AND kind = 'main' ORDER BY target`
 		)
 			.bind(created.value.unityAssetId)
-			.all<{ platform: string; byte_length: number; r2_key: string }>()
-		expect(files.map((f) => [f.platform, f.byte_length])).toEqual([
-			['android', droidBytes.length],
-			['windows', winBytes.length],
-		])
-		const win = await env.CDN_ASSETS.get(files[1]!.r2_key)
+			.all<{ target: number; filename: string }>()
+		expect(files.map((f) => f.target)).toEqual([0, 2])
+		const win = await env.CDN_ASSETS.get(`room/${files[0]!.filename}`)
 		expect([...new Uint8Array(await win!.arrayBuffer())]).toEqual(winBytes)
 	})
 })

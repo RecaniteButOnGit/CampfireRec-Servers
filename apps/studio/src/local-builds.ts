@@ -1,36 +1,16 @@
 import {
+	deleteUnityAssetBuilds,
 	getSubRoom,
 	markRoomAsRecRoomStudio,
 	publicStudioBundleFilename,
 	setSubRoomSaveUnityAssetId,
+	STUDIO_ASSET_VERSION,
+	studioAssetTarget,
+	studioBundleR2Key,
+	unityAssetUpsert,
 } from '@repo/domain'
 
-/** Mirrors migrations/0001_studio_cloud_build.sql. Tests apply this; deploy uses the file. */
-export const STUDIO_CLOUD_BUILD_SCHEMA_DDL: string[] = [
-	`CREATE TABLE IF NOT EXISTS studio_cloud_build (
-		cloud_build_id TEXT PRIMARY KEY,
-		room_id INTEGER NOT NULL,
-		sub_room_id INTEGER NOT NULL,
-		sub_room_data_save_id INTEGER NOT NULL,
-		unity_asset_id TEXT NOT NULL,
-		created_by_account_id INTEGER NOT NULL,
-		started_at TEXT NOT NULL,
-		completed_at TEXT NOT NULL,
-		error TEXT
-	)`,
-	`CREATE INDEX IF NOT EXISTS idx_studio_cloud_build_room
-		ON studio_cloud_build (room_id, sub_room_id, started_at)`,
-	`CREATE TABLE IF NOT EXISTS studio_unity_asset_file (
-		unity_asset_id TEXT NOT NULL,
-		platform TEXT NOT NULL,
-		kind TEXT NOT NULL,
-		filename TEXT NOT NULL,
-		sha256 TEXT NOT NULL,
-		byte_length INTEGER NOT NULL,
-		r2_key TEXT NOT NULL,
-		PRIMARY KEY (unity_asset_id, platform, kind)
-	)`,
-]
+import type { StudioBundlePlatform, UnityAssetKind } from '@repo/domain'
 
 export interface CloudBuildRow {
 	cloudBuildId: string
@@ -41,8 +21,8 @@ export interface CloudBuildRow {
 	createdByAccountId: number
 }
 
-export type BundlePlatform = 'windows' | 'android'
-export type BundleKind = 'main' | 'stripped'
+export type BundlePlatform = StudioBundlePlatform
+export type BundleKind = UnityAssetKind
 
 export interface LocalBundleFile {
 	platform: BundlePlatform
@@ -103,16 +83,22 @@ export async function listCloudBuilds(
 	return { results: results.map(toCloudBuild), totalResults: Number(total?.n ?? 0) }
 }
 
-async function sha256Hex(bytes: ArrayBuffer): Promise<string> {
+/** Base64 SHA-256 — the encoding `unity_asset.hash` (and every other bundle hash) uses. */
+async function sha256Base64(bytes: ArrayBuffer): Promise<string> {
 	const digest = await crypto.subtle.digest('SHA-256', bytes)
-	return [...new Uint8Array(digest)].map((b) => b.toString(16).padStart(2, '0')).join('')
+	let binary = ''
+	for (const byte of new Uint8Array(digest)) binary += String.fromCharCode(byte)
+	return btoa(binary)
 }
 
 /**
  * Store a PC-built Windows + Android pair as a cloud build that is already finished.
- * The bytes go to R2. The build row points at the subroom's current save, that save's
- * `UnityAssetId` is set to the new asset, and the room is marked as a Studio room the
- * first time (`BecameRRStudioRoomAt`).
+ * The bytes go to R2 under `room/` and each bundle becomes a `unity_asset` row — target
+ * 0 Windows / 2 Android, its kind, the `filename` the client prefixes with `/room/` to
+ * download it (so the R2 key is `room/<filename>`), the base64 SHA-256 as `hash`. The
+ * build row points at the subroom's current save, that save's `UnityAssetId` is set
+ * to the new asset, and the room is marked as a Studio room the first time
+ * (`BecameRRStudioRoomAt`).
  *
  * Returns null when the subroom has no current save — the caller uploaded bundles
  * before Upload created one.
@@ -140,35 +126,31 @@ export async function storeLocalCloudBuild(
 
 	const stored = await Promise.all(
 		files.map(async (file) => {
-			const sha256 = await sha256Hex(file.bytes)
-			// The download route looks a bundle up by filename alone, so the stored
-			// name is this build's, not the uploaded basename two rooms can share.
-			const filename = publicStudioBundleFilename(unityAssetId, file.platform, file.kind)
-			const r2Key = `studio-room-bundles/${unityAssetId}/${file.platform}/${file.kind}/${filename}`
-			await bucket.put(r2Key, file.bytes)
-			return { ...file, filename, sha256, r2Key }
+			// The client downloads `/room/<filename>` from the bucket, so the stored name is
+			// this build's, not the uploaded basename two rooms can share.
+			const filename = publicStudioBundleFilename(roomId, unityAssetId, file.platform, file.kind)
+			const hash = await sha256Base64(file.bytes)
+			await bucket.put(studioBundleR2Key(filename), file.bytes)
+			return { ...file, filename, hash }
 		})
 	)
 
-	const discardObjects = () => Promise.all(stored.map((file) => bucket.delete(file.r2Key)))
+	const discardObjects = () =>
+		Promise.all(stored.map((file) => bucket.delete(studioBundleR2Key(file.filename))))
 	try {
 		await db.batch([
 			...stored.map((file) =>
-				db
-					.prepare(
-						`INSERT INTO studio_unity_asset_file
-						 (unity_asset_id, platform, kind, filename, sha256, byte_length, r2_key)
-						 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)`
-					)
-					.bind(
-						unityAssetId,
-						file.platform,
-						file.kind,
-						file.filename,
-						file.sha256,
-						file.bytes.byteLength,
-						file.r2Key
-					)
+				unityAssetUpsert(
+					db,
+					{
+						UnityAssetId: unityAssetId,
+						Target: studioAssetTarget(file.platform),
+						Version: STUDIO_ASSET_VERSION,
+						Filename: file.filename,
+						Hash: file.hash,
+					},
+					file.kind
+				)
 			),
 			db
 				.prepare(
@@ -190,10 +172,7 @@ export async function storeLocalCloudBuild(
 			.prepare('DELETE FROM studio_cloud_build WHERE cloud_build_id = ?1')
 			.bind(cloudBuildId)
 			.run()
-		await db
-			.prepare('DELETE FROM studio_unity_asset_file WHERE unity_asset_id = ?1')
-			.bind(unityAssetId)
-			.run()
+		await deleteUnityAssetBuilds(db, unityAssetId)
 		await discardObjects()
 		return null
 	}

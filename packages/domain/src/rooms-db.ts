@@ -21,13 +21,9 @@ import { bindPlaceholders, chunkForBinds, MAX_BOUND_PARAMS } from './d1-binds'
 import { Accessibility, Role } from './enums'
 import { countPlayersByRoom } from './presence-db'
 import { resyncInstanceCapacity } from './room-instance-db'
-import {
-	bakedStudioUnityAssets,
-	isMissingStudioAssetTable,
-	listStudioUnityAssetFiles,
-} from './studio-unity-assets'
+import { bakedUnityAssets, listUnityAssetBuilds } from './unity-assets-db'
 
-import type { StudioUnityAssetFile } from './studio-unity-assets'
+import type { UnityAssetBuild } from './unity-assets-db'
 
 /** Schema DDL (mirror of the head migration schema, sans the seed INSERT). */
 export const ROOM_SCHEMA_DDL: string[] = [
@@ -2287,10 +2283,10 @@ async function attachCurrentSaves(
 }
 
 /**
- * Fill `UnitySubAssets` on saves that point at a stored Studio build. Maker-pen
- * saves have no `UnityAssetId` and are left untouched, including their empty
- * arrays. A missing studio table is the same answer: the scene blob still loads,
- * and the bundle list stays empty until the migration exists.
+ * Fill `UnitySubAssets` on saves that point at a stored Studio build (rows of
+ * `unity_asset`). Maker-pen saves have no `UnityAssetId` and are left untouched,
+ * including their empty arrays; so is a save whose asset has no stored build —
+ * the scene blob still loads, and the bundle list stays empty.
  *
  * Only main bundles are listed. Stripped bundles stay in the bucket.
  */
@@ -2306,23 +2302,18 @@ export async function attachStudioUnityAssets(
 		),
 	]
 	if (ids.length === 0) return
-	let files: StudioUnityAssetFile[]
-	try {
-		files = await listStudioUnityAssetFiles(db, ids)
-	} catch (err) {
-		if (isMissingStudioAssetTable(err)) return
-		throw err
-	}
-	const byAsset = new Map<string, StudioUnityAssetFile[]>()
-	for (const file of files) {
-		const list = byAsset.get(file.unityAssetId) ?? []
-		list.push(file)
-		byAsset.set(file.unityAssetId, list)
+	const builds = await listUnityAssetBuilds(db, ids)
+	// Rows come back with the id lowercased; a save may spell its GUID either way.
+	const byAsset = new Map<string, UnityAssetBuild[]>()
+	for (const build of builds) {
+		const list = byAsset.get(build.UnityAssetId) ?? []
+		list.push(build)
+		byAsset.set(build.UnityAssetId, list)
 	}
 	for (const save of saves) {
 		const id = save.UnityAssetId
 		if (typeof id !== 'string') continue
-		const baked = bakedStudioUnityAssets(byAsset.get(id) ?? [])
+		const baked = bakedUnityAssets(byAsset.get(id.toLowerCase()) ?? [])
 		if (baked.length === 0) continue
 		save.UnitySubAssets = baked
 	}

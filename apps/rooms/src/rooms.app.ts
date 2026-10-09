@@ -8,6 +8,7 @@ import {
 	applyRoomTagEdit,
 	attachStudioUnityAssets,
 	autocompleteRoomSearch,
+	bakedUnityAssets,
 	banPlayerFromRoom,
 	canManageRoom,
 	canManageRoomById,
@@ -53,7 +54,6 @@ import {
 	getVisitedRooms,
 	incrementRoomExperience,
 	inviteRoomRole,
-	isMissingStudioAssetTable,
 	isPlayerBannedFromRoom,
 	isRoomOwner,
 	MessageType,
@@ -78,9 +78,6 @@ import {
 	setRoomProgression,
 	setRoomRole,
 	setSubRoomPermissions,
-	sha256HexToBase64,
-	STUDIO_ASSET_VERSION,
-	studioAssetTarget,
 	toggleCheer,
 	toggleFavorite,
 	transferRoomOwnership,
@@ -3819,33 +3816,27 @@ const app = new Hono<App>()
 			const save = saves.find((row) => row.UnityAssetId === unityAssetId)
 			if (!save) return c.notFound()
 
-			let asset
-			try {
-				asset = await getStudioUnityAsset(c.env.DB, unityAssetId)
-			} catch (err) {
-				if (isMissingStudioAssetTable(err)) return c.notFound()
-				throw err
-			}
+			const asset = await getStudioUnityAsset(c.env.DB, unityAssetId)
 			if (!asset) return c.notFound()
 
-			const mains = asset.files
-				.filter((file) => file.kind === 'main')
-				.sort((a, b) => studioAssetTarget(a.platform) - studioAssetTarget(b.platform))
-			const source = mains.find((file) => file.platform === 'windows') ?? mains[0]
+			// Main bundles, Windows first; the Windows one (or the first there is) supplies
+			// the top-level `filename`/`hash`.
+			const mains = bakedUnityAssets(asset.builds)
+			const source = mains.find((build) => build.Target === 0) ?? mains[0]
 			if (!source) return c.notFound()
 
 			const savedBy = typeof save.SavedByAccountId === 'number' ? save.SavedByAccountId : 0
 			return c.json({
 				unityAssetId: asset.unityAssetId,
 				createdByAccountId: asset.createdByAccountId || savedBy,
-				bakedUnityAssets: mains.map((file) => ({
-					unityAssetId: file.unityAssetId,
-					target: studioAssetTarget(file.platform),
-					version: STUDIO_ASSET_VERSION,
-					filename: file.filename,
+				bakedUnityAssets: mains.map((build) => ({
+					unityAssetId: build.UnityAssetId,
+					target: build.Target,
+					version: build.Version,
+					filename: build.Filename,
 				})),
-				filename: source.filename,
-				hash: sha256HexToBase64(source.sha256),
+				filename: source.Filename,
+				hash: source.Hash,
 			})
 		}
 	)
