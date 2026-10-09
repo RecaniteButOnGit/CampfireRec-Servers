@@ -11,9 +11,11 @@ import { withNotFound, withOnError } from '@repo/hono-helpers'
 import { validateAndGetAccountId, validateAndGetRoles } from '@repo/jwt'
 
 import { listCloudBuilds, storeLocalCloudBuild } from './local-builds'
+import { parseMultipart } from './multipart'
 
 import type { Context } from 'hono'
 import type { App } from './context'
+import type { FormFields } from './multipart'
 
 /**
  * A query id the editor already validated as a positive integer. Anything else is
@@ -55,7 +57,7 @@ function rejected(c: Context<App>, status: 400 | 403 | 404, error: string) {
 	return c.json({ success: false, error, value: null }, status)
 }
 
-function formText(form: Record<string, unknown>, name: string): string | undefined {
+function formText(form: FormFields, name: string): string | undefined {
 	const value = form[name]
 	return typeof value === 'string' ? value : undefined
 }
@@ -68,7 +70,7 @@ function bundleFilename(name: string): string {
 }
 
 async function bundlePart(
-	form: Record<string, unknown>,
+	form: FormFields,
 	field: string,
 	platform: 'windows' | 'android',
 	kind: 'main' | 'stripped'
@@ -97,7 +99,9 @@ async function postLocalCloudBuild(c: Context<App>) {
 	// Same claim the editor treats as Full Studio access. Developer does not confer it.
 	if (!roles.includes('betastudio')) return rejected(c, 403, NOT_AUTHORIZED)
 
-	const form = await c.req.parseBody().catch(() => ({}) as Record<string, unknown>)
+	// Not `c.req.parseBody()`: the editor leaves its form-data names unquoted, which the
+	// runtime's parser rejects outright. See multipart.ts.
+	const form = await parseMultipart(c.req.raw)
 
 	const roomId = positiveId(formText(form, 'roomId'))
 	if (roomId == null) return rejected(c, 404, 'No such room.')

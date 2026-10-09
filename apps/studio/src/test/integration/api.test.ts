@@ -434,4 +434,59 @@ describe('local cloud builds', () => {
 		expect(third.value.createdByAccountId).toBe(77)
 		expect(await studioFlag(LOCAL_ROOM)).toBe(first.value.startedAt)
 	})
+
+	// The editor writes `name=roomId` and `filename=…` with NO quotes, which the runtime's
+	// own parser rejects. Build the body by hand, byte for byte like the capture, rather
+	// than through FormData, which would quote them and hide the bug.
+	it("accepts the editor's unquoted form-data names", async () => {
+		const boundary = 'ad9b9597-d65d-4eb1-a989-9fb7bd7ee764'
+		const text = (name: string, value: string) =>
+			`--${boundary}\r\nContent-Type: text/plain; charset=utf-8\r\n` +
+			`Content-Disposition: form-data; name=${name}\r\n\r\n${value}\r\n`
+		const file = (name: string, filename: string) =>
+			`--${boundary}\r\nContent-Type: application/octet-stream\r\n` +
+			`Content-Disposition: form-data; name=${name}; filename=${filename}; filename*=utf-8''${filename}\r\n\r\n`
+		const enc = new TextEncoder()
+		// Bundle bytes include CR, LF and `--` so the part scan has to honour the delimiter.
+		const winBytes = [85, 110, 105, 116, 121, 70, 83, 13, 10, 45, 45, 0, 255]
+		const droidBytes = [85, 110, 105, 116, 121, 70, 83, 0, 13, 10]
+		const body = new Blob([
+			enc.encode(text('roomId', String(LOCAL_ROOM))),
+			enc.encode(text('subRoomId', String(LOCAL_SUB))),
+			enc.encode(file('windows', '87562fb63c5c468cbb055e6ee3102e0f.WindowsDesktop.assetbundle')),
+			new Uint8Array(winBytes),
+			enc.encode(
+				`\r\n${file('android', '87562fb63c5c468cbb055e6ee3102e0f.MobileAndroid.assetbundle')}`
+			),
+			new Uint8Array(droidBytes),
+			enc.encode(`\r\n--${boundary}--\r\n`),
+		])
+		const res = await SELF.fetch(`${ORIGIN}/cloud-builds/from-editor`, {
+			method: 'POST',
+			headers: {
+				...(await bearer('42', STUDIO_ROLES)),
+				'content-type': `multipart/form-data; boundary=${boundary}`,
+			},
+			body,
+		})
+		expect(res.status).toBe(200)
+		const created = (await res.json()) as {
+			success: boolean
+			value: { unityAssetId: string }
+		}
+		expect(created.success).toBe(true)
+
+		const { results: files } = await env.DB.prepare(
+			`SELECT platform, byte_length, r2_key FROM studio_unity_asset_file
+			 WHERE unity_asset_id = ?1 AND kind = 'main' ORDER BY platform`
+		)
+			.bind(created.value.unityAssetId)
+			.all<{ platform: string; byte_length: number; r2_key: string }>()
+		expect(files.map((f) => [f.platform, f.byte_length])).toEqual([
+			['android', droidBytes.length],
+			['windows', winBytes.length],
+		])
+		const win = await env.CDN_ASSETS.get(files[1]!.r2_key)
+		expect([...new Uint8Array(await win!.arrayBuffer())]).toEqual(winBytes)
+	})
 })
