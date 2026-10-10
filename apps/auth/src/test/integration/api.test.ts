@@ -14,6 +14,7 @@ import {
 	SCHEMA_DDL,
 	seedRoomWithSubRooms,
 	SUBROOM_SCHEMA_DDL,
+	updateAccount,
 } from '@repo/domain'
 import { TOKEN_TTL_SECONDS } from '@repo/jwt'
 
@@ -31,6 +32,11 @@ import {
 	PLATFORM_SCHEMA_DDL,
 } from '../../platform-db'
 import { consumeRefreshToken, issueRefreshToken, REFRESH_SCHEMA_DDL } from '../../refresh-db'
+import {
+	STUDIO_CLIENT_ID,
+	STUDIO_CLIENT_SECRET,
+	STUDIO_DEVICE_SCHEMA_DDL,
+} from '../../studio-device'
 
 import type { Env } from '../../context'
 
@@ -96,6 +102,7 @@ beforeAll(async () => {
 	// Report table (owned by the api worker) — a ban is a report row with `banned` set;
 	// the token grant reads it for the evasion arms.
 	for (const stmt of REPORTS_SCHEMA_DDL) await env.DB.prepare(stmt).run()
+	for (const stmt of STUDIO_DEVICE_SCHEMA_DDL) await env.DB.prepare(stmt).run()
 })
 
 /**
@@ -681,6 +688,8 @@ describe('auth worker routes', () => {
 		expect(payload.role).not.toContain('developer')
 		expect(payload.role).not.toContain('moderator')
 		expect(payload.role).not.toContain('junior')
+		// Studio upload access is a whitelist, not a default role.
+		expect(payload.role).not.toContain('betastudio')
 		// No privileges to carry, so the claim is absent rather than an empty array.
 		expect(payload['rn.privilege']).toBeUndefined()
 		// Same for Plus: omitted rather than `false`, so a non-subscriber's token is
@@ -722,6 +731,91 @@ describe('auth worker routes', () => {
 			.run()
 		const payload = await tokenFor(`account_id=91&password=${LOGIN_PASSWORD}`)
 		expect(payload.role).toEqual(expect.arrayContaining(['gameClient', 'developer', 'moderator']))
+		// developer is a different grant. It does not set the account's hasStudio flag.
+		expect(payload.role).not.toContain('betastudio')
+	})
+
+	// RecFlare Studio treats the role claim `betastudio` as permission to upload.
+	// It is stamped from the account's hasStudio flag on every mint path — password,
+	// refresh, and the Studio device grant — and a refresh after a revoke drops it. A
+	// token that kept the role for the rest of the day would leave a removed player
+	// uploading.
+	test('POST /connect/token stamps betastudio only while the account has hasStudio', async () => {
+		// 9811/9812, not 9601–9605: those ids belong to the staff-login audit tests,
+		// which insert with OR IGNORE and then count `staff_login` rows.
+		await seedAccount(9811, 'StudioPlayer')
+		expect((await tokenFor(`account_id=9811&password=${LOGIN_PASSWORD}`)).role).not.toContain(
+			'betastudio'
+		)
+
+		await updateAccount(env.DB, 9811, { hasStudio: true })
+		expect((await tokenFor(`account_id=9811&password=${LOGIN_PASSWORD}`)).role).toEqual([
+			'gameClient',
+			'screenshare',
+			'betastudio',
+		])
+
+		// developer and moderator stay in front of betastudio, so the claim order is stable.
+		await env.DB.prepare('INSERT OR IGNORE INTO account (data) VALUES (?1)')
+			.bind(
+				JSON.stringify({
+					accountId: 9812,
+					username: 'StudioStaff',
+					passwordHash: await hashPassword(LOGIN_PASSWORD),
+					isDeveloper: true,
+					isModerator: true,
+					hasStudio: true,
+				})
+			)
+			.run()
+		expect((await tokenFor(`account_id=9812&password=${LOGIN_PASSWORD}`)).role).toEqual([
+			'gameClient',
+			'screenshare',
+			'developer',
+			'moderator',
+			'betastudio',
+		])
+
+		const client = `client_id=${STUDIO_CLIENT_ID}&client_secret=${STUDIO_CLIENT_SECRET}`
+		const started = await exports.default.fetch(`${ORIGIN}/connect/deviceauthorization`, {
+			method: 'POST',
+			headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+			body: client,
+		})
+		expect(started.status).toBe(200)
+		const codes = (await started.json()) as { device_code: string; user_code: string }
+		const session = await postToken(
+			`grant_type=password&username=StudioPlayer&password=${LOGIN_PASSWORD}`
+		)
+		expect(session.status).toBe(200)
+		const approved = await exports.default.fetch(`${ORIGIN}/connect/device/approve`, {
+			method: 'POST',
+			headers: {
+				'Content-Type': 'application/x-www-form-urlencoded',
+				Authorization: `Bearer ${session.json.access_token as string}`,
+			},
+			body: `user_code=${codes.user_code}`,
+		})
+		expect(approved.status).toBe(200)
+		const signedIn = await postToken(
+			`${client}&grant_type=${encodeURIComponent('urn:ietf:params:oauth:grant-type:device_code')}&device_code=${codes.device_code}`
+		)
+		expect(signedIn.status).toBe(200)
+		expect(decodePayload(signedIn.json.access_token as string).role).toEqual([
+			'gameClient',
+			'screenshare',
+			'betastudio',
+		])
+
+		// Revoke between issue and refresh. The refresh re-reads the account.
+		const login = await postToken(`account_id=9811&password=${LOGIN_PASSWORD}`)
+		await updateAccount(env.DB, 9811, { hasStudio: false })
+		await updateAccount(env.DB, 9812, { hasStudio: false })
+		const refreshed = await postToken(
+			`grant_type=refresh_token&refresh_token=${encodeURIComponent(login.json.refresh_token as string)}`
+		)
+		expect(refreshed.status).toBe(200)
+		expect(decodePayload(refreshed.json.access_token as string).role).not.toContain('betastudio')
 	})
 
 	// Rec Room Plus rides on the token as `rn.plus`, stamped from `account.hasPlus` — which
@@ -799,6 +893,29 @@ describe('auth worker routes', () => {
 		// `rn.privilege` is a claim, not a scope — it sits beside `role`, never in `scope`.
 		expect(payload['rn.privilege']).toEqual(['BanVChat', 'BanRmChat'])
 		expect(payload.scope).not.toContain('rn.privilege')
+	})
+
+	test('POST /connect/token stamps the influencer role for an isInfluencer account', async () => {
+		await env.DB.prepare('INSERT OR IGNORE INTO account (data) VALUES (?1)')
+			.bind(
+				JSON.stringify({
+					accountId: 95,
+					username: 'InfluencerPlayer',
+					passwordHash: await hashPassword(LOGIN_PASSWORD),
+					isInfluencer: true,
+				})
+			)
+			.run()
+		const payload = await tokenFor(`account_id=95&password=${LOGIN_PASSWORD}`)
+		expect(payload.role).toEqual(
+			expect.arrayContaining(['gameClient', 'screenshare', 'influencer'])
+		)
+		expect(payload.role).not.toContain('developer')
+
+		// Off the flag, off the token — no other flag implies it.
+		await updateAccount(env.DB, 95, { isInfluencer: false })
+		const revoked = await tokenFor(`account_id=95&password=${LOGIN_PASSWORD}`)
+		expect(revoked.role).not.toContain('influencer')
 	})
 
 	test('POST /connect/token 400s when no account_id is posted (never defaults to 1)', async () => {
@@ -1645,6 +1762,76 @@ describe('auth worker routes', () => {
 		expect(res.status).toBe(404)
 	})
 
+	test('Studio device login is approved on the website and polled on auth', async () => {
+		const client = `client_id=${STUDIO_CLIENT_ID}&client_secret=${STUDIO_CLIENT_SECRET}`
+		const bad = await exports.default.fetch(`${ORIGIN}/connect/deviceauthorization`, {
+			method: 'POST',
+			headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+			body: 'client_id=recroom.studio&client_secret=nope',
+		})
+		expect(bad.status).toBe(400)
+
+		const started = await exports.default.fetch(`${ORIGIN}/connect/deviceauthorization`, {
+			method: 'POST',
+			headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+			body: client,
+		})
+		expect(started.status).toBe(200)
+		const codes = (await started.json()) as {
+			device_code: string
+			user_code: string
+			verification_uri: string
+			verification_uri_complete: string
+			expires_in: number
+			interval: number
+		}
+		// The editor opens this in a browser. It is the website, not the auth API.
+		expect(codes.verification_uri).toBe('https://www.rec.example.com/device')
+		expect(codes.verification_uri_complete).toBe(
+			`https://www.rec.example.com/device?user_code=${codes.user_code}`
+		)
+		expect(codes.expires_in).toBeGreaterThan(0)
+		expect(codes.interval).toBeGreaterThan(0)
+
+		const pending = await postToken(
+			`${client}&grant_type=${encodeURIComponent('urn:ietf:params:oauth:grant-type:device_code')}&device_code=${codes.device_code}`
+		)
+		expect(pending.status).toBe(400)
+		expect(pending.json.error).toBe('authorization_pending')
+
+		const session = await postToken(
+			`grant_type=password&username=Player42&password=${LOGIN_PASSWORD}`
+		)
+		expect(session.status).toBe(200)
+		const approved = await exports.default.fetch(`${ORIGIN}/connect/device/approve`, {
+			method: 'POST',
+			headers: {
+				'Content-Type': 'application/x-www-form-urlencoded',
+				Authorization: `Bearer ${session.json.access_token as string}`,
+			},
+			body: `user_code=${codes.user_code}`,
+		})
+		expect(approved.status).toBe(200)
+
+		const signedIn = await postToken(
+			`${client}&grant_type=${encodeURIComponent('urn:ietf:params:oauth:grant-type:device_code')}&device_code=${codes.device_code}`
+		)
+		expect(signedIn.status).toBe(200)
+		expect(typeof signedIn.json.access_token).toBe('string')
+		expect(signedIn.json.expires_in).toBe(TOKEN_TTL_SECONDS)
+		// Studio treats expires_in as seconds, same as the game client.
+		const devicePayload = decodePayload(signedIn.json.access_token as string)
+		expect(devicePayload.sub).toBe('42')
+		// Player42 has no hasStudio flag, so a Studio login is still Limited.
+		expect(devicePayload.role).not.toContain('betastudio')
+
+		const again = await postToken(
+			`${client}&grant_type=${encodeURIComponent('urn:ietf:params:oauth:grant-type:device_code')}&device_code=${codes.device_code}`
+		)
+		expect(again.status).toBe(400)
+		expect(again.json.error).toBe('invalid_grant')
+	})
+
 	test('GET /openapi.json documents every route', async () => {
 		const res = await exports.default.fetch(`${ORIGIN}/openapi.json`)
 		expect(res.status).toBe(200)
@@ -1678,6 +1865,9 @@ describe('auth worker routes', () => {
 			'POST /account/me/changepassword',
 			'POST /cachedlogin/forplatformid/{platform}/{id}',
 			'POST /cachedlogin/forplatformids',
+			'POST /connect/device/approve',
+			'POST /connect/device/deny',
+			'POST /connect/deviceauthorization',
 			'POST /connect/token',
 			'POST /photon/authenticate',
 		])

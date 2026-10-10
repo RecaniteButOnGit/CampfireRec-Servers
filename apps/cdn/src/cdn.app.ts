@@ -155,9 +155,7 @@ function resolveBundledRange(
 }
 
 async function serveBundledRooms2Template(c: Context<App>, assetPath: string): Promise<Response> {
-	const asset = await c.env.ASSETS.fetch(
-		new Request(new URL(assetPath, c.req.url), c.req.raw)
-	)
+	const asset = await c.env.ASSETS.fetch(new Request(new URL(assetPath, c.req.url), c.req.raw))
 	if (asset.status === 304) {
 		const headers = new Headers(asset.headers)
 		headers.set('content-type', 'application/octet-stream')
@@ -457,6 +455,103 @@ const app = new Hono<App>()
 		(c) => serveAsset(c, `avatar/${c.req.param('asset')}`)
 	)
 
+	// Rec Room Studio room bundles. The filename is the one a room save or
+	// `GET …/unityasset` advertises, as `unity_asset.filename` records it. Studio
+	// stores these under `room/studio/<roomId>/…`. Only a recorded filename is served, so this
+	// checks the table before streaming the key. Reads stay unauthenticated, same as
+	// `/avatar/` and `/room/`. HEAD is the editor's "already uploaded?" check: 200
+	// exists, 404 does not.
+	.on(
+		'HEAD',
+		'/unityasset/:filename{.+}',
+		describeRoute({
+			tags: ['Assets'],
+			summary: 'Check that a Rec Room Studio room bundle exists',
+			description: [
+				'200 when `filename` names a stored Studio bundle, 404 otherwise. The',
+				'Studio editor treats this HEAD as “already uploaded?” before it downloads the bytes',
+				'with GET. No body.',
+			].join(' '),
+			parameters: [keyParam('filename', 'The bundle filename from the room save.', true)],
+			responses: {
+				200: { description: 'The bundle exists (no body)' },
+				400: { description: 'The filename contains `..` (no body)' },
+				404: { description: 'No single stored bundle has this filename' },
+			},
+		}),
+		(c) => studioUnityAssetHead(c.env, c.req.param('filename'))
+	)
+	.get(
+		'/unityasset/:filename{.+}',
+		describeRoute({
+			tags: ['Assets'],
+			summary: 'Serve a Rec Room Studio room bundle',
+			description: [
+				'Streams the Studio asset bundle stored for `filename`. The name comes from a',
+				'room save’s `UnitySubAssets` (or from `GET /rooms/{roomId}/subrooms/{subRoomId}/unityasset`',
+				'on the rooms worker) and is the R2 key the studio upload stored the bytes under.',
+				'Only a filename recorded in `unity_asset` is served: anything else is a 404, as is',
+				'a missing table. The worker does not interpret the bytes.',
+			].join(' '),
+			parameters: [
+				keyParam('filename', 'The bundle filename from the room save.', true),
+				...CONDITIONAL_HEADERS,
+			],
+			responses: assetResponses('The asset bundle'),
+		}),
+		(c) => serveUnityAsset(c)
+	)
+
+/**
+ * The bucket key for a recorded bundle filename. Studio bundles use the same `room/`
+ * prefix as the game's direct download URL. Null when no build is, or the table has not been migrated
+ * yet (the rooms worker owns it).
+ */
+async function unityAssetR2Key(db: D1Database, filename: string): Promise<string | null> {
+	try {
+		// Inlined rather than imported so this worker does not take a dependency on the
+		// domain package.
+		const row = await db
+			.prepare(`SELECT 1 AS stored FROM unity_asset WHERE filename = ?1 LIMIT 1`)
+			.bind(filename)
+			.first<{ stored: number }>()
+		return row ? (filename.startsWith('studio/') ? `room/${filename}` : filename) : null
+	} catch (err) {
+		const message = err instanceof Error ? err.message : String(err)
+		if (message.toLowerCase().includes('no such table')) return null
+		throw err
+	}
+}
+
+/** GET `/unityasset/:filename` — the bytes, with the same range handling as other blobs. */
+async function serveUnityAsset(c: Context<App>) {
+	const name = c.req.param('filename') ?? ''
+	if (name.includes('..')) return c.body(null, 400)
+	const key = await unityAssetR2Key(c.env.DB, name)
+	if (!key) return c.notFound()
+	return serveAsset(c, key)
+}
+
+/** Build the Studio bundle HEAD response outside Hono's HEAD-to-GET fallback. */
+async function studioUnityAssetHead(env: StudioAssetEnv, name: string): Promise<Response> {
+	if (name.includes('..')) return new Response(null, { status: 400 })
+	const key = await unityAssetR2Key(env.DB, name)
+	if (!key) return new Response(null, { status: 404 })
+	if (!env.CDN_ASSETS) return new Response(null, { status: 404 })
+	const head = await env.CDN_ASSETS.head(key)
+	if (!head) return new Response(null, { status: 404 })
+
+	const headers = new Headers()
+	head.writeHttpMetadata(headers)
+	headers.set('etag', head.httpEtag)
+	headers.set('accept-ranges', 'bytes')
+	headers.set('cache-control', CACHE_CONTROL)
+	headers.set('access-control-allow-origin', '*')
+	const response = new Response(null, { status: 200, headers, encodeBody: 'manual' })
+	response.headers.set('content-length', String(head.size))
+	return response
+}
+
 // The generated spec. Documentation only — no request is validated against it (see
 // openapi.ts). `hide: true` keeps this route out of its own output.
 app.get(
@@ -480,7 +575,9 @@ app.get(
 						'served as',
 						'`application/octet-stream`; the worker never interprets what it hands back. Reads',
 						'are unauthenticated — a caller needs the exact key, which only comes from an',
-						'authenticated call to another worker.',
+						'authenticated call to another worker. `/unityasset/{filename}` is a Studio room',
+						'bundle: the filename is the R2 key, streamed once `unity_asset` records it.',
+						'`HEAD` on that path is 200 when a bundle is stored under the name.',
 						'',
 						'This worker only READS. Uploads go through the `storage` worker, which writes the',
 						'same bucket, and images are served by `img` rather than from here.',
@@ -500,4 +597,24 @@ app.get(
 	)
 )
 
-export default app
+/**
+ * What the Studio HEAD needs from the environment. Narrower than `Env` on purpose: the
+ * `mono` worker mounts this app with its own (superset) Env, which has no `ASSETS`
+ * binding, and the wrapper below must stay mountable there.
+ */
+type StudioAssetEnv = Pick<Env, 'DB' | 'CDN_ASSETS'>
+
+export default {
+	fetch(
+		request: Request,
+		env: StudioAssetEnv,
+		executionCtx: ExecutionContext
+	): Response | Promise<Response> {
+		const url = new URL(request.url)
+		if (request.method === 'HEAD' && url.pathname.startsWith('/unityasset/')) {
+			const filename = decodeURIComponent(url.pathname.slice('/unityasset/'.length))
+			return studioUnityAssetHead(env, filename)
+		}
+		return app.fetch(request, env, executionCtx)
+	},
+}

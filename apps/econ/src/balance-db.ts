@@ -1,6 +1,8 @@
 import { BalancePlatform } from '../../notify/src/notification-payloads'
 import { CurrencyType } from './currency'
 
+import type { GiftContent } from '@repo/domain'
+
 // The currency vocabulary and the Plus reload SQL live in the import-free `currency.ts` so
 // the Node CLI in @repo/tools can share them; re-exported here so this stays the module
 // everything else reads balances from.
@@ -198,4 +200,137 @@ export async function spendCurrency(
 		.bind(accountId, currencyType, amount)
 		.run()
 	return meta.changes > 0
+}
+
+/** One token box to hand over: whose, how many, and the stored box. See {@link payTokenGifts}. */
+export interface TokenGift {
+	accountId: number
+	/** Signed: positive credits, negative debits (guarded — see below), zero only boxes. */
+	amount: number
+	/** The box as stored in `received_gift`, serialized as-is. */
+	content: GiftContent
+}
+
+/** One box handed over by {@link payTokenGifts}: the resulting balance and the box's id. */
+export interface PaidTokenGift extends TokenGift {
+	balance: number
+	giftId: number
+}
+
+/**
+ * How many accounts one round of {@link payTokenGifts} writes at once. Every statement
+ * binds three values per account, and D1 allows 100 bound parameters a statement.
+ */
+export const TOKEN_GIFT_CHUNK = 30
+
+/**
+ * Hand RecCenterTokens in a gift box to MANY accounts at once — the staff drops, the room
+ * gift and the Discord supporter cron, which all pay a crowd. Paid one account at a time
+ * (seed, credit, re-read, box: five D1 round trips each) a full server was ~1,250 queries
+ * in series, past D1's 1,000-queries-an-invocation cap somewhere around 200 players, and
+ * died partway with the first players paid and the rest not. This pays
+ * {@link TOKEN_GIFT_CHUNK} accounts a round in two batches of multi-row statements.
+ *
+ * Per account it is exactly the one-player grant: the signup grant seeded first (a
+ * never-touched balance must not start from the gift alone), the balance moved, then a box
+ * stored. A credit is an upsert; a debit is `amount >= ?` guarded in the UPDATE itself, so
+ * nobody is overdrawn, and an account that can't cover it is SKIPPED — no box — rather than
+ * failing the rest. `paid` keeps the order of `gifts`; `skipped` is the rest. A duplicate
+ * account among `gifts` is paid once, the first entry's amount: a multi-row upsert may not
+ * name one key twice.
+ *
+ * Sends NOTHING: the caller builds the balance frame (the RESULTING total, `balance`, into
+ * the -2 bucket) and the box's announcement from the rows returned, and should push them in
+ * one hub call. Nothing here is transactional across rounds: a round that throws leaves the
+ * earlier ones paid, which the caller reports.
+ */
+export async function payTokenGifts(
+	db: D1Database,
+	gifts: readonly TokenGift[],
+	startingTokens: number
+): Promise<{ paid: PaidTokenGift[]; skipped: number[] }> {
+	const grants = startingBalances(startingTokens)
+	const paid: PaidTokenGift[] = []
+	const skipped: number[] = []
+
+	const seen = new Set<number>()
+	const unique = gifts.filter((g) => !seen.has(g.accountId) && seen.add(g.accountId))
+	for (let i = 0; i < unique.length; i += TOKEN_GIFT_CHUNK) {
+		const chunk = unique.slice(i, i + TOKEN_GIFT_CHUNK)
+		const credits = chunk.filter((g) => g.amount > 0)
+		const debits = chunk.filter((g) => g.amount < 0)
+		const holds = chunk.filter((g) => g.amount === 0)
+
+		// Seed the signup grant, then move the money: one batch, one transaction. A debit's
+		// guard is per row, so a chunk of debits is one UPDATE per distinct amount.
+		const statements: D1PreparedStatement[] = [
+			db
+				.prepare(
+					`INSERT OR IGNORE INTO balance (account_id, currency_type, amount) VALUES ${chunk
+						.flatMap(() => grants.map(() => '(?, ?, ?)'))
+						.join(', ')}`
+				)
+				.bind(
+					...chunk.flatMap((g) => grants.flatMap((b) => [g.accountId, b.currencyType, b.amount]))
+				),
+		]
+		if (credits.length > 0) {
+			statements.push(
+				db
+					.prepare(
+						`INSERT INTO balance (account_id, currency_type, amount) VALUES ${credits
+							.map(() => '(?, ?, ?)')
+							.join(', ')}
+						 ON CONFLICT (account_id, currency_type) DO UPDATE SET amount = amount + excluded.amount
+						 RETURNING account_id, amount`
+					)
+					.bind(...credits.flatMap((g) => [g.accountId, CurrencyType.RecCenterTokens, g.amount]))
+			)
+		}
+		for (const amount of new Set(debits.map((g) => g.amount))) {
+			const ids = debits.filter((g) => g.amount === amount).map((g) => g.accountId)
+			statements.push(
+				db
+					.prepare(
+						`UPDATE balance SET amount = amount - ?1
+						 WHERE currency_type = ?2 AND amount >= ?1
+						   AND account_id IN (${ids.map(() => '?').join(', ')})
+						 RETURNING account_id, amount`
+					)
+					.bind(-amount, CurrencyType.RecCenterTokens, ...ids)
+			)
+		}
+		if (holds.length > 0) {
+			statements.push(
+				db
+					.prepare(
+						`SELECT account_id, amount FROM balance
+						 WHERE currency_type = ?1 AND account_id IN (${holds.map(() => '?').join(', ')})`
+					)
+					.bind(CurrencyType.RecCenterTokens, ...holds.map((g) => g.accountId))
+			)
+		}
+		const [, ...moved] = await db.batch<{ account_id: number; amount: number }>(statements)
+		// RETURNING comes back in no promised order; key it, then walk the chunk in its order.
+		const balances = new Map(moved.flatMap((r) => r.results).map((r) => [r.account_id, r.amount]))
+		const debited = chunk.filter((g) => balances.has(g.accountId))
+		for (const g of chunk) if (!balances.has(g.accountId)) skipped.push(g.accountId)
+		if (debited.length === 0) continue
+
+		const createdAt = new Date().toISOString()
+		const { results: boxes } = await db
+			.prepare(
+				`INSERT INTO received_gift (account_id, data, created_at) VALUES ${debited
+					.map(() => '(?, ?, ?)')
+					.join(', ')} RETURNING id, account_id`
+			)
+			.bind(...debited.flatMap((g) => [g.accountId, JSON.stringify(g.content), createdAt]))
+			.all<{ id: number; account_id: number }>()
+		const giftIds = new Map(boxes.map((r) => [r.account_id, r.id]))
+
+		for (const g of debited) {
+			paid.push({ ...g, balance: balances.get(g.accountId)!, giftId: giftIds.get(g.accountId)! })
+		}
+	}
+	return { paid, skipped }
 }

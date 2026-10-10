@@ -226,6 +226,7 @@ export class AgentRetrieval {
 				: null
 		} else if (
 			name === 'read_cached_result' &&
+			this.pendingDiff != null &&
 			this.pendingDiff?.handle === (output as RecordData).handle
 		) {
 			const page = output as RecordData

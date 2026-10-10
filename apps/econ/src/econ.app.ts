@@ -15,8 +15,10 @@ import {
 	grantInvention,
 	levelReward,
 	levelsReached,
+	listInfluencerIds,
 	ownsInvention,
 	setOutfit,
+	updateAccount,
 } from '@repo/domain'
 import { intVar, logger, withCleanSpec, withNotFound, withOnError } from '@repo/hono-helpers'
 import { validateAndGetAccountId, validateAndGetPlus, validateAndGetVersion } from '@repo/jwt'
@@ -106,12 +108,14 @@ import {
 	CreateRoomCurrencyRequest,
 	CreateRoomKeyRequest,
 	CustomAvatarItemsResponse,
+	DeletePurchaseOfferRequest,
 	EquipmentUpdateRequest,
 	ErrorResponse,
 	form,
 	GameRewardRequest,
 	InfluencerIdsResponse,
-	InfluencerTierResponse,
+	IsOnWishlistBulkRequest,
+	IsOnWishlistBulkResponse,
 	ItemPurchaseInfoList,
 	ItemPurchaseInfosRequest,
 	json,
@@ -129,6 +133,7 @@ import {
 	PurchaseRoomKeyWithCurrencyRequest,
 	PurchaseRoomKeyWithCurrencyResponse,
 	ReferralProgressResponse,
+	RemoveInfluencerBody,
 	RoomConsumableDto,
 	RoomConsumableEnvelope,
 	RoomCurrencyDto,
@@ -144,14 +149,21 @@ import {
 	SaveOutfitRequest,
 	SaveOutfitV4Response,
 	SubscriptionResponse,
+	SupportedInfluencerResponse,
+	SupportInfluencerBody,
+	SupportInfluencerResponse,
 	UgcPurchasableBulkRequest,
 	UgcPurchasableItemList,
 	UNAUTHORIZED_RESPONSE,
+	UpdateActiveConsumableRequest,
 	UpdateObjectiveRequest,
 	UpdateObjectiveResponse,
 	UpdateRoomCurrencyRequest,
 	UpdateRoomKeyRequest,
 	UpsertRoomConsumableRequest,
+	WishlistEnvelope,
+	WishlistItemList,
+	WishlistItemRequest,
 } from './openapi'
 import { claimReward, isNewActivity } from './reward-db'
 import {
@@ -164,6 +176,7 @@ import {
 	awardRoomCurrency,
 	createPurchaseOffer,
 	createRoomCurrency,
+	deletePurchaseOffer,
 	findPurchaseOffer,
 	getPurchaseOffers,
 	getRoomBalance,
@@ -184,6 +197,13 @@ import {
 	updateRoomKey,
 } from './room-key-db'
 import { getRoomPurchasables } from './room-purchasables-db'
+import {
+	addWishlistItem,
+	getWishlist,
+	isOnWishlists,
+	parseWishlistTarget,
+	removeWishlistItem,
+} from './wishlist-db'
 
 import type { Context } from 'hono'
 import type { GiftContent, Outfit, Progression, StoredGift, XpGrant } from '@repo/domain'
@@ -209,6 +229,7 @@ import type { AvatarItem } from './inventory-db'
 import type { RoomConsumable } from './room-consumable-db'
 import type { RoomCurrency, RoomCurrencyPurchaseOffer } from './room-currency-db'
 import type { RoomKey, RoomKeyHolding } from './room-key-db'
+import type { WishlistItem } from './wishlist-db'
 
 // Invention storage (owned by the `api` worker, on this same `recflare` database).
 // Imported directly rather than copied: these are plain D1 helpers with no bindings of
@@ -222,7 +243,7 @@ import type { RoomKey, RoomKeyHolding } from './room-key-db'
  * inventory (avatar items, equipment, bought inventions), consumables, saved outfits,
  * avatars, gift boxes, weekly-challenge progress and game-reward eligibility are D1-backed;
  * storefront catalogs are static assets (`sf{N}.json`) served via the ASSETS
- * binding. Some routes are still empty-list stubs (room keys, wishlist, …).
+ * binding. Some routes are still empty-list stubs (equipment, room consumables, …).
  *
  * Auth-gated routes validate the Bearer JWT issued by the `auth` worker.
  */
@@ -254,6 +275,39 @@ async function authedBuild(c: Context<App>): Promise<number | null> {
 /** Results.Unauthorized() equivalent — 401 with empty body. */
 function unauthorized(c: Context<App>) {
 	return c.body(null, 401)
+}
+
+/**
+ * The `Error` a wishlist write answers when its body names no item. Shown to the player
+ * verbatim behind the client's “Wishlist error: ” prefix, so it is a sentence, not a code.
+ */
+const WISHLIST_NO_ITEM = 'No item was specified.'
+
+/**
+ * The `{ Value, Success, Error, error_id }` envelope the wishlist writes answer in — the
+ * same shape the room-currency writes use. A null `item` with no `error` is still a success
+ * (removing something that wasn't listed); an `error` makes it a refusal.
+ */
+function wishlistEnvelope(c: Context<App>, item: WishlistItem | null, error?: string) {
+	return c.json({
+		Value: item,
+		Success: error === undefined,
+		Error: error ?? null,
+		error_id: null,
+	})
+}
+
+/**
+ * The item a wishlist write's form body names — `purchasableItemId` or `customAvatarItemId`,
+ * as the client spells them, with the PascalCase spellings accepted for a hand-written
+ * request. Null when the body names nothing usable (see `parseWishlistTarget`).
+ */
+async function wishlistTargetFromBody(c: Context<App>) {
+	const body = (await c.req.parseBody().catch(() => ({}))) as Record<string, unknown>
+	return parseWishlistTarget(
+		body.purchasableItemId ?? body.PurchasableItemId,
+		body.customAvatarItemId ?? body.CustomAvatarItemId
+	)
 }
 
 /**
@@ -301,6 +355,7 @@ const HUB_INSTANCE = 'global'
 const CREATE_CURRENCY_FAILED = 'Failed to create currency'
 const UPDATE_CURRENCY_FAILED = 'Failed to update currency'
 const CREATE_OFFER_FAILED = 'Failed to create purchase offer'
+const DELETE_OFFER_FAILED = 'Failed to delete purchase offer'
 const SAVE_CONSUMABLE_FAILED = 'Failed to save consumable'
 /**
  * `Status` on the room-key create's `{ Status, RoomKey }` reply. 0 is the observed success
@@ -368,8 +423,8 @@ function roomConsumableEnvelope(c: Context<App>, value: RoomConsumable | null, e
 }
 
 /**
- * The create-offer envelope — the same `{ Value, Success, Error, error_id }` shape again,
- * carrying one purchase offer.
+ * The create- and delete-offer envelope — the same `{ Value, Success, Error, error_id }`
+ * shape again, carrying one purchase offer.
  */
 function purchaseOfferEnvelope(
 	c: Context<App>,
@@ -681,11 +736,17 @@ async function pushBalancePurchase(
 }
 
 /**
- * The influencer partner tier every account has here — the "not an influencer" one. It is
- * the whole body of both `/api/influencerpartnerprogram/influencer` and `…/myinfluencer`,
- * served as a bare number rather than wrapped in anything.
+ * The influencer an account supports in the partner program, as its reads serve it — the
+ * `supportedInfluencerId` on the account, or 0 for nobody (and for an account that does not
+ * exist, which supports nobody too). The whole body of `/api/influencerpartnerprogram/influencer`,
+ * `…/myinfluencer`, served as a bare number rather than wrapped in anything; the `…/support`
+ * and `…/remove` writes answer a status envelope instead. The stored id is served as-is: it was an influencer when picked, and a later
+ * revoke of their flag drops them from `…/influencers` but not from their supporters.
  */
-const NOT_AN_INFLUENCER = 0
+async function supportedInfluencer(db: D1Database, accountId: number): Promise<number> {
+	const account = await getAccount(db, accountId)
+	return account?.supportedInfluencerId ?? 0
+}
 
 /**
  * Whether the caller holds a Rec Room Plus subscription — the ONE definition, shared by
@@ -3115,20 +3176,41 @@ const app = new Hono<App>({ strict: false })
 		}
 	)
 
-	// The caller's item wishlist. [Authorize]; empty — nothing stores wishlists yet.
+	// The caller's item wishlist. [Authorize]. A bare array of entries, newest wish first;
+	// `[]` for a player who has wished for nothing. The client appends a KEYLESS query string
+	// (`/me?True`, `/me?False` — a raw `bool.ToString()` after the `?`, no parameter name) that
+	// no server can bind by name, so it is ignored: both spellings serve the same list. The
+	// client caches this for five seconds and drops the cache when an add succeeds.
 	.get(
 		'/api/itemWishlists/v1/wishlist/me',
-		listRoute('The player’s item wishlist', 'Empty for now', true),
+		describeRoute({
+			tags: ['Econ'],
+			summary: 'The player’s item wishlist',
+			description: [
+				'The caller’s wishlist as a bare array of entries, newest first — `[]` when empty.',
+				'Each entry names ONE item: a storefront item by `PurchasableItemId`, or a custom',
+				'avatar item by `CustomAvatarItemId` (with `PurchasableItemId` 0, the client’s field',
+				'being a plain int).',
+				'',
+				'The client appends `?True` or `?False` with no parameter name; it cannot be read',
+				'and is ignored — both serve the same list.',
+			].join('\n'),
+			security: AUTHED,
+			responses: {
+				200: json(WishlistItemList, 'The caller’s wishlist, newest first'),
+				401: UNAUTHORIZED_RESPONSE,
+			},
+		}),
 		async (c) => {
 			const id = await authedId(c)
 			if (id === null) return unauthorized(c)
-			return c.json([])
+			return c.json(await getWishlist(c.env.DB, id))
 		}
 	)
 
 	// Another player's item wishlist, by account id — what the client reads to show what
-	// somebody else is hoping for (and to mark items in the store as already wished for).
-	// Empty like `/me`: nothing stores wishlists, so there is nothing to show for anyone.
+	// somebody else is hoping for. Public to any signed-in player: a wishlist exists to be
+	// read by others. An unknown account has simply wished for nothing.
 	//
 	// Registered AFTER `/me` so that path stays its own route rather than being read as an
 	// account id — the pattern here is digits-only, so it could not swallow `me`, but the
@@ -3139,10 +3221,11 @@ const app = new Hono<App>({ strict: false })
 			tags: ['Econ'],
 			summary: 'Another player’s item wishlist',
 			description: [
-				'The wishlist of the account named in the path, as a bare array. Empty for now —',
-				'nothing on this server stores wishlists, so every player’s is empty, and an empty',
-				'list is what the client renders as “nothing wished for” where a 404 would read as a',
-				'failed load.',
+				'The wishlist of the account named in the path, as a bare array of entries, newest',
+				'first. Readable by any signed-in player — a wishlist is for others to see. An',
+				'unknown account answers `[]`, which the client renders as “nothing wished for”',
+				'where a 404 would read as a failed load. The keyless `?True`/`?False` the client',
+				'appends is ignored, as on `/me`.',
 			].join(' '),
 			security: AUTHED,
 			parameters: [
@@ -3155,14 +3238,136 @@ const app = new Hono<App>({ strict: false })
 				},
 			],
 			responses: {
-				200: json(JsonArray, 'That player’s wishlist — empty for now'),
+				200: json(WishlistItemList, 'That player’s wishlist, newest first'),
 				401: UNAUTHORIZED_RESPONSE,
 			},
 		}),
 		async (c) => {
 			const id = await authedId(c)
 			if (id === null) return unauthorized(c)
-			return c.json([])
+			const accountId = Number.parseInt(c.req.param('accountId'), 10)
+			if (!Number.isInteger(accountId)) return c.json([])
+			return c.json(await getWishlist(c.env.DB, accountId))
+		}
+	)
+
+	// Wish for an item. [Authorize]. Form-encoded: the client posts BOTH `purchasableItemId`
+	// and `customAvatarItemId` every time with the unused one empty (its two nullables are
+	// boxed without a HasValue guard), so either may be empty or absent; exactly one has to
+	// name an item. Answers the `{ Value, Success, Error, error_id }` envelope with the entry.
+	// An item already on the list answers its EXISTING entry: the toggle is driven by the
+	// client's idea of the current state, and re-adding changes nothing.
+	//
+	// The row has to persist: on success the client drops its cached list and re-reads it,
+	// so a 200 that stored nothing shows the heart un-filling again at once.
+	.post(
+		'/api/itemWishlists/v1/wishlist/add',
+		describeRoute({
+			tags: ['Econ'],
+			summary: 'Wish for an item',
+			description: [
+				'Adds an item to the caller’s wishlist. Form-encoded; the client posts both',
+				'`purchasableItemId` and `customAvatarItemId` with the unused one EMPTY',
+				'(`purchasableItemId=1534&customAvatarItemId=`), and either may also be absent —',
+				'exactly one has to name an item.',
+				'',
+				'Answers `{ Value, Success, Error, error_id }` with the entry as `Value`. An item',
+				'already on the list answers its existing entry rather than a twin or a refusal.',
+				'A body naming no item is `Success: false` with a player-readable `Error` — the',
+				'client shows it verbatim behind “Wishlist error: ”. A bare entry or a 204 fails the',
+				'client the same way `Success: false` does.',
+			].join('\n'),
+			security: AUTHED,
+			requestBody: form(WishlistItemRequest, 'The item to wish for'),
+			responses: {
+				200: json(WishlistEnvelope, 'The entry, or a refusal in the same shape'),
+				401: UNAUTHORIZED_RESPONSE,
+			},
+		}),
+		async (c) => {
+			const id = await authedId(c)
+			if (id === null) return unauthorized(c)
+			const target = await wishlistTargetFromBody(c)
+			if (target === null) return wishlistEnvelope(c, null, WISHLIST_NO_ITEM)
+			return wishlistEnvelope(c, await addWishlistItem(c.env.DB, id, target))
+		}
+	)
+
+	// Take an item off the caller's wishlist. [Authorize]. A POST, not a DELETE, with the same
+	// form body as `add`. The client parses the same envelope and discards `Value`, so the
+	// removed entry is served anyway; an item that wasn't on the list is still a success —
+	// the list ends up as asked — with a null `Value`.
+	.post(
+		'/api/itemWishlists/v1/wishlist/remove',
+		describeRoute({
+			tags: ['Econ'],
+			summary: 'Un-wish an item',
+			description: [
+				'Removes an item from the caller’s wishlist. A POST (not a DELETE) with the same',
+				'form body as `add`. Answers the same envelope with the REMOVED entry as `Value`;',
+				'the client discards it but parses the shape, so a bare body or 204 fails it. An',
+				'item that wasn’t on the list is still `Success: true`, with a null `Value`. A body',
+				'naming no item is `Success: false`.',
+			].join('\n'),
+			security: AUTHED,
+			requestBody: form(WishlistItemRequest, 'The item to un-wish'),
+			responses: {
+				200: json(WishlistEnvelope, 'The removed entry, or a refusal in the same shape'),
+				401: UNAUTHORIZED_RESPONSE,
+			},
+		}),
+		async (c) => {
+			const id = await authedId(c)
+			if (id === null) return unauthorized(c)
+			const target = await wishlistTargetFromBody(c)
+			if (target === null) return wishlistEnvelope(c, null, WISHLIST_NO_ITEM)
+			return wishlistEnvelope(c, await removeWishlistItem(c.env.DB, id, target))
+		}
+	)
+
+	// Whether each of several players has an item wished for. [Authorize]. Form-encoded:
+	// `accountIds` repeated once per player plus the item named as on add/remove. A BARE
+	// positional array of booleans back, one per id in the order posted — a short array would
+	// leave the tail reading as unset, so every id is answered, unknown players as false.
+	.post(
+		'/api/itemWishlists/v1/isonwishlist/bulk',
+		describeRoute({
+			tags: ['Econ'],
+			summary: 'Whether players have an item wished for',
+			description: [
+				'For each `accountIds` entry, whether that player’s wishlist has the item named by',
+				'`purchasableItemId` or `customAvatarItemId`. Form-encoded, `accountIds` repeated',
+				'once per id (a comma-separated single value is accepted too). The answer is a BARE',
+				'array of booleans, one per id in the order posted. A body naming no item answers',
+				'false for everyone.',
+			].join(' '),
+			security: AUTHED,
+			requestBody: form(IsOnWishlistBulkRequest, 'The players to ask about, and the item'),
+			responses: {
+				200: json(IsOnWishlistBulkResponse, 'One boolean per `accountIds` entry, in order'),
+				401: UNAUTHORIZED_RESPONSE,
+			},
+		}),
+		async (c) => {
+			const id = await authedId(c)
+			if (id === null) return unauthorized(c)
+			const body = await c.req
+				.parseBody({ all: true })
+				.catch(() => ({}) as Record<string, string | string[] | File | File[]>)
+			// `all: true` keeps the repeated field a list; a single value arrives as a string.
+			const accountIds = [body.accountIds, body.AccountIds]
+				.flat()
+				.filter((v): v is string => typeof v === 'string')
+				.flatMap((v) => v.split(','))
+				.map((v) => Number.parseInt(v.trim(), 10))
+				.filter((n) => Number.isInteger(n))
+			const first = (v: unknown): unknown => (Array.isArray(v) ? v[0] : v)
+			const target = parseWishlistTarget(
+				first(body.purchasableItemId ?? body.PurchasableItemId),
+				first(body.customAvatarItemId ?? body.CustomAvatarItemId)
+			)
+			if (target === null) return c.json(accountIds.map(() => false))
+			return c.json(await isOnWishlists(c.env.DB, accountIds, target))
 		}
 	)
 
@@ -4020,6 +4225,64 @@ const app = new Hono<App>({ strict: false })
 		}
 	)
 
+	// Take a purchase offer down. Auth-gated (401) and gated to the creator or a co-owner of
+	// the room that minted the currency the offer sells (403). The body names ONLY the offer,
+	// so the currency — and through it the room — is found by walking the shops for the id;
+	// nothing about the caller's whereabouts is consulted.
+	.post(
+		'/api/roomcurrencies/v1/deletePurchaseOffer',
+		describeRoute({
+			tags: ['Econ'],
+			summary: 'Remove a purchase offer from a room currency',
+			description: [
+				'Removes the offer named by `PurchaseOfferId` (its `CurrencyPurchaseOfferId`) from',
+				'whichever currency’s shop lists it. Form-encoded (`PurchaseOfferId=…`). The body',
+				'names nothing else: the currency, and the room that gates the delete, are found',
+				'from the offer.',
+				'',
+				'Gated to the creator or a co-owner of the room that minted the currency. A valid',
+				'token from anyone else is a 403. Answers the same',
+				'`{ Value, Success, Error, error_id }` envelope the create answers in, with the',
+				'offer as it stood when removed in `Value`, or a 200 carrying `Success: false` when',
+				'no shop lists that id. What the client does with `Value` here is an assumption —',
+				'only the create’s reply has been observed.',
+			].join('\n'),
+			security: AUTHED,
+			requestBody: form(DeletePurchaseOfferRequest, 'The offer to remove'),
+			responses: {
+				200: json(
+					RoomCurrencyPurchaseOfferEnvelope,
+					'The offer as removed, or a rejection with `Success: false`'
+				),
+				401: UNAUTHORIZED_RESPONSE,
+				403: { description: 'Not the creator or a co-owner of the minting room (empty body)' },
+			},
+		}),
+		async (c) => {
+			const accountId = await authedId(c)
+			if (accountId === null) return unauthorized(c)
+
+			const body = (await c.req.parseBody().catch(() => ({}))) as Record<string, unknown>
+			const purchaseOfferId = (
+				typeof body.PurchaseOfferId === 'string' ? body.PurchaseOfferId : ''
+			).trim()
+			if (purchaseOfferId === '') return purchaseOfferEnvelope(c, null, DELETE_OFFER_FAILED)
+
+			// Found BEFORE it is removed, because the find is what says which room gates the
+			// delete: an unknown id is a refusal, and a known one is somebody's to refuse.
+			const found = await findPurchaseOffer(c.env.DB, purchaseOfferId)
+			if (!found) return purchaseOfferEnvelope(c, null, DELETE_OFFER_FAILED)
+
+			const canManage = await canManageRoomById(c.env.DB, found.RoomId, accountId)
+			if (canManage === null) return purchaseOfferEnvelope(c, null, DELETE_OFFER_FAILED)
+			if (!canManage) return c.body(null, 403)
+
+			const removed = await deletePurchaseOffer(c.env.DB, purchaseOfferId)
+			if (!removed) return purchaseOfferEnvelope(c, null, DELETE_OFFER_FAILED)
+			return purchaseOfferEnvelope(c, removed.Offer)
+		}
+	)
+
 	// Award room currency to players, several awards per call. Auth-gated (401); everything
 	// else is reported PER ENTRY, including whether the caller may award that currency at all.
 	.post(
@@ -4309,7 +4572,9 @@ const app = new Hono<App>({ strict: false })
 				'drew it is refused rather than sold at numbers the player did not see.',
 				'',
 				'The tokens are paid to the room’s OWNER (its `CreatorAccountId`), as a room-key sale',
-				'is; an owner buying from their own shop, and a free offer, move no tokens.',
+				'is. The room’s owner and co-owners (the `canManageRoom` set) take from their own shop',
+				'for free: the client shows them the offer at no cost and posts `RequestedPrice=0`, so',
+				'their posted price is not checked and no tokens move. A free offer moves none either.',
 				'',
 				'Answers the `{ Value, Success, Error, error_id }` envelope the room-currency writes',
 				'use. `Value` is BOTH balances the purchase moved, each a RESULTING total:',
@@ -4356,15 +4621,24 @@ const app = new Hono<App>({ strict: false })
 			if (int(body.RequestedAmount) !== offer.CurrencyAmount) {
 				return refuse('Requested amount does not match')
 			}
-			if (int(body.RequestedPrice) !== offer.Price) return refuse('Requested price does not match')
 
 			const ownerId = await getRoomOwnerId(c.env.DB, roomId)
 			if (ownerId === null) return refuse('Purchase offer is not available')
 
-			// The owner paying themselves would be a debit and a credit of the same tokens.
+			// The room's owner and co-owners take from their own shop for free: the client
+			// shows THEM the offer at no cost and posts `RequestedPrice=0`, so holding a
+			// contributor to the offer's price refused every purchase they made. Nobody is
+			// charged — the owner paying themselves would be a debit and a credit of the same
+			// tokens, and a co-owner is building the shop, not buying from it — so the posted
+			// price is not checked for them at all; everyone else must have seen the real one.
+			const canManage = (await canManageRoomById(c.env.DB, roomId, id)) === true
+			if (!canManage && int(body.RequestedPrice) !== offer.Price) {
+				return refuse('Requested price does not match')
+			}
+
 			const startingTokens = intVar(c.env.STARTING_TOKENS, DEFAULT_STARTING_TOKENS)
 			const tokens = CurrencyType.RecCenterTokens
-			const charged = offer.Price > 0 && ownerId !== id
+			const charged = offer.Price > 0 && !canManage
 			// Charged FIRST, and atomically: a buyer who cannot pay is handed nothing.
 			if (charged && !(await spendCurrency(c.env.DB, id, tokens, offer.Price, startingTokens))) {
 				return refuse('Not enough tokens')
@@ -4666,6 +4940,54 @@ const app = new Hono<App>({ strict: false })
 				if (consumed !== null) await pushConsumableRemoved(c, id, consumed)
 			}
 			return c.json({ error: '', success: true, value: null })
+		}
+	)
+
+	// STUB. The client posts `{ Id, IsActive, ActivatedByRoomie }` when a consumable starts
+	// or stops being used — `Id` is the consumable row id, as on `/consume`. Nothing is
+	// stored: the body is read only to log it, and the client ignores the response entirely,
+	// so none is sent.
+	//
+	// What this most likely means: the consumable is IN USE, and marking it so is what keeps
+	// a player from reusing one before it is over (a second Confetti Cannon while the first
+	// is still firing), and `ActivatedByRoomie` says a roommate set it off rather than its
+	// owner. That is a guess from the field names, not observed behaviour, so no row flips
+	// and `/consume` is unchanged. When the client's reading of it is known, this is where
+	// an `is_active` flag on the consumable row (and a refusal on `/consume`) would go.
+	.post(
+		'/api/consumables/v1/updateActive',
+		describeRoute({
+			tags: ['Consumables'],
+			summary: 'Mark a consumable active or inactive (stub)',
+			description: [
+				'STUB. Accepts `{ Id, IsActive, ActivatedByRoomie }` — the client posting that one',
+				'of its consumables has started or stopped being used — and stores nothing. The',
+				'client ignores the response entirely, so this answers an empty 200.',
+				'',
+				'Believed to mark the consumable as IN USE so it cannot be reused before it is over,',
+				'with `ActivatedByRoomie` saying a roommate set it off; that is a guess from the field',
+				'names, and nothing acts on it yet. `/consume` is unaffected.',
+			].join(' '),
+			security: AUTHED,
+			requestBody: jsonBody(UpdateActiveConsumableRequest, 'The consumable and its new state'),
+			responses: {
+				200: { description: 'Empty body — the client ignores the response entirely' },
+				401: UNAUTHORIZED_RESPONSE,
+			},
+		}),
+		async (c) => {
+			const id = await authedId(c)
+			if (id === null) return unauthorized(c)
+			const body = await c.req
+				.json<Record<string, unknown>>()
+				.catch(() => ({}) as Record<string, unknown>)
+			logger.info('consumable updateActive (stub, not stored)', {
+				accountId: id,
+				consumableId: body.Id,
+				isActive: body.IsActive,
+				activatedByRoomie: body.ActivatedByRoomie,
+			})
+			return c.body(null, 200)
 		}
 	)
 
@@ -6392,22 +6714,24 @@ const app = new Hono<App>({ strict: false })
 
 	// Everyone in the influencer partner program, by account id — the list the client keeps
 	// so it can badge an influencer wherever they turn up, rather than asking per player.
+	// Membership is the account's `isInfluencer` flag (`runx admin grant-influencer`), read
+	// through the `is_influencer` generated column's partial index so the account table is
+	// never scanned.
 	//
-	// Empty: no programme runs here, so there is nobody to list. Note this is the LIST
-	// counterpart of the single-account check below, and the two answer very differently —
-	// that one 404s to say "not an influencer", this one is a 200 carrying an empty list,
-	// because "nobody is" is a complete answer to "who is?".
-	//
-	// `take` is accepted and ignored; there is nothing to page through.
+	// Paged in shape only: the client asks for `take=1000` and this server will not have
+	// that many, so the whole list is one page and `ContinuationToken` is always null. `take`
+	// is accepted and ignored. Note this is the LIST counterpart of the single-account tier
+	// check below, which still answers 0 for everyone.
 	.get(
 		'/api/influencerpartnerprogram/influencers',
 		describeRoute({
 			tags: ['Econ'],
 			summary: 'Every influencer in the partner program',
 			description: [
-				'The account ids in the influencer partner program, as `{ InfluencerIds }` — an object',
-				'around the list, not a bare array. Always empty here: no programme runs on this',
-				'server. `take` is accepted and ignored, there being nothing to page.',
+				'The account ids in the influencer partner program — every account flagged',
+				'`isInfluencer` — as `{ InfluencerIds, ContinuationToken }`: an object around the',
+				'list, not a bare array. Served whole: `take` is accepted and ignored, and',
+				'`ContinuationToken` is always null.',
 			].join(' '),
 			security: AUTHED,
 			parameters: [
@@ -6415,90 +6739,174 @@ const app = new Hono<App>({ strict: false })
 					name: 'take',
 					in: 'query',
 					required: false,
-					description: 'How many ids to return. Accepted and ignored.',
+					description: 'How many ids to return. Accepted and ignored — the list is served whole.',
 					schema: { type: 'integer' },
 				},
 			],
 			responses: {
-				200: json(InfluencerIdsResponse, 'The influencer ids — always empty'),
+				200: json(InfluencerIdsResponse, 'The influencer ids, lowest first'),
 				401: UNAUTHORIZED_RESPONSE,
 			},
 		}),
 		async (c) => {
 			const id = await authedId(c)
 			if (id === null) return unauthorized(c)
-			return c.json({ InfluencerIds: [] })
+			const InfluencerIds = await listInfluencerIds(c.env.DB)
+			return c.json({ InfluencerIds, ContinuationToken: null })
 		}
 	)
 
-	// One account's standing in the influencer partner program. NOBODY here has one: this
-	// server runs no such program, so the answer is the literal `0` — the "not an influencer"
-	// tier — for every account.
+	// The influencer one account SUPPORTS in the partner program, by account id — every
+	// player picks one (`…/support` below), and this is how anyone reads anyone's pick.
 	//
 	// A BARE NUMBER is the whole body, like `…/makerai/checkfreetrialeligibility`'s bare
-	// `false`, not a number wrapped in an object. This used to answer 404 with an empty body;
-	// the tier is what the client actually reads.
-	//
-	// `accountId` names the account being asked about. It makes no difference to the answer
-	// while nobody is an influencer, but it is read rather than ignored so this stays the
-	// question it looks like — the caller's own standing is `…/myinfluencer` below.
+	// `false`, not a number wrapped in an object; 0 is "supports nobody", which is also what
+	// an account that does not exist answers. The caller's own pick is `…/myinfluencer`.
 	.get(
 		'/api/influencerpartnerprogram/influencer',
 		describeRoute({
 			tags: ['Econ'],
-			summary: 'An account’s influencer partner program tier',
+			summary: 'The influencer an account supports',
 			description: [
-				'The partner tier of the account named by `accountId`, as a BARE NUMBER — the whole',
-				'body is `0`, not an object around it. Always 0: this server runs no partner program,',
-				'so no account is an influencer. Auth-gated; a missing or invalid token is a 401.',
+				'The account id of the influencer the account named by `accountId` supports, as a',
+				'BARE NUMBER — the whole body is the id, not an object around it; `0` when they',
+				'support nobody (or no such account exists). Auth-gated; a missing or invalid token',
+				'is a 401. A missing or non-numeric `accountId` is a 400.',
 			].join(' '),
 			security: AUTHED,
 			parameters: [
 				{
 					name: 'accountId',
 					in: 'query',
-					required: false,
-					description: 'The account being asked about. Every account answers 0.',
+					required: true,
+					description: 'The account being asked about.',
 					schema: { type: 'integer' },
 				},
 			],
 			responses: {
-				200: json(InfluencerTierResponse, 'The account’s tier — always 0'),
+				200: json(SupportedInfluencerResponse, 'The supported influencer’s id, or 0'),
+				400: { description: '`accountId` missing or not an integer (empty body)' },
 				401: UNAUTHORIZED_RESPONSE,
 			},
 		}),
 		async (c) => {
 			const id = await authedId(c)
 			if (id === null) return unauthorized(c)
-			return c.json(NOT_AN_INFLUENCER)
+			const accountId = Number.parseInt(c.req.query('accountId') ?? '', 10)
+			if (!Number.isInteger(accountId)) return c.body(null, 400)
+			return c.json(await supportedInfluencer(c.env.DB, accountId))
 		}
 	)
 
 	// The same question about the CALLER — the `my` form, which names no account because the
-	// token already does. Same bare `0`, for the same reason: nobody here is an influencer.
+	// token already does. Same bare number, same 0 for nobody.
 	//
 	// Its own route rather than an alias of the one above, because the two differ in who they
-	// are about; they agree today only because the answer is currently the same for everyone.
+	// are about.
 	.get(
 		'/api/influencerpartnerprogram/myinfluencer',
 		describeRoute({
 			tags: ['Econ'],
-			summary: 'The caller’s influencer partner program tier',
+			summary: 'The influencer the caller supports',
 			description: [
-				'The caller’s own partner tier — the `my` form of the route above, taking the account',
-				'from the token rather than a query parameter. A BARE NUMBER, always `0`: this server',
-				'runs no partner program. Auth-gated; a missing or invalid token is a 401.',
+				'The account id of the influencer the caller supports — the `my` form of the route',
+				'above, taking the account from the token rather than a query parameter. A BARE',
+				'NUMBER; `0` when they support nobody. Auth-gated; a missing or invalid token is a 401.',
 			].join(' '),
 			security: AUTHED,
 			responses: {
-				200: json(InfluencerTierResponse, 'The caller’s tier — always 0'),
+				200: json(SupportedInfluencerResponse, 'The supported influencer’s id, or 0'),
 				401: UNAUTHORIZED_RESPONSE,
 			},
 		}),
 		async (c) => {
 			const id = await authedId(c)
 			if (id === null) return unauthorized(c)
-			return c.json(NOT_AN_INFLUENCER)
+			return c.json(await supportedInfluencer(c.env.DB, id))
+		}
+	)
+
+	// Pick the influencer the caller supports: `influencerAccountId=<id>`, form-encoded. ONE
+	// per player, stored on the account as `supportedInfluencerId`; posting again replaces
+	// the pick. The id has to name an account currently flagged `isInfluencer` — anything
+	// else, the caller's own id included, is a 400 and changes nothing. The reply is a bare
+	// `{ Success, Error, error_id }` status envelope — no `Value`: the client reads the pick
+	// back from `…/myinfluencer` rather than from this reply.
+	.post(
+		'/api/influencerpartnerprogram/support',
+		describeRoute({
+			tags: ['Econ'],
+			summary: 'Pick the influencer the caller supports',
+			description: [
+				'Set the ONE influencer the caller supports in the partner program, replacing any',
+				'earlier pick. `influencerAccountId` must name an account that is currently an',
+				'influencer (listed by `…/influencers`); the caller cannot support themselves. The',
+				'reply is a `{ Success, Error, error_id }` status envelope with no `Value`; read the',
+				'new pick back from `…/myinfluencer`.',
+			].join(' '),
+			security: AUTHED,
+			requestBody: form(SupportInfluencerBody, 'The influencer to support'),
+			responses: {
+				200: json(SupportInfluencerResponse, 'The pick was recorded'),
+				400: {
+					description:
+						'`influencerAccountId` missing, not an integer, the caller’s own id, or not an influencer (empty body)',
+				},
+				401: UNAUTHORIZED_RESPONSE,
+			},
+		}),
+		async (c) => {
+			const id = await authedId(c)
+			if (id === null) return unauthorized(c)
+			const body = (await c.req.parseBody().catch(() => ({}))) as Record<string, unknown>
+			const raw = body.influencerAccountId
+			const influencerId = Number.parseInt(typeof raw === 'string' ? raw : '', 10)
+			if (!Number.isInteger(influencerId) || influencerId === id) return c.body(null, 400)
+			const influencer = await getAccount(c.env.DB, influencerId)
+			if (influencer?.isInfluencer !== true) return c.body(null, 400)
+			await updateAccount(c.env.DB, id, { supportedInfluencerId: influencerId })
+			return c.json({ Success: true, Error: null, error_id: null })
+		}
+	)
+
+	// Stop supporting an influencer: `influencerAccountId=<id>`, form-encoded, the same body
+	// as `…/support`. The field is UNSET on the account (dropped from the JSON, not written
+	// as 0), so `…/myinfluencer` goes back to 0. The id has to be an integer (else 400), but
+	// it only has to NAME THE CURRENT PICK to do anything: naming anyone else — a stale pick
+	// from before a `…/support` that replaced it, or nobody at all — is a no-op that still
+	// answers success, like a wishlist remove of something not listed. Guarding on the match
+	// keeps a stale client from clearing a pick it never saw.
+	.post(
+		'/api/influencerpartnerprogram/remove',
+		describeRoute({
+			tags: ['Econ'],
+			summary: 'Stop supporting an influencer',
+			description: [
+				'Clear the influencer the caller supports in the partner program. `influencerAccountId`',
+				'names the current pick; the field is unset and `…/myinfluencer` answers 0 again.',
+				'An id that is not the current pick changes nothing and still answers success. The',
+				'reply is the same `{ Success, Error, error_id }` status envelope as `…/support`.',
+			].join(' '),
+			security: AUTHED,
+			requestBody: form(RemoveInfluencerBody, 'The influencer to stop supporting'),
+			responses: {
+				200: json(SupportInfluencerResponse, 'The pick was cleared (or was not this one)'),
+				400: { description: '`influencerAccountId` missing or not an integer (empty body)' },
+				401: UNAUTHORIZED_RESPONSE,
+			},
+		}),
+		async (c) => {
+			const id = await authedId(c)
+			if (id === null) return unauthorized(c)
+			const body = (await c.req.parseBody().catch(() => ({}))) as Record<string, unknown>
+			const raw = body.influencerAccountId
+			const influencerId = Number.parseInt(typeof raw === 'string' ? raw : '', 10)
+			if (!Number.isInteger(influencerId)) return c.body(null, 400)
+			if ((await supportedInfluencer(c.env.DB, id)) === influencerId) {
+				// `undefined` wins the spread in updateAccount and JSON.stringify drops the key.
+				await updateAccount(c.env.DB, id, { supportedInfluencerId: undefined })
+			}
+			return c.json({ Success: true, Error: null, error_id: null })
 		}
 	)
 

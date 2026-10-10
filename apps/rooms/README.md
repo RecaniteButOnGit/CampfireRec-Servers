@@ -36,6 +36,13 @@ Reads are the exception: they carry no envelope at all. A paged read (the save h
 `…/subrooms/{subRoomId}/saves` and its lighter `…/saves/no_unity_assets` twin) is a bare
 `{ Results, TotalResults, TotalCount }` wrapper — `TotalResults` and `TotalCount` are the
 same number, because the client's paged DTO and the reference disagree on the name.
+`GET /rooms/{roomId}` puts a Studio build's main bundles on `CurrentSave.UnitySubAssets`
+(target 0 Windows, 2 Android/Quest). `unityAssetTarget` keeps only that target. Maker-pen
+saves keep the arrays empty. `GET …/unityasset?unityAssetId=` is the bare metadata for
+those files; the bytes are on the CDN.
+`POST /unity_assets/baked/bulk` (form `target=0&version=3&id=<guid>&id=<guid>`) is the
+2025 client's bulk lookup of baked bundles from the `unity_asset` table — a bare array of
+`{ UnityAssetId, Target, Version, Filename, Hash }`, one per asset that has a build.
 
 ## Cron
 

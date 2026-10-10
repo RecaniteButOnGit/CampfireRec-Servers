@@ -60,8 +60,15 @@ import {
 	requireDeveloper,
 	requireStaff,
 	searchReportsHandler,
+	syncDiscordRolesHandler,
 	topReportedHandler,
 } from './staff'
+import {
+	grantStudioAccessHandler,
+	listStudioAccessHandler,
+	revokeStudioAccessHandler,
+	studioAccessStatusHandler,
+} from './studio-access'
 import { passwordSignupOpen, turnstileKeys, verifyTurnstile } from './turnstile'
 import {
 	accountsBase,
@@ -527,6 +534,11 @@ const app = new Hono<App>()
 		return c.json({ hasPlus: true, discordUsername: membership.username, tokensAwarded })
 	})
 
+	// Whether the signed-in account has studio upload access (`hasStudio`). The page
+	// Studio opens (`/settings/recroomstudio`) asks this; it does not list anyone
+	// else. Staff manage the flag on the routes below.
+	.get('/api/studio-access', studioAccessStatusHandler)
+
 	// ---- Staff moderation panel ---------------------------------------------
 	// The endpoints behind `/moderation` in the SPA. They live here rather than on `api`
 	// (which owns the `report` table) because they are a recflare addition with no
@@ -564,12 +576,20 @@ const app = new Hono<App>()
 	// Its sibling: the same gift to every account whose Discord link holds a role, offline
 	// included — the supporter cron's audience, with an operator's amount and message.
 	.post('/api/staff/discord-roles/:roleId/gift-tokens', requireDeveloper, giftRoleTokensHandler)
+	// The daily role sweep, run now and answered with its summary (halt reason included) —
+	// the cron reports only to a log line, and this is the way to see why it wrote nothing.
+	.post('/api/staff/discord-roles/sync', requireDeveloper, syncDiscordRolesHandler)
 	// Rec Room Plus is worth tokens and a discount, so granting it is developer-only too.
 	.post('/api/staff/players/:id/grant-plus', requireDeveloper, grantPlusHandler)
 	.post('/api/staff/players/:id/username-changes', addUsernameChangeHandler)
 	.post('/api/staff/players/:id/clear-password', clearPasswordHandler)
 	// Exclusive to the verified session for account 2; accepts a protobuf file or ZIP.
 	.post('/api/avatar-import/players/:id', importAvatarHandler)
+	// RecFlare Studio upload access. The same staff gate as moderation: a moderator
+	// decides who can upload, and the role lands on the player's next token.
+	.get('/api/staff/studio-access', listStudioAccessHandler)
+	.post('/api/staff/studio-access', grantStudioAccessHandler)
+	.delete('/api/staff/studio-access/:id', revokeStudioAccessHandler)
 
 	// ---- Privacy policy -----------------------------------------------------
 	// Server-rendered rather than a SPA route so the page has real text without

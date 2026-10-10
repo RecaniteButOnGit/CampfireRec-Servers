@@ -16,6 +16,7 @@ import {
 	GAME_VERSION,
 	getAccount,
 	getClubSummary,
+	getExpiredPresenceAccountIds,
 	getExpiredPresenceInstanceIds,
 	getFriendIds,
 	getJoinableInstance,
@@ -30,10 +31,12 @@ import {
 	getRoomInstancesByRoom,
 	getRoomInstanceSummariesByRoom,
 	getRoomInvite,
+	getSharedPrivateInstance,
 	getStoredRoomInstance,
 	hasRoomInviteTo,
 	InviteMode,
 	isClubMember,
+	isMatchmakingPolicy,
 	isPlayerBannedFromRoom,
 	MatchmakingErrorCode,
 	MessageType,
@@ -48,6 +51,7 @@ import {
 	roomRoles,
 	setPresence,
 	setRoomInstanceInProgress,
+	setRoomInstanceMatchmakingPolicy,
 	setRoomInstancePrivate,
 	subRoomDataBlob,
 } from '@repo/domain'
@@ -87,6 +91,7 @@ import {
 	MatchmakeRoomRequest,
 	MatchmakeRoomV2Request,
 	MatchmakeV2Response,
+	MatchPolicyRequest,
 	NotifyDisconnectRequest,
 	PlayerDto,
 	QosRegion,
@@ -561,19 +566,22 @@ function presenceUpdateMessage(
 
 /**
  * Push a SubscriptionUpdatePresence to every online friend of `playerId` after their
- * presence changes (they entered a room). Mirrors the reference's PlayerPresenceChanged:
- * only currently-connected friends receive it (an offline friend gets nothing, not a
- * queued stale frame), so it's an ephemeral batch send. The room instance the friends
- * see is read from the player's stored presence — the authoritative record just written,
- * the same one the heartbeat replays. Best-effort: a hub or lookup failure is logged and
- * swallowed, so it never fails the matchmake that triggered it.
+ * presence changes (they entered a room, logged out, or lapsed). Mirrors the reference's
+ * PlayerPresenceChanged: only currently-connected friends receive it (an offline friend
+ * gets nothing, not a queued stale frame), so it's an ephemeral batch send. The room
+ * instance the friends see is read from the player's stored presence — the authoritative
+ * record just written, the same one the heartbeat replays; with the row gone (logout, or
+ * the cron sweep purging a lapsed row) the read is null and the frame is the offline
+ * snapshot (roomInstance null, isOnline false). Takes `Env` rather than a request context
+ * so the sweep, which has no request, sends the same frame. Best-effort: a hub or lookup
+ * failure is logged and swallowed, so it never fails the matchmake that triggered it.
  */
-async function notifyFriendsPresence(c: Context<App>, playerId: number): Promise<void> {
+async function notifyFriendsPresence(env: Env, playerId: number): Promise<void> {
 	try {
-		const friendIds = await getFriendIds(c.env.DB, playerId)
+		const friendIds = await getFriendIds(env.DB, playerId)
 		if (friendIds.length === 0) return
-		const presence = await getPresence<RoomInstance>(c.env.DB, playerId)
-		await c.env.RECFLARE_NOTIFICATIONS_HUB.getByName(HUB_INSTANCE).notifyPlayersEphemeral(
+		const presence = await getPresence<RoomInstance>(env.DB, playerId)
+		await env.RECFLARE_NOTIFICATIONS_HUB.getByName(HUB_INSTANCE).notifyPlayersEphemeral(
 			friendIds,
 			NotificationType.SubscriptionUpdatePresence,
 			presenceUpdateMessage(playerId, presence?.roomInstance ?? null, presence?.appVersion)
@@ -645,7 +653,7 @@ async function enterRoom(c: Context<App>, id: number, roomInstance: RoomInstance
 	// The player's presence changed — tell their online friends where they went, reading
 	// the instance back from the presence we just stored. Best-effort; never blocks or
 	// fails the matchmake.
-	await notifyFriendsPresence(c, id)
+	await notifyFriendsPresence(c.env, id)
 }
 
 /** Returned when a room isn't in the DB — and for every other opaque refusal. */
@@ -1163,9 +1171,11 @@ async function readCorrelationId(c: Context<App>): Promise<string> {
 }
 
 /**
- * How the instance is matched into, echoed on every v2 instance. The reference server
- * sends 0 and this server has no policy to express, so it is a constant — kept as a
- * named field rather than dropped, because the client's decoder wants the key.
+ * How the instance is matched into, echoed on every v2 instance. The stored policy
+ * (`PUT /roominstance/:id/matchpolicy`) is not threaded through to the wire instance,
+ * which is rebuilt from the room; a matchmake only ever lands in an instance that is not
+ * `Ignore`, so this echoes Default. Kept as a named field rather than dropped, because
+ * the client's decoder wants the key.
  */
 const DEFAULT_MATCHMAKING_POLICY = 0
 
@@ -1486,10 +1496,16 @@ async function resolveRoomInstance(
 	// it never admitted — a friend follows the owner in, and `IsPrivate: false` tells every
 	// client the session is open. The owner walking through their own room's subroom door
 	// posts `JoinMode` 0, so this has to be decided here rather than trusted from the body.
-	// Private means a fresh instance each time, as `JoinMode` 2 always has: the room's
-	// people reach each other by invite. Room routes only, like the gate — an event or a
-	// clubhouse held in a private room is a session its own guest list shares.
-	const privateInstance = isPrivate || (gateOnAccessibility && !isPublished(room))
+	// Room routes only, like the gate — an event or a clubhouse held in a private room is a
+	// session its own guest list shares.
+	//
+	// It is also ONE session, not a fresh one per matchmake: an unpublished room has a
+	// single private instance (per subroom and build), and everyone the gate admits is
+	// placed in it — that is what "come look at my room" means to a co-owner. Spawning a
+	// fresh instance each time, as `JoinMode` 2 does on a published room, put the creator
+	// and each person they let in into separate empty copies of the room.
+	const unpublished = gateOnAccessibility && !isPublished(room)
+	const privateInstance = isPrivate || unpublished
 
 	// The build this player is on, from their token. A 2023 client can't load a scene
 	// saved at a newer persistence version, so it is refused the room outright (see
@@ -1510,23 +1526,34 @@ async function resolveRoomInstance(
 	// your current instance (e.g. the only public instance of a room you're already in)
 	// returns the same id and hangs the client mid-join. Exclude it from the join
 	// search, which pushes them to another live instance if one exists or forces a
-	// fresh one below. (Only the public path reuses instances, so only it needs the
-	// read; a private matchmake always gets a fresh instance.)
-	const currentInstanceId = privateInstance
-		? undefined
-		: (await getPresence<RoomInstance>(c.env.DB, ownerId))?.roomInstance?.roomInstanceId
+	// fresh one below. (Only the paths that reuse instances — public, and the shared
+	// session of an unpublished room — need the read; a private matchmake into a
+	// published room always gets a fresh instance.)
+	const reusesInstance = unpublished || !privateInstance
+	const currentInstanceId = reusesInstance
+		? (await getPresence<RoomInstance>(c.env.DB, ownerId))?.roomInstance?.roomInstanceId
+		: undefined
 	// The same build, with GAME_VERSION standing in for a token that names none. It scopes
 	// the search below and is stamped on the instance when one is created, which is what
 	// keeps a session to a single client version.
 	const gameVersion = tokenVersion ?? GAME_VERSION
-	// Reuse an existing joinable public instance *of the same subroom and the same
-	// build* — subrooms are separate places, so joining one must never land you in
-	// another, and neither must a session running a different version of the room.
-	// Private matchmakes always get a fresh instance. Create one when there's nothing
-	// to join.
-	let instance = privateInstance
-		? null
-		: await getJoinableInstance(c.env.DB, f.roomId, gameVersion, f.subRoomId, currentInstanceId)
+	// Reuse an existing joinable instance *of the same subroom and the same build* —
+	// subrooms are separate places, so joining one must never land you in another, and
+	// neither must a session running a different version of the room. A published room
+	// reuses a public instance; an unpublished one reuses its single private session.
+	// A private matchmake into a published room always gets a fresh instance. Create
+	// one when there's nothing to join.
+	let instance = unpublished
+		? await getSharedPrivateInstance(
+				c.env.DB,
+				f.roomId,
+				gameVersion,
+				f.subRoomId,
+				currentInstanceId
+			)
+		: privateInstance
+			? null
+			: await getJoinableInstance(c.env.DB, f.roomId, gameVersion, f.subRoomId, currentInstanceId)
 	if (!instance) {
 		instance = await createRoomInstance(c.env.DB, {
 			ownerAccountId: ownerId,
@@ -1566,7 +1593,9 @@ async function resolveRoomInstance(
  * {@link canEnterRoom}): a room that isn't published answers `RoomIsPrivate` (25) to anyone
  * but its creator, its role holders and its invitees, in either join mode — a private
  * instance of an unpublished room is still a way into it. Those it does admit always get
- * a PRIVATE instance of it, whatever `JoinMode` they posted.
+ * a PRIVATE instance of it, whatever `JoinMode` they posted — and the SAME one: an
+ * unpublished room has a single private instance per subroom and build, shared by
+ * everyone it admits (see `getSharedPrivateInstance`).
  *
  * `subRoomId` is optional: absent, `resolveRoomInstance` falls back to the room's first
  * subroom (its default entrance).
@@ -1834,7 +1863,7 @@ const app = new Hono<App>()
 					// Their presence changed — tell online friends they went offline. Presence
 					// is already cleared, so notifyFriendsPresence reads null and sends the
 					// offline snapshot (roomInstance null, isOnline false).
-					await notifyFriendsPresence(c, id)
+					await notifyFriendsPresence(c.env, id)
 				}
 			}
 			return c.body(null, 200)
@@ -3299,6 +3328,56 @@ const app = new Hono<App>()
 		}
 	)
 
+	// How matchmaking treats this instance (`policy=0|1|2`: Default, Avoid, Ignore —
+	// see MatchmakingPolicy). Gated on STANDING IN the instance rather than owning the
+	// room: whoever is in a session decides whether more players should be matched into
+	// it, the way in-progress is set by whoever starts the game. `Ignore` drops the
+	// instance from both reuse searches; invites, room codes and the owner's session
+	// picker still reach it. Empty ack.
+	.put(
+		'/roominstance/:id/matchpolicy',
+		describeRoute({
+			tags: ['Room instance'],
+			summary: 'Set an instance’s matchmaking policy',
+			description: [
+				'Sets the instance’s `matchmakingPolicy`: 0 Default (matchmaking places players in',
+				'it), 1 Avoid (it ranks behind every Default instance), 2 Ignore (matchmaking never',
+				'places anyone in it; invites, room codes and the owner’s session picker still do).',
+				'Players already inside are unaffected. Auth-gated and gated to a caller whose live',
+				'presence puts them IN this instance (403 otherwise) — not the room’s owner. Body is',
+				'`policy=<0|1|2>`; anything else is a 400. Empty ack.',
+			].join(' '),
+			security: AUTHED,
+			requestBody: form(MatchPolicyRequest, 'The policy'),
+			parameters: [{ name: 'id', in: 'path', required: true, schema: { type: 'string' } }],
+			responses: {
+				200: EMPTY_OK,
+				400: { description: '`policy` missing or not 0, 1 or 2 (empty body)' },
+				401: UNAUTHORIZED_RESPONSE,
+				403: { description: 'The caller is not in this instance (empty body)' },
+				404: { description: 'Non-numeric id or no such instance (empty body)' },
+			},
+		}),
+		async (c) => {
+			const id = await authedId(c)
+			if (id === null) return unauthorized(c)
+
+			const instanceId = Number.parseInt(c.req.param('id'), 10)
+			if (Number.isNaN(instanceId)) return c.body(null, 404)
+
+			const body = await c.req.parseBody().catch(() => ({}) as Record<string, unknown>)
+			const policy = typeof body.policy === 'string' ? Number.parseInt(body.policy, 10) : Number.NaN
+			if (!isMatchmakingPolicy(policy)) return c.body(null, 400)
+
+			if (!(await getRoomInstance(c.env.DB, instanceId))) return c.body(null, 404)
+			const presence = await getPresence<RoomInstance>(c.env.DB, id)
+			if (presence?.roomInstance?.roomInstanceId !== instanceId) return c.body(null, 403)
+
+			await setRoomInstanceMatchmakingPolicy(c.env.DB, instanceId, policy)
+			return c.body(null, 200)
+		}
+	)
+
 	// Close a live instance to strangers (`/roominstance/{id}/markprivate`) — the owner
 	// makes the session they're running private, so public matchmaking stops feeding new
 	// players into it (getJoinableInstance only reuses non-private instances). Everyone
@@ -3439,13 +3518,25 @@ const app = new Hono<App>()
  * running after the purge above: this order is what makes a lapsed row count as a
  * departure. Fullness is recomputed last, so it works from the final head-count and
  * skips (returns null for) the instances just deleted.
+ *
+ * A lapsed row is also the player going offline, exactly as a logout is — the client just
+ * never got to post one (it crashed, or lost its connection). So the sweep tells each
+ * lapsed player's online friends what `POST /player/logout` would have: the offline
+ * SubscriptionUpdatePresence. Without it a crashed player's friends kept seeing them
+ * online until their own client re-read the friends list. The account ids are read
+ * before the purge (the rows are what remembers who lapsed) and the frames sent after
+ * it, so `notifyFriendsPresence` reads no presence and sends the offline snapshot.
  */
 async function sweepExpiredPresence(env: Env): Promise<void> {
 	const staleInstanceIds = await getExpiredPresenceInstanceIds(env.DB)
+	const lapsedPlayerIds = await getExpiredPresenceAccountIds(env.DB)
 	const removed = await deleteExpiredPresence(env.DB)
 	const emptyInstanceIds = await deleteEmptyRoomInstances(env.DB)
 	for (const instanceId of staleInstanceIds) {
 		await refreshInstanceFullness(env.DB, instanceId)
+	}
+	for (const playerId of lapsedPlayerIds) {
+		await notifyFriendsPresence(env, playerId)
 	}
 	// Sample the player count into `stat` — taken after the purge, so it's the live
 	// rows and not the ones that just lapsed. One row per cron run: the `online` series.

@@ -99,6 +99,13 @@ export interface HubState {
 	pending: Array<{ playerId: number; count: number; latest: string }>
 }
 
+/** One entry of a {@link NotificationsHub.notifyPlayers} call: a `notifyPlayer`'s arguments. */
+export interface PlayerNotification {
+	playerId: number
+	notificationType: string | number
+	data?: Record<string, unknown>
+}
+
 /**
  * How many queued notifications one offline player may accumulate. Past this the OLDEST
  * are dropped, newest kept.
@@ -462,6 +469,48 @@ export class NotificationsHub extends DurableObject<Env> {
 			return { delivered: 0, queued: true }
 		}
 		return { delivered, queued: false }
+	}
+
+	/**
+	 * {@link notifyPlayer} for MANY notifications in ONE RPC, each with its own player and
+	 * payload, delivered (or queued, when that player is offline) in the order given. The
+	 * server-wide token drop pays a few hundred players at once, and each needs two frames of
+	 * their own — a balance that differs per player, then a box whose id does — so sent
+	 * through `notifyPlayer` it was two round trips per player, in series, from a request
+	 * already short of its subrequest budget. One call carries the lot.
+	 *
+	 * `notifyPlayersEphemeral` is the other bulk send: one identical payload to many, never
+	 * queued. This one keeps `notifyPlayer`'s durability, player by player. The "nobody to
+	 * deliver to" warning is logged ONCE for the whole call, naming the players, rather than
+	 * once per frame: a drop reaches everyone with an unexpired presence row, and a good
+	 * share of them are between sessions at any moment.
+	 */
+	async notifyPlayers(
+		notifications: readonly PlayerNotification[]
+	): Promise<{ delivered: number; queued: number }> {
+		let delivered = 0
+		let queued = 0
+		const unreachable = new Set<number>()
+		for (const { playerId, notificationType, data } of notifications) {
+			const payload = this.buildNotificationPayload(notificationType, data)
+			const sent = this.deliverToPlayer(playerId, payload)
+			if (sent === 0) {
+				this.queuePending(playerId, payload)
+				queued++
+				unreachable.add(playerId)
+			} else {
+				delivered += sent
+			}
+		}
+		if (queued > 0) {
+			console.warn('hub: notifications queued, nobody to deliver to', {
+				playerIds: [...unreachable],
+				queued,
+				notifications: notifications.length,
+				liveSockets: this.ctx.getWebSockets().length,
+			})
+		}
+		return { delivered, queued }
 	}
 
 	/**

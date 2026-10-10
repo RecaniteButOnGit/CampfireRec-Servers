@@ -28,6 +28,7 @@ import type { D1ExecResult } from '../d1'
  *   runx admin clear-password  --username alice [--remote]
  *   runx admin lookup          --username alice [--remote]
  *   runx admin grant-developer --account 1 [--revoke] [--remote]
+ *   runx admin grant-influencer --account 1 [--revoke] [--remote]
  *   runx admin grant-plus      --username alice [--revoke] [--remote]
  *   runx admin reload-plus     <amount> [--dry-run] [--remote]
  *   runx admin cai-load        [--file <export.json>] [--dry-run] [--remote]
@@ -169,6 +170,11 @@ function grantRoleCommand(name: string, jsonKey: string, roleLabel: string, noun
 
 const grantDeveloper = grantRoleCommand('grant-developer', 'isDeveloper', 'developer')
 const grantModerator = grantRoleCommand('grant-moderator', 'isModerator', 'moderator')
+/**
+ * The influencer role, the account's `isInfluencer` flag. `auth` stamps it into the token's
+ * `role` claim as `influencer` on the next login; nothing else reads the flag.
+ */
+const grantInfluencer = grantRoleCommand('grant-influencer', 'isInfluencer', 'influencer')
 
 /**
  * Rec Room Plus, the account's `hasPlus` flag. Players normally get it themselves by
@@ -184,6 +190,14 @@ const grantModerator = grantRoleCommand('grant-moderator', 'isModerator', 'moder
  * expires. It is not a way to cut someone off immediately.
  */
 const grantPlus = grantRoleCommand('grant-plus', 'hasPlus', 'Rec Room Plus', 'subscription')
+
+/**
+ * Rec Room Studio upload access, the account's `hasStudio` flag. Staff normally set it
+ * from the website (`/settings/recroomstudio`); this is the operator's way in. `auth`
+ * stamps it into the token as the `betastudio` role, so like Plus it lands on the
+ * player's next Studio sign-in or refresh.
+ */
+const grantStudio = grantRoleCommand('grant-studio', 'hasStudio', 'Rec Room Studio', 'access')
 
 /**
  * The Rec Room Plus token reload: credit every subscriber's RecCenterTokens balance by
@@ -385,7 +399,9 @@ const lookup = new Command('lookup')
 			json_extract(data, '$.lastLoginTime') AS lastLoginTime,
 			(json_extract(data, '$.passwordHash') IS NOT NULL) AS hasPassword,
 			(json_extract(data, '$.isDeveloper') = 1) AS isDeveloper,
-			(json_extract(data, '$.isModerator') = 1) AS isModerator
+			(json_extract(data, '$.isModerator') = 1) AS isModerator,
+			(json_extract(data, '$.isInfluencer') = 1) AS isInfluencer,
+			(json_extract(data, '$.hasStudio') = 1) AS hasStudio
 			FROM account WHERE ${where}`
 		const res = await execSql(sql, remote)
 		const row = res.results[0]
@@ -399,7 +415,13 @@ const lookup = new Command('lookup')
 				: typeof v === 'object'
 					? JSON.stringify(v)
 					: String(v as number | string | boolean)
-		const boolKeys = new Set(['hasPassword', 'isDeveloper', 'isModerator'])
+		const boolKeys = new Set([
+			'hasPassword',
+			'isDeveloper',
+			'isModerator',
+			'isInfluencer',
+			'hasStudio',
+		])
 		const table = new Table()
 		for (const [key, value] of Object.entries(row)) {
 			const shown = boolKeys.has(key) ? (value === 1 ? 'yes' : 'no') : asText(value)
@@ -417,7 +439,9 @@ export const adminCmd = new Command('admin')
 	.addCommand(clearPassword)
 	.addCommand(grantDeveloper)
 	.addCommand(grantModerator)
+	.addCommand(grantInfluencer)
 	.addCommand(grantPlus)
+	.addCommand(grantStudio)
 	.addCommand(reloadPlus)
 	.addCommand(caiLoad)
 	.addCommand(lookup)

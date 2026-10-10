@@ -311,6 +311,70 @@ describe('notification delivery', () => {
 		ws.close()
 	})
 
+	// The bulk send is notifyPlayer many times over in one RPC: each entry its own player and
+	// payload, delivered live or queued per player, in the order given. What the token drop
+	// sends — two frames a player, a few hundred players.
+	test('delivers a batch to each player, live or queued, in order', async () => {
+		const live = 9005
+		const offline = 9006
+		const { ws, waitFor, records } = await connect('conn-bulk')
+		send(ws, {
+			type: 1,
+			invocationId: 's',
+			target: 'SubscribeToPlayers',
+			arguments: [{ playerIds: [live] }],
+		})
+		await waitFor((r) => r.type === 3 && r.invocationId === 's')
+
+		const stub = env.RECFLARE_NOTIFICATIONS_HUB.getByName('global')
+		const result = await runInDurableObject(stub, (instance) =>
+			instance.notifyPlayers([
+				{ playerId: live, notificationType: 61, data: { Balance: 10 } },
+				{ playerId: offline, notificationType: 61, data: { Balance: 20 } },
+				{ playerId: live, notificationType: 31, data: { Id: 1 } },
+				{ playerId: offline, notificationType: 31, data: { Id: 2 } },
+			])
+		)
+		expect(result).toEqual({ delivered: 2, queued: 2 })
+
+		await waitFor(
+			(r) =>
+				r.type === 1 &&
+				r.target === 'Notification' &&
+				(JSON.parse((r.arguments as string[])[0]) as { Id: string }).Id === '31'
+		)
+		const notes = records
+			.filter((r) => r.type === 1 && r.target === 'Notification')
+			.map((r) => JSON.parse((r.arguments as string[])[0]) as unknown)
+		expect(notes).toEqual([
+			{ Id: '61', Msg: { Balance: 10 } },
+			{ Id: '31', Msg: { Id: 1 } },
+		])
+		ws.close()
+
+		// The offline player's two are queued, and flush in order when they subscribe.
+		const late = await connect('conn-bulk-late')
+		send(late.ws, {
+			type: 1,
+			target: 'SubscribeToPlayers',
+			arguments: [{ playerIds: [offline] }],
+		})
+		await late.waitFor(
+			(r) =>
+				r.type === 1 &&
+				r.target === 'Notification' &&
+				(JSON.parse((r.arguments as string[])[0]) as { Id: string }).Id === '31'
+		)
+		const flushed = late.records
+			.filter((r) => r.type === 1 && r.target === 'Notification')
+			.map((r) => JSON.parse((r.arguments as string[])[0]) as unknown)
+		expect(flushed).toEqual([
+			{ Id: '61', Msg: { Balance: 20 } },
+			{ Id: '31', Msg: { Id: 2 } },
+		])
+		late.ws.close()
+	})
+
 	test('broadcast reaches connected clients', async () => {
 		const { ws, waitFor } = await connect('conn-broadcast')
 		const res = await post('/internal/broadcast', {
@@ -737,7 +801,7 @@ describe('pending queue bound', () => {
 		// Unbounded, this is what a broken delivery path fills up — and what flushPending
 		// then reads into memory in one go. Seeded straight into the object: the point is
 		// the bound, not the 500 HTTP round trips it would take to reach it.
-		const playerId = 9302
+		const playerId = 9402
 		const stub = env.RECFLARE_NOTIFICATIONS_HUB.getByName('global')
 		await runInDurableObject(stub, (_instance, state) => {
 			for (let i = 0; i < MAX_PENDING_PER_PLAYER + 100; i++) {

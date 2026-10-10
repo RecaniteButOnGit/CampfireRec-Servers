@@ -34,9 +34,11 @@ import {
 	usernamesFor,
 	where,
 } from './api'
+import { DeviceLinkPage } from './DeviceLink'
 import { customAvatarItemIdFromPath, ItemPage } from './Item'
 import { ModerationPage } from './Moderation'
 import { StatsPage } from './Stats'
+import { StudioAccessPage } from './StudioAccess'
 
 import type { ReactNode } from 'react'
 import type { ArchiveAudio, RoomArchive } from '../room-archive'
@@ -114,6 +116,11 @@ interface SubRoom {
 		 * this one first, ahead of the subroom's own.
 		 */
 		DataBlob: string
+		/**
+		 * The Studio build this save is drawn from, when it has one. The key is ABSENT on a
+		 * maker-pen save rather than null — the worker emits it only when the save carried one.
+		 */
+		UnityAssetId?: string
 	} | null
 }
 
@@ -383,6 +390,11 @@ async function blobHash(file: File): Promise<string> {
  * The envelope answers HTTP 200 either way and puts the refusal in `error`, so success
  * has to be read from the body rather than the status. `value.room` is the updated room,
  * which the page re-renders from rather than re-fetching the whole list.
+ *
+ * `unityAssetId` goes on the save beside the blob. The worker records it only when it is
+ * sent — a save that names none gets none, it is NOT carried over from the last save — so
+ * keeping a subroom's Studio build across an upload is the caller's job (see
+ * `previousUnityAssetId`).
  */
 async function saveSubRoomBlob(
 	roomId: number,
@@ -393,6 +405,7 @@ async function saveSubRoomBlob(
 		description: string
 		autoPublish: boolean
 		persistenceVersion?: number
+		unityAssetId?: string
 	}
 ): Promise<OwnedRoom> {
 	const res = await call<{
@@ -404,6 +417,7 @@ async function saveSubRoomBlob(
 		authed: true,
 		json: {
 			SubRoomData: { Filename: input.filename, Hash: input.hash },
+			...(input.unityAssetId ? { UnityAssetId: input.unityAssetId } : {}),
 			Description: input.description,
 			AutoPublish: input.autoPublish,
 			...(input.persistenceVersion === undefined
@@ -417,6 +431,30 @@ async function saveSubRoomBlob(
 	const room = res.value?.room
 	if (!room) throw new Error('The save was recorded but the room came back empty.')
 	return room
+}
+
+/** A `UnityAssetId` is a GUID, in the hyphenated form every save carries it in. */
+const UNITY_ASSET_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i
+
+/**
+ * The `UnityAssetId` of the save a new one builds on, or undefined when that save has none
+ * (or the subroom has never been saved).
+ *
+ * "Builds on" is the worker's own rule for what a save carries forward: the STAGED save
+ * when there is one, otherwise the published `CurrentSave`. The published one arrives
+ * with the room; a staged one is only an id there, so it is read from the save's detail
+ * route — which answers in camelCase, unlike the PascalCase save embedded in the room.
+ */
+async function previousUnityAssetId(roomId: number, sub: SubRoom): Promise<string | undefined> {
+	const stagedId = sub.StagedSubRoomDataSaveId
+	if (stagedId !== null && stagedId !== undefined) {
+		const staged = await call<{ unityAssetId?: string | null }>(
+			`${where().rooms}/rooms/${roomId}/subrooms/${sub.SubRoomId}/saves/${stagedId}`,
+			{ authed: true }
+		)
+		return staged.unityAssetId || undefined
+	}
+	return sub.CurrentSave?.UnityAssetId || undefined
 }
 
 /**
@@ -1616,6 +1654,307 @@ function StaffPlayerActions({ account, navigate }: { account: PublicAccount; nav
 	)
 }
 
+/** Halloween mode: on through October, off after. `?halloween=1` forces it on for testing. */
+const HALLOWEEN_KEY = 'rf_halloween_off'
+const HALLOWEEN_SPRITES = ['🦇', '👻', '🎃', '🕷️', '🦇', '👻', '🎃', '🦇', '👻', '🎃', '🕷️', '🦇']
+
+const HALLOWEEN_CSS = `
+.rf-halloween { position: fixed; inset: 0; pointer-events: none; z-index: 9998; overflow: hidden;
+	background: radial-gradient(ellipse at center, transparent 55%, rgba(255, 110, 0, 0.14) 100%); }
+.rf-halloween-sprite { position: absolute; top: 0; opacity: 0; animation: rf-drift linear infinite; will-change: transform; }
+.rf-halloween-web { position: absolute; top: 0; font-size: 64px; opacity: 0.45; line-height: 1; }
+@keyframes rf-drift {
+	0% { transform: translate(0, 105vh) rotate(-8deg); opacity: 0; }
+	10% { opacity: 0.85; }
+	50% { transform: translate(40px, 50vh) rotate(8deg); }
+	90% { opacity: 0.85; }
+	100% { transform: translate(-30px, -10vh) rotate(-8deg); opacity: 0; }
+}
+@media (prefers-reduced-motion: reduce) { .rf-halloween-sprite { display: none; } }
+.rf-halloween-toggle { position: fixed; left: 12px; bottom: 12px; z-index: 9999; pointer-events: auto;
+	font-size: 20px; line-height: 1; padding: 6px 8px; border-radius: 999px; cursor: pointer; }
+`
+
+function halloweenActive(): boolean {
+	if (new Date().getMonth() === 9) return true
+	return new URLSearchParams(window.location.search).get('halloween') === '1'
+}
+
+/** The sprite, 23x25 native pixels, drawn at 3x with hard edges. */
+const PUMPKIN_SRC =
+	'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAABcAAAAZCAYAAADaILXQAAAFD0lEQVR42pWVX2xcxRXGf2fu3Lu7jh0bO3FsnMQ2idP8gZoIGkootZsIGrUlVEVCTVW1qVREUPtSiTckYgQPqEIg1FZU6gtP8EJVAaZpIqE4UtrQOCSIkj+YVgRsp3E2mzisnb27OzOnD+uuE2yJZJ7u6J755jvf+eYc4SbX7qHBbNyjpe5VS5k4Nw3VZj4evcrFiWn+9fZxuTbW3Cw43WcxBMBCNYtYRYwiujDU3ijmwK++rWv7G7BSpLdrGf8Zv8TY+54kCuQ/v4IsckZuBPg7Twzq2ntq1IwXjvzlCz4cPv6VZxcN2LttTfXh9phKLPxtMmVnW7BqAiPnU2aipTzUFnjzonMiFhFn9747vihO9P+PoW29Dz7Yt3LD/sdl3dRl/9NmLRu1GJPzpqfFk2SV6ZIhGwlrVoBP1MQO0xQrQ/1N76/qXL7u4KeXxxbV3Jjwuveu1USGH98XOH44EIopu+7PECJBXGBmVpFKhr71JfqAD0cTVMGY5G1MukAJC/DM9l597IEmVsRTAJz4u2XrG+cxQGnPHuyOP6L797AxOYh1KdGmnYAhHPsrrjrLlq05dNTCtm71Jd82dGTiUh3cKDV7ac2ZAUP60moEB6ffQvfvQeucQt3Bd+3eAZlb+OCV1+n/Zpl3hpsAP8/86QdW6VM/tEjlCmWf8sizGcaiHB9thYQZgg+sfngYMPxuR46VpkS/exMRRQWE5bWL1fD9LsuhcV/Yu707febdz3I29gapBMg0467maG5pI3JlitaSAZaEIk1tHbXqNyxBowTT4IjK0zW72Qoyl7GmJdTPu8SC4dg/Krw6GrhcbeUDrYIY7v+th4uTnHxuaT3NR157j0CVvoN3cvo303PyBPRLjz3MSWiDwMvvrQACEpRg5v6oQVs3sfHFgEpg7NzxufRhbPIE0ZNw+NG1xDbHvnxA/+mR+kVz4Af9p/G31vjq5NkGyppjszpOYFFVQBERfmkNfvVmHIqo4e5cBBiy4RIVyhiRmhnUAG6+cY2M4FzSMNyQc9XWlgoiwi0mkAhkgO4AagUTZVkeWZZloSnyeHzNTdfIMeWgHMmBGbtkX12o5w+ceWj5ra7Y1j4LQK8qwZfRNGVbDgKWINCei+kVT1+Yt6XB4VGEwNEZoZKaXS8cOPWjBV1RCKAWpMLPlrYg1at4CWzf/DkXTt7K16qeFhNxVCI6br/Avrwl+Dw/6Grl5zMrWNbXQFquwpGJhf1cTJYnt16ou8BVpxm8q7bvvCPPW50T/L6rQMcd+TmPQ5rt4RezLdz7aCNrtwi5ZlMYeGKgdF0v2NR/W8FFcatUS/ykI8POzhasVf787/N8rzNi31TKRyu7KSyJicXw30/ykFiCEZbd1k6aFvn6fRmSOEsZ5ZPDbl4Wn2QxCmQa0VCiWrlMKjE+00g5MlQyEaXY4GyEw+EaDZFP8FJG1WGTLGhMpeJAPS5yNeYb7t543ZA6fexUPaP139ioEULcnqGtu5mKKOu3eFDDn84eihiiXt7BXw/o4HdXYnIlxicK12uuaHotMMCZ0VMSVClPpRTOzlL4rMjYUaGnq5nHewb8Y68O1ImpKucu5BmfrNXkpgb0lUK+oz3X1IRa1MiCoSwnTay2dEmI+fio1jRXleFIwYupLgZqggwDJMXkKhtwEEhLji+uKEhdFUZGRtztu3YeMBI1Znzxxgb0tWtw92BWGyitu8dzZlQxCof+cHhRnP8B5aopRAfi2ZcAAAAASUVORK5CYII='
+const PUMPKIN_SCALE = 3
+const PUMPKIN_W = 23 * PUMPKIN_SCALE
+const PUMPKIN_H = 25 * PUMPKIN_SCALE
+const PUMPKIN_LINES = ['boo!', 'hehe', 'hey!', 'spooky!', 'happy halloween!', 'ow!', '🎃']
+
+const PUMPKIN_CSS = `
+.rf-pumpkin { position: absolute; top: 0; left: 0; width: ${PUMPKIN_W}px; height: ${PUMPKIN_H}px; will-change: transform; }
+.rf-pumpkin img {
+        display: block;
+        width: ${PUMPKIN_W}px;
+        height: ${PUMPKIN_H}px;
+        image-rendering: pixelated;
+        transform-origin: 50% 100%;
+}
+.rf-pumpkin.is-walking img {
+        animation: rf-pumpkin-step 0.24s steps(2, end) infinite;
+}
+@keyframes rf-pumpkin-step {
+        0%, 100% { transform: translateY(0) scaleX(1); }
+        50% { transform: translateY(-1px) scaleX(0.96); }
+}
+@media (prefers-reduced-motion: reduce) {
+        .rf-pumpkin.is-walking img { animation: none; }
+}
+.rf-pumpkin-bubble { position: absolute; left: 50%; transform: translateX(-50%); margin: 6px 0; padding: 3px 8px;
+	border-radius: 10px; background: #fff3dc; color: #2a1608; font-size: 12px; font-weight: 600;
+	white-space: nowrap; opacity: 0; transition: opacity 0.15s; }
+`
+
+/**
+ * A little pumpkin that strolls around the viewport, wanders off to random spots, walks toward the
+ * cursor (stopping short of it), wobbles when the pointer is over it, and hops and talks when clicked.
+ * It never captures pointer events, so it can't block anything underneath it.
+ */
+function LilPumpkin() {
+	const rootRef = useRef<HTMLDivElement>(null)
+	const flipRef = useRef<HTMLDivElement>(null)
+	const bubbleRef = useRef<HTMLDivElement>(null)
+
+	useEffect(() => {
+		const root = rootRef.current
+		const flip = flipRef.current
+		const bubble = bubbleRef.current
+		if (!root || !flip || !bubble) return
+		if (window.matchMedia('(prefers-reduced-motion: reduce)').matches) {
+			root.style.display = 'none'
+			return
+		}
+
+		const clamp = (v: number, lo: number, hi: number) => Math.max(lo, Math.min(hi, v))
+		const maxX = () => Math.max(0, window.innerWidth - PUMPKIN_W)
+		const maxY = () => Math.max(0, window.innerHeight - PUMPKIN_H)
+
+		let x = clamp(window.innerWidth * 0.3, 0, maxX())
+		let y = maxY()
+		let tx = x
+		let ty = y
+		let facing = 1
+		let pause = 1
+		let jy = 0
+		let vy = 0
+		let walkTime = 0
+		let mouseX = -1
+		let mouseY = -1
+		let mouseAt = -Infinity
+		let speechTimer = 0
+		let last = performance.now()
+		let raf = 0
+
+		root.style.transform = `translate(${x}px, ${y}px)`
+
+		const say = (line: string) => {
+			const nearTop = y + jy < 36
+			bubble.style.top = nearTop ? '100%' : 'auto'
+			bubble.style.bottom = nearTop ? 'auto' : '100%'
+			bubble.textContent = line
+			bubble.style.opacity = '1'
+			window.clearTimeout(speechTimer)
+			speechTimer = window.setTimeout(() => {
+				bubble.style.opacity = '0'
+			}, 1600)
+		}
+
+		const onMove = (e: MouseEvent) => {
+			mouseX = e.clientX
+			mouseY = e.clientY
+			mouseAt = performance.now()
+		}
+		const onLeave = () => {
+			mouseAt = -Infinity
+		}
+		const onClick = (e: MouseEvent) => {
+			const top = y + jy
+			const hit =
+				e.clientX >= x - 6 &&
+				e.clientX <= x + PUMPKIN_W + 6 &&
+				e.clientY >= top - 6 &&
+				e.clientY <= top + PUMPKIN_H + 6
+			if (!hit) return
+			if (jy === 0) vy = -430
+			say(PUMPKIN_LINES[Math.floor(Math.random() * PUMPKIN_LINES.length)])
+		}
+		const onResize = () => {
+			x = clamp(x, 0, maxX())
+			y = clamp(y, 0, maxY())
+			tx = clamp(tx, 0, maxX())
+			ty = clamp(ty, 0, maxY())
+		}
+		window.addEventListener('mousemove', onMove)
+		document.documentElement.addEventListener('mouseleave', onLeave)
+		window.addEventListener('click', onClick)
+		window.addEventListener('resize', onResize)
+
+		const frame = (now: number) => {
+			const dt = Math.min(0.05, (now - last) / 1000)
+			last = now
+			const following = now - mouseAt < 3000
+			let speed = 0
+
+			if (following) {
+				const dx = mouseX - (x + PUMPKIN_W / 2)
+				const dy = mouseY - (y + PUMPKIN_H / 2)
+				const dist = Math.hypot(dx, dy)
+				if (Math.abs(dx) > 4) facing = dx > 0 ? 1 : -1
+				if (dist > 110) {
+					// Walk toward the cursor but stop short, so it never ends up sitting under the pointer.
+					tx = clamp(mouseX - (dx / dist) * 80 - PUMPKIN_W / 2, 0, maxX())
+					ty = clamp(mouseY - (dy / dist) * 80 - PUMPKIN_H / 2, 0, maxY())
+					speed = 150
+				} else {
+					tx = x
+					ty = y
+				}
+				pause = 0.5
+			} else if (pause > 0) {
+				pause -= dt
+				if (pause <= 0) {
+					tx = Math.random() * maxX()
+					ty = Math.random() * maxY()
+				}
+			} else {
+				speed = 60
+			}
+
+			const mx = tx - x
+			const my = ty - y
+			const md = Math.hypot(mx, my)
+			let moving = false
+			if (speed > 0 && md > 2) {
+				const step = Math.min(md, speed * dt)
+				x += (mx / md) * step
+				y += (my / md) * step
+				moving = true
+				if (!following && Math.abs(mx) > 4) facing = mx > 0 ? -1 : 1
+			} else if (speed > 0 && !following) {
+				pause = 1 + Math.random() * 2.5
+			}
+
+			if (jy < 0 || vy < 0) {
+				vy += 1500 * dt
+				jy += vy * dt
+				if (jy >= 0) {
+					jy = 0
+					vy = 0
+				}
+			}
+
+			walkTime += moving ? dt : 0
+			const bob = moving ? Math.abs(Math.sin(walkTime * 12)) * 7 : 0
+			const breath = 1 + Math.sin(now / 400) * 0.03
+			const over =
+				following &&
+				mouseX >= x &&
+				mouseX <= x + PUMPKIN_W &&
+				mouseY >= y + jy &&
+				mouseY <= y + jy + PUMPKIN_H
+			const rot = over ? Math.sin(now / 60) * 7 : 0
+
+			root.classList.toggle('is-walking', moving)
+			root.style.transform = `translate(${x.toFixed(1)}px, ${(y + jy - bob).toFixed(1)}px)`
+			flip.style.transform = `rotate(${rot.toFixed(1)}deg) scale(${facing}, ${breath.toFixed(3)})`
+			raf = requestAnimationFrame(frame)
+		}
+		raf = requestAnimationFrame(frame)
+
+		return () => {
+			cancelAnimationFrame(raf)
+			window.clearTimeout(speechTimer)
+			window.removeEventListener('mousemove', onMove)
+			document.documentElement.removeEventListener('mouseleave', onLeave)
+			window.removeEventListener('click', onClick)
+			window.removeEventListener('resize', onResize)
+		}
+	}, [])
+
+	return (
+		<>
+			<style>{PUMPKIN_CSS}</style>
+			<div className="rf-pumpkin" ref={rootRef}>
+				<div className="rf-pumpkin-bubble" ref={bubbleRef} />
+				<div ref={flipRef} style={{ transformOrigin: '50% 100%' }}>
+					<img src={PUMPKIN_SRC} alt="" draggable={false} />
+				</div>
+			</div>
+		</>
+	)
+}
+
+/** Drifting bats, ghosts and pumpkins plus corner cobwebs. Never blocks clicks; the corner button turns it off. */
+function HalloweenOverlay() {
+	const [off, setOff] = useState(() => {
+		try {
+			return localStorage.getItem(HALLOWEEN_KEY) === '1'
+		} catch {
+			return false
+		}
+	})
+	if (!halloweenActive()) return null
+
+	const toggle = () => {
+		const next = !off
+		setOff(next)
+		try {
+			if (next) localStorage.setItem(HALLOWEEN_KEY, '1')
+			else localStorage.removeItem(HALLOWEEN_KEY)
+		} catch {
+			// Storage can be unavailable; the toggle still works for this visit.
+		}
+	}
+
+	return (
+		<>
+			<style>{HALLOWEEN_CSS}</style>
+			{!off && (
+				<div className="rf-halloween" aria-hidden="true">
+					<span className="rf-halloween-web" style={{ left: 0 }}>
+						🕸️
+					</span>
+					<span className="rf-halloween-web" style={{ right: 0, transform: 'scaleX(-1)' }}>
+						🕸️
+					</span>
+					<LilPumpkin />
+					{HALLOWEEN_SPRITES.map((emoji, i) => (
+						<span
+							key={i}
+							className="rf-halloween-sprite"
+							style={{
+								left: `${(i * 37 + 5) % 96}vw`,
+								fontSize: `${22 + (i % 4) * 8}px`,
+								animationDuration: `${14 + (i % 5) * 3}s`,
+								animationDelay: `-${(i * 2.3).toFixed(1)}s`,
+							}}
+						>
+							{emoji}
+						</span>
+					))}
+				</div>
+			)}
+			<button
+				type="button"
+				className="rf-halloween-toggle"
+				onClick={toggle}
+				title={off ? 'Turn Halloween mode on' : 'Turn Halloween mode off'}
+				aria-label={off ? 'Turn Halloween mode on' : 'Turn Halloween mode off'}
+				style={{ opacity: off ? 0.5 : 1 }}
+			>
+				🎃
+			</button>
+		</>
+	)
+}
+
 export function App() {
 	// undefined = still checking the session; null = signed out.
 	const [account, setAccount] = useState<SelfAccount | null | undefined>(undefined)
@@ -1678,6 +2017,10 @@ export function App() {
 					navigate={navigate}
 					onAuthed={setAccount}
 				/>
+			) : path === '/device' ? (
+				// Studio opens this from verification_uri_complete. The code was minted by
+				// auth; this page only approves it with the website session.
+				<DeviceLinkPage account={account} search={search} navigate={navigate} />
 			) : path === '/account' ? (
 				<AccountPage account={account} config={config} navigate={navigate} onChange={setAccount} />
 			) : path === '/claim' ? (
@@ -1695,6 +2038,12 @@ export function App() {
 				// on any of them falls through to the SPA shell; the page then gates itself on
 				// the token's role, and every endpoint behind it re-checks.
 				<ModerationPage account={account} path={path} search={search} navigate={navigate} />
+			) : path === '/settings/recroomstudio' || path === '/settings/recroomstudio/' ? (
+				// The URL Studio already opens from the "not authorized to upload" dialog.
+				// A client-side route like /moderation: not in run_worker_first, so a cold
+				// load falls through to the SPA shell. The page shows one account's own
+				// status to whoever is signed in, and the whitelist editor only to staff.
+				<StudioAccessPage account={account} navigate={navigate} />
 			) : path === '/stats' ? (
 				// Unlinked on purpose — nothing in the nav or footer points here; it's for whoever
 				// is handed the URL. Public all the same, and a client-side route like the rest:
@@ -1719,6 +2068,7 @@ export function App() {
 				<HomePage account={account} config={config} navigate={navigate} />
 			)}
 			<SiteFooter />
+			<HalloweenOverlay />
 		</>
 	)
 }
@@ -1784,6 +2134,19 @@ function NavBar({
 								}
 							>
 								Moderation
+							</Link>
+						)}
+						{isAdmin() && (
+							<Link
+								to="/settings/recroomstudio"
+								navigate={navigate}
+								className={
+									path === '/settings/recroomstudio' || path === '/settings/recroomstudio/'
+										? 'active'
+										: ''
+								}
+							>
+								Studio access
 							</Link>
 						)}
 						<Link to="/account" navigate={navigate} className={path === '/account' ? 'active' : ''}>
@@ -2794,7 +3157,7 @@ function SubRoomRow({
 					cdnHost={cdnHost}
 				/>
 			)}
-			<BlobUpload roomId={roomId} subRoomId={sub.SubRoomId} onRoomChange={onRoomChange} />
+			<BlobUpload roomId={roomId} sub={sub} onRoomChange={onRoomChange} />
 		</li>
 	)
 }
@@ -2814,18 +3177,23 @@ function SubRoomRow({
  * uploaded file live would be a bigger step than the game's own save takes. Left on by
  * default all the same: someone uploading a blob here is restoring a room, and a restore
  * nobody can see isn't one.
+ *
+ * A save can also name a `UnityAssetId` — the Studio build drawn with the scene. Given
+ * one, the new save carries it; left blank, it keeps the one on the save it builds on, so
+ * replacing a Studio room's scene data doesn't quietly detach its build.
  */
 function BlobUpload({
 	roomId,
-	subRoomId,
+	sub,
 	onRoomChange,
 }: {
 	roomId: number
-	subRoomId: number
+	sub: SubRoom
 	onRoomChange: (room: OwnedRoom) => void
 }) {
 	const [file, setFile] = useState<File | null>(null)
 	const [description, setDescription] = useState('')
+	const [unityAssetId, setUnityAssetId] = useState('')
 	const [publish, setPublish] = useState(true)
 	// Default on for a migrated `.binpb`, off for a raw `.original.binpb` or
 	// `.room`; the owner may override it. Circuits and objects remain intact.
@@ -2843,23 +3211,34 @@ function BlobUpload({
 				e.preventDefault()
 				if (!file) return
 				void run(async () => {
+					// Settled before anything is uploaded: a mistyped id is still a string the
+					// worker would store, and the save would point at a build that doesn't exist.
+					const typedAssetId = unityAssetId.trim()
+					if (typedAssetId !== '' && !UNITY_ASSET_ID.test(typedAssetId)) {
+						throw new Error(
+							'A Unity asset ID looks like 22555d14-2918-43f3-94d4-da0c893d96c4. Fix it, or leave it blank.'
+						)
+					}
+					const assetId = typedAssetId || (await previousUnityAssetId(roomId, sub))
 					const blob = await prepareRoomBlob(file, forceVersionOne)
 					const persistenceVersion = forceVersionOne
 						? 1
 						: roomVersion(new Uint8Array(await blob.arrayBuffer()))
 					const [filename, hash] = await Promise.all([uploadRoomBlob(blob), blobHash(blob)])
 					onRoomChange(
-						await saveSubRoomBlob(roomId, subRoomId, {
+						await saveSubRoomBlob(roomId, sub.SubRoomId, {
 							filename,
 							hash,
 							description: description.trim(),
 							autoPublish: publish,
 							persistenceVersion,
+							unityAssetId: assetId,
 						})
 					)
 					setFile(null)
 					setForceVersionOne(false)
 					setDescription('')
+					setUnityAssetId('')
 					if (input.current) input.current.value = ''
 					const uploaded = forceVersionOne ? 'Version set to 1, uploaded' : 'Uploaded'
 					return publish
@@ -2918,6 +3297,17 @@ function BlobUpload({
 					placeholder="Uploaded from the website"
 					maxLength={200}
 					onChange={(e) => setDescription(e.target.value)}
+				/>
+			</label>
+			<label className="blob-upload-note">
+				Unity asset ID<span className="optional">optional</span>
+				<input
+					type="text"
+					value={unityAssetId}
+					placeholder="Same as the previous save"
+					spellCheck={false}
+					autoComplete="off"
+					onChange={(e) => setUnityAssetId(e.target.value)}
 				/>
 			</label>
 			<label className="check">
@@ -3490,6 +3880,7 @@ function Dashboard({
 							<>
 								<TokenDropForm />
 								<RoleTokenDropForm />
+								<DiscordRoleSyncCard />
 							</>
 						),
 					},
@@ -4007,6 +4398,9 @@ function MaintenanceForm() {
  */
 const MAX_TOKEN_DROP = 1_000
 
+/** The role drop's own, higher cap — a mirror of www's `MAX_ROLE_TOKEN_DROP`. */
+const MAX_ROLE_TOKEN_DROP = 10_000
+
 /**
  * Developer-only: give every player online right now the same number of tokens, in a gift
  * box carrying the operator's message — the server-wide cousin of the room page's staff gift.
@@ -4085,7 +4479,8 @@ function TokenDropForm() {
  *
  * The audience is the roles the website recorded at each player's benefits claim and
  * refreshes once a day, so it trails Discord by up to a day and never includes a member who
- * hasn't claimed; the copy says so. Same cap as the online drop, repeated on the input.
+ * hasn't claimed; the copy says so. Its own cap (`MAX_ROLE_TOKEN_DROP`, 10,000 each), repeated
+ * on the input.
  */
 function RoleTokenDropForm() {
 	const [roleId, setRoleId] = useState('')
@@ -4100,8 +4495,8 @@ function RoleTokenDropForm() {
 				Give everyone holding a Discord role the same number of tokens, whether or not they are
 				online — a player who is signed out finds the gift box waiting. Only players who have
 				claimed benefits on this site are counted, and their roles are refreshed once a day, so a
-				role given or taken since then isn&apos;t seen yet. Up to {MAX_TOKEN_DROP.toLocaleString()}{' '}
-				tokens each.
+				role given or taken since then isn&apos;t seen yet. Up to{' '}
+				{MAX_ROLE_TOKEN_DROP.toLocaleString()} tokens each.
 			</p>
 			<form
 				onSubmit={(e) => {
@@ -4152,7 +4547,7 @@ function RoleTokenDropForm() {
 					<input
 						type="number"
 						min={1}
-						max={MAX_TOKEN_DROP}
+						max={MAX_ROLE_TOKEN_DROP}
 						step={1}
 						value={tokens}
 						required
@@ -4165,6 +4560,75 @@ function RoleTokenDropForm() {
 					{pending ? 'Sending…' : 'Send to everyone with the role'}
 				</button>
 			</form>
+		</section>
+	)
+}
+
+/** What one run of the Discord role sweep did — www's `SweepSummary`, as the sync answers. */
+interface SweepSummary {
+	skipped: boolean
+	refreshed: number
+	changed: number
+	gone: number
+	failed: number
+	halted: string | null
+}
+
+/**
+ * Developer-only: run the Discord role sweep now, instead of waiting for its nightly cron.
+ * Sits under the role drop because the drop reads the snapshot this refreshes — press this
+ * first and the drop sees this morning's roles rather than yesterday's.
+ *
+ * The answer is the point. The cron reports only to a log line, so a sweep that halts on
+ * its first call (a token Discord refuses, a bot not yet in the guild) halts silently every
+ * night; here the same run comes back with its summary, and a `halted` or `skipped` run is
+ * shown as the error it is for the operator, with the reason the server gave. A run that
+ * went through is summed up in a sentence.
+ */
+function DiscordRoleSyncCard() {
+	const { pending, error, done, run } = useAction()
+
+	return (
+		<section className="card">
+			<h2>Refresh Discord roles</h2>
+			<p className="muted">
+				Re-read every linked Discord member&apos;s roles from the server now. This runs on its own
+				once a day; use it after changing the bot or inviting it to the server, or when the role
+				drop above needs today&apos;s roles. If the sweep can&apos;t run, the reason is shown here.
+			</p>
+			{error && <p className="error">{error}</p>}
+			{done && <p className="ok">{done}</p>}
+			<button
+				type="button"
+				disabled={pending}
+				onClick={() =>
+					void run(async () => {
+						const s = await call<SweepSummary>('/api/staff/discord-roles/sync', {
+							authed: true,
+							method: 'POST',
+						})
+						if (s.skipped) {
+							throw new Error(
+								'The sweep is off: no Discord guild or bot token is configured on the server.'
+							)
+						}
+						if (s.halted !== null) {
+							throw new Error(
+								`The sweep stopped before writing anything: ${s.halted}. ${s.refreshed} link${s.refreshed === 1 ? '' : 's'} refreshed first.`
+							)
+						}
+						const parts = [
+							`Refreshed ${s.refreshed} link${s.refreshed === 1 ? '' : 's'}`,
+							`${s.changed} changed`,
+							`${s.gone} left the server`,
+						]
+						if (s.failed > 0) parts.push(`${s.failed} skipped for a transient error`)
+						return `${parts.join(', ')}.`
+					})
+				}
+			>
+				{pending ? 'Refreshing…' : 'Refresh roles now'}
+			</button>
 		</section>
 	)
 }

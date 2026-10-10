@@ -304,6 +304,54 @@ describe('cdn endpoints', () => {
 		expect(res.status).toBe(404)
 	})
 
+	test('GET and HEAD /unityasset/:filename stream a stored studio bundle', async () => {
+		await env.DB.prepare('DROP TABLE IF EXISTS unity_asset').run()
+		const absent = await exports.default.fetch(`${ORIGIN}/unityasset/not-stored.assetbundle`)
+		expect(absent.status).toBe(404)
+
+		// The rooms worker's table (UNITY_ASSET_SCHEMA_DDL in @repo/domain), inlined like
+		// the route's own lookup is.
+		await env.DB.prepare(
+			`CREATE TABLE IF NOT EXISTS unity_asset (
+				unity_asset_id TEXT NOT NULL,
+				target INTEGER NOT NULL,
+				version INTEGER NOT NULL,
+				kind TEXT NOT NULL DEFAULT 'main',
+				filename TEXT NOT NULL,
+				hash TEXT NOT NULL,
+				PRIMARY KEY (unity_asset_id, target, version, kind)
+			)`
+		).run()
+		// Studio's public filename is stored under the same room/ prefix the game downloads.
+		const filename = 'studio/20930/abc111.windows.main.assetbundle'
+		await env.DB.prepare(
+			`INSERT INTO unity_asset (unity_asset_id, target, version, kind, filename, hash)
+			 VALUES ('asset-a', 0, 1, 'main', ?1, 'n2SnR+G5fxMfq7a0Rylsm28CAeefs8U1bmx36JtqgGo=')`
+		)
+			.bind(filename)
+			.run()
+		await env.CDN_ASSETS.put(`room/${filename}`, new Uint8Array([1, 2, 3, 4]))
+		// A key in the bucket that no row records is not served.
+		await env.CDN_ASSETS.put('room/studio/20930/unrecorded.assetbundle', new Uint8Array([9]))
+
+		const res = await exports.default.fetch(`${ORIGIN}/unityasset/${filename}`)
+		expect(res.status).toBe(200)
+		expect(res.headers.get('content-type')).toBe('application/octet-stream')
+		expect(new Uint8Array(await res.arrayBuffer())).toEqual(new Uint8Array([1, 2, 3, 4]))
+
+		const head = await exports.default.fetch(`${ORIGIN}/unityasset/${filename}`, { method: 'HEAD' })
+		expect(head.status).toBe(200)
+		expect(head.headers.get('content-length')).toBe('4')
+		expect(await head.arrayBuffer()).toEqual(new ArrayBuffer(0))
+
+		expect((await exports.default.fetch(`${ORIGIN}/unityasset/other.assetbundle`)).status).toBe(404)
+		expect(
+			(await exports.default.fetch(`${ORIGIN}/unityasset/studio/20930/unrecorded.assetbundle`))
+				.status
+		).toBe(404)
+		expect((await exports.default.fetch(`${ORIGIN}/unityasset/a..b`)).status).toBe(400)
+	})
+
 	test('GET /openapi.json documents every route', async () => {
 		const res = await exports.default.fetch(`${ORIGIN}/openapi.json`)
 		expect(res.status).toBe(200)
@@ -334,6 +382,8 @@ describe('cdn endpoints', () => {
 			'GET /room/{dataBlob}',
 			'GET /roommetadata/{dataBlob}',
 			'GET /sigs/{sigName}',
+			'GET /unityasset/{filename}',
+			'HEAD /unityasset/{filename}',
 		])
 
 		// Every operation carries a summary — a path present but undescribed is not

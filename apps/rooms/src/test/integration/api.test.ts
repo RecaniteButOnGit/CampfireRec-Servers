@@ -17,11 +17,16 @@ import {
 	MessageType,
 	NOTIFICATION_SCHEMA_DDL,
 	PRESENCE_SCHEMA_DDL,
+	publicStudioBundleFilename,
+	putUnityAsset,
 	ROOM_INSTANCE_SCHEMA_DDL,
 	ROOM_INVITE_SCHEMA_DDL,
 	ROOM_SCHEMA_DDL,
+	ROOM_XP_SCHEMA_DDL,
 	seedRoomWithSubRooms,
+	STUDIO_CLOUD_BUILD_SCHEMA_DDL,
 	SUBROOM_SCHEMA_DDL,
+	UNITY_ASSET_SCHEMA_DDL,
 } from '@repo/domain'
 
 import { SCHEMA_DDL as INVENTION_SCHEMA_DDL } from '../../../../api/src/inventions-db'
@@ -286,6 +291,10 @@ beforeAll(async () => {
 	// Inventions (owned by the api worker) — a room save writes each one's room count.
 	for (const stmt of INVENTION_SCHEMA_DDL) await env.DB.prepare(stmt).run()
 	for (const stmt of ROOM_INVITE_SCHEMA_DDL) await env.DB.prepare(stmt).run()
+	// Baked unity asset bundles — what `POST /unity_assets/baked/bulk` serves.
+	for (const stmt of UNITY_ASSET_SCHEMA_DDL) await env.DB.prepare(stmt).run()
+	// Per-room XP — what `GET /rooms/:id/experience/player` reads.
+	for (const stmt of ROOM_XP_SCHEMA_DDL) await env.DB.prepare(stmt).run()
 	// Seed each room and split its subrooms into the subroom table (mirrors 0007's backfill).
 	for (const r of importRooms) await seedRoomWithSubRooms(env.DB, r as Record<string, unknown>)
 
@@ -353,14 +362,6 @@ describe('rooms endpoints', () => {
 			error_id: null,
 			error: null,
 		})
-	})
-
-	// Stub. Registered (not 404) matters more than the body: the client asks for this on
-	// room entry, and an unregistered path stalls the load rather than erroring visibly.
-	it('GET /rooms/:id/experience/player returns [] for any room', async () => {
-		const res = await SELF.fetch(`${ORIGIN}/rooms/92/experience/player`)
-		expect(res.status).toBe(200)
-		expect(await res.json()).toEqual([])
 	})
 
 	// Stub, same reasoning: the profile asks for a showcase for any player, and an
@@ -702,25 +703,16 @@ describe('rooms endpoints', () => {
 		await env.DB.prepare('DELETE FROM room WHERE room_id BETWEEN 30401 AND 30407').run()
 	})
 
-	it('GET /rooms/:roomId/experience serves the fixed XP settings, no auth', async () => {
+	it('GET /rooms/:roomId/experience serves the room’s stored XP settings, no auth', async () => {
 		const res = await SELF.fetch(`${ORIGIN}/rooms/2/experience`)
 		expect(res.status).toBe(200)
-		// A bare two-key object — no `{ success, error, value }` envelope around it. Disabled:
-		// no room awards XP here, and DailyLimit is the cap that would apply if one did.
-		expect(await res.json()).toEqual({ Enabled: false, DailyLimit: 1000 })
+		// A bare two-key object — no `{ success, error, value }` envelope around it. A room
+		// nobody has configured is off with a 0 cap.
+		expect(await res.json()).toEqual({ Enabled: false, DailyLimit: 0 })
 
-		// Nothing is stored per room, so every room answers the same — including one that
-		// doesn't exist, which is never looked up.
-		expect(await (await SELF.fetch(`${ORIGIN}/rooms/77/experience`)).json()).toEqual({
-			Enabled: false,
-			DailyLimit: 1000,
-		})
-		expect(await (await SELF.fetch(`${ORIGIN}/rooms/99999/experience`)).json()).toEqual({
-			Enabled: false,
-			DailyLimit: 1000,
-		})
-
-		// The id is digits-only, like the other room-scoped routes.
+		// A room that doesn't exist is a 404, and the id is digits-only like the other
+		// room-scoped routes.
+		expect((await SELF.fetch(`${ORIGIN}/rooms/99999/experience`)).status).toBe(404)
 		expect((await SELF.fetch(`${ORIGIN}/rooms/abc/experience`)).status).toBe(404)
 	})
 
@@ -3024,6 +3016,110 @@ describe('rooms endpoints', () => {
 		await env.DB.prepare('DELETE FROM room_leaderboard WHERE room_id IN (2, 3)').run()
 	})
 
+	it('POST /rooms/:id/experience sets a room’s progression, which the GETs read back', async () => {
+		// RecCenter (room 2) is owned by account 1, with account 2 as co-owner.
+		const getXp = async (roomId: number, sub?: string) =>
+			SELF.fetch(`${ORIGIN}/rooms/${roomId}/experience/player`, {
+				headers: sub ? await bearer(sub) : {},
+			})
+		// The real client body, verbatim.
+		const body = { enabled: 'True', dailyLimit: '1000' }
+		// The same bare envelope as the leaderboard write.
+		const OK = { Success: true, Error: null, error_id: null }
+
+		// No token → 401; a valid token but no role on the room → 403.
+		expect((await postForm('/rooms/2/experience', body)).status).toBe(401)
+		expect((await postForm('/rooms/2/experience', body, '999')).status).toBe(403)
+		// Unknown room → failure envelope, not a 404.
+		expect(await (await postForm('/rooms/99999/experience', body, '1')).json()).toEqual({
+			Success: false,
+			Error: 'This room does not exist!',
+			error_id: null,
+		})
+
+		// The owner turns it on, and the room-level GET reads it back as a bare pair.
+		const ok = await postForm('/rooms/2/experience', body, '1')
+		expect(ok.status).toBe(200)
+		expect(await ok.json()).toEqual(OK)
+		expect(await (await SELF.fetch(`${ORIGIN}/rooms/2/experience`)).json()).toEqual({
+			Enabled: true,
+			DailyLimit: 1000,
+		})
+		// It lands on the room blob under the names the room DTO carries.
+		const room = (await (await SELF.fetch(`${ORIGIN}/rooms/2`)).json()) as Record<string, unknown>
+		expect(room).toMatchObject({ progressionEnabled: true, progressionDailyLimit: 1000 })
+
+		// The per-player read is auth-gated, 404 for no such room, and echoes the switch. A
+		// player with no XP recorded here is 0 — and nothing is written by reading. The
+		// `ConcurrencyCode` is a GUID minted per response, not stored.
+		expect((await getXp(2)).status).toBe(401)
+		expect((await getXp(99999, '999')).status).toBe(404)
+		const fresh = (await (await getXp(2, '999')).json()) as {
+			RoomExperienceEnabled: boolean
+			Experience: number
+			ConcurrencyCode: string
+		}
+		expect(fresh).toMatchObject({ RoomExperienceEnabled: true, Experience: 0 })
+		expect(fresh.ConcurrencyCode).toMatch(/^[0-9a-f-]{36}$/)
+		expect(
+			await env.DB.prepare('SELECT 1 FROM room_xp WHERE room_id = 2 AND player_id = 999').first()
+		).toBeNull()
+
+		// The increment write creates the row on first use and answers the read's DTO with the
+		// new total, wrapped in the leaderboard write's envelope — the read serves it bare. The
+		// real client body, verbatim; the code is accepted and ignored.
+		const add = { increment: '2500', concurrencyCode: '79e10fb4-1956-4251-b482-9f21d76c3776' }
+		const addXp = async (roomId: number, fields: Record<string, string>, sub: string) =>
+			(await (await postForm(`/rooms/${roomId}/experience/player`, fields, sub)).json()) as {
+				Value: { RoomExperienceEnabled: boolean; Experience: number; ConcurrencyCode: string }
+				Success: boolean
+				Error: string | null
+				error_id: string | null
+			}
+		expect((await postForm('/rooms/2/experience/player', add)).status).toBe(401)
+		expect((await postForm('/rooms/99999/experience/player', add, '999')).status).toBe(404)
+		const added = await addXp(2, add, '999')
+		expect(added).toMatchObject({
+			Value: { RoomExperienceEnabled: true, Experience: 2500 },
+			Success: true,
+			Error: null,
+			error_id: null,
+		})
+		expect(added.Value.ConcurrencyCode).toMatch(/^[0-9a-f-]{36}$/)
+		// It accumulates, per (room, player); the read serves the running total.
+		expect((await addXp(2, { increment: '250' }, '999')).Value.Experience).toBe(2750)
+		expect((await addXp(3, { increment: '1' }, '999')).Value.Experience).toBe(1)
+		expect(await (await getXp(2, '999')).json()).toMatchObject({
+			RoomExperienceEnabled: true,
+			Experience: 2750,
+		})
+		// A missing increment adds nothing.
+		expect((await addXp(2, {}, '999')).Value.Experience).toBe(2750)
+
+		// A stored row serves its XP.
+		await env.DB.prepare('UPDATE room_xp SET xp = 1250 WHERE room_id = 2 AND player_id = 999').run()
+		expect(await (await getXp(2, '999')).json()).toMatchObject({
+			RoomExperienceEnabled: true,
+			Experience: 1250,
+		})
+
+		// The co-owner may turn it off; `enabled` parses case-insensitively, and a missing
+		// or non-numeric `dailyLimit` is 0. Off is echoed to the per-player read.
+		expect(await (await postForm('/rooms/2/experience', { enabled: 'false' }, '2')).json()).toEqual(
+			OK
+		)
+		expect(await (await SELF.fetch(`${ORIGIN}/rooms/2/experience`)).json()).toEqual({
+			Enabled: false,
+			DailyLimit: 0,
+		})
+		expect(await (await getXp(2, '999')).json()).toMatchObject({
+			RoomExperienceEnabled: false,
+			Experience: 1250,
+		})
+
+		await env.DB.prepare('DELETE FROM room_xp WHERE player_id = 999').run()
+	})
+
 	it('POST /rooms/:id/bans takes a reason and a duration', async () => {
 		type Ban = { Reason: string | null; ExpiresAt: string | null; CreatedAt: string }
 		type Sent = { playerIds: number[]; data: { duration: number; isBan: boolean; message: string } }
@@ -3838,8 +3934,8 @@ describe('rooms endpoints', () => {
 			}
 		}
 		expect(saved.success).toBe(true)
-	expect(saved.error).toBeNull()
-	expect(saved.value.room).toMatchObject({ RoomId: 2, Description: before.Description })
+		expect(saved.error).toBeNull()
+		expect(saved.value.room).toMatchObject({ RoomId: 2, Description: before.Description })
 
 		// The save is a camelCase projection, NOT the PascalCase CurrentSave shape.
 		expect(saved.value.subRoomDataSave).toEqual({
@@ -3915,9 +4011,9 @@ describe('rooms endpoints', () => {
 			PersistenceVersion: number
 			InventionUsage?: string
 		}
-	expect(room.Description).toBe(before.Description)
-	expect(room.PersistenceVersion).toBe(before.PersistenceVersion)
-	expect(room.InventionUsage).toBeUndefined()
+		expect(room.Description).toBe(before.Description)
+		expect(room.PersistenceVersion).toBe(before.PersistenceVersion)
+		expect(room.InventionUsage).toBeUndefined()
 
 		// A CoOwner (account 2 holds Role 30 in the seeded rooms) may also save — 200
 		// with the room envelope. The creator stays account 1 (not clobbered).
@@ -4697,13 +4793,13 @@ describe('rooms endpoints', () => {
 		expect((await SELF.fetch(`${ORIGIN}/photon_access_token`)).status).toBe(401)
 	})
 
-	it('GET /photon_access_token returns permissions + presence instance', async () => {
+	it('GET /photon_access_token gives a VISITOR no build permissions, with their presence instance', async () => {
 		// Seed the caller's presence so RoomInstanceId reflects their current instance.
 		await env.DB.prepare('INSERT OR REPLACE INTO presence (data) VALUES (?1)')
 			.bind(
 				JSON.stringify({
 					accountId: 777,
-					roomInstance: { roomInstanceId: 1000042 },
+					roomInstance: { roomInstanceId: 1000042, roomId: 2, subRoomId: 2 },
 					expiresAt: Math.floor(Date.now() / 1000) + 900,
 				})
 			)
@@ -4711,38 +4807,91 @@ describe('rooms endpoints', () => {
 		const res = await SELF.fetch(`${ORIGIN}/photon_access_token`, { headers: await bearer('777') })
 		expect(res.status).toBe(200)
 		const body = (await res.json()) as {
-			Permissions: Array<{ Permission: string; Role: number }>
+			Permissions: Array<{ Permission: string; Role: number; Override: boolean; Value: string }>
 			PhotonAccessToken: string
 			RoomInstanceId: number | null
 		}
-		expect(body.Permissions.length).toBe(11)
 		expect(body.RoomInstanceId).toBe(1000042)
-		// A non-dev account does NOT get the global (Role 0) maker pen.
-		expect(body.Permissions.some((p) => p.Permission === 'CAN_USE_MAKER_PEN' && p.Role === 0)).toBe(
-			false
-		)
+		expect(body.PhotonAccessToken).toBe('')
+		// 777 holds no role in room 2: one Role 0 row per permission, every one of them False.
+		// Serving True here handed every visitor the delete-all button.
+		expect(body.Permissions.map((p) => p.Permission)).toEqual([
+			'CAN_USE_MAKER_PEN',
+			'CAN_USE_ROOM_RESET_BUTTON',
+			'CAN_USE_DELETE_ALL_BUTTON',
+			'CAN_SAVE_INVENTIONS',
+			'CAN_SPAWN_INVENTIONS',
+			'CAN_USE_PLAY_GIZMOS_TOGGLE',
+		])
+		for (const p of body.Permissions) {
+			expect(p).toMatchObject({ Role: 0, Override: true, Type: 0, Value: 'False' })
+		}
 	})
 
 	it('GET /photon_access_token returns null RoomInstanceId when the caller has no presence', async () => {
 		const res = await SELF.fetch(`${ORIGIN}/photon_access_token`, { headers: await bearer('888') })
 		expect(res.status).toBe(200)
-		expect(((await res.json()) as { RoomInstanceId: number | null }).RoomInstanceId).toBeNull()
+		const body = (await res.json()) as {
+			RoomInstanceId: number | null
+			Permissions: Array<{ Value: string }>
+		}
+		expect(body.RoomInstanceId).toBeNull()
+		// In no room, they are nobody's manager.
+		expect(body.Permissions.every((p) => p.Value === 'False')).toBe(true)
 	})
 
-	it('GET /photon_access_token grants the global maker pen to dev accounts (1/2/3)', async () => {
+	it('GET /photon_access_token gives the room’s MANAGERS every build permission', async () => {
+		// Room 2 is account 1's, with account 2 a co-owner (Role 30).
+		const tableFor = async (accountId: number) => {
+			await env.DB.prepare('INSERT OR REPLACE INTO presence (data) VALUES (?1)')
+				.bind(
+					JSON.stringify({
+						accountId,
+						roomInstance: { roomInstanceId: 1000043, roomId: 2, subRoomId: 2 },
+						expiresAt: Math.floor(Date.now() / 1000) + 900,
+					})
+				)
+				.run()
+			const res = await SELF.fetch(`${ORIGIN}/photon_access_token`, {
+				headers: await bearer(String(accountId)),
+			})
+			return (
+				(await res.json()) as {
+					Permissions: Array<{ Role: number; Override: boolean; Value: string }>
+				}
+			).Permissions
+		}
+		// A manager gets the WHOLE table — a row per permission for every role tier, grouped
+		// by role — because the permissions screen reads each cell from the row at exactly
+		// that role. Nothing is stored on subroom 2 here, so every row is a default
+		// (`Override: false`): co-owner and creator rows True, the rest False.
+		const roles = [0, 10, 20, 30, 255]
+		for (const table of [await tableFor(1), await tableFor(2)]) {
+			expect(table.length).toBe(30)
+			expect(table.map((p) => p.Role)).toEqual(roles.flatMap((r) => Array<number>(6).fill(r)))
+			for (const p of table) {
+				expect(p).toMatchObject({ Override: false, Value: p.Role >= 30 ? 'True' : 'False' })
+			}
+		}
+		await env.DB.prepare('DELETE FROM presence WHERE account_id IN (1, 2)').run()
+	})
+
+	it('GET /photon_access_token grants the global maker pen to dev accounts (1/2/3), nothing else', async () => {
 		for (const sub of ['1', '2', '3']) {
+			// Out of any room: a visitor with the dev maker pen.
 			const res = await SELF.fetch(`${ORIGIN}/photon_access_token`, { headers: await bearer(sub) })
 			expect(res.status).toBe(200)
 			const body = (await res.json()) as {
-				Permissions: Array<{ Permission: string; Role: number; Override: boolean }>
+				Permissions: Array<{ Permission: string; Role: number; Override: boolean; Value: string }>
 			}
-			// The global maker pen is prepended → first entry, Role 0, Override true.
-			expect(body.Permissions[0]).toMatchObject({
+			expect(body.Permissions[0]).toEqual({
+				Override: true,
 				Permission: 'CAN_USE_MAKER_PEN',
 				Role: 0,
-				Override: true,
+				Type: 0,
+				Value: 'True',
 			})
-			expect(body.Permissions.length).toBe(12)
+			expect(body.Permissions.slice(1).every((p) => p.Value === 'False')).toBe(true)
 		}
 	})
 
@@ -5012,9 +5161,10 @@ describe('rooms endpoints', () => {
 
 	// The permission table a room's creator saves on a subroom, and how it reaches the
 	// client: `PUT …/permissions` stores entries keyed by (Permission, Role), and
-	// `GET /photon_access_token` merges them over its defaults for whoever is standing in
-	// that subroom. Room 2 / subroom 2 is owned by account 1; account 743 is the visitor
-	// whose presence points at it.
+	// `GET /photon_access_token` builds the table for whoever is standing in that subroom,
+	// from the entries that reach THEIR role over the role's defaults. Room 2 / subroom 2 is
+	// owned by account 1, with account 2 a co-owner; 743–747 are visitors whose presence
+	// points at it.
 	describe('subroom permissions', () => {
 		type Permission = { Permission: string; Role: number; Override: boolean; Value: string }
 
@@ -5044,86 +5194,247 @@ describe('rooms endpoints', () => {
 			return ((await res.json()) as { Permissions: Permission[] }).Permissions
 		}
 
-		const entry = (list: Permission[], permission: string, role: number) =>
-			list.find((p) => p.Permission === permission && p.Role === role)
+		/**
+		 * The value a non-manager's table serves for a permission (every row of theirs
+		 * agrees), or the value a manager's table serves at one role (`at`): the cell the
+		 * permissions screen draws for that pair.
+		 */
+		const valueOf = (list: Permission[], permission: string, at?: number) => {
+			const rows = list.filter(
+				(p) => p.Permission === permission && (at === undefined || p.Role === at)
+			)
+			const values = new Set(rows.map((p) => p.Value))
+			expect(values.size).toBeLessThanOrEqual(1)
+			return [...values][0]
+		}
+		/** One cell of a manager's table, as the permissions screen reads it. */
+		const cell = (list: Permission[], permission: string, at: number) =>
+			list.find((p) => p.Permission === permission && p.Role === at)
+		// Room 2's seeded co-owner is account 2 — one of the hardcoded dev accounts, whose
+		// global maker pen no table takes away — so the role-holder cases use 748 (a Host)
+		// and 749 (a co-owner), given their roles here.
+		const setRoles = async () => {
+			await env.DB.prepare(
+				`UPDATE room SET data = json_set(data, '$.Roles', json(?1)) WHERE room_id = 2`
+			)
+				.bind(
+					JSON.stringify([
+						{ AccountId: 2, Role: 30 },
+						{ AccountId: 748, Role: 10 },
+						{ AccountId: 749, Role: 30 },
+					])
+				)
+				.run()
+		}
 
-		it('is auth-gated and creator-only', async () => {
+		type Envelope = {
+			Value: { RoomId: number; SubRooms: unknown[] } | null
+			Success: boolean
+			Error: string | null
+			error_id: null
+		}
+		const refusal = async (res: Response): Promise<string | null> => {
+			expect(res.status).toBe(200)
+			const env = (await res.json()) as Envelope
+			expect(env.Success).toBe(false)
+			expect(env.Value).toBeNull()
+			expect(env.error_id).toBeNull()
+			return env.Error
+		}
+
+		it('is auth-gated and open to the room’s managers only', async () => {
 			const body = [
 				{ Permission: 'CAN_SAVE_INVENTIONS', Role: 30, Override: false, Type: 0, Value: 'True' },
 			]
 			// No token → 401.
 			expect((await putPermissions('/rooms/2/subrooms/2/permissions', body)).status).toBe(401)
-			// A valid token that isn't the room's creator → 403.
-			expect((await putPermissions('/rooms/2/subrooms/2/permissions', body, '999')).status).toBe(
-				403
-			)
-			// Not even a co-owner: account 2 holds Role 30 on the seeded rooms. Co-owners may
-			// build in a room but don't decide what a role may do.
-			expect((await putPermissions('/rooms/2/subrooms/2/permissions', body, '2')).status).toBe(403)
-			// Unknown room / unknown subroom → 404.
-			expect((await putPermissions('/rooms/99999/subrooms/2/permissions', body, '1')).status).toBe(
-				404
-			)
+			// A valid token that isn't the room's creator or a co-owner → a `Success: false`
+			// rejection, as the other PascalCase-envelope routes answer.
+			expect(
+				await refusal(await putPermissions('/rooms/2/subrooms/2/permissions', body, '999'))
+			).toBe('You are not the owner of this room!')
+			// A co-owner may: account 2 holds Role 30 on the seeded rooms. (This body clears a
+			// pair that was never stored, so it changes nothing.)
+			expect((await putPermissions('/rooms/2/subrooms/2/permissions', body, '2')).status).toBe(200)
+			// A Host (a lower tier) may not.
+			await setRoles()
+			expect(
+				await refusal(await putPermissions('/rooms/2/subrooms/2/permissions', body, '748'))
+			).toBe('You are not the owner of this room!')
+			// Unknown room / unknown subroom.
+			expect(
+				await refusal(await putPermissions('/rooms/99999/subrooms/2/permissions', body, '1'))
+			).toBe('This room does not exist!')
 			// A subroom id belonging to another room doesn't resolve either.
-			expect((await putPermissions('/rooms/2/subrooms/9999/permissions', body, '1')).status).toBe(
-				404
-			)
+			expect(
+				await refusal(await putPermissions('/rooms/2/subrooms/9999/permissions', body, '1'))
+			).toBe('This subroom does not exist!')
 		})
 
-		it('answers an empty 200 — the client reads no body', async () => {
+		it('answers the whole room in the PascalCase `{ Value, Success, Error, error_id }` envelope', async () => {
 			const res = await putPermissions(
 				'/rooms/2/subrooms/2/permissions',
 				[{ Permission: 'CAN_SPAWN_INVENTIONS', Role: 30, Override: true, Type: 0, Value: 'True' }],
 				'1'
 			)
 			expect(res.status).toBe(200)
-			expect(await res.text()).toBe('')
+			const env = (await res.json()) as Envelope
+			expect(env.Success).toBe(true)
+			expect(env.Error).toBeNull()
+			expect(env.error_id).toBeNull()
+			// `Value` is the same Room DTO `GET /rooms/2` serves — subrooms re-attached and all.
+			const room = (await (
+				await SELF.fetch(`${ORIGIN}/rooms/2`, { headers: await bearer('1') })
+			).json()) as Envelope['Value']
+			expect(env.Value).toEqual(room)
 		})
 
-		it('a checked Override replaces the matching default in place', async () => {
-			const before = await permissionsIn(743, 2)
-			expect(before.length).toBe(11)
-			const at = before.findIndex((p) => p.Permission === 'CAN_USE_MAKER_PEN' && p.Role === 30)
-			// The default for this pair is an un-overridden grant.
-			expect(before[at]).toMatchObject({ Override: false, Value: 'True' })
+		it('a Role 0 grant reaches a visitor; a Role 30 grant does not', async () => {
+			// Nothing stored for everyone: the visitor may do nothing.
+			expect(valueOf(await permissionsIn(743, 2), 'CAN_SPAWN_INVENTIONS')).toBe('False')
 
+			// The creator lets everyone spawn inventions in this subroom.
 			expect(
 				(
 					await putPermissions(
 						'/rooms/2/subrooms/2/permissions',
 						[
 							{
-								Permission: 'CAN_USE_MAKER_PEN',
-								Role: 30,
+								Permission: 'CAN_SPAWN_INVENTIONS',
+								Role: 0,
 								Override: true,
 								Type: 0,
-								Value: 'False',
+								Value: 'True',
 							},
 						],
 						'1'
 					)
 				).status
 			).toBe(200)
+			const granted = await permissionsIn(743, 2)
+			expect(valueOf(granted, 'CAN_SPAWN_INVENTIONS')).toBe('True')
+			// Only that one: the rest of the visitor's table is still False, and one row each.
+			expect(valueOf(granted, 'CAN_USE_DELETE_ALL_BUTTON')).toBe('False')
+			expect(granted.length).toBe(6)
 
+			// A grant stored for co-owners is not the visitor's — and nor is it listed for them.
+			await putPermissions(
+				'/rooms/2/subrooms/2/permissions',
+				[{ Permission: 'CAN_INVITE', Role: 30, Override: true, Type: 0, Value: 'True' }],
+				'1'
+			)
 			const after = await permissionsIn(743, 2)
-			// Replaced, not appended — and at the same index, so the table doesn't reshuffle.
-			expect(after.length).toBe(11)
-			expect(after[at]).toMatchObject({
-				Permission: 'CAN_USE_MAKER_PEN',
-				Role: 30,
+			expect(after.find((p) => p.Permission === 'CAN_INVITE')).toBeUndefined()
+			expect(after.length).toBe(6)
+			// The co-owner is a manager and reads the whole table: that entry at its own role
+			// with `Override: true`, inherited (`false`) by the creator above it, and absent
+			// below it where nothing reaches — a pair the defaults don't carry has no cell.
+			await setRoles()
+			const coOwner = await permissionsIn(749, 2)
+			expect(cell(coOwner, 'CAN_INVITE', 30)).toMatchObject({ Override: true, Value: 'True' })
+			expect(cell(coOwner, 'CAN_INVITE', 255)).toMatchObject({ Override: false, Value: 'True' })
+			expect(coOwner.filter((p) => p.Permission === 'CAN_INVITE').map((p) => p.Role)).toEqual([
+				30, 255,
+			])
+			// And the Role 0 grant stored above: its own cell overridden, every tier above
+			// inheriting it — except Role 30, where the envelope test stored its own entry.
+			expect(cell(coOwner, 'CAN_SPAWN_INVENTIONS', 0)).toMatchObject({ Override: true })
+			expect(cell(coOwner, 'CAN_SPAWN_INVENTIONS', 30)).toMatchObject({ Override: true })
+			for (const at of [10, 20, 255]) {
+				expect(cell(coOwner, 'CAN_SPAWN_INVENTIONS', at)).toMatchObject({
+					Override: false,
+					Value: 'True',
+				})
+			}
+		})
+
+		it('serves a manager every role’s row, so a Host grant reads back at Role 10', async () => {
+			// The creator switches a permission on for hosts. Served only at Role 0 and the
+			// creator's own role (as this once was), the Host cell had no row to read and the
+			// switch snapped back to the default every time.
+			await putPermissions(
+				'/rooms/2/subrooms/2/permissions',
+				[{ Permission: 'CAN_SELF_REVIVE', Role: 10, Override: true, Type: 0, Value: 'True' }],
+				'1'
+			)
+			const creator = await permissionsIn(1, 2)
+			expect(cell(creator, 'CAN_SELF_REVIVE', 10)).toEqual({
+				Override: true,
+				Permission: 'CAN_SELF_REVIVE',
+				Role: 10,
+				Type: 0,
+				Value: 'True',
+			})
+			// Nothing reaches "everyone", so there is no Role 0 cell; the tiers above inherit.
+			expect(cell(creator, 'CAN_SELF_REVIVE', 0)).toBeUndefined()
+			expect(cell(creator, 'CAN_SELF_REVIVE', 255)).toMatchObject({
+				Override: false,
+				Value: 'True',
+			})
+			// A default cell is NOT an override — otherwise un-checking it could never stick.
+			expect(cell(creator, 'CAN_USE_DELETE_ALL_BUTTON', 10)).toMatchObject({
+				Override: false,
+				Value: 'False',
+			})
+			// The host themself (not a manager) gets only their own rows, at 0 and 10.
+			const host = await permissionsIn(748, 2)
+			expect(host.filter((p) => p.Permission === 'CAN_SELF_REVIVE').map((p) => p.Role)).toEqual([
+				0, 10,
+			])
+			expect(valueOf(host, 'CAN_SELF_REVIVE')).toBe('True')
+			await putPermissions(
+				'/rooms/2/subrooms/2/permissions',
+				[{ Permission: 'CAN_SELF_REVIVE', Role: 10, Override: false, Type: 0, Value: 'True' }],
+				'1'
+			)
+			expect(cell(await permissionsIn(1, 2), 'CAN_SELF_REVIVE', 10)).toBeUndefined()
+			await env.DB.prepare('DELETE FROM presence WHERE account_id = 1').run()
+		})
+
+		it('a stored entry at the caller’s role beats one below it, and revokes a default', async () => {
+			// Take the maker pen away from co-owners, while everyone may spawn inventions.
+			await putPermissions(
+				'/rooms/2/subrooms/2/permissions',
+				[{ Permission: 'CAN_USE_MAKER_PEN', Role: 30, Override: true, Type: 0, Value: 'False' }],
+				'1'
+			)
+			const coOwner = await permissionsIn(749, 2)
+			expect(cell(coOwner, 'CAN_USE_MAKER_PEN', 30)).toMatchObject({
 				Override: true,
 				Value: 'False',
 			})
+			expect(cell(coOwner, 'CAN_SPAWN_INVENTIONS', 30)).toMatchObject({ Value: 'True' })
+			// The revocation reaches the creator's cell too (the highest lower role with an
+			// entry) — but account 1 is a dev account, whose own-role maker pen nothing takes.
+			expect(valueOf(await permissionsIn(1, 2), 'CAN_USE_MAKER_PEN', 255)).toBe('True')
 
-			// Re-sending the same (Permission, Role) updates that entry rather than adding one.
+			// A Host (Role 10) sits between: the Role 0 grant reaches them, the Role 30
+			// revocation does not, and their own default is no maker pen either way.
+			const host = await permissionsIn(748, 2)
+			expect(host.map((p) => p.Role).filter((r) => r === 10).length).toBe(6)
+			expect(valueOf(host, 'CAN_SPAWN_INVENTIONS')).toBe('True')
+			expect(valueOf(host, 'CAN_USE_MAKER_PEN')).toBe('False')
+			expect(valueOf(host, 'CAN_USE_DELETE_ALL_BUTTON')).toBe('False')
+			// Now the creator opens the delete-all button to hosts and up.
 			await putPermissions(
 				'/rooms/2/subrooms/2/permissions',
-				[{ Permission: 'CAN_USE_MAKER_PEN', Role: 30, Override: true, Type: 0, Value: 'True' }],
+				[
+					{
+						Permission: 'CAN_USE_DELETE_ALL_BUTTON',
+						Role: 10,
+						Override: true,
+						Type: 0,
+						Value: 'True',
+					},
+				],
 				'1'
 			)
-			const changed = await permissionsIn(743, 2)
-			expect(changed.length).toBe(11)
-			expect(changed[at]).toMatchObject({ Override: true, Value: 'True' })
+			expect(valueOf(await permissionsIn(748, 2), 'CAN_USE_DELETE_ALL_BUTTON')).toBe('True')
+			// Which reaches a co-owner (above 10) but not a visitor (below it).
+			expect(valueOf(await permissionsIn(749, 2), 'CAN_USE_DELETE_ALL_BUTTON', 30)).toBe('True')
+			expect(valueOf(await permissionsIn(749, 2), 'CAN_USE_DELETE_ALL_BUTTON', 0)).toBe('False')
+			expect(valueOf(await permissionsIn(743, 2), 'CAN_USE_DELETE_ALL_BUTTON')).toBe('False')
+			await env.DB.prepare('DELETE FROM presence WHERE account_id = 1').run()
 		})
 
 		it('an unchecked Override erases the entry, back to the default', async () => {
@@ -5148,7 +5459,7 @@ describe('rooms endpoints', () => {
 								Role: 30,
 								Override: false,
 								Type: 0,
-								Value: 'True',
+								Value: 'False',
 							},
 						],
 						'1'
@@ -5156,11 +5467,10 @@ describe('rooms endpoints', () => {
 				).status
 			).toBe(200)
 
-			// The row is gone, and the token serves the default for the pair again.
+			// The row is gone, and the co-owner has their default maker pen again — a default
+			// cell, no longer an override.
 			expect(await stored()).toBe(0)
-			const table = await permissionsIn(743, 2)
-			expect(table.length).toBe(11)
-			expect(entry(table, 'CAN_USE_MAKER_PEN', 30)).toMatchObject({
+			expect(cell(await permissionsIn(749, 2), 'CAN_USE_MAKER_PEN', 30)).toMatchObject({
 				Override: false,
 				Value: 'True',
 			})
@@ -5171,31 +5481,21 @@ describe('rooms endpoints', () => {
 				[{ Permission: 'CAN_INVITE', Role: 0, Override: false, Type: 0, Value: 'True' }],
 				'1'
 			)
-			expect((await permissionsIn(743, 2)).length).toBe(11)
+			expect((await permissionsIn(743, 2)).length).toBe(6)
 		})
 
-		it('appends a permission the defaults do not carry, and scopes it to its subroom', async () => {
-			// CAN_INVITE is in none of the defaults, so it lands as a new entry.
-			await putPermissions(
-				'/rooms/2/subrooms/2/permissions',
-				[{ Permission: 'CAN_INVITE', Role: 30, Override: true, Type: 0, Value: 'False' }],
-				'1'
-			)
-			const inSubRoom2 = await permissionsIn(744, 2)
-			expect(inSubRoom2.length).toBe(12)
-			expect(entry(inSubRoom2, 'CAN_INVITE', 30)).toMatchObject({
-				Override: true,
-				Value: 'False',
-			})
-
-			// A different subroom is untouched — the table is per-subroom, not per-room.
-			expect((await permissionsIn(744, 3)).length).toBe(11)
-			// And so is a player in no instance at all.
+		it('scopes the table to its subroom', async () => {
+			// Subroom 2 lets everyone spawn inventions (set above); subroom 3 does not.
+			expect(valueOf(await permissionsIn(744, 2), 'CAN_SPAWN_INVENTIONS')).toBe('True')
+			expect(valueOf(await permissionsIn(744, 3), 'CAN_SPAWN_INVENTIONS')).toBe('False')
+			// And a player in no instance at all is a visitor with the defaults.
 			await env.DB.prepare('DELETE FROM presence WHERE account_id = ?1').bind(744).run()
 			const lobby = await SELF.fetch(`${ORIGIN}/photon_access_token`, {
 				headers: await bearer('744'),
 			})
-			expect(((await lobby.json()) as { Permissions: Permission[] }).Permissions.length).toBe(11)
+			const table = ((await lobby.json()) as { Permissions: Permission[] }).Permissions
+			expect(table.length).toBe(6)
+			expect(table.every((p) => p.Value === 'False')).toBe(true)
 		})
 
 		it('keeps a Value that isn’t True/False verbatim', async () => {
@@ -5206,42 +5506,23 @@ describe('rooms endpoints', () => {
 				[{ Permission: 'MAX_SPAWNED_INVENTIONS', Role: 0, Override: true, Type: 0, Value: '25' }],
 				'1'
 			)
-			expect(entry(await permissionsIn(747, 2), 'MAX_SPAWNED_INVENTIONS', 0)).toMatchObject({
-				Override: true,
-				Value: '25',
-			})
+			expect(valueOf(await permissionsIn(747, 2), 'MAX_SPAWNED_INVENTIONS')).toBe('25')
 		})
 
-		it('applies over the dev accounts’ global maker pen, without listing a pair twice', async () => {
+		it('applies over the dev accounts’ global maker pen', async () => {
+			// Account 3 is one of the hardcoded dev accounts, so it holds the global maker pen
+			// in every room — the one grant a subroom's table doesn't take away.
 			await putPermissions(
 				'/rooms/2/subrooms/2/permissions',
-				[
-					{ Permission: 'CAN_USE_MAKER_PEN', Role: 0, Override: true, Type: 0, Value: 'False' },
-					// The third sample body — a Role 0 grant the defaults already carry.
-					{
-						Permission: 'CAN_USE_DELETE_ALL_BUTTON',
-						Role: 0,
-						Override: true,
-						Type: 0,
-						Value: 'True',
-					},
-				],
+				[{ Permission: 'CAN_USE_MAKER_PEN', Role: 0, Override: true, Type: 0, Value: 'False' }],
 				'1'
 			)
-			// Account 3 is one of the hardcoded dev accounts, so it gets the global (Role 0)
-			// maker pen prepended — which this subroom then revokes. The merge runs last and
-			// replaces it in place, so the pair appears exactly ONCE: a table listing it twice
-			// with two values would leave which one applies up to the client.
 			const devTable = await permissionsIn(3, 2)
-			expect(devTable.filter((p) => p.Permission === 'CAN_USE_MAKER_PEN' && p.Role === 0)).toEqual([
-				{ Override: true, Permission: 'CAN_USE_MAKER_PEN', Role: 0, Type: 0, Value: 'False' },
+			expect(devTable.filter((p) => p.Permission === 'CAN_USE_MAKER_PEN')).toEqual([
+				{ Override: true, Permission: 'CAN_USE_MAKER_PEN', Role: 0, Type: 0, Value: 'True' },
 			])
-			expect(entry(devTable, 'CAN_USE_DELETE_ALL_BUTTON', 0)).toMatchObject({ Value: 'True' })
-
-			// A normal player in the same subroom sees the same revocation.
-			expect(entry(await permissionsIn(745, 2), 'CAN_USE_MAKER_PEN', 0)).toMatchObject({
-				Value: 'False',
-			})
+			// A normal player in the same subroom has none, as before.
+			expect(valueOf(await permissionsIn(745, 2), 'CAN_USE_MAKER_PEN')).toBe('False')
 		})
 
 		it('a cloned subroom inherits the source’s permission table', async () => {
@@ -5253,8 +5534,8 @@ describe('rooms endpoints', () => {
 			const cloneId = Math.max(...room.value.SubRooms.map((s) => s.SubRoomId))
 
 			const inClone = await permissionsIn(746, cloneId)
-			expect(entry(inClone, 'CAN_INVITE', 30)).toMatchObject({ Value: 'False' })
-			expect(entry(inClone, 'CAN_USE_MAKER_PEN', 0)).toMatchObject({ Value: 'False' })
+			expect(valueOf(inClone, 'CAN_SPAWN_INVENTIONS')).toBe('True')
+			expect(valueOf(inClone, 'MAX_SPAWNED_INVENTIONS')).toBe('25')
 		})
 	})
 
@@ -5609,18 +5890,18 @@ describe('rooms endpoints', () => {
 		expect(await empty.json()).toEqual({ Results: [], TotalResults: 0, TotalCount: 0 })
 
 		// The list exposes unpublished saves, so it isn't public: no token → 401, and a
-		// valid token from someone who is neither the creator nor in the room → 403. Account
-		// 2 is a co-owner (Role 30 on the seeded rooms) and is refused too — holding a role
-		// grants nothing here; being in the room does (see below).
+		// valid token from someone who neither manages the room nor is in it → 403.
 		expect((await SELF.fetch(`${ORIGIN}/rooms/2/subrooms/2/saves`)).status).toBe(401)
 		expect(
 			(await SELF.fetch(`${ORIGIN}/rooms/2/subrooms/2/saves`, { headers: await bearer('999') }))
 				.status
 		).toBe(403)
+		// Account 2 is a co-owner (Role 30 on the seeded rooms) and reads it from anywhere:
+		// the client opens the save history from the room's settings, not from inside it.
 		expect(
 			(await SELF.fetch(`${ORIGIN}/rooms/2/subrooms/2/saves`, { headers: await bearer('2') }))
 				.status
-		).toBe(403)
+		).toBe(200)
 
 		// …but a player standing IN the room reads it: the client resolves which version to
 		// load from this list, so a visitor who can't read it can't load the instance.
@@ -5712,7 +5993,7 @@ describe('rooms endpoints', () => {
 		// Same gate as the list it mirrors — it exposes the same unpublished saves.
 		expect((await get(light)).status).toBe(401)
 		expect((await get(light, '999')).status).toBe(403)
-		expect((await get(light, '2')).status).toBe(403)
+		expect((await get(light, '2')).status).toBe(200)
 		await putInRoom(999, 2)
 		expect((await get(light, '999')).status).toBe(200)
 		await clearPresence(999)
@@ -5725,28 +6006,65 @@ describe('rooms endpoints', () => {
 
 		// Pick a real save off the history the previous test paged.
 		const list = (await (await get('/rooms/2/subrooms/2/saves', '1')).json()) as {
-			Results: Array<{ SubRoomDataSaveId: number; DataBlob: string; Description: string }>
+			Results: Array<{
+				SubRoomDataSaveId: number
+				DataBlob: string
+				Description: string
+				PersistenceVersion: number
+				UgcSubVersion: number
+			}>
 		}
 		const row = list.Results[0]!
 
 		const res = await get(`/rooms/2/subrooms/2/saves/${row.SubRoomDataSaveId}`, '1')
 		expect(res.status).toBe(200)
-		// The camelCase projection the room save returns — NOT the PascalCase row the list
-		// serves. Same field set, exactly: no persistence/OM/UGC versions, no asset arrays.
-		expect(await res.json()).toEqual({
-			subRoomDataSaveId: row.SubRoomDataSaveId,
-			subRoomId: 2,
-			unityAssetId: null,
-			unityAsset: null,
-			unityAssetHash: null,
-			dataBlob: row.DataBlob,
-			dataBlobHash: null,
-			savedByAccountId: expect.any(Number),
-			savedOnPlatform: 0,
-			savedOnDeviceClass: 0,
-			description: row.Description,
-			createdAt: expect.any(String),
+		// A PascalCase row like the list serves — NOT the camelCase projection the room save
+		// returns (served that, the client showed a save with every value missing). Its
+		// bundle fields are the detail's own: top-level `UnityAsset`/`UnityAssetHash`, no
+		// `Tags`, and `UnityAssetId` present-and-null rather than omitted.
+		const detailRow = (await res.json()) as Record<string, unknown>
+		expect(Object.keys(detailRow)).toEqual([
+			'UnitySubAssets',
+			'ReferencedUnityAssets',
+			'UnityAsset',
+			'UnityAssetHash',
+			'SubRoomDataSaveId',
+			'SubRoomId',
+			'UnityAssetId',
+			'ReferencedUnityAssetIds',
+			'DataBlob',
+			'DataBlobHash',
+			'PersistenceVersion',
+			'OMVersion',
+			'SavedByAccountId',
+			'SavedOnPlatform',
+			'SavedOnDeviceClass',
+			'Description',
+			'ModerationState',
+			'CreatedAt',
+			'UgcSubVersion',
+		])
+		expect(detailRow).toMatchObject({
+			UnitySubAssets: [],
+			ReferencedUnityAssets: [],
+			UnityAsset: null,
+			UnityAssetHash: null,
+			SubRoomDataSaveId: row.SubRoomDataSaveId,
+			SubRoomId: 2,
+			UnityAssetId: null,
+			ReferencedUnityAssetIds: [],
+			DataBlob: row.DataBlob,
+			DataBlobHash: null,
+			SavedByAccountId: expect.any(Number),
+			SavedOnPlatform: 0,
+			SavedOnDeviceClass: 0,
+			Description: row.Description,
+			ModerationState: 0,
+			CreatedAt: expect.any(String),
 		})
+		// The versions come off the row, not the room save's trimmed projection.
+		expect(detailRow.PersistenceVersion).toBe(row.PersistenceVersion)
+		expect(detailRow.UgcSubVersion).toBe(row.UgcSubVersion)
 
 		// Unknown save, and a save that exists but belongs to ANOTHER subroom (ids are
 		// global, so an unscoped lookup would happily resolve this one) — both 404.
@@ -5763,17 +6081,131 @@ describe('rooms endpoints', () => {
 		expect((await get('/rooms/99999/subrooms/2/saves/1', '1')).status).toBe(404)
 		expect((await get('/rooms/2/subrooms/99999/saves/1', '1')).status).toBe(404)
 
-		// Same gate as the list it details: 401 unauthed, 403 for someone who is neither the
-		// creator nor in the room (a co-owner included) — it reads unpublished saves.
+		// Same gate as the list it details: 401 unauthed, 403 for someone who neither manages
+		// the room nor is in it — it reads unpublished saves. A co-owner (account 2) passes.
 		const detail = `/rooms/2/subrooms/2/saves/${row.SubRoomDataSaveId}`
 		expect((await get(detail)).status).toBe(401)
 		expect((await get(detail, '999')).status).toBe(403)
-		expect((await get(detail, '2')).status).toBe(403)
+		expect((await get(detail, '2')).status).toBe(200)
 		// A player standing in the room reads it, for as long as they're there.
 		await putInRoom(999, 2)
 		expect((await get(detail, '999')).status).toBe(200)
 		await clearPresence(999)
 		expect((await get(detail, '999')).status).toBe(403)
+	})
+
+	describe('POST /unity_assets/baked/bulk', () => {
+		const URL = `${ORIGIN}/unity_assets/baked/bulk`
+		const post = (body: string) =>
+			SELF.fetch(URL, {
+				method: 'POST',
+				headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+				body,
+			})
+		const A = '4f0c1e4a-2b77-4b16-9a3e-5dbcfd7f2865'
+		const B = '9a3e5dbc-fd7f-2865-8f0c-1e4a2b774b16'
+		const C = '22555d14-2918-43f3-94d4-da0c893d96c4'
+
+		beforeAll(async () => {
+			await putUnityAsset(env.DB, {
+				UnityAssetId: A,
+				Target: 0,
+				Version: 227,
+				Filename: '2026-10-05/a0d83019-675d-41c0-8924-c238c5a12ee8',
+				Hash: 'R0SVMvrAW4n1TIF2lxaOAQZ5XXVJh7prEP6GpiLCrQo=',
+			})
+			await putUnityAsset(env.DB, {
+				UnityAssetId: A,
+				Target: 2,
+				Version: 227,
+				Filename: '2026-10-05/quest-a',
+				Hash: 'quest-a-hash',
+			})
+			// B was built twice for Windows.
+			await putUnityAsset(env.DB, {
+				UnityAssetId: B,
+				Target: 0,
+				Version: 3,
+				Filename: '2026-10-05/b-v3',
+				Hash: 'b-v3-hash',
+			})
+			await putUnityAsset(env.DB, {
+				UnityAssetId: B,
+				Target: 0,
+				Version: 5,
+				Filename: '2026-10-05/b-v5',
+				Hash: 'b-v5-hash',
+			})
+		})
+
+		it('answers a bare array of five-key entries for the ids asked, in order', async () => {
+			const res = await post(`target=0&version=227&id=${B}&id=${A}`)
+			expect(res.status).toBe(200)
+			const body = (await res.json()) as Array<Record<string, unknown>>
+			expect(body.map((e) => e.UnityAssetId)).toEqual([B, A])
+			expect(Object.keys(body[1]!)).toEqual([
+				'UnityAssetId',
+				'Target',
+				'Version',
+				'Filename',
+				'Hash',
+			])
+			expect(body[1]).toEqual({
+				UnityAssetId: A,
+				Target: 0,
+				Version: 227,
+				Filename: '2026-10-05/a0d83019-675d-41c0-8924-c238c5a12ee8',
+				Hash: 'R0SVMvrAW4n1TIF2lxaOAQZ5XXVJh7prEP6GpiLCrQo=',
+			})
+		})
+
+		it('serves the build for the target asked, and leaves out assets with none', async () => {
+			// C has no build at all, so no blank row: the client downloads nothing for it either
+			// way, and a row with no Filename is the quieter failure.
+			const quest = (await (
+				await post(`target=2&version=227&id=${A}&id=${C}&id=${B}`)
+			).json()) as Array<Record<string, unknown>>
+			expect(quest).toEqual([
+				{
+					UnityAssetId: A,
+					Target: 2,
+					Version: 227,
+					Filename: '2026-10-05/quest-a',
+					Hash: 'quest-a-hash',
+				},
+			])
+		})
+
+		it('prefers the build at the requested version and falls back to the newest', async () => {
+			const exact = (await (await post(`target=0&version=3&id=${B}`)).json()) as Array<{
+				Version: number
+			}>
+			expect(exact.map((e) => e.Version)).toEqual([3])
+			// A version nothing was built at still answers the asset — its newest build.
+			const newest = (await (await post(`target=0&version=4&id=${B}`)).json()) as Array<{
+				Version: number
+			}>
+			expect(newest.map((e) => e.Version)).toEqual([5])
+			// No version at all: the newest.
+			const none = (await (await post(`target=0&id=${B}`)).json()) as Array<{ Version: number }>
+			expect(none.map((e) => e.Version)).toEqual([5])
+		})
+
+		it('matches ids case-insensitively and accepts a comma-separated list', async () => {
+			const body = (await (
+				await post(`target=0&version=227&id=${A.toUpperCase()},${B}`)
+			).json()) as Array<{
+				UnityAssetId: string
+			}>
+			expect(body.map((e) => e.UnityAssetId)).toEqual([A, B])
+		})
+
+		it('answers [] for no ids, an unknown id, or a non-integer target', async () => {
+			expect(await (await post('target=0&version=227')).json()).toEqual([])
+			expect(await (await post(`target=0&version=227&id=${C}`)).json()).toEqual([])
+			expect(await (await post(`target=win&version=227&id=${A}`)).json()).toEqual([])
+			expect(await (await post('')).json()).toEqual([])
+		})
 	})
 
 	it('GET /openapi.json documents every route', async () => {
@@ -5839,18 +6271,22 @@ describe('rooms endpoints', () => {
 			'GET /rooms/{roomId}/subrooms/{subRoomId}/saves',
 			'GET /rooms/{roomId}/subrooms/{subRoomId}/saves/no_unity_assets',
 			'GET /rooms/{roomId}/subrooms/{subRoomId}/saves/{saveId}',
+			'GET /rooms/{roomId}/subrooms/{subRoomId}/unityasset',
 			'GET /roomserver/rooms/createdby/me',
 			'GET /showcase/{playerId}',
 			'POST /rooms/bulk',
 			'POST /rooms/import',
 			'POST /rooms/{roomId}/bans',
 			'POST /rooms/{roomId}/clone',
+			'POST /rooms/{roomId}/experience',
+			'POST /rooms/{roomId}/experience/player',
 			'POST /rooms/{roomId}/leaderboards/{leaderboardId}',
 			'POST /rooms/{roomId}/subrooms',
 			'POST /rooms/{roomId}/subrooms/{subRoomId}/clone',
 			'POST /rooms/{roomId}/subrooms/{subRoomId}/data',
 			'POST /rooms/{roomId}/subrooms/{subRoomId}/move',
 			'POST /rooms/{roomId}/subrooms/{subRoomId}/publish_save',
+			'POST /unity_assets/baked/bulk',
 			'PUT /rooms/{roomId}/accessibility',
 			'PUT /rooms/{roomId}/cloning',
 			'PUT /rooms/{roomId}/creator',
@@ -5877,6 +6313,235 @@ describe('rooms endpoints', () => {
 		for (const ops of Object.values(spec.paths)) {
 			for (const op of Object.values(ops)) expect(op.summary).toBeTruthy()
 		}
+	})
+})
+
+// A Rec Room Studio build is a unity asset on the save: `unity_asset` rows the studio
+// worker wrote. The game loads the scene from `CurrentSave.DataBlob` and the bundles from
+// `UnitySubAssets`. Maker-pen saves stay empty arrays, and a missing studio cloud-build
+// table must not fail the room read.
+describe('studio room bundles', () => {
+	const ASSET = '11111111-2222-4333-8444-555555555555'
+	const winName = publicStudioBundleFilename(9901, ASSET, 'windows', 'main')
+	const androidName = publicStudioBundleFilename(9901, ASSET, 'android', 'main')
+	const winHash = '47DEQpj8HBSa+/TImW+5JCeuQeRkm5NMpJWZG3hSuFU='
+	const androidHash = 'ypeBEsobvcr6wjGzmiPcTaeG7/gUfE5yuYB3ha/uSLs='
+
+	const save = (unityAssetId?: string) => ({
+		UnitySubAssets: [],
+		ReferencedUnityAssets: [],
+		DataBlob: 'studio-scene-blob',
+		DataBlobHash: null,
+		ReferencedUnityAssetIds: [],
+		PersistenceVersion: 1,
+		OMVersion: 0,
+		UgcSubVersion: 0,
+		SavedByAccountId: 7,
+		SavedOnPlatform: 0,
+		SavedOnDeviceClass: 0,
+		Description: '',
+		Tags: [],
+		ModerationState: 0,
+		CreatedAt: '2026-10-03T00:00:00.000Z',
+		...(unityAssetId ? { UnityAssetId: unityAssetId } : {}),
+	})
+
+	async function reset() {
+		await env.DB.prepare('DROP TABLE IF EXISTS studio_cloud_build').run()
+		await env.DB.prepare('DELETE FROM unity_asset WHERE unity_asset_id = ?1').bind(ASSET).run()
+		await env.DB.prepare('DELETE FROM subroom_save WHERE sub_room_id IN (99011, 99021)').run()
+		await env.DB.prepare('DELETE FROM subroom WHERE room_id IN (9901, 9902)').run()
+		await env.DB.prepare('DELETE FROM room WHERE room_id IN (9901, 9902)').run()
+		await seedRoomWithSubRooms(env.DB, {
+			RoomId: 9901,
+			Name: 'StudioLoadRoom',
+			CreatorAccountId: 1,
+			Accessibility: 1,
+			IsDorm: false,
+			SubRooms: [
+				{
+					SubRoomId: 99011,
+					Name: 'Main',
+					UnitySceneId: '76d98498-60a1-430c-ab76-b54a29b7a163',
+					MaxPlayers: 20,
+					Accessibility: 1,
+					CurrentSave: save(ASSET),
+				},
+			],
+		})
+		await seedRoomWithSubRooms(env.DB, {
+			RoomId: 9902,
+			Name: 'MakerPenRoom',
+			CreatorAccountId: 1,
+			Accessibility: 1,
+			IsDorm: false,
+			SubRooms: [
+				{
+					SubRoomId: 99021,
+					Name: 'Sandbox',
+					UnitySceneId: '76d98498-60a1-430c-ab76-b54a29b7a163',
+					MaxPlayers: 20,
+					Accessibility: 1,
+					CurrentSave: save(),
+				},
+			],
+		})
+	}
+
+	async function storeFiles() {
+		for (const sql of STUDIO_CLOUD_BUILD_SCHEMA_DDL) await env.DB.prepare(sql).run()
+		await env.DB.prepare(
+			`INSERT INTO studio_cloud_build
+				 (cloud_build_id, room_id, sub_room_id, sub_room_data_save_id, unity_asset_id,
+				  created_by_account_id, started_at, completed_at, error)
+				 VALUES ('build-1', 9901, 99011, 0, ?1, 42, '2026-10-03T00:00:00.000Z',
+				         '2026-10-03T00:00:00.000Z', NULL)`
+		)
+			.bind(ASSET)
+			.run()
+		const insert = (target: number, kind: 'main' | 'stripped', filename: string, hash: string) =>
+			putUnityAsset(
+				env.DB,
+				{ UnityAssetId: ASSET, Target: target, Version: 1, Filename: filename, Hash: hash },
+				kind
+			)
+		await insert(0, 'main', winName, winHash)
+		await insert(2, 'main', androidName, androidHash)
+		await insert(
+			0,
+			'stripped',
+			publicStudioBundleFilename(9901, ASSET, 'windows', 'stripped'),
+			winHash
+		)
+	}
+
+	it('loads baked bundles onto the room and serves the unity asset', async () => {
+		await reset()
+
+		const before = (await (await SELF.fetch(`${ORIGIN}/rooms/9901`)).json()) as {
+			SubRooms: Array<{ CurrentSave: { UnitySubAssets: unknown[] } }>
+		}
+		expect(before.SubRooms[0]!.CurrentSave.UnitySubAssets).toEqual([])
+
+		await storeFiles()
+
+		type Baked = { Target: number; Filename: string; Hash: string; Version: number }
+		const loaded = (await (await SELF.fetch(`${ORIGIN}/rooms/9901`)).json()) as {
+			SubRooms: Array<{
+				CurrentSave: {
+					UnitySubAssets: Baked[]
+					ReferencedUnityAssets: unknown[]
+					SubRoomDataSaveId: number
+				}
+			}>
+		}
+		const current = loaded.SubRooms[0]!.CurrentSave
+		expect(current.ReferencedUnityAssets).toEqual([])
+		expect(current.UnitySubAssets).toEqual([
+			{
+				UnityAssetId: ASSET,
+				Target: 0,
+				Version: 1,
+				Filename: winName,
+				Hash: winHash,
+			},
+			{
+				UnityAssetId: ASSET,
+				Target: 2,
+				Version: 1,
+				Filename: androidName,
+				Hash: androidHash,
+			},
+		])
+
+		const quest = (await (
+			await SELF.fetch(`${ORIGIN}/rooms/9901?unityAssetTarget=2`)
+		).json()) as typeof loaded
+		expect(quest.SubRooms[0]!.CurrentSave.UnitySubAssets.map((asset) => asset.Target)).toEqual([2])
+
+		const pc = (await (
+			await SELF.fetch(`${ORIGIN}/rooms/9901?unityAssetTarget=0`)
+		).json()) as typeof loaded
+		expect(pc.SubRooms[0]!.CurrentSave.UnitySubAssets.map((asset) => asset.Filename)).toEqual([
+			winName,
+		])
+
+		const maker = (await (await SELF.fetch(`${ORIGIN}/rooms/9902`)).json()) as typeof loaded
+		expect(maker.SubRooms[0]!.CurrentSave.UnitySubAssets).toEqual([])
+
+		const meta = await SELF.fetch(
+			`${ORIGIN}/rooms/9901/subrooms/99011/unityasset?unityAssetId=${ASSET}`
+		)
+		expect(meta.status).toBe(200)
+		expect(await meta.json()).toEqual({
+			unityAssetId: ASSET,
+			createdByAccountId: 42,
+			bakedUnityAssets: [
+				{ unityAssetId: ASSET, target: 0, version: 1, filename: winName },
+				{ unityAssetId: ASSET, target: 2, version: 1, filename: androidName },
+			],
+			filename: winName,
+			hash: winHash,
+		})
+		expect((await SELF.fetch(`${ORIGIN}/rooms/9901/subrooms/99011/unityasset`)).status).toBe(404)
+		expect(
+			(
+				await SELF.fetch(
+					`${ORIGIN}/rooms/9901/subrooms/99011/unityasset?unityAssetId=00000000-0000-4000-8000-000000000000`
+				)
+			).status
+		).toBe(404)
+		expect(
+			(await SELF.fetch(`${ORIGIN}/rooms/9902/subrooms/99021/unityasset?unityAssetId=${ASSET}`))
+				.status
+		).toBe(404)
+
+		const detail = await SELF.fetch(
+			`${ORIGIN}/rooms/9901/subrooms/99011/saves/${current.SubRoomDataSaveId}`,
+			{ headers: await bearer('1') }
+		)
+		expect(detail.status).toBe(200)
+		// The detail lifts the Windows bundle to the top level when no target is named, and
+		// names every bundle the client's way — `UnityAsset`/`UnityAssetHash`, not the stored
+		// `Filename`/`Hash`.
+		expect(await detail.json()).toMatchObject({
+			UnityAsset: winName,
+			UnityAssetHash: winHash,
+			UnitySubAssets: [
+				{ UnityAssetId: ASSET, UnityAsset: winName, UnityAssetHash: winHash },
+				{ UnityAssetId: ASSET, UnityAsset: androidName, UnityAssetHash: androidHash },
+			],
+		})
+
+		const questDetail = await SELF.fetch(
+			`${ORIGIN}/rooms/9901/subrooms/99011/saves/${current.SubRoomDataSaveId}?unityAssetTarget=2`,
+			{ headers: await bearer('1') }
+		)
+		expect(await questDetail.json()).toMatchObject({
+			UnityAsset: androidName,
+			UnityAssetHash: androidHash,
+			UnitySubAssets: [
+				{ UnityAssetId: ASSET, UnityAsset: androidName, UnityAssetHash: androidHash },
+			],
+		})
+
+		const light = await SELF.fetch(`${ORIGIN}/rooms/9901/subrooms/99011/saves/no_unity_assets`, {
+			headers: await bearer('1'),
+		})
+		const page = (await light.json()) as { Results: Array<Record<string, unknown>> }
+		expect(page.Results[0]).not.toHaveProperty('UnitySubAssets')
+		expect(page.Results[0]).not.toHaveProperty('ReferencedUnityAssets')
+
+		const makerDetailId = maker.SubRooms[0]!.CurrentSave.SubRoomDataSaveId
+		const makerDetail = await SELF.fetch(
+			`${ORIGIN}/rooms/9902/subrooms/99021/saves/${makerDetailId}`,
+			{ headers: await bearer('1') }
+		)
+		expect(await makerDetail.json()).toMatchObject({
+			UnityAsset: null,
+			UnityAssetHash: null,
+			UnitySubAssets: [],
+		})
 	})
 })
 

@@ -21,6 +21,10 @@ import { bindPlaceholders, chunkForBinds, MAX_BOUND_PARAMS } from './d1-binds'
 import { Accessibility, Role } from './enums'
 import { countPlayersByRoom } from './presence-db'
 import { JULY_2025_ROOM_IMPORT_VERSIONS } from './room-import-versions'
+import { resyncInstanceCapacity } from './room-instance-db'
+import { bakedUnityAssets, listUnityAssetBuilds } from './unity-assets-db'
+
+import type { UnityAssetBuild } from './unity-assets-db'
 
 /** Schema DDL (mirror of the head migration schema, sans the seed INSERT). */
 export const ROOM_SCHEMA_DDL: string[] = [
@@ -303,6 +307,31 @@ export async function canManageRoomById(
 	)
 	if (!room) return null
 	return canManageRoom(room, accountId)
+}
+
+/**
+ * Account ids that co-own a room: its creator, and every `Roles` entry at Creator or
+ * CoOwner. Null when the room does not exist. A pending invite is not a co-owner yet
+ * (`Role` stays None until they accept), and Host / Moderator are not in this set —
+ * the same ownership set as {@link canManageRoom}. Ordered by account id.
+ *
+ * Reads the blob only, like {@link canManageRoomById}.
+ */
+export async function getRoomCoOwnerIds(db: D1Database, roomId: number): Promise<number[] | null> {
+	const room = parseOne(
+		await db
+			.prepare(`SELECT ${ROOM_COLUMNS} FROM room WHERE room_id = ?1`)
+			.bind(roomId)
+			.first<RoomRow>()
+	)
+	if (!room) return null
+	const ids = new Set<number>()
+	const creator = Number(room.CreatorAccountId)
+	if (Number.isSafeInteger(creator) && creator > 0) ids.add(creator)
+	for (const role of roomRoles(room)) {
+		if (role.AccountId > 0 && MANAGE_ROLES.has(role.Role)) ids.add(role.AccountId)
+	}
+	return [...ids].sort((a, b) => a - b)
 }
 
 /**
@@ -987,6 +1016,45 @@ export async function setRoomDescription(
 		.run()
 }
 
+/** A room's progression settings, as `GET /rooms/:id/experience` serves them. */
+export interface RoomProgression {
+	Enabled: boolean
+	DailyLimit: number
+}
+
+/**
+ * Read a room's progression settings off its blob: `progressionEnabled` and
+ * `progressionDailyLimit`. A room that has never had them set reads as off with a 0 cap.
+ */
+export function roomProgression(room: Room): RoomProgression {
+	const limit = room.progressionDailyLimit
+	return {
+		Enabled: room.progressionEnabled === true,
+		DailyLimit: typeof limit === 'number' && Number.isFinite(limit) ? limit : 0,
+	}
+}
+
+/**
+ * Set a room's progression settings in place (the caller checks ownership first). These
+ * are `progressionEnabled` / `progressionDailyLimit` on the blob; the per-player XP is in
+ * `room_xp` (see room-xp-db.ts).
+ */
+export async function setRoomProgression(
+	db: D1Database,
+	roomId: number,
+	enabled: boolean,
+	dailyLimit: number
+): Promise<void> {
+	await db
+		.prepare(
+			`UPDATE room
+			 SET data = json_set(data, '$.progressionEnabled', json(?2), '$.progressionDailyLimit', ?3)
+			 WHERE room_id = ?1`
+		)
+		.bind(roomId, enabled ? 'true' : 'false', dailyLimit)
+		.run()
+}
+
 /** Set a room's Name in place (the caller checks ownership + name uniqueness first). */
 export async function setRoomName(db: D1Database, roomId: number, name: string): Promise<void> {
 	await db
@@ -1005,6 +1073,47 @@ export async function setRoomImage(
 		.prepare("UPDATE room SET data = json_set(data, '$.ImageName', ?2) WHERE room_id = ?1")
 		.bind(roomId, imageName)
 		.run()
+}
+
+/**
+ * Stamp `BecameRRStudioRoomAt` the first time a Rec Room Studio build is stored for
+ * this room. A room that already carries a timestamp keeps it: a later local build
+ * is another cloud build, not a new moment of becoming a Studio room. A missing key
+ * and a JSON null both count as unset (`json_type` is not `text`).
+ */
+export async function markRoomAsRecRoomStudio(
+	db: D1Database,
+	roomId: number,
+	at: string
+): Promise<void> {
+	await db
+		.prepare(
+			`UPDATE room SET data = json_set(data, '$.BecameRRStudioRoomAt', ?2)
+			 WHERE room_id = ?1 AND json_type(data, '$.BecameRRStudioRoomAt') IS NOT 'text'`
+		)
+		.bind(roomId, at)
+		.run()
+}
+
+/**
+ * Point one existing subroom save at a baked Unity asset, in place. Local Studio
+ * builds attach to the save the room is already published from; they do not append
+ * a new save row. Returns false when that save id is not this subroom's.
+ */
+export async function setSubRoomSaveUnityAssetId(
+	db: D1Database,
+	subRoomId: number,
+	saveId: number,
+	unityAssetId: string
+): Promise<boolean> {
+	const result = await db
+		.prepare(
+			`UPDATE subroom_save SET data = json_set(data, '$.UnityAssetId', ?3)
+			 WHERE sub_room_data_save_id = ?1 AND sub_room_id = ?2`
+		)
+		.bind(saveId, subRoomId, unityAssetId)
+		.run()
+	return (result.meta.changes ?? 0) > 0
 }
 
 /**
@@ -1590,10 +1699,12 @@ interface BuildSaveInput {
 
 /**
  * Build a `SubRoomDataSave` in the shape the client parses — the reference's `MapSave`
- * projection. The four array fields are always empty (we neither resolve nor record
- * referenced Unity assets) but must be PRESENT, and `UnityAssetId` is emitted only when
- * the save actually carried one, exactly as the reference does. There is deliberately no
- * `DataBlobHash`: it is commented out of the reference DTO and absent from its output.
+ * projection. The array fields start empty and must be PRESENT. `UnitySubAssets` is
+ * filled in on read when this save's `UnityAssetId` has stored Studio bundles (see
+ * {@link attachStudioUnityAssets}); referenced assets stay empty. `UnityAssetId` is
+ * emitted only when the save actually carried one, exactly as the reference does.
+ * There is deliberately no `DataBlobHash` of our own: the caller stores the hash the
+ * client sent, and a save that carried none keeps it null.
  *
  * `SavedOnPlatform`/`SavedOnDeviceClass` are 0 — the reference fills them from the saving
  * player's live platform/device, which the save request doesn't carry and we don't track.
@@ -1949,12 +2060,15 @@ export async function appendSubRoomSaveIfLatest(
 		CreatedAt: createdAt,
 	}
 	const result = await db.batch([
-		db.prepare(`INSERT INTO subroom_save (sub_room_id, data)
+		db
+			.prepare(
+				`INSERT INTO subroom_save (sub_room_id, data)
 		 SELECT ?1, ?2 FROM subroom s WHERE s.sub_room_id = ?1 AND s.room_id = ?3
 		 AND s.current_save_id IS ?4 AND s.staged_save_id IS ?5
 		 AND (SELECT MAX(sub_room_data_save_id) FROM subroom_save WHERE sub_room_id = ?1) = ?6
 		 ${expected.runId ? "AND EXISTS (SELECT 1 FROM cv2_agent_run WHERE run_id=?7 AND state='running' AND deadline_at>?8)" : ''}
-		 RETURNING sub_room_data_save_id`)
+		 RETURNING sub_room_data_save_id`
+			)
 			.bind(
 				subRoomId,
 				serializeSubRoomSave(save),
@@ -1964,19 +2078,27 @@ export async function appendSubRoomSaveIfLatest(
 				expected.latest,
 				...(expected.runId ? [expected.runId, createdAt] : [])
 			),
-		db.prepare(`UPDATE subroom SET
+		db
+			.prepare(
+				`UPDATE subroom SET
 		 ${input.publish ? 'current_save_id' : 'staged_save_id'} =
 		 (SELECT sub_room_data_save_id FROM subroom_save WHERE sub_room_id = ?1 AND json_extract(data, '$.DataBlob') = ?2),
 		 ${input.publish ? 'staged_save_id = NULL,' : ''}
 		 data = json_set(data, '$.DataSavedAt', ?3)
 		 WHERE sub_room_id = ?1 AND EXISTS
-		 (SELECT 1 FROM subroom_save WHERE sub_room_id = ?1 AND json_extract(data, '$.DataBlob') = ?2)`)
+		 (SELECT 1 FROM subroom_save WHERE sub_room_id = ?1 AND json_extract(data, '$.DataBlob') = ?2)`
+			)
 			.bind(subRoomId, input.dataBlob, createdAt),
 		...(expected.runId
-			? [db.prepare(`UPDATE cv2_agent_run SET state='done',error=NULL,updated_at=?3,
+			? [
+					db
+						.prepare(
+							`UPDATE cv2_agent_run SET state='done',error=NULL,updated_at=?3,
 		 final_save_id=(SELECT sub_room_data_save_id FROM subroom_save WHERE sub_room_id=?2 AND json_extract(data, '$.DataBlob')=?4)
-		 WHERE run_id=?1 AND EXISTS (SELECT 1 FROM subroom_save WHERE sub_room_id=?2 AND json_extract(data, '$.DataBlob')=?4)`)
-				.bind(expected.runId, subRoomId, createdAt, input.dataBlob)]
+		 WHERE run_id=?1 AND EXISTS (SELECT 1 FROM subroom_save WHERE sub_room_id=?2 AND json_extract(data, '$.DataBlob')=?4)`
+						)
+						.bind(expected.runId, subRoomId, createdAt, input.dataBlob),
+				]
 			: []),
 	])
 	const row = result[0]?.results?.[0] as { sub_room_data_save_id: number } | undefined
@@ -2038,6 +2160,10 @@ export interface ModifySubRoomInput {
  * (the fields the client's subroom `modify` form carries). Only the supplied fields
  * are changed; the subroom row is updated in the `subroom` table. Returns the updated
  * (hydrated) room, or null when the room or subroom doesn't exist.
+ *
+ * A changed `MaxPlayers` is pushed onto the subroom's LIVE instances too (see
+ * {@link resyncInstanceCapacity}): each instance carries a copy of the cap it enforces,
+ * and this is the write that makes that copy stale.
  */
 export async function modifySubRoom(
 	db: D1Database,
@@ -2050,8 +2176,10 @@ export async function modifySubRoom(
 
 	if (input.name !== undefined) sub.Name = input.name
 	if (input.accessibility !== undefined) sub.Accessibility = input.accessibility
+	const capacityChanged = input.maxPlayers !== undefined && input.maxPlayers !== sub.MaxPlayers
 	if (input.maxPlayers !== undefined) sub.MaxPlayers = input.maxPlayers
 	await updateSubRoom(db, sub)
+	if (capacityChanged) await resyncInstanceCapacity(db, roomId, subRoomId, input.maxPlayers!)
 
 	return getRoomById(db, roomId)
 }
@@ -2440,6 +2568,47 @@ async function attachCurrentSaves(
 		const id = rows[i]!.current_save_id
 		sub.CurrentSave = id == null ? null : (byId.get(id) ?? null)
 	})
+	const saves = subs
+		.map((sub) => sub.CurrentSave)
+		.filter((save): save is SubRoomDataSave => typeof save === 'object' && save !== null)
+	await attachStudioUnityAssets(db, saves)
+}
+
+/**
+ * Fill `UnitySubAssets` on saves that point at a stored Studio build (rows of
+ * `unity_asset`). Maker-pen saves have no `UnityAssetId` and are left untouched,
+ * including their empty arrays; so is a save whose asset has no stored build —
+ * the scene blob still loads, and the bundle list stays empty.
+ *
+ * Only main bundles are listed. Stripped bundles stay in the bucket.
+ */
+export async function attachStudioUnityAssets(
+	db: D1Database,
+	saves: SubRoomDataSave[]
+): Promise<void> {
+	const ids = [
+		...new Set(
+			saves
+				.map((save) => save.UnityAssetId)
+				.filter((id): id is string => typeof id === 'string' && id !== '')
+		),
+	]
+	if (ids.length === 0) return
+	const builds = await listUnityAssetBuilds(db, ids)
+	// Rows come back with the id lowercased; a save may spell its GUID either way.
+	const byAsset = new Map<string, UnityAssetBuild[]>()
+	for (const build of builds) {
+		const list = byAsset.get(build.UnityAssetId) ?? []
+		list.push(build)
+		byAsset.set(build.UnityAssetId, list)
+	}
+	for (const save of saves) {
+		const id = save.UnityAssetId
+		if (typeof id !== 'string') continue
+		const baked = bakedUnityAssets(byAsset.get(id.toLowerCase()) ?? [])
+		if (baked.length === 0) continue
+		save.UnitySubAssets = baked
+	}
 }
 
 // ---- Room tags ------------------------------------------------------------
@@ -2905,7 +3074,9 @@ export async function getSubRoomSaves(
 		)
 		.bind(subRoomId)
 		.all<SubRoomSaveRow>()
-	return results.map(parseSubRoomSaveRow)
+	const saves = results.map(parseSubRoomSaveRow)
+	await attachStudioUnityAssets(db, saves)
+	return saves
 }
 
 /**
@@ -2924,7 +3095,10 @@ export async function getSubRoomSaveById(
 		)
 		.bind(saveId, subRoomId)
 		.first<SubRoomSaveRow>()
-	return row ? parseSubRoomSaveRow(row) : null
+	if (!row) return null
+	const save = parseSubRoomSaveRow(row)
+	await attachStudioUnityAssets(db, [save])
+	return save
 }
 
 // ---- Subroom permissions --------------------------------------------------
@@ -2941,7 +3115,9 @@ export async function getSubRoomSaveById(
  * this permission overridden in this subroom?") plus a True/False picker for the value.
  * Unchecking it means "fall back to the default", so an entry arriving with
  * `Override: false` DELETES the stored row rather than storing anything. Every stored
- * entry is therefore an override, and reads always serve `Override: true`.
+ * entry is therefore an override and reads back `Override: true` at its own role; the
+ * `false` rows in a manager's token table are defaults the `rooms` worker fills in around
+ * them, never stored.
  */
 export interface RoomPermission {
 	Permission: string

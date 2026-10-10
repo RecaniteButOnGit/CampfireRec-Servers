@@ -4,8 +4,9 @@
  * An operator maps Discord ROLE ids to a token amount — `DISCORD_ROLE_TOKENS`,
  * `<roleId>=<tokens>,<roleId>=<tokens>` — and every time the cron fires, every account
  * holding one of those roles is handed that many RecCenterTokens in a gift box. ONE box per
- * account per run: an account holding several mapped roles is paid the HIGHEST amount among
- * them, not the sum, so the map reads as tiers however Discord stacks the roles.
+ * account per run: an account holding several mapped roles — across every Discord link it
+ * has — is paid the HIGHEST amount among them, not the sum, so the map reads as tiers
+ * however Discord stacks the roles.
  *
  * HOW OFTEN is the cron schedule's business, not this module's: `triggers.crons` in
  * wrangler.jsonc says weekly, and an operator who wants a daily gift changes that line. There
@@ -42,13 +43,21 @@ import { PlatformType } from '@repo/domain/src/enums'
 
 import { getLinksForPlatform } from '../../auth/src/platform-db'
 import { NotificationType } from '../../notify/src/notification-types'
-import { ALL_PLATFORMS, creditCurrency, CurrencyType, ensureStartingBalances } from './balance-db'
+import {
+	ALL_PLATFORMS,
+	creditCurrency,
+	CurrencyType,
+	ensureStartingBalances,
+	payTokenGifts,
+	TOKEN_GIFT_CHUNK,
+} from './balance-db'
 
 import type { GiftContent } from '@repo/domain'
 import type {
 	BalanceResponsePayload,
 	GiftPackagePayload,
 } from '../../notify/src/notification-payloads'
+import type { PlayerNotification } from '../../notify/src/notifications-hub'
 import type { Env } from './context'
 
 /** The system "Coach" account — who a box the server hands over is from. */
@@ -178,19 +187,24 @@ export interface RoleGiftSummary {
 	granted: number
 	/** Tokens handed out this run, across every box. */
 	tokens: number
-	/** Grants that failed partway — logged with the account and role to sort out by hand. */
+	/** Accounts whose grant failed — logged with the account and role to sort out by hand. */
 	failed: number
 }
 
 /**
- * One run of the gift: every Discord link holding a mapped role is paid its best role's
- * tokens. Sequential: each grant is a handful of D1 writes and two hub calls, and a cron
- * invocation has a fixed subrequest budget (50 free, 1000 paid) — a community whose
- * supporters outgrow that is the point to batch it, not before.
+ * One run of the gift: every account whose Discord links hold a mapped role is paid its
+ * best role's tokens. Batched, as the staff drops are: `payTokenGifts` banks the boxes a
+ * few dozen accounts a round, and the frames go out in ONE hub call — grant by grant this
+ * was five D1 round trips and two hub calls an account, in series, against a cron
+ * invocation's fixed subrequest budget (50 free, 1,000 paid).
  *
- * `startingTokens` is the signup grant to seed before the credit — `creditCurrency` upserts
- * the balance row, so a never-touched balance would otherwise start from this gift instead
- * of the grant plus this gift.
+ * A round that throws fails every account in it: they are logged, with their roles, and
+ * counted in `failed` rather than retried — a retry that ALSO failed partway is how a
+ * balance gets credited twice — and the later rounds still run.
+ *
+ * `startingTokens` is the signup grant to seed before the credit — the credit upserts the
+ * balance row, so a never-touched balance would otherwise start from this gift instead of
+ * the grant plus this gift.
  */
 export async function grantDiscordRoleGifts(
 	env: Env,
@@ -215,19 +229,53 @@ export async function grantDiscordRoleGifts(
 	const links = await getLinksForPlatform(env.DB, PlatformType.Discord)
 	summary.links = links.length
 
+	// One box per ACCOUNT: an account with two Discord links is paid the best role across
+	// both, once. Kept in link order (oldest first) so the frames go out in a stable order.
+	const best = new Map<number, RoleTokens>()
 	for (const link of links) {
 		const role = bestRoleGift(link.roles, roles)
 		if (role === null) continue
+		const held = best.get(link.accountId)
+		if (held === undefined || role.tokens > held.tokens) best.set(link.accountId, role)
+	}
+
+	const frames: PlayerNotification[] = []
+	const due = [...best]
+	for (let i = 0; i < due.length; i += TOKEN_GIFT_CHUNK) {
+		const round = due.slice(i, i + TOKEN_GIFT_CHUNK)
 		try {
-			await grantOne(env, link.accountId, role, startingTokens)
-			summary.granted++
-			summary.tokens += role.tokens
+			const { paid } = await payTokenGifts(
+				env.DB,
+				round.map(([accountId, role]) => ({
+					accountId,
+					amount: role.tokens,
+					content: roleGiftContent(role.tokens),
+				})),
+				startingTokens
+			)
+			for (const p of paid) {
+				summary.granted++
+				summary.tokens += p.amount
+				frames.push(...giftFrames(p.accountId, p.balance, p.giftId, p.content))
+			}
 		} catch (err) {
-			// Logged with everything needed to check what did land rather than retried: a
-			// retry that ALSO failed partway is how a balance gets credited twice.
-			summary.failed++
+			summary.failed += round.length
 			console.error(
-				`discord role gift: account ${link.accountId}'s grant for role ${role.roleId} (${role.tokens} tokens) failed: ${err instanceof Error ? err.message : String(err)}`
+				`discord role gift: a round of ${round.length} grant(s) failed (${round
+					.map(
+						([accountId, role]) => `account ${accountId} role ${role.roleId} ${role.tokens} tokens`
+					)
+					.join('; ')}): ${err instanceof Error ? err.message : String(err)}`
+			)
+		}
+	}
+
+	if (frames.length > 0) {
+		try {
+			await env.RECFLARE_NOTIFICATIONS_HUB.getByName(HUB_INSTANCE).notifyPlayers(frames)
+		} catch (err) {
+			console.error(
+				`discord role gift: could not notify ${summary.granted} account(s) of their box: ${err instanceof Error ? err.message : String(err)}`
 			)
 		}
 	}
@@ -283,36 +331,59 @@ async function grantOne(
 	const content = roleGiftContent(role.tokens)
 	const gift = await createGift(env.DB, accountId, content)
 
-	const hub = env.RECFLARE_NOTIFICATIONS_HUB.getByName(HUB_INSTANCE)
 	try {
-		// The balance first, so the box's announcement lands on a total that includes it.
-		// `Balance` is the RESULTING total, into the one -2 bucket: the frame SETS it.
-		await hub.notifyPlayer(accountId, NotificationType.StorefrontBalanceUpdate, {
-			Balance: balance,
-			CurrencyType: CurrencyType.RecCenterTokens,
-			Platform: ALL_PLATFORMS,
-		} satisfies BalanceResponsePayload)
-		await hub.notifyPlayer(accountId, NotificationType.GiftPackageReceivedImmediate, {
-			Id: gift.id,
-			FromPlayerId: COACH_ACCOUNT_ID,
-			ConsumableItemDesc: content.ConsumableItemDesc,
-			AvatarItemType: content.AvatarItemType,
-			AvatarItemDesc: content.AvatarItemDesc,
-			EquipmentPrefabName: content.EquipmentPrefabName,
-			EquipmentModificationGuid: content.EquipmentModificationGuid,
-			CurrencyType: content.CurrencyType,
-			Currency: content.Currency,
-			Xp: content.Xp,
-			GiftContext: content.GiftContext ?? 0,
-			GiftRarity: content.GiftRarity,
-			Message: content.Message,
-			Platform: -1,
-			PlatformsToSpawnOn: -1,
-			BalanceType: ALL_PLATFORMS,
-		} satisfies GiftPackagePayload)
+		await env.RECFLARE_NOTIFICATIONS_HUB.getByName(HUB_INSTANCE).notifyPlayers(
+			giftFrames(accountId, balance, gift.id, content)
+		)
 	} catch (err) {
 		console.error(
 			`discord role gift: could not notify account ${accountId} of box ${gift.id}: ${err instanceof Error ? err.message : String(err)}`
 		)
 	}
+}
+
+/**
+ * The two frames announcing a stored box, in order: the balance first — the RESULTING
+ * total, into the one -2 bucket; the frame SETS it — so the box's announcement lands on a
+ * total that already includes it.
+ */
+function giftFrames(
+	accountId: number,
+	balance: number,
+	giftId: number,
+	content: GiftContent
+): PlayerNotification[] {
+	return [
+		{
+			playerId: accountId,
+			notificationType: NotificationType.StorefrontBalanceUpdate,
+			data: {
+				Balance: balance,
+				CurrencyType: CurrencyType.RecCenterTokens,
+				Platform: ALL_PLATFORMS,
+			} satisfies BalanceResponsePayload,
+		},
+		{
+			playerId: accountId,
+			notificationType: NotificationType.GiftPackageReceivedImmediate,
+			data: {
+				Id: giftId,
+				FromPlayerId: COACH_ACCOUNT_ID,
+				ConsumableItemDesc: content.ConsumableItemDesc,
+				AvatarItemType: content.AvatarItemType,
+				AvatarItemDesc: content.AvatarItemDesc,
+				EquipmentPrefabName: content.EquipmentPrefabName,
+				EquipmentModificationGuid: content.EquipmentModificationGuid,
+				CurrencyType: content.CurrencyType,
+				Currency: content.Currency,
+				Xp: content.Xp,
+				GiftContext: content.GiftContext ?? 0,
+				GiftRarity: content.GiftRarity,
+				Message: content.Message,
+				Platform: -1,
+				PlatformsToSpawnOn: -1,
+				BalanceType: ALL_PLATFORMS,
+			} satisfies GiftPackagePayload,
+		},
+	]
 }

@@ -9,6 +9,7 @@ import { exports } from 'cloudflare:workers'
 import { beforeAll, describe, expect, test } from 'vitest'
 
 import {
+	getAccount,
 	getOwnedInventionIds,
 	getPendingGifts,
 	getProgression,
@@ -18,6 +19,7 @@ import {
 	PROGRESSION_SCHEMA_DDL,
 	RECEIVED_GIFT_SCHEMA_DDL,
 	ROOM_SCHEMA_DDL,
+	updateAccount,
 } from '@repo/domain'
 import { PlatformType } from '@repo/domain/src/enums'
 
@@ -116,6 +118,7 @@ import {
 	ROOM_CURRENCY_SCHEMA_DDL,
 } from '../../room-currency-db'
 import { createRoomKey, ROOM_KEY_SCHEMA_DDL } from '../../room-key-db'
+import { WISHLIST_SCHEMA_DDL } from '../../wishlist-db'
 
 import type { CatalogLoadRow, CatalogRow, CatalogValue, StoreListing } from '../../catalog-db'
 import type { Env } from '../../context'
@@ -223,6 +226,7 @@ beforeAll(async () => {
 	for (const stmt of ROOM_CONSUMABLE_SCHEMA_DDL) await env.DB.prepare(stmt).run()
 	for (const stmt of ROOM_INVENTORY_SCHEMA_DDL) await env.DB.prepare(stmt).run()
 	for (const stmt of ROOM_KEY_SCHEMA_DDL) await env.DB.prepare(stmt).run()
+	for (const stmt of WISHLIST_SCHEMA_DDL) await env.DB.prepare(stmt).run()
 	// The platform link table (owned by `auth`) — the Discord supporter gift reads the roles
 	// `www` records on each Discord link.
 	for (const stmt of PLATFORM_SCHEMA_DDL) await env.DB.prepare(stmt).run()
@@ -827,6 +831,206 @@ describe('econ endpoints', () => {
 			headers: await bearer(),
 		})
 		expect(mine.status).toBe(200)
+	})
+
+	describe('item wishlist', () => {
+		const WISHLIST = `${ORIGIN}/api/itemWishlists/v1`
+		const GUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/
+		// The form body exactly as the client posts it: both fields, the unused one empty.
+		const post = async (path: string, sub: string, body: string) =>
+			exports.default.fetch(`${WISHLIST}${path}`, {
+				method: 'POST',
+				headers: { ...(await bearer(sub)), 'Content-Type': 'application/x-www-form-urlencoded' },
+				body,
+			})
+		const list = async (who: string, sub: string) =>
+			(
+				await exports.default.fetch(`${WISHLIST}/wishlist/${who}`, { headers: await bearer(sub) })
+			).json()
+
+		test('the writes 401 without a token', async () => {
+			for (const path of ['/wishlist/add', '/wishlist/remove', '/isonwishlist/bulk']) {
+				const res = await exports.default.fetch(`${WISHLIST}${path}`, {
+					method: 'POST',
+					headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+					body: 'purchasableItemId=1534&customAvatarItemId=',
+				})
+				expect(res.status, path).toBe(401)
+			}
+		})
+
+		test('add stores an entry, serves it enveloped, and the list reads it back newest first', async () => {
+			const first = await post('/wishlist/add', '601', 'purchasableItemId=1534&customAvatarItemId=')
+			expect(first.status).toBe(200)
+			const env1 = (await first.json()) as {
+				Value: Record<string, unknown>
+				Success: boolean
+				Error: null
+				error_id: null
+			}
+			// The envelope, `Value` first; the entry is the client's five keys in its order, with
+			// a GUID id and a NULL custom id for a storefront item.
+			expect(Object.keys(env1)).toEqual(['Value', 'Success', 'Error', 'error_id'])
+			expect(env1.Success).toBe(true)
+			expect(env1.Error).toBeNull()
+			expect(env1.error_id).toBeNull()
+			expect(Object.keys(env1.Value)).toEqual([
+				'WishlistItemId',
+				'AccountId',
+				'PurchasableItemId',
+				'CustomAvatarItemId',
+				'CreatedAt',
+			])
+			expect(env1.Value.WishlistItemId).toMatch(GUID_RE)
+			expect(env1.Value.AccountId).toBe(601)
+			expect(env1.Value.PurchasableItemId).toBe(1534)
+			expect(env1.Value.CustomAvatarItemId).toBeNull()
+			expect(typeof env1.Value.CreatedAt).toBe('string')
+
+			// Wait so the second wish sorts after the first by its timestamp.
+			await new Promise((r) => setTimeout(r, 5))
+			// A custom avatar item is the mirror image: `PurchasableItemId` 0 (the client's field
+			// is a plain int), the GUID beside it — lowercased, however the client spelled it.
+			const second = await post(
+				'/wishlist/add',
+				'601',
+				'purchasableItemId=&customAvatarItemId=C3ED9841-1B4A-40A6-B266-5DBCFD7F2865'
+			)
+			const env2 = (await second.json()) as { Value: Record<string, unknown> }
+			expect(env2.Value.PurchasableItemId).toBe(0)
+			expect(env2.Value.CustomAvatarItemId).toBe('c3ed9841-1b4a-40a6-b266-5dbcfd7f2865')
+
+			// Newest first — the order the reference served. The keyless `?True`/`?False` the
+			// client appends is ignored, so both spellings serve the same list.
+			const mine = (await list('me?True', '601')) as Array<Record<string, unknown>>
+			expect(mine.map((e) => e.WishlistItemId)).toEqual([
+				env2.Value.WishlistItemId,
+				env1.Value.WishlistItemId,
+			])
+			expect(await list('me?False', '601')).toEqual(mine)
+			expect(await list('me', '601')).toEqual(mine)
+			// Readable by another signed-in player under the account id.
+			expect(await list('601?False', '602')).toEqual(mine)
+			// And nobody else's list picked it up.
+			expect(await list('me', '602')).toEqual([])
+		})
+
+		test('re-adding an item answers the existing entry rather than a twin', async () => {
+			const first = (await (
+				await post('/wishlist/add', '603', 'purchasableItemId=2137&customAvatarItemId=')
+			).json()) as { Value: { WishlistItemId: string } }
+			const again = (await (
+				await post('/wishlist/add', '603', 'purchasableItemId=2137&customAvatarItemId=')
+			).json()) as { Success: boolean; Value: { WishlistItemId: string } }
+			expect(again.Success).toBe(true)
+			expect(again.Value.WishlistItemId).toBe(first.Value.WishlistItemId)
+			expect(((await list('me', '603')) as unknown[]).length).toBe(1)
+		})
+
+		test('remove answers the removed entry; removing an unlisted item is still a success', async () => {
+			const added = (await (
+				await post('/wishlist/add', '604', 'purchasableItemId=1274&customAvatarItemId=')
+			).json()) as { Value: { WishlistItemId: string } }
+
+			const removed = await post(
+				'/wishlist/remove',
+				'604',
+				'purchasableItemId=1274&customAvatarItemId='
+			)
+			expect(removed.status).toBe(200)
+			expect(await removed.json()).toEqual({
+				Value: expect.objectContaining({
+					WishlistItemId: added.Value.WishlistItemId,
+					AccountId: 604,
+					PurchasableItemId: 1274,
+				}),
+				Success: true,
+				Error: null,
+				error_id: null,
+			})
+			expect(await list('me', '604')).toEqual([])
+
+			// Already gone: the list is as asked, so this is not an error — a null `Value`.
+			const again = await post(
+				'/wishlist/remove',
+				'604',
+				'purchasableItemId=1274&customAvatarItemId='
+			)
+			expect(await again.json()).toEqual({
+				Value: null,
+				Success: true,
+				Error: null,
+				error_id: null,
+			})
+		})
+
+		test('remove only touches the caller’s own list', async () => {
+			await post('/wishlist/add', '605', 'purchasableItemId=1274&customAvatarItemId=')
+			const other = await post(
+				'/wishlist/remove',
+				'606',
+				'purchasableItemId=1274&customAvatarItemId='
+			)
+			expect(((await other.json()) as { Value: unknown }).Value).toBeNull()
+			expect(((await list('me', '605')) as unknown[]).length).toBe(1)
+		})
+
+		test('a body naming no item is a refusal in the envelope, with a readable Error', async () => {
+			for (const body of [
+				'',
+				'purchasableItemId=&customAvatarItemId=',
+				'purchasableItemId=abc',
+				'customAvatarItemId=not-a-guid',
+				'purchasableItemId=0',
+			]) {
+				for (const path of ['/wishlist/add', '/wishlist/remove']) {
+					const res = await post(path, '607', body)
+					expect(res.status, `${path} ${body}`).toBe(200)
+					expect(await res.json(), `${path} ${body}`).toEqual({
+						Value: null,
+						Success: false,
+						Error: 'No item was specified.',
+						error_id: null,
+					})
+				}
+			}
+			expect(await list('me', '607')).toEqual([])
+		})
+
+		test('POST /isonwishlist/bulk answers one boolean per accountId, in order', async () => {
+			await post('/wishlist/add', '608', 'purchasableItemId=3001&customAvatarItemId=')
+			await post('/wishlist/add', '610', 'purchasableItemId=3001&customAvatarItemId=')
+			await post(
+				'/wishlist/add',
+				'609',
+				'purchasableItemId=&customAvatarItemId=8f0c1e4a-2b77-4b16-9a3e-5dbcfd7f2865'
+			)
+
+			// `accountIds` repeated once per id, as the client's list parameter encodes; the
+			// unknown account 611 reads false rather than shortening the array.
+			const res = await post(
+				'/isonwishlist/bulk',
+				'608',
+				'accountIds=608&accountIds=609&accountIds=610&accountIds=611&purchasableItemId=3001&customAvatarItemId='
+			)
+			expect(res.status).toBe(200)
+			expect(await res.json()).toEqual([true, false, true, false])
+
+			// A comma-separated single value, and a custom item, matched case-insensitively.
+			const custom = await post(
+				'/isonwishlist/bulk',
+				'608',
+				'accountIds=609,608&purchasableItemId=&customAvatarItemId=8F0C1E4A-2B77-4B16-9A3E-5DBCFD7F2865'
+			)
+			expect(await custom.json()).toEqual([true, false])
+
+			// No item named: false for everyone, still one per id.
+			const none = await post('/isonwishlist/bulk', '608', 'accountIds=608&accountIds=610')
+			expect(await none.json()).toEqual([false, false])
+			// No ids: an empty array.
+			const empty = await post('/isonwishlist/bulk', '608', 'purchasableItemId=3001')
+			expect(await empty.json()).toEqual([])
+		})
 	})
 
 	test('GET /api/avatar/v3/saved 401s without a token, returns [] with one', async () => {
@@ -1877,6 +2081,123 @@ describe('econ endpoints', () => {
 			])
 		})
 
+		test('POST deletePurchaseOffer takes one offer out of its shop, gated to the room', async () => {
+			type Offer = {
+				CurrencyPurchaseOfferId: string
+				CurrencyId: string
+				Order: number
+				Name: string
+				CurrencyAmount: number
+				Price: number
+				ModifiedAt: string
+			}
+			type Envelope = {
+				Value: Offer | null
+				Success: boolean
+				Error: string | null
+				error_id: null
+			}
+			const post = async (path: string, fields: Record<string, string>, sub: string | null) =>
+				exports.default.fetch(`${ORIGIN}${path}`, {
+					method: 'POST',
+					headers: {
+						'Content-Type': 'application/x-www-form-urlencoded',
+						...(sub === null ? {} : await bearer(sub)),
+					},
+					body: new URLSearchParams(fields),
+				})
+			const addOffer = async (currencyId: string, name: string, order: number) =>
+				(
+					(await (
+						await post(
+							'/api/roomcurrencies/v1/createPurchaseOffer',
+							{
+								CurrencyId: currencyId,
+								Name: name,
+								Amount: '5',
+								Price: '50',
+								Order: String(order),
+							},
+							'1'
+						)
+					).json()) as Envelope
+				).Value!
+			const remove = (offerId: string, sub: string | null) =>
+				post('/api/roomcurrencies/v1/deletePurchaseOffer', { PurchaseOfferId: offerId }, sub)
+			const shopOf = async (currencyId: string) =>
+				(
+					(await (
+						await exports.default.fetch(
+							`${ORIGIN}/api/roomcurrencies/v1/getPurchaseOffersBatch?ids=${currencyId}`
+						)
+					).json()) as Array<{ PurchaseOffers: Offer[] }>
+				)[0].PurchaseOffers.map((o) => o.Name)
+			const refused = {
+				Value: null,
+				Success: false,
+				Error: 'Failed to delete purchase offer',
+				error_id: null,
+			}
+
+			// Two shops in room 2511, so the delete has to find the right one from the id alone.
+			const shopped = (await envOf(await create({ ...body, Name: 'Shopped' }, await bearer('1'))))
+				.Value!
+			const other = (await envOf(await create({ ...body, Name: 'Other' }, await bearer('1'))))
+				.Value!
+			const first = await addOffer(shopped.CurrencyId, 'First', 0)
+			const second = await addOffer(shopped.CurrencyId, 'Second', 1)
+			const third = await addOffer(shopped.CurrencyId, 'Third', 2)
+			const elsewhere = await addOffer(other.CurrencyId, 'Elsewhere', 0)
+
+			// No token → 401; a valid token with no standing in the room → 403, and the offer
+			// stays. An id no shop lists, or none at all, is a refusal in the envelope.
+			expect((await remove(second.CurrencyPurchaseOfferId, null)).status).toBe(401)
+			expect((await remove(second.CurrencyPurchaseOfferId, '999')).status).toBe(403)
+			expect(await shopOf(shopped.CurrencyId)).toEqual(['First', 'Second', 'Third'])
+			for (const id of [crypto.randomUUID(), '']) {
+				const res = await remove(id, '1')
+				expect(res.status).toBe(200)
+				expect(await res.json()).toEqual(refused)
+			}
+
+			// The co-owner removes the middle one: the answer is the offer as it stood, the
+			// shop keeps its neighbours in order, and the other currency's shop is untouched.
+			const res = await remove(second.CurrencyPurchaseOfferId, '2')
+			expect(res.status).toBe(200)
+			expect(await res.json()).toEqual({
+				Value: second,
+				Success: true,
+				Error: null,
+				error_id: null,
+			})
+			expect(await shopOf(shopped.CurrencyId)).toEqual(['First', 'Third'])
+			expect(await shopOf(other.CurrencyId)).toEqual(['Elsewhere'])
+			// What is left is still what the create wrote, not a re-encoding of it.
+			expect(
+				(await (
+					await exports.default.fetch(
+						`${ORIGIN}/api/roomcurrencies/v1/getPurchaseOffersBatch?ids=${shopped.CurrencyId}`
+					)
+				).json()) as Array<{ PurchaseOffers: Offer[] }>
+			).toEqual([{ CurrencyId: shopped.CurrencyId, PurchaseOffers: [first, third] }])
+
+			// Gone means gone: a second delete is the unknown-id refusal. The id matches in any
+			// letter case, like the purchase's lookup.
+			expect(await (await remove(second.CurrencyPurchaseOfferId, '1')).json()).toEqual(refused)
+			expect(
+				(
+					(await (
+						await remove(third.CurrencyPurchaseOfferId.toUpperCase(), '1')
+					).json()) as Envelope
+				).Value?.Name
+			).toBe('Third')
+			// Emptying a shop leaves it an empty shop, still listed.
+			await remove(first.CurrencyPurchaseOfferId, '1')
+			expect(await shopOf(shopped.CurrencyId)).toEqual([])
+			expect(await shopOf(other.CurrencyId)).toEqual(['Elsewhere'])
+			expect(elsewhere.Name).toBe('Elsewhere')
+		})
+
 		test('POST createCurrency pushes RoomCurrencyCreated to the room and the creator', async () => {
 			// Two players standing in 2511, one somewhere else, and one whose presence lapsed.
 			const now = Math.floor(Date.now() / 1000)
@@ -2098,6 +2419,24 @@ describe('econ endpoints', () => {
 			expect(own.Value.CurrencyBalanceResponse.Balance).toBe(444)
 			expect(own.Value.TokenBalanceResponse.Balance).toBe(1555)
 			expect([await tokens(1), await tokens(7402)]).toEqual([1555, 100])
+			expect(await drainFrames()).toEqual([])
+
+			// A co-owner (account 2 on room 2511) takes from the shop for free too. The client
+			// shows them the offer at no cost and posts `RequestedPrice=0` — which a stranger
+			// is refused for above — so their price is not checked: 0 and the real one both go
+			// through, nobody is charged, the owner is not paid, and no frame is sent.
+			await setTokens(2, 50)
+			const coOwner = (await (await purchase('2', offerId, 444, 0)).json()) as typeof gratis
+			expect(coOwner.Value.CurrencyBalanceResponse.Balance).toBe(444)
+			expect(coOwner.Value.TokenBalanceResponse.Balance).toBe(50)
+			const coOwnerAgain = (await (await purchase('2', offerId, 444, 555)).json()) as typeof gratis
+			expect(coOwnerAgain.Value.CurrencyBalanceResponse.Balance).toBe(888)
+			expect(coOwnerAgain.Value.TokenBalanceResponse.Balance).toBe(50)
+			// The amount still has to be the offer's, manager or not.
+			expect(await (await purchase('2', offerId, 1, 0)).json()).toEqual(
+				refused('Requested amount does not match')
+			)
+			expect([await tokens(1), await tokens(2)]).toEqual([1555, 50])
 			expect(await drainFrames()).toEqual([])
 
 			await env.DB.prepare('DELETE FROM room_balance WHERE currency_id IN (?1, ?2)')
@@ -3374,6 +3713,30 @@ describe('econ endpoints', () => {
 		})
 		expect(res.status).toBe(200)
 		expect(await res.json()).toEqual([])
+	})
+
+	test('POST /api/consumables/v1/updateActive is a stub: auth-gated, stores nothing, answers nothing', async () => {
+		const before = await env.DB.prepare('SELECT * FROM consumable ORDER BY id').all()
+		const body = { Id: 7550, IsActive: true, ActivatedByRoomie: false }
+
+		const anon = await exports.default.fetch(`${ORIGIN}/api/consumables/v1/updateActive`, {
+			method: 'POST',
+			headers: { 'Content-Type': 'application/json' },
+			body: JSON.stringify(body),
+		})
+		expect(anon.status).toBe(401)
+
+		const res = await exports.default.fetch(`${ORIGIN}/api/consumables/v1/updateActive`, {
+			method: 'POST',
+			headers: { ...(await bearer('314')), 'Content-Type': 'application/json' },
+			body: JSON.stringify(body),
+		})
+		expect(res.status).toBe(200)
+		// No body at all: the client ignores the response entirely.
+		expect(await res.text()).toBe('')
+		// Nothing is stored yet.
+		const after = await env.DB.prepare('SELECT * FROM consumable ORDER BY id').all()
+		expect(after.results).toEqual(before.results)
 	})
 
 	test('POST /api/consumables/v1/consume reduces the count and deletes the row at zero', async () => {
@@ -6533,15 +6896,48 @@ describe('econ endpoints', () => {
 		expect(await res.text()).toBe('')
 	})
 
-	test('GET /api/influencerpartnerprogram/influencers lists nobody', async () => {
+	test('GET /api/influencerpartnerprogram/influencers lists every isInfluencer account', async () => {
+		const seed = async (accountId: number, isInfluencer: boolean | undefined) => {
+			await env.DB.prepare('INSERT OR IGNORE INTO account (data) VALUES (?1)')
+				.bind(
+					JSON.stringify({
+						accountId,
+						username: `Influencer${accountId}`,
+						...(isInfluencer === undefined ? {} : { isInfluencer }),
+					})
+				)
+				.run()
+		}
+		await seed(8103, true)
+		await seed(8101, true)
+		await seed(8102, false) // explicitly not one
+		await seed(8104, undefined) // flag never set
+
 		const res = await exports.default.fetch(
 			`${ORIGIN}/api/influencerpartnerprogram/influencers?take=1000`,
 			{ headers: await bearer('207') }
 		)
 		expect(res.status).toBe(200)
 		// An object around the list, not a bare array — unlike its single-account siblings
-		// below, whose whole body is a bare tier number.
-		expect(await res.json()).toEqual({ InfluencerIds: [] })
+		// below, whose whole body is a bare tier number. Lowest id first; the whole list is
+		// one page, so the continuation token is null rather than absent.
+		expect(await res.json()).toEqual({ InfluencerIds: [8101, 8103], ContinuationToken: null })
+
+		// The list is read through the `is_influencer` generated column's partial index
+		// (auth migration 0012), so the mirrored schema has to carry it — and the planner
+		// has to pick it over a scan of the account table.
+		const plan = await env.DB.prepare(
+			'EXPLAIN QUERY PLAN SELECT account_id FROM account WHERE is_influencer = 1 ORDER BY account_id'
+		).all<{ detail: string }>()
+		expect(plan.results.map((r) => r.detail).join('\n')).toContain('idx_account_is_influencer')
+
+		// Revoking drops the account from the list on the next read — no cache in between.
+		await updateAccount(env.DB, 8103, { isInfluencer: false })
+		const after = await exports.default.fetch(
+			`${ORIGIN}/api/influencerpartnerprogram/influencers?take=1000`,
+			{ headers: await bearer('207') }
+		)
+		expect(await after.json()).toEqual({ InfluencerIds: [8101], ContinuationToken: null })
 	})
 
 	test('GET /api/influencerpartnerprogram/influencers 401s without a bearer token', async () => {
@@ -6549,43 +6945,164 @@ describe('econ endpoints', () => {
 		expect(res.status).toBe(401)
 	})
 
-	test('GET /api/influencerpartnerprogram/influencer answers a bare 0', async () => {
-		const res = await exports.default.fetch(
-			`${ORIGIN}/api/influencerpartnerprogram/influencer?accountId=220`,
-			{ headers: await bearer('206') }
-		)
+	test('POST /api/influencerpartnerprogram/support picks the ONE influencer the caller supports', async () => {
+		const seed = async (accountId: number, isInfluencer: boolean) => {
+			await env.DB.prepare('INSERT OR IGNORE INTO account (data) VALUES (?1)')
+				.bind(JSON.stringify({ accountId, username: `Support${accountId}`, isInfluencer }))
+				.run()
+		}
+		await seed(8201, true)
+		await seed(8202, true)
+		await seed(8203, false) // a player, not an influencer
+		await seed(8204, false) // the supporter
+		const support = async (body: string, sub = '8204') =>
+			exports.default.fetch(`${ORIGIN}/api/influencerpartnerprogram/support`, {
+				method: 'POST',
+				headers: { ...(await bearer(sub)), 'content-type': 'application/x-www-form-urlencoded' },
+				body,
+			})
+		const my = async (sub = '8204') => {
+			const res = await exports.default.fetch(
+				`${ORIGIN}/api/influencerpartnerprogram/myinfluencer`,
+				{
+					headers: await bearer(sub),
+				}
+			)
+			expect(res.status).toBe(200)
+			return res.text()
+		}
+
+		// Nobody picked yet: a bare 0, the whole body.
+		expect(await my()).toBe('0')
+
+		// The raw form body the client posts. The reply is a bare status envelope — no `Value`;
+		// the pick is read back from `…/myinfluencer`.
+		const res = await support('influencerAccountId=8201')
 		expect(res.status).toBe(200)
-		// The tier is the WHOLE body — a bare number, not `{ Tier: 0 }` or a string. 0 is
-		// "not an influencer", which every account is here.
 		expect(res.headers.get('content-type')).toContain('application/json')
-		expect(await res.text()).toBe('0')
+		expect(await res.json()).toEqual({ Success: true, Error: null, error_id: null })
+		expect(await my()).toBe('8201')
+		expect((await getAccount(env.DB, 8204))?.supportedInfluencerId).toBe(8201)
 
-		// Any account, the caller's own included, gets the same answer.
-		const self = await exports.default.fetch(
-			`${ORIGIN}/api/influencerpartnerprogram/influencer?accountId=206`,
+		// One pick per player: posting again REPLACES it.
+		expect((await support('influencerAccountId=8202')).status).toBe(200)
+		expect(await my()).toBe('8202')
+
+		// Only an influencer can be supported, and not oneself. Each refusal is a 400 that
+		// leaves the pick alone.
+		expect((await support('influencerAccountId=8203')).status).toBe(400) // not an influencer
+		expect((await support('influencerAccountId=99999999')).status).toBe(400) // no such account
+		expect((await support('influencerAccountId=8204')).status).toBe(400) // oneself
+		expect((await support('influencerAccountId=8201', '8201')).status).toBe(400) // an influencer, oneself
+		expect((await support('influencerAccountId=nope')).status).toBe(400)
+		expect((await support('')).status).toBe(400)
+		expect(await my()).toBe('8202')
+
+		// Anyone can read anyone's pick, as the same bare number.
+		const theirs = await exports.default.fetch(
+			`${ORIGIN}/api/influencerpartnerprogram/influencer?accountId=8204`,
 			{ headers: await bearer('206') }
 		)
-		expect(await self.json()).toBe(0)
+		expect(theirs.status).toBe(200)
+		expect(await theirs.text()).toBe('8202')
 	})
 
-	test('GET /api/influencerpartnerprogram/myinfluencer answers a bare 0', async () => {
-		// The `my` form takes the account from the token instead of a query parameter, and
-		// answers the same tier in the same shape.
-		const res = await exports.default.fetch(`${ORIGIN}/api/influencerpartnerprogram/myinfluencer`, {
-			headers: await bearer('206'),
-		})
+	test('POST /api/influencerpartnerprogram/remove unsets the pick it names', async () => {
+		for (const [accountId, isInfluencer] of [
+			[8211, true],
+			[8212, true],
+			[8213, false],
+		] as const) {
+			await env.DB.prepare('INSERT OR IGNORE INTO account (data) VALUES (?1)')
+				.bind(JSON.stringify({ accountId, username: `Remove${accountId}`, isInfluencer }))
+				.run()
+		}
+		const post = async (path: 'support' | 'remove', body: string, sub = '8213') =>
+			exports.default.fetch(`${ORIGIN}/api/influencerpartnerprogram/${path}`, {
+				method: 'POST',
+				headers: { ...(await bearer(sub)), 'content-type': 'application/x-www-form-urlencoded' },
+				body,
+			})
+		const my = async () => {
+			const res = await exports.default.fetch(
+				`${ORIGIN}/api/influencerpartnerprogram/myinfluencer`,
+				{ headers: await bearer('8213') }
+			)
+			return res.text()
+		}
+
+		expect((await post('support', 'influencerAccountId=8211')).status).toBe(200)
+		expect(await my()).toBe('8211')
+
+		// Naming someone other than the current pick is a no-op success: the pick stays.
+		const other = await post('remove', 'influencerAccountId=8212')
+		expect(other.status).toBe(200)
+		expect(await other.json()).toEqual({ Success: true, Error: null, error_id: null })
+		expect(await my()).toBe('8211')
+
+		// Naming the current pick clears it: the same envelope, and `…/myinfluencer` is 0
+		// again. The field is DROPPED from the account, not written as 0.
+		const res = await post('remove', 'influencerAccountId=8211')
 		expect(res.status).toBe(200)
-		expect(await res.text()).toBe('0')
+		expect(res.headers.get('content-type')).toContain('application/json')
+		expect(await res.json()).toEqual({ Success: true, Error: null, error_id: null })
+		expect(await my()).toBe('0')
+		const account = await getAccount(env.DB, 8213)
+		expect(account).not.toBeNull()
+		expect('supportedInfluencerId' in account!).toBe(false)
+
+		// Removing with nothing picked is also a no-op success.
+		expect((await post('remove', 'influencerAccountId=8211')).status).toBe(200)
+		expect(await my()).toBe('0')
+
+		// A body that names no integer is a 400.
+		expect((await post('remove', 'influencerAccountId=nope')).status).toBe(400)
+		expect((await post('remove', '')).status).toBe(400)
+
+		// Unauthenticated is a 401.
+		const anon = await exports.default.fetch(`${ORIGIN}/api/influencerpartnerprogram/remove`, {
+			method: 'POST',
+			headers: { 'content-type': 'application/x-www-form-urlencoded' },
+			body: 'influencerAccountId=8211',
+		})
+		expect(anon.status).toBe(401)
 	})
 
-	test('the influencer tier routes 401 without a bearer token', async () => {
+	test('GET /api/influencerpartnerprogram/influencer answers 0 for nobody, 400 for no accountId', async () => {
+		// An account that has picked nobody, and one that does not exist, both support nobody.
+		for (const accountId of ['206', '99999999']) {
+			const res = await exports.default.fetch(
+				`${ORIGIN}/api/influencerpartnerprogram/influencer?accountId=${accountId}`,
+				{ headers: await bearer('206') }
+			)
+			expect(res.status, accountId).toBe(200)
+			// The id is the WHOLE body — a bare number, not `{ Id: 0 }` or a string.
+			expect(res.headers.get('content-type')).toContain('application/json')
+			expect(await res.text()).toBe('0')
+		}
+		for (const query of ['', '?accountId=', '?accountId=abc']) {
+			const res = await exports.default.fetch(
+				`${ORIGIN}/api/influencerpartnerprogram/influencer${query}`,
+				{ headers: await bearer('206') }
+			)
+			expect(res.status, query).toBe(400)
+		}
+	})
+
+	test('the influencer support routes 401 without a bearer token', async () => {
 		// Auth is checked before anything is answered, so an unauthenticated caller is told
-		// that rather than handed a tier.
-		for (const path of ['influencer', 'myinfluencer']) {
+		// that rather than handed an id.
+		for (const path of ['influencer?accountId=206', 'myinfluencer']) {
 			const res = await exports.default.fetch(`${ORIGIN}/api/influencerpartnerprogram/${path}`)
 			expect(res.status, path).toBe(401)
 			expect(await res.text()).toBe('')
 		}
+		const post = await exports.default.fetch(`${ORIGIN}/api/influencerpartnerprogram/support`, {
+			method: 'POST',
+			headers: { 'content-type': 'application/x-www-form-urlencoded' },
+			body: 'influencerAccountId=8201',
+		})
+		expect(post.status).toBe(401)
 	})
 
 	test('GET /api/makerai/checkfreetrialeligibility answers a bare false', async () => {
@@ -6789,8 +7306,14 @@ describe('econ endpoints', () => {
 			'POST /api/checklist/v1/complete',
 			'POST /api/checklist/v2/complete',
 			'POST /api/consumables/v1/consume',
+			'POST /api/consumables/v1/updateActive',
 			'POST /api/equipment/v1/update',
 			'POST /api/gamerewards/v1/request',
+			'POST /api/influencerpartnerprogram/remove',
+			'POST /api/influencerpartnerprogram/support',
+			'POST /api/itemWishlists/v1/isonwishlist/bulk',
+			'POST /api/itemWishlists/v1/wishlist/add',
+			'POST /api/itemWishlists/v1/wishlist/remove',
 			'POST /api/items/bulkpurchase',
 			'POST /api/items/purchaseInfos',
 			'POST /api/objectives/v1/cleargroup',
@@ -6800,6 +7323,7 @@ describe('econ endpoints', () => {
 			'POST /api/roomcurrencies/v1/awardCurrency/bulk',
 			'POST /api/roomcurrencies/v1/createCurrency',
 			'POST /api/roomcurrencies/v1/createPurchaseOffer',
+			'POST /api/roomcurrencies/v1/deletePurchaseOffer',
 			'POST /api/roomcurrencies/v1/updateCurrency',
 			'POST /api/roomkeys/v1/awardbulk',
 			'POST /api/roomkeys/v1/create',
@@ -7668,6 +8192,49 @@ describe('discord role gift', () => {
 			[9331, NotificationType.StorefrontBalanceUpdate],
 			[9331, NotificationType.GiftPackageReceivedImmediate],
 		])
+	})
+
+	// One box per ACCOUNT, not per link: a player who linked two Discord identities is paid
+	// once, the best role across both. And more accounts than one round pays (30) are all
+	// paid once, each with their own box, with two frames apiece in link order.
+	test('pays an account with two links once, and more accounts than one round holds', async () => {
+		const many = Array.from({ length: 40 }, (_, i) => 9400 + i)
+		await onlyDiscordLinks([
+			[9341, '900000000000000341', [ROLE_A]],
+			[9341, '900000000000000342', [ROLE_B]],
+			...many.map((id): [number, string, string[]] => [id, `9000000000000${id}`, [ROLE_A]]),
+		])
+		await drainFrames()
+
+		const summary = await grantDiscordRoleGifts(giftEnv(MAP), DEFAULT_STARTING_TOKENS)
+		expect(summary).toEqual({
+			skipped: false,
+			roles: 2,
+			links: 42,
+			granted: 41,
+			tokens: 10000 + 40 * 2500,
+			failed: 0,
+		})
+		expect(await tokens(9341)).toBe(DEFAULT_STARTING_TOKENS + 10000)
+		expect(await getPendingGifts(env.DB, 9341)).toMatchObject([{ Currency: 10000 }])
+
+		const frames = await drainFrames()
+		expect(frames.map((f) => f.accountId)).toEqual([9341, 9341, ...many.flatMap((id) => [id, id])])
+		const boxIds = new Set<number>()
+		for (const id of many) {
+			expect(await tokens(id)).toBe(DEFAULT_STARTING_TOKENS + 2500)
+			const boxes = await getPendingGifts(env.DB, id)
+			expect(boxes).toHaveLength(1)
+			boxIds.add(boxes[0]!.Id)
+			const own = frames.filter((f) => f.accountId === id)
+			expect(own[0]!.payload).toEqual({
+				Balance: DEFAULT_STARTING_TOKENS + 2500,
+				CurrencyType: CurrencyType.RecCenterTokens,
+				Platform: -2,
+			})
+			expect(own[1]!.payload).toMatchObject({ Id: boxes[0]!.Id, Currency: 2500 })
+		}
+		expect(boxIds.size).toBe(many.length)
 	})
 
 	test('every run pays again — the schedule is the cadence — and a lapsed role is not paid', async () => {

@@ -292,6 +292,54 @@ export async function setRoomInstancePrivate(
 }
 
 /**
+ * How matchmaking treats an instance (`matchmakingPolicy`). Set by whoever is standing
+ * in it via `PUT /roominstance/:id/matchpolicy` (the `match` worker).
+ */
+export const MatchmakingPolicy = {
+	/** Normal matchmaking — the instance accepts new players. */
+	Default: 0,
+	/** Deprioritise this instance; matchmaking sends players elsewhere when it can. */
+	Avoid: 1,
+	/** Exclude this instance from matchmaking entirely. */
+	Ignore: 2,
+} as const
+
+/** Whether a number names a {@link MatchmakingPolicy}. */
+export function isMatchmakingPolicy(value: number): boolean {
+	return Object.values(MatchmakingPolicy).includes(value as 0 | 1 | 2)
+}
+
+/**
+ * Set an instance's `matchmakingPolicy`, rewriting the JSON blob (the generated
+ * `matchmaking_policy` column follows it). Returns the updated DTO, or null when the
+ * instance doesn't exist.
+ *
+ * `Ignore` (2) takes the instance out of both reuse searches ({@link getJoinableInstance}
+ * and {@link getSharedPrivateInstance}) — nobody matchmakes into it again until the policy
+ * is lowered; `Avoid` (1) ranks it behind every `Default` instance. Direct joins (an
+ * invite, a room code, the owner picking a session) are not matchmaking and are unaffected,
+ * and everyone already inside stays.
+ */
+export async function setRoomInstanceMatchmakingPolicy(
+	db: D1Database,
+	id: number,
+	policy: number
+): Promise<RoomInstanceDto | null> {
+	const row = await db
+		.prepare('SELECT data FROM room_instance WHERE id = ?1')
+		.bind(id)
+		.first<{ data: string }>()
+	if (!row) return null
+	const stored = parse(row.data)
+	stored.matchmakingPolicy = policy
+	await db
+		.prepare('UPDATE room_instance SET data = ?1 WHERE id = ?2')
+		.bind(JSON.stringify(stored), id)
+		.run()
+	return toDto(stored)
+}
+
+/**
  * Recompute an instance's `isFull` flag from live match presence: full once the
  * number of players currently present in the instance reaches its `maxCapacity`
  * (capacity 0 — unset — is never full). Rewrites the JSON blob (the generated
@@ -320,6 +368,48 @@ export async function refreshInstanceFullness(
 			.run()
 	}
 	return isFull
+}
+
+/**
+ * Restamp the `maxCapacity` of every live instance of a subroom and recompute each one's
+ * `isFull` against it. Called by the subroom settings write (`modifySubRoom`), which is
+ * the ONE place a subroom's `MaxPlayers` changes after creation.
+ *
+ * An instance's `maxCapacity` is a copy of the subroom's cap taken when the instance was
+ * created, and it is what everything enforces — the fullness recompute, the join
+ * searches' `is_full` filter, the served DTO. It is a copy rather than a live read
+ * because the instance is read on every matchmake, heartbeat and presence fan-out, and
+ * a subroom lookup on each of those is D1 cost paid for a setting that changes rarely.
+ * So the copy is invalidated at the write instead: without this, an owner who raised
+ * the cap mid-session found the running instance still refusing players at the old
+ * number until it was torn down. Returns the number of instances rewritten.
+ */
+export async function resyncInstanceCapacity(
+	db: D1Database,
+	roomId: number,
+	subRoomId: number,
+	maxCapacity: number,
+	now = Math.floor(Date.now() / 1000)
+): Promise<number> {
+	const { results } = await db
+		.prepare('SELECT data FROM room_instance WHERE room_id = ?1 AND sub_room_id = ?2')
+		.bind(roomId, subRoomId)
+		.all<{ data: string }>()
+	let rewritten = 0
+	for (const row of results) {
+		const stored = parse(row.data)
+		const count = await countPlayersInInstance(db, stored.roomInstanceId, now)
+		const isFull = maxCapacity > 0 && count >= maxCapacity
+		if (stored.maxCapacity === maxCapacity && stored.isFull === isFull) continue
+		stored.maxCapacity = maxCapacity
+		stored.isFull = isFull
+		await db
+			.prepare('UPDATE room_instance SET data = ?1 WHERE id = ?2')
+			.bind(JSON.stringify(stored), stored.roomInstanceId)
+			.run()
+		rewritten++
+	}
+	return rewritten
 }
 
 /**
@@ -379,9 +469,10 @@ export async function deleteEmptyRoomInstances(
 
 /**
  * The oldest joinable public instance of a room (not private, not full, joins
- * enabled, not already in progress) that is running `gameVersion`, or null when
- * there's none to join. Used by matchmaking to reuse an existing instance before
- * creating a new one.
+ * enabled, not already in progress, not set to `Ignore`) that is running `gameVersion`,
+ * or null when there's none to join. Used by matchmaking to reuse an existing instance
+ * before creating a new one. An instance set to `Avoid` is a candidate, but ranks behind
+ * every `Default` one however old it is (see {@link MatchmakingPolicy}).
  *
  * The build is part of the search, not a detail of it — which is why it's a required
  * argument rather than an optional filter a caller can forget. Two builds in one Photon
@@ -424,8 +515,63 @@ export async function getJoinableInstance(
 			`SELECT data FROM room_instance
 			 WHERE room_id = ?1 AND game_version = ?2
 			   AND is_private = 0 AND is_full = 0 AND join_disabled = 0
-			   AND is_in_progress = 0 ${filters.join(' ')}
-			 ORDER BY id LIMIT 1`
+			   AND is_in_progress = 0
+			   AND matchmaking_policy != ${MatchmakingPolicy.Ignore} ${filters.join(' ')}
+			 ORDER BY matchmaking_policy, id LIMIT 1`
+		)
+		.bind(...binds)
+		.first<{ data: string }>()
+	return row ? toDto(parse(row.data)) : null
+}
+
+/**
+ * The ONE private session of an unpublished room — the instance of `subRoomId` running
+ * `gameVersion` that the room's people share — or null when nobody has opened one. The
+ * complement of {@link getJoinableInstance}: that search only ever reuses PUBLIC instances,
+ * and an unpublished room has none (every instance of it is private, see the match
+ * worker's `resolveRoomInstance`), so without this each of the room's people who
+ * matchmaked in got a private instance of their own and never found each other — a
+ * co-owner answering the creator's "come look at this" landed in an empty copy of the
+ * room beside them.
+ *
+ * Scoped like the public search: by subroom (separate places) and by build (a session
+ * belongs to one client version; another build's session reads as nothing to join and the
+ * caller opens one beside it). Full instances and ones set to `Ignore` are skipped — there
+ * is nothing to put a player into, or its people asked that nobody be matched in — and
+ * `excludeInstanceId` drops the one the caller is already standing in,
+ * because the client keys its room transition off a CHANGING instance id and hangs when
+ * handed the same one back.
+ *
+ * That exclusion is also why the search prefers the instance with the most live players
+ * in it over the oldest: a creator re-entering the subroom they're in is moved to a fresh
+ * instance, and the one they left sits empty for the sweep's grace window. A co-owner
+ * arriving in the meantime must land with the creator, not in the abandoned shell.
+ */
+export async function getSharedPrivateInstance(
+	db: D1Database,
+	roomId: number,
+	gameVersion: string,
+	subRoomId: number,
+	excludeInstanceId?: number,
+	now = Math.floor(Date.now() / 1000)
+): Promise<RoomInstanceDto | null> {
+	const binds: Array<number | string> = [roomId, gameVersion, subRoomId, now]
+	let exclude = ''
+	if (excludeInstanceId !== undefined) {
+		binds.push(excludeInstanceId)
+		exclude = `AND id != ?${binds.length}`
+	}
+	const row = await db
+		.prepare(
+			`SELECT data FROM room_instance
+			 WHERE room_id = ?1 AND game_version = ?2 AND sub_room_id = ?3
+			   AND is_private = 1 AND is_full = 0
+			   AND matchmaking_policy != ${MatchmakingPolicy.Ignore} ${exclude}
+			 ORDER BY (
+			   SELECT COUNT(*) FROM presence
+			    WHERE presence.room_instance_id = room_instance.id AND presence.expires_at > ?4
+			 ) DESC, id
+			 LIMIT 1`
 		)
 		.bind(...binds)
 		.first<{ data: string }>()

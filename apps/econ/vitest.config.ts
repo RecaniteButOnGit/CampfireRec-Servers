@@ -35,6 +35,14 @@ export default defineConfig({
 									this.frames.push({ accountId, notificationType, payload })
 									return { delivered: 0, queued: true }
 								}
+								// One recorded frame per entry, the shape notifyPlayer records, so a test
+								// asserts the same thing whichever call sent it.
+								async notifyPlayers(notifications) {
+									for (const { playerId, notificationType, data } of notifications) {
+										this.frames.push({ accountId: playerId, notificationType, payload: data })
+									}
+									return { delivered: 0, queued: notifications.length }
+								}
 								async broadcast() { return { delivered: 0 } }
 								/** Everything pushed since the last call, then forget it. */
 								async drainFrames() {

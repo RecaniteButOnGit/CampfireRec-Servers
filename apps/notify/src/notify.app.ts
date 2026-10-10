@@ -266,14 +266,18 @@ const app = new Hono<App>()
 		// entirely rather than letting them sit there collecting broadcasts.
 		if (playerId === null) return c.json({ error: 'Unauthorized' }, 401)
 
-		const request = new Request(c.req.raw)
+		const request = new Request(c.req.raw, {
+			headers: new Headers(c.req.raw.headers),
+		})
 		// Always set from the validated token, never passed through: the header is the
 		// DO's proof of identity, so a client sending its own must not be believed.
 		request.headers.set(OWNER_HEADER, String(playerId))
 
 		// The upgrade is retried too: it is a bodyless GET, so re-issuing it is free, and a
-		// reset here would otherwise fail the client's connect outright.
-		return hubCall(c, (hub) => hub.fetch(new Request(request)))
+		// reset here would otherwise fail the client's connect outright. Preserve the
+		// original upgrade request rather than re-wrapping an already-upgraded Request,
+		// which can lose the WebSocket upgrade metadata and trigger a 500 in the DO.
+		return hubCall(c, (hub) => hub.fetch(request))
 	})
 
 	// ---- Internal service-to-service send/broadcast --------------------------

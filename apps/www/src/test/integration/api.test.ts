@@ -59,7 +59,9 @@ import {
 	BALANCE_SCHEMA_DDL,
 	CurrencyType,
 	DEFAULT_STARTING_TOKENS,
+	ensureStartingBalances,
 	getBalance,
+	spendCurrency,
 } from '../../../../econ/src/balance-db'
 import { CATALOG_SCHEMA_DDL } from '../../../../econ/src/catalog-db'
 import { CONSUMABLE_SCHEMA_DDL, getConsumables } from '../../../../econ/src/consumables-db'
@@ -828,6 +830,14 @@ async function staffGet(path: string, accountId: number, roles: string[] = ['mod
 	})
 }
 
+/** DELETE a staff endpoint as a moderator (or whatever `roles` names). */
+async function staffDelete(path: string, accountId: number, roles: string[] = ['moderator']) {
+	return SELF.fetch(`https://example.com${path}`, {
+		method: 'DELETE',
+		headers: { authorization: `Bearer ${await tokenFor(accountId, roles)}` },
+	})
+}
+
 /** POST a JSON body to a staff endpoint as a moderator (or whatever `roles` names). */
 async function staffPost(
 	path: string,
@@ -923,6 +933,7 @@ it('refuses every staff endpoint without a token, and without a staff role', asy
 		'/api/staff/bans',
 		'/api/staff/players/1',
 		'/api/staff/players/1/linked',
+		'/api/staff/studio-access',
 	]
 	const writes = [
 		'/api/staff/players/1/gift-tokens',
@@ -930,13 +941,15 @@ it('refuses every staff endpoint without a token, and without a staff role', asy
 		'/api/staff/players/1/gift-xp',
 		'/api/staff/players/1/username-changes',
 		'/api/staff/players/1/clear-password',
+		'/api/staff/studio-access',
 		'/api/staff/players/1/grant-plus',
 	]
 	writes.push(
 		'/api/staff/rooms/1/gift-tokens',
 		'/api/staff/rooms/1/rro-tag',
 		'/api/staff/online/gift-tokens',
-		'/api/staff/discord-roles/1/gift-tokens'
+		'/api/staff/discord-roles/1/gift-tokens',
+		'/api/staff/discord-roles/sync'
 	)
 	for (const path of writes) {
 		expect((await SELF.fetch(`https://example.com${path}`, { method: 'POST' })).status).toBe(401)
@@ -947,8 +960,15 @@ it('refuses every staff endpoint without a token, and without a staff role', asy
 		expect(res.status).toBe(403)
 	}
 
-	// Developer actions are narrower: a moderator is staff, but not a developer.
-	for (const path of writes.filter((p) => p.includes('/gift-') || p.endsWith('/rro-tag') || p.includes('/grant-plus'))) {
+	// The gifts, the Plus grant and the role sweep are narrower: a moderator is staff, but
+	// not a developer.
+	for (const path of writes.filter(
+		(p) =>
+			p.includes('/gift-') ||
+			p.endsWith('/rro-tag') ||
+			p.includes('/grant-plus') ||
+			p.endsWith('/sync')
+	)) {
 		expect((await staffPost(path, 8101, { amount: 1 })).status).toBe(403)
 	}
 
@@ -975,6 +995,16 @@ it('refuses every staff endpoint without a token, and without a staff role', asy
 		body: JSON.stringify({ banned: true, days: 1 }),
 	})
 	expect(player.status).toBe(403)
+
+	const remove = await SELF.fetch('https://example.com/api/staff/studio-access/1', {
+		method: 'DELETE',
+	})
+	expect(remove.status).toBe(401)
+	const playerRemove = await SELF.fetch('https://example.com/api/staff/studio-access/1', {
+		method: 'DELETE',
+		headers: { authorization: `Bearer ${await tokenFor(8101, ['gameClient'])}` },
+	})
+	expect(playerRemove.status).toBe(403)
 })
 
 it('lets a developer enable RRO settings and system tags without changing other room tags', async () => {
@@ -1897,6 +1927,7 @@ it('drops tokens on everyone online, lobby included, with the message on the box
 		`UPDATE presence SET data = json_set(data, '$.expiresAt', 1) WHERE account_id = 8383`
 	).run()
 
+	await clearHub()
 	const res = await devPost('/api/staff/online/gift-tokens', 8110, {
 		amount: 100,
 		message: 'Thanks for playing!',
@@ -1908,6 +1939,7 @@ it('drops tokens on everyone online, lobby included, with the message on the box
 	expect(body.paid).toEqual(expect.arrayContaining([8380, 8381, 8382]))
 	expect(body.paid).not.toContain(8383)
 
+	const frames = await hubFrames()
 	for (const playerId of [8380, 8381, 8382]) {
 		await expect(
 			getBalance(env.DB, playerId, CurrencyType.RecCenterTokens, DEFAULT_STARTING_TOKENS)
@@ -1915,7 +1947,23 @@ it('drops tokens on everyone online, lobby included, with the message on the box
 		const gifts = await getPendingGifts(env.DB, playerId)
 		expect(gifts).toHaveLength(1)
 		expect(gifts[0]).toMatchObject({ Currency: 100, Message: 'Thanks for playing!' })
+		// The same two frames the one-player gift sends, in the same order: the resulting
+		// total into the -2 bucket, then the box it came in — every player's own.
+		const own = frames.filter((f) => f.playerId === playerId)
+		expect(own.map((f) => f.notificationType)).toEqual([61, 31])
+		expect(own[0].data).toEqual({
+			Balance: DEFAULT_STARTING_TOKENS + 100,
+			CurrencyType: CurrencyType.RecCenterTokens,
+			Platform: -2,
+		})
+		expect(own[1].data).toMatchObject({
+			Id: gifts[0]!.Id,
+			Currency: 100,
+			Message: 'Thanks for playing!',
+			BalanceType: -2,
+		})
 	}
+	expect(frames.filter((f) => f.playerId === 8383)).toEqual([])
 	expect(await getPendingGifts(env.DB, 8383)).toEqual([])
 
 	const { results } = await env.DB.prepare(
@@ -1938,6 +1986,115 @@ it('refuses a token drop over the cap, without a message, or with nobody online'
 	// An empty server is a 404 rather than a silent success, as an empty room is.
 	await env.DB.prepare('DELETE FROM presence').run()
 	expect((await drop({ amount: 1_000, message: 'hi' })).status).toBe(404)
+})
+
+// The drop pays in rounds of 30 (three bound values a player, 100 a statement) and announces
+// the lot in one hub call. More players than one round holds, with a balance row already
+// present for some and none for the rest: everyone is paid once, in presence order, each
+// box has its own id, and the hub gets exactly two frames a player — nobody doubled by a
+// round boundary and nobody dropped past it.
+it('drops tokens on more players than one round pays, each exactly once', async () => {
+	await env.DB.prepare('DELETE FROM presence').run()
+	const players = Array.from({ length: 70 }, (_, i) => 8600 + i)
+	for (const accountId of players) {
+		await setPresence(env.DB, {
+			accountId,
+			roomInstance: null,
+			statusVisibility: 0,
+			deviceClass: 0,
+			vrMovementMode: 0,
+			platform: 4,
+			appVersion: 'test',
+		})
+	}
+	// Half already hold a balance row (one touched by a prior read); the rest get the signup
+	// grant seeded by the drop itself. Both must land on grant + drop.
+	for (const accountId of players.filter((id) => id % 2 === 0)) {
+		await getBalance(env.DB, accountId, CurrencyType.RecCenterTokens, DEFAULT_STARTING_TOKENS)
+	}
+
+	await clearHub()
+	const res = await devPost('/api/staff/online/gift-tokens', 8110, {
+		amount: 7,
+		message: 'Round and round',
+	})
+	expect(res.status).toBe(200)
+	const body = (await res.json()) as { paid: number[] }
+	expect(body.paid).toEqual(players)
+
+	const { results } = await env.DB.prepare(
+		`SELECT account_id AS accountId, amount FROM balance
+		 WHERE currency_type = ?1 AND account_id BETWEEN 8600 AND 8669 ORDER BY account_id`
+	)
+		.bind(CurrencyType.RecCenterTokens)
+		.all<{ accountId: number; amount: number }>()
+	expect(results.map((r) => r.accountId)).toEqual(players)
+	expect(new Set(results.map((r) => r.amount))).toEqual(new Set([DEFAULT_STARTING_TOKENS + 7]))
+
+	const frames = await hubFrames()
+	expect(frames).toHaveLength(players.length * 2)
+	const boxIds = new Set<number>()
+	for (const playerId of players) {
+		const own = frames.filter((f) => f.playerId === playerId)
+		expect(own.map((f) => f.notificationType)).toEqual([61, 31])
+		expect(own[0].data.Balance).toBe(DEFAULT_STARTING_TOKENS + 7)
+		const gifts = await getPendingGifts(env.DB, playerId)
+		expect(gifts).toHaveLength(1)
+		expect(own[1].data.Id).toBe(gifts[0]!.Id)
+		boxIds.add(gifts[0]!.Id)
+	}
+	expect(boxIds.size).toBe(players.length)
+})
+
+// A negative room gift is a debit guarded per player: whoever can't cover it is skipped —
+// no debit, no box, no frame — and the ones who can are still charged.
+it('skips the players a room debit would overdraw, and charges the rest', async () => {
+	const inRoom = async (accountId: number) =>
+		setPresence(env.DB, {
+			accountId,
+			roomInstance: { roomId: 7730, roomInstanceId: 77301 },
+			statusVisibility: 0,
+			deviceClass: 0,
+			vrMovementMode: 0,
+			platform: 4,
+			appVersion: 'test',
+		})
+	await inRoom(8480)
+	await inRoom(8481)
+	await inRoom(8482)
+	// 8481 has already spent most of their grant.
+	await ensureStartingBalances(env.DB, 8481, DEFAULT_STARTING_TOKENS)
+	expect(
+		await spendCurrency(
+			env.DB,
+			8481,
+			CurrencyType.RecCenterTokens,
+			DEFAULT_STARTING_TOKENS - 10,
+			DEFAULT_STARTING_TOKENS
+		)
+	).toBe(true)
+
+	await clearHub()
+	const res = await devPost('/api/staff/rooms/7730/gift-tokens', 8110, { amount: -100 })
+	expect(res.status).toBe(200)
+	expect(await res.json()).toEqual({
+		roomId: 7730,
+		amount: -100,
+		paid: [8480, 8482],
+		skipped: [8481],
+	})
+	for (const playerId of [8480, 8482]) {
+		await expect(
+			getBalance(env.DB, playerId, CurrencyType.RecCenterTokens, DEFAULT_STARTING_TOKENS)
+		).resolves.toBe(DEFAULT_STARTING_TOKENS - 100)
+		expect(await getPendingGifts(env.DB, playerId)).toHaveLength(1)
+	}
+	await expect(
+		getBalance(env.DB, 8481, CurrencyType.RecCenterTokens, DEFAULT_STARTING_TOKENS)
+	).resolves.toBe(10)
+	expect(await getPendingGifts(env.DB, 8481)).toEqual([])
+	const frames = await hubFrames()
+	expect(frames.map((f) => f.playerId)).toEqual([8480, 8480, 8482, 8482])
 })
 
 // The role drop's audience is the Discord links that record the role — offline included,
@@ -2016,15 +2173,15 @@ it('drops tokens on every account whose Discord link holds the role, online or n
 	})
 })
 
-// Same bounds as the online drop, plus the role has to be a snowflake, and a role nobody's
-// link records is a 404 rather than a silent success.
+// Same bounds as the online drop but with a higher cap (10,000), plus the role has to be a
+// snowflake, and a role nobody's link records is a 404 rather than a silent success.
 it('refuses a role drop over the cap, without a message, with a bad role, or with no holders', async () => {
 	const drop = (role: string, body: unknown) =>
 		devPost(`/api/staff/discord-roles/${role}/gift-tokens`, 8110, body)
 	await linkPlatformIdentity(env.DB, 8396, PlatformType.Discord, '900000000000008396', [
 		'1077000000000000779',
 	])
-	expect((await drop('1077000000000000779', { amount: 1_001, message: 'hi' })).status).toBe(400)
+	expect((await drop('1077000000000000779', { amount: 10_001, message: 'hi' })).status).toBe(400)
 	expect((await drop('1077000000000000779', { amount: 0, message: 'hi' })).status).toBe(400)
 	expect((await drop('1077000000000000779', { amount: -5, message: 'hi' })).status).toBe(400)
 	expect((await drop('1077000000000000779', { amount: 10, message: '   ' })).status).toBe(400)
@@ -2607,6 +2764,34 @@ it('runs the sweep from the scheduled handler and stays off without a guild', as
 	expect(await discordLink(9100)).toEqual(before)
 })
 
+// The same sweep on a developer's request, answered with its summary. The deployed test
+// config has no guild, so this pins the shape of the answer and the audit row, not a
+// Discord round trip: the sweep's own behaviour is covered below through its seams.
+it('runs the sweep on demand for a developer and answers with the summary', async () => {
+	await onlyDiscordLinks([[9100, '900000000000000100', [ROLE_A]]])
+	const before = await discordLink(9100)
+
+	const res = await devPost('/api/staff/discord-roles/sync', 8110, {})
+	expect(res.status).toBe(200)
+	const summary = (await res.json()) as Record<string, unknown>
+	expect(summary).toEqual({
+		skipped: true,
+		refreshed: 0,
+		changed: 0,
+		gone: 0,
+		failed: 0,
+		halted: null,
+	})
+	expect(await discordLink(9100)).toEqual(before)
+
+	const row = await env.DB.prepare(
+		`SELECT player_id, data FROM audit_log WHERE action = 'sync_discord_roles'
+		 ORDER BY audit_log_id DESC LIMIT 1`
+	).first<{ player_id: number; data: string }>()
+	expect(row?.player_id).toBe(8110)
+	expect(JSON.parse(row?.data ?? '{}')).toMatchObject({ skipped: true })
+})
+
 it('re-reads every discord link and writes the roles back', async () => {
 	await onlyDiscordLinks([
 		[9111, '900000000000000111', [ROLE_A]],
@@ -2779,4 +2964,95 @@ it('decodes a bot member read: roles, gone, halt and error', async () => {
 			throw new TypeError('fetch failed')
 		})
 	).resolves.toEqual({ kind: 'error', status: null })
+})
+
+// ---- Studio upload access ---------------------------------------------------
+//
+// RecFlare Studio treats the JWT role `betastudio` as permission to upload. Staff
+// set the account's `hasStudio` flag here; auth stamps it onto the next login and
+// the next refresh. A signed-in player can ask about themselves. They cannot see or
+// edit the list.
+
+it('tells a signed-in player whether they can upload, and nobody else', async () => {
+	expect((await SELF.fetch('https://example.com/api/studio-access')).status).toBe(401)
+	const res = await SELF.fetch('https://example.com/api/studio-access', {
+		headers: { authorization: `Bearer ${await tokenFor(8601, ['gameClient'])}` },
+	})
+	expect(res.status).toBe(200)
+	expect(await res.json()).toEqual({ granted: false })
+})
+
+it('lets staff add, list, and remove studio upload access', async () => {
+	await updateAccount(env.DB, 8601, { username: 'StudioFan' })
+	await updateAccount(env.DB, 8602, { username: 'OtherFan' })
+	await updateAccount(env.DB, 8110, { username: 'Moderator' })
+
+	expect((await staffPost('/api/staff/studio-access', 8110, {})).status).toBe(400)
+	expect((await staffPost('/api/staff/studio-access', 8110, { username: 'Nobody' })).status).toBe(
+		404
+	)
+	expect(
+		(
+			await staffPost('/api/staff/studio-access', 8110, {
+				username: 'StudioFan',
+				accountId: 8602,
+			})
+		).status
+	).toBe(400)
+
+	const added = await staffPost('/api/staff/studio-access', 8110, { username: '@StudioFan' })
+	expect(added.status).toBe(200)
+	expect(await added.json()).toEqual({
+		accountId: 8601,
+		username: 'StudioFan',
+		granted: true,
+		alreadyGranted: false,
+	})
+
+	const again = await staffPost('/api/staff/studio-access', 8110, { accountId: 8601 })
+	expect(again.status).toBe(200)
+	expect(await again.json()).toMatchObject({ accountId: 8601, alreadyGranted: true })
+
+	const mine = await SELF.fetch('https://example.com/api/studio-access', {
+		headers: { authorization: `Bearer ${await tokenFor(8601, ['gameClient'])}` },
+	})
+	expect(await mine.json()).toEqual({ granted: true })
+
+	const list = await staffGet('/api/staff/studio-access', 8110)
+	expect(list.status).toBe(200)
+	const body = (await list.json()) as { accounts: Array<{ accountId: number }> }
+	expect(body.accounts).toEqual([
+		{ accountId: 8601, username: 'StudioFan', displayName: expect.any(String) },
+	])
+	expect((await getAccount(env.DB, 8601))?.hasStudio).toBe(true)
+
+	expect((await staffDelete('/api/staff/studio-access/nope', 8110)).status).toBe(400)
+	expect((await staffDelete('/api/staff/studio-access/8609', 8110)).status).toBe(404)
+
+	const removed = await staffDelete('/api/staff/studio-access/8601', 8110)
+	expect(removed.status).toBe(200)
+	expect(await removed.json()).toEqual({ accountId: 8601, granted: false, removed: true })
+	expect((await getAccount(env.DB, 8601))?.hasStudio).toBe(false)
+	const repeat = await staffDelete('/api/staff/studio-access/8601', 8110)
+	expect(await repeat.json()).toEqual({ accountId: 8601, granted: false, removed: false })
+
+	const after = await SELF.fetch('https://example.com/api/studio-access', {
+		headers: { authorization: `Bearer ${await tokenFor(8601, ['gameClient'])}` },
+	})
+	expect(await after.json()).toEqual({ granted: false })
+
+	expect(await auditRows('grant_studio_access', 8601)).toEqual([
+		{
+			actor: 8110,
+			data: { playerId: 8601, username: 'StudioFan', alreadyGranted: false },
+		},
+		{
+			actor: 8110,
+			data: { playerId: 8601, username: 'StudioFan', alreadyGranted: true },
+		},
+	])
+	expect(await auditRows('revoke_studio_access', 8601)).toEqual([
+		{ actor: 8110, data: { playerId: 8601, username: 'StudioFan', removed: true } },
+		{ actor: 8110, data: { playerId: 8601, username: 'StudioFan', removed: false } },
+	])
 })

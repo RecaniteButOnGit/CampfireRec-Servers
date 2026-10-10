@@ -6,6 +6,11 @@ export type Env = SharedHonoEnv & {
 	// with `await env.JWT_SECRET.get()`; all workers bind the same store so tokens
 	// signed by `auth` verify here.
 	JWT_SECRET: SecretsStoreSecret
+	// Shared `recflare` database, read-only here. Studio bundle downloads check that
+	// `unity_asset` records the requested filename (which is the R2 key) before
+	// streaming it. The rooms worker owns that table's migration; this binding has no
+	// migrations_dir.
+	DB: D1Database
 	// R2 bucket holding CDN binaries: signature blobs under `sigs/<name>` and
 	// room build data under `room/<name>`.
 	CDN_ASSETS: R2Bucket

@@ -222,25 +222,55 @@ export const RRPlusSignUpBonus = z.object({
 /**
  * `GET /api/influencerpartnerprogram/influencers` — the ids of every influencer in the
  * partner program, which the client uses to badge them wherever they appear. An object
- * around the list, not a bare array.
+ * around the list, not a bare array. `ContinuationToken` is the paging cursor; always null
+ * here, the whole list fitting in one page.
  */
 export const InfluencerIdsResponse = z.object({
 	InfluencerIds: z
 		.array(z.int())
-		.describe('Account ids in the partner program. Empty — no programme runs here'),
+		.describe('Account ids in the partner program — every account flagged `isInfluencer`'),
+	ContinuationToken: z
+		.null()
+		.describe('Paging cursor for the next page. Always null — the list is served whole'),
 })
 
 /**
- * `GET /api/influencerpartnerprogram/influencer` and `…/myinfluencer` — one account's
- * standing in the partner program.
+ * `GET /api/influencerpartnerprogram/influencer` and `…/myinfluencer` — the account id of
+ * the influencer an account supports.
  *
- * A BARE NUMBER, not an object: the body is the literal `0`, which is the "not an
- * influencer" tier. Nobody on this server is one, so 0 is the answer for every account, the
- * caller's own included.
+ * A BARE NUMBER, not an object: the body is the literal id, or `0` when the account
+ * supports nobody. The write (`POST …/support`) does NOT answer in this shape; see
+ * `SupportInfluencerResponse`.
  */
-export const InfluencerTierResponse = z
-	.literal(0)
-	.describe('The account’s partner tier. Always 0 — nobody here is an influencer')
+export const SupportedInfluencerResponse = z
+	.int()
+	.describe('The account id of the influencer this account supports; 0 for nobody')
+
+/** `POST /api/influencerpartnerprogram/support` — the influencer the caller picks. */
+export const SupportInfluencerBody = z.object({
+	influencerAccountId: z
+		.int()
+		.describe('The account id of the influencer to support. Must be flagged `isInfluencer`'),
+})
+
+/** `POST /api/influencerpartnerprogram/remove` — the influencer the caller stops supporting. */
+export const RemoveInfluencerBody = z.object({
+	influencerAccountId: z
+		.int()
+		.describe('The account id of the influencer to stop supporting — the caller’s current pick'),
+})
+
+/**
+ * The reply to `POST /api/influencerpartnerprogram/support` and `…/remove` — a bare
+ * `{ Success, Error, error_id }` status envelope with NO `Value`: the pick is read back from
+ * `…/myinfluencer`, not from this reply. The same mixed casing as `RoomCurrencyEnvelope`
+ * (PascalCase `Success`/`Error` beside a lowercase `error_id`), minus the payload.
+ */
+export const SupportInfluencerResponse = z.object({
+	Success: z.boolean().describe('Always true — every refusal is an empty 400 instead'),
+	Error: z.null().describe('Always null'),
+	error_id: z.null().describe('Always null. Present as a key, and lowercase'),
+})
 
 /**
  * `GET /api/incentivizedreferrals/progress` — how far the caller has got with the
@@ -847,6 +877,79 @@ export const OwnsRoomKeysResponse = z.array(
 )
 
 /**
+ * One wishlist entry — the client's five-key DTO, in its order. An element of the GET's bare
+ * array and the `Value` of the add/remove envelope.
+ *
+ * `PurchasableItemId` is a plain int on the client, so an entry for a custom avatar item
+ * carries 0 there and the item's GUID in `CustomAvatarItemId`; a storefront-item entry has
+ * the id and a null GUID. Exactly one of the two names the item.
+ */
+export const WishlistItemDto = z.object({
+	WishlistItemId: z.string().describe('GUID — the client’s `Guid`, so never an int'),
+	AccountId: z.int().describe('Whose list the entry is on'),
+	PurchasableItemId: z
+		.int()
+		.describe('The storefront item wished for, or 0 when the entry names a custom avatar item'),
+	CustomAvatarItemId: z
+		.string()
+		.nullable()
+		.describe('The custom avatar item wished for, or null when the entry names a storefront item'),
+	CreatedAt: z.string().describe('ISO-8601 UTC'),
+})
+
+/** `GET /api/itemWishlists/v1/wishlist/me|{accountId}` — a bare array, newest wish first. */
+export const WishlistItemList = z.array(WishlistItemDto)
+
+/**
+ * The envelope `wishlist/add` and `wishlist/remove` answer in — the same `{ Value, Success,
+ * Error, error_id }` the room-currency writes use. The client reads `add`’s `Value` and
+ * discards `remove`’s, but parses both as this shape: a bare entry or a 204 fails the same
+ * way `Success: false` does. `Error` is shown to the player verbatim behind “Wishlist error: ”.
+ */
+export const WishlistEnvelope = z.object({
+	Value: WishlistItemDto.nullable().describe(
+		'The entry added or removed; null on a refusal, or on removing an item that wasn’t listed'
+	),
+	Success: z.boolean(),
+	Error: z.string().nullable().describe('Null on success; the failure message otherwise'),
+	error_id: z.null().describe('Always null. Present as a key, and lowercase'),
+})
+
+/**
+ * `wishlist/add` and `wishlist/remove` — form-encoded. The client posts BOTH fields every
+ * time with the unused one empty (`purchasableItemId=1534&customAvatarItemId=`); either may
+ * also be omitted. Exactly one has to name an item.
+ */
+export const WishlistItemRequest = z.object({
+	purchasableItemId: z
+		.string()
+		.optional()
+		.describe('The storefront item, as a positive integer; empty or absent for a custom item'),
+	customAvatarItemId: z
+		.string()
+		.optional()
+		.describe('The custom avatar item’s GUID; empty or absent for a storefront item'),
+})
+
+/**
+ * `POST /api/itemWishlists/v1/isonwishlist/bulk` — form-encoded. `accountIds` is REPEATED,
+ * once per account (`accountIds=205&accountIds=207`); a comma-separated single value is
+ * accepted too. The item is named as on add/remove.
+ */
+export const IsOnWishlistBulkRequest = WishlistItemRequest.extend({
+	accountIds: z
+		.array(z.string())
+		.describe('The players to ask about, repeated once per id — answered in this order'),
+})
+
+/**
+ * `isonwishlist/bulk`’s answer: a bare POSITIONAL array of booleans, one per `accountIds`
+ * entry in the order posted. A short array leaves the tail reading as “not wished for”, so
+ * every id gets an element — an unknown player’s is false.
+ */
+export const IsOnWishlistBulkResponse = z.array(z.boolean())
+
+/**
  * One purchase offer on a room currency — a way to BUY that currency, priced in another
  * ("5 SuperTokens for 500 Rec Center Tokens"). The client's own model, member for member and
  * in its order.
@@ -998,9 +1101,17 @@ export const CreatePurchaseOfferRequest = z.object({
 	Order: z.string().optional().describe('Where it sits in the shop; defaults to 0'),
 })
 
+/** `POST /api/roomcurrencies/v1/deletePurchaseOffer` — form-encoded. */
+export const DeletePurchaseOfferRequest = z.object({
+	PurchaseOfferId: z
+		.string()
+		.describe('The offer to take down, by its `CurrencyPurchaseOfferId` (any letter case)'),
+})
+
 /**
- * The envelope the create-offer endpoint answers in — the same
- * `{ Value, Success, Error, error_id }` the currency writes use, with the offer in `Value`.
+ * The envelope the create- and delete-offer endpoints answer in — the same
+ * `{ Value, Success, Error, error_id }` the currency writes use, with the offer (as created,
+ * or as it stood when removed) in `Value`.
  */
 export const RoomCurrencyPurchaseOfferEnvelope = z.object({
 	Value: RoomCurrencyPurchaseOfferDto.nullable(),
@@ -1069,7 +1180,11 @@ export const AwardRoomCurrencyResultList = z.array(AwardRoomCurrencyResult)
 export const PurchaseRoomCurrencyRequest = z.object({
 	PurchaseOfferId: z.string().describe('The offer — a `CurrencyPurchaseOfferId`'),
 	RequestedAmount: z.string().describe('How much room currency; must equal the offer’s'),
-	RequestedPrice: z.string().describe('What it costs in tokens; must equal the offer’s'),
+	RequestedPrice: z
+		.string()
+		.describe(
+			'What it costs in tokens; must equal the offer’s, except for the room’s owner and co-owners, who are shown 0 and pay nothing'
+		),
 })
 
 /**
@@ -1182,6 +1297,19 @@ export const BulkPurchaseRequest = z.object({
 export const ConsumeConsumableRequest = z.object({
 	Id: z.int().describe('The consumable row id to spend from'),
 	DeltaCount: z.int().optional().describe('How many to spend; defaults to 1'),
+})
+
+/**
+ * `POST /api/consumables/v1/updateActive` JSON body — the client marking one of its
+ * consumables active or not. Accepted and NOT acted on yet; see the route.
+ */
+export const UpdateActiveConsumableRequest = z.object({
+	Id: z.int().describe('The consumable row id'),
+	IsActive: z.boolean().describe('Whether the consumable is now in use'),
+	ActivatedByRoomie: z
+		.boolean()
+		.optional()
+		.describe('Whether a roommate, rather than the owner, activated it'),
 })
 
 /** `POST /api/avatar/v2/gifts/consume` form body (posted with a trailing slash). */

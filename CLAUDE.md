@@ -115,15 +115,20 @@ inconsistency here without checking the client first.
   `StagedSubRoomDataSaveId` carries no subroom context), and nothing is overwritten, so
   `…/saves` is real history and `publish_save` doubles as restore-a-save. There
   is no `GET …/subrooms/:sid/data`; only the POST (the room save) exists on that path.
-  `GET …/saves/:saveId` is the detail behind a list row, under the same gate, but in the
-  CAMELCASE projection the room save's response uses — not the PascalCase rows the list
-  serves. Three shapes of one save; keep them straight.
-- Both save reads (`rooms`: `…/saves` and `…/saves/:saveId`) are auth-gated and readable by
-  the room's CREATOR or by anyone whose live `presence` row puts them in that room — not by
-  co-owners as such (a co-owner passes only by standing there). They list unpublished
-  staged saves, so they aren't public; but a visitor resolves which version an instance is
-  running from this list, so creator-only locks them out of loading the room. The grant
-  expires with the presence row.
+  `GET …/saves/:saveId` is the detail behind a list row, under the same gate, and a
+  PASCALCASE row like the list serves — NOT the camelCase projection the room save's
+  response uses (served that, the client showed a save with every value missing). It
+  differs from the list row only in how it names bundles: each `UnitySubAssets` entry is
+  `{ UnityAssetId, UnityAsset, UnityAssetHash }`, the main bundle is lifted to top-level
+  `UnityAsset`/`UnityAssetHash`, and there is no `Tags`. Three shapes of one save; keep
+  them straight.
+- The save reads (`rooms`: `…/saves`, `…/saves/no_unity_assets` and `…/saves/:saveId`) are
+  auth-gated and readable by the room's creator, a CO-OWNER, or anyone whose live `presence`
+  row puts them in that room. They list unpublished staged saves, so they aren't public; but
+  a co-owner opens the save history from the room's settings without being in the room
+  (creator-only showed them the buttons and a list that 403'd), and a visitor resolves which
+  version an instance is running from this list, so managers-only locks them out of loading
+  the room. The presence grant expires with the presence row.
 - A room save writes ONLY to the subroom and its save row — never to the room. Everything
   the body carries describes that one revision: `Description` is the save comment shown in
   `…/saves`, and `PersistenceVersion`/`InventionUsage` describe the scene just saved (the

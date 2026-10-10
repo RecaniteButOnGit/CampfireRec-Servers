@@ -51,6 +51,18 @@ bun runx admin grant-developer --account 1 --revoke
 bun runx admin grant-moderator --username alice --remote
 ```
 
+### `grant-studio` — grant or revoke Rec Room Studio upload access
+
+Sets the account's `hasStudio` flag, which `auth` stamps into the token as the
+`betastudio` role — the claim RecFlare Studio reads as permission to upload. Staff
+normally manage this from the website (`/settings/recroomstudio`); this is the
+operator's way in. Takes effect on the player's next Studio sign-in or refresh.
+
+```sh
+bun runx admin grant-studio --username alice
+bun runx admin grant-studio --account 42 --revoke
+```
+
 ### `reload-plus` — credit every Plus subscriber's tokens
 
 Also exposed directly as `just reload-plus`.

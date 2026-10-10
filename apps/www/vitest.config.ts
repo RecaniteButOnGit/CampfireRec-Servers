@@ -61,6 +61,12 @@ export default defineConfig({
 									this.sent.push({ playerIds, ephemeral: true, notificationType, data })
 									return { delivered: 0 }
 								}
+								// Recorded one entry per frame, as notifyPlayer records one, so a test
+								// asserts the same shape whichever path a gift took.
+								async notifyPlayers(notifications) {
+									for (const n of notifications) this.sent.push(n)
+									return { delivered: 0, queued: notifications.length }
+								}
 								async broadcast() { return { delivered: 0 } }
 								async fetch(request) {
 									if (request.method === 'DELETE') {

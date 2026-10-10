@@ -71,7 +71,7 @@ preview:
 deploy *args:
   bun turbo deploy "$@"
 
-# Apply D1 migrations (rooms + auth own them). Defaults to --remote; pass `-- --local`
+# Apply D1 migrations (every worker with a `migrate` script). Defaults to --remote; pass `-- --local`
 # for the dev db. Scope with -F, e.g. `just migrate -F rooms`.
 [group('2. local dev')]
 [positional-arguments]

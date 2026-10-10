@@ -97,12 +97,12 @@ const CATALOG_SKIN_ID = 90_002
 const CATALOG_SKINS_SEEDED = 70
 
 /**
- * First-party custom avatar items the GENERIC rows draw, as `[name, OutfitType]`. More shirts
- * than a row holds, so the LIMIT and the randomness are exercised on the unfiltered draw; one
- * or two in each other slot the category rows take.
+ * First-party custom avatar items the GENERIC rows draw, as `[name, OutfitType]`. There are more
+ * eligible items than a row holds overall, while the tops category has exactly 49 shirts and
+ * one team jersey so its category assertion is deterministic; other slots fill the rest.
  */
 const CUSTOM_ITEM_SEEDS: Array<[name: string, outfitType: number]> = [
-	...Array.from({ length: 60 }, (_, i): [string, number] => [`Seeded Shirt ${i}`, 101]),
+	...Array.from({ length: 49 }, (_, i): [string, number] => [`Seeded Shirt ${i}`, 101]),
 	['Top Hat', 0],
 	['Angled Bob Hair', 2],
 	['Round Earrings', 3],
@@ -938,7 +938,7 @@ it('fills a GENERIC (type=5) row with random first-party custom avatar items', a
 		expect(guids).not.toContain(excluded)
 	}
 
-	// Actually RANDOM, not a fixed slice: two reads of 50 from 72 rows agree only by a
+	// Actually RANDOM, not a fixed slice: two reads of 50 from 61 rows agree only by a
 	// vanishing coincidence, so identical draws mean the ORDER BY RANDOM() was lost.
 	expect(await readGenericGuids('summerpartycarousel')).not.toEqual(guids)
 

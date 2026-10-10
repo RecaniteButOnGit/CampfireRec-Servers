@@ -25,7 +25,11 @@ missing/invalid). `~` = optional auth: served to anyone, personalised for a vali
 | GET      | `/api/avatar/v2`                                     | ✓    | The player's own avatar                 |
 | POST     | `/api/avatar/v2/set`                                 | ✓    | Save the player's avatar                |
 | GET      | `/api/checklist/v1/current`                          | ✓    | NUX checklist (stub `[]`)               |
-| GET      | `/api/itemWishlists/v1/wishlist/me`                  | ✓    | Item wishlist (stub `[]`)               |
+| GET      | `/api/itemWishlists/v1/wishlist/me`                  | ✓    | The caller's item wishlist              |
+| GET      | `/api/itemWishlists/v1/wishlist/:accountId`          | ✓    | Another player's item wishlist          |
+| POST     | `/api/itemWishlists/v1/wishlist/add`                 | ✓    | Wish for an item (form, enveloped)      |
+| POST     | `/api/itemWishlists/v1/wishlist/remove`              | ✓    | Un-wish an item (a POST, not DELETE)    |
+| POST     | `/api/itemWishlists/v1/isonwishlist/bulk`            | ✓    | Per-player "has it wished for" booleans |
 | GET      | `/api/avatar/v3/saved`                               | ✓    | Saved outfits                           |
 | POST     | `/api/avatar/v3/saved/set`                           | ✓    | Save an outfit into a slot              |
 | GET      | `/api/avatar/v2/gifts`                               | ✓    | Pending (unopened) gift boxes           |
@@ -39,6 +43,7 @@ missing/invalid). `~` = optional auth: served to anyone, personalised for a vali
 | POST     | `/api/settings/v2/set`                               | ✓    | Persist settings (accept-and-ack)       |
 | GET      | `/api/consumables/v2/getUnlocked`                    | ✓    | Unlocked consumables                    |
 | POST     | `/api/consumables/v1/consume`                        | ✓    | Consume an owned consumable             |
+| POST     | `/api/consumables/v1/updateActive`                   | ✓    | Mark a consumable active (stub, empty)  |
 | GET      | `/api/storefronts/v4/balance/:currencyType`          | ✓    | Currency balance                        |
 | GET      | `/api/storefronts/v3/giftdropstore/:id`              |      | Gift-drop storefront catalog            |
 | POST     | `/api/storefronts/v2/buyItem`                        | ✓    | Buy a storefront item                   |
@@ -638,8 +643,8 @@ Add a storefront by dropping a new `sfN.json` in `static/storefronts` — no cod
   publish; per-item weighting and a multi-catalog pool would both need a manifest of the
   storefronts, which the ASSETS binding can't enumerate.
 - Consumables are granted and listed but never spent by gameplay, so `Count` only grows.
-- Several routes (room keys, wishlist, equipment, room consumables/currencies) are
-  empty-list stubs pending their own stores.
+- Several routes (equipment, room consumables/currencies) are empty-list stubs pending
+  their own stores.
 - Game rewards pay a flat 5 XP; there is no daily XP cap beyond the hourly cooldown (the
   reference caps activity XP per day in `daily_xp_ledgers`).
 - The level-reward table and the served config's `GiftRarity` disagree in places (see the

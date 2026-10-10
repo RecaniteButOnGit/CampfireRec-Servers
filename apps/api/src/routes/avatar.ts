@@ -1734,8 +1734,9 @@ export const avatarRoutes = new Hono<App>({ strict: false })
 	)
 
 	// Invention search/browse: published inventions matching `value` (matched against
-	// name + description; absent → browse everything published), newest first.
-	// Paginated via skip/take (take defaults to 100). Returns a bare array.
+	// name + description; absent → browse everything published; `@username` → that
+	// player's published inventions), newest first. Paginated via skip/take (take
+	// defaults to 100). Returns a bare array.
 	//
 	// Filtered, ordered and paged in SQL — it must not read the catalogue into memory to
 	// answer one page.
@@ -1748,10 +1749,16 @@ export const avatarRoutes = new Hono<App>({ strict: false })
 				'Published inventions matching `value`, newest first. `value` is split into terms ' +
 				'and every term must match, each against the name and the description. An absent ' +
 				'`value` browses everything published — that is the browse screen’s initial ' +
-				'request. Tags are NOT searched: a `#tag` term from the browse screen’s filter ' +
-				'chips is treated as text and matches nothing.',
+				'request. A `value` starting with `@` names a player: `@djdevin` lists that ' +
+				'player’s PUBLISHED inventions (the same set `v1/fromcreators` serves), resolved by ' +
+				'username case-insensitively, with any further terms narrowing them as text; an ' +
+				'unknown username is an empty array. Tags are NOT searched: a `#tag` term from the ' +
+				'browse screen’s filter chips is treated as text and matches nothing.',
 			parameters: [
-				stringQuery('value', 'Search text; absent browses everything'),
+				stringQuery(
+					'value',
+					'Search text; absent browses everything; `@username` is a player’s inventions'
+				),
 				...pageParams(100),
 			],
 			responses: { 200: json(InventionDto.array(), 'The matching inventions') },

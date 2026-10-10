@@ -33,6 +33,10 @@ Upstream hosts are derived from the shared base domain (`auth.<DOMAIN>`,
 | POST   | `/api/email`    | accounts `POST /account/me/email`                        |
 | POST   | `/api/password` | auth `POST /account/me/changepassword`                   |
 
+`/device` is a client-side page, not a BFF route. Rec Room Studio opens it (from
+the `verification_uri` auth returns) so a signed-in player can approve the
+editor's device code. The page calls auth `POST /connect/device/approve` itself.
+
 On signup/login the access token returned by `auth` is stored in an httpOnly
 `rf_token` cookie; the other routes read it and forward it as a Bearer token.
 
@@ -265,6 +269,14 @@ genuinely left (404 `Unknown Member`) is written as holding no roles. Transient 
 skip that one link and leave its snapshot for the next run, and the sweep honors
 Discord's rate-limit headers between calls. `wrangler tail www` shows a summary line per
 run: `discord role sweep: refreshed N of M links, …`.
+
+A developer can run the same sweep on demand with `POST /api/staff/discord-roles/sync`
+(developer role required, empty body). It answers with the run's summary —
+`{ skipped, refreshed, changed, gone, failed, halted }` — so a run that stops on its first
+call reports WHY (`halted: "the bot is not in the guild (Unknown Guild)"`) instead of
+leaving a silent log line on a worker with observability off. Use it after changing the
+bot token or inviting the bot, or when the role drop needs this morning's roles. The run
+is written to `audit_log` as `sync_discord_roles` against the developer who pressed it.
 
 ## Development
 

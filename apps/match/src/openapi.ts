@@ -274,6 +274,15 @@ export const InProgressRequest = z.object({
 	inProgress: z.string().describe('"True" | "False" (case-insensitive)'),
 })
 
+/** `PUT /roominstance/:id/matchpolicy` form body. */
+export const MatchPolicyRequest = z.object({
+	policy: z
+		.string()
+		.describe(
+			'0 Default (accepts players), 1 Avoid (deprioritised), 2 Ignore (never matched into)'
+		),
+})
+
 /** `PUT /player/statusvisibility` form body. */
 export const StatusVisibilityRequest = z.object({
 	statusVisibility: z.string().describe('Integer string; non-numeric is ignored'),

@@ -6,7 +6,9 @@ import {
 	Accessibility,
 	answerRoomRoleInvite,
 	applyRoomTagEdit,
+	attachStudioUnityAssets,
 	autocompleteRoomSearch,
+	bakedUnityAssets,
 	banPlayerFromRoom,
 	canManageRoom,
 	canManageRoomById,
@@ -21,6 +23,7 @@ import {
 	deleteSubRoom,
 	findSubRoom,
 	getAccount,
+	getBakedUnityAssets,
 	getBaseRooms,
 	getContributedRooms,
 	getFavoritedRooms,
@@ -38,15 +41,19 @@ import {
 	getRoomBans,
 	getRoomById,
 	getRoomByName,
+	getRoomExperience,
 	getRoomsByCreator,
 	getRoomsByIds,
 	getSimilarRooms,
+	getStudioUnityAsset,
+	getSubRoom,
 	getSubRoomPermissions,
 	getSubRoomSaveById,
 	getSubRoomSaves,
 	getTrendingRooms,
 	getVisitedRooms,
 	importRoom,
+	incrementRoomExperience,
 	inviteRoomRole,
 	isPlayerBannedFromRoom,
 	isRoomOwner,
@@ -60,6 +67,7 @@ import {
 	removeRoomRole,
 	Role,
 	roomNameRejection,
+	roomProgression,
 	roomRoles,
 	saveSubRoomData,
 	searchRooms,
@@ -68,6 +76,7 @@ import {
 	setRoomImage,
 	setRoomLeaderboard,
 	setRoomName,
+	setRoomProgression,
 	setRoomRole,
 	setSubRoomPermissions,
 	subRoomNameRejection,
@@ -94,6 +103,8 @@ import { NotificationType } from '../../notify/src/notification-types'
 import {
 	AccessibilityRequest,
 	AUTHED,
+	BakedUnityAssetBulkList,
+	BakedUnityAssetBulkRequest,
 	bannedPlayerIdParam,
 	BanRequest,
 	BulkRoomsRequest,
@@ -104,6 +115,8 @@ import {
 	CuratedPlaylists,
 	DescriptionRequest,
 	DormRoomId,
+	ExperienceIncrementRequest,
+	ExperienceRequest,
 	FeaturedRoomGroupDto,
 	FORBIDDEN_RESPONSE,
 	form,
@@ -143,6 +156,7 @@ import {
 	RoomEnvelope,
 	RoomExperience,
 	RoomExperiencePlayer,
+	RoomExperiencePlayerEnvelope,
 	roomIdParam,
 	RoomLookup,
 	RoomPascalEnvelope,
@@ -156,7 +170,7 @@ import {
 	ShowcasedRooms,
 	stringQuery,
 	SubRoomAccessibilityRequest,
-	SubRoomDataSaveResponseDto,
+	SubRoomDataSaveDetailDto,
 	subRoomIdParam,
 	SubRoomPermissionsRequest,
 	SubRoomSavesNoUnityAssetsPage,
@@ -168,11 +182,12 @@ import {
 	UNAUTHORIZED_ENVELOPE,
 	UNAUTHORIZED_RESPONSE,
 	UnbanBulkRequest,
+	UnityAssetWithSourceDto,
 	WarningRequest,
 } from './openapi'
 
 import type { Context } from 'hono'
-import type { RoomBan, RoomBanRecord, RoomPermission } from '@repo/domain'
+import type { Room, RoomBan, RoomBanRecord, RoomPermission } from '@repo/domain'
 import type { MessageReceivedPayload } from '../../notify/src/notification-payloads'
 import type { App, Env } from './context'
 
@@ -249,59 +264,143 @@ interface PresenceView {
 }
 
 /**
- * Room permissions + Photon token the client needs to spawn into a room. The
- * global (Role 0) maker pen is added only for the hardcoded dev accounts, and
- * `RoomInstanceId` is the caller's current instance from presence (null when
- * they aren't in one). `PhotonAccessToken` stays empty — the reference server
- * signs it via `ClientSecurity`, whose secret/algorithm we don't have; our
- * Photon setup accepts an empty token.
+ * The permissions the token table carries for every role, in the order the client has been
+ * seen receiving them. A room's creator may override any of them per subroom and per role
+ * (`PUT …/subrooms/{subRoomId}/permissions`); the table may also carry pairs the creator
+ * added that aren't listed here (`CAN_INVITE`, `MAX_SPAWNED_INVENTIONS`).
+ */
+const BUILD_PERMISSIONS = [
+	'CAN_USE_MAKER_PEN',
+	'CAN_USE_ROOM_RESET_BUTTON',
+	'CAN_USE_DELETE_ALL_BUTTON',
+	'CAN_SAVE_INVENTIONS',
+	'CAN_SPAWN_INVENTIONS',
+	'CAN_USE_PLAY_GIZMOS_TOGGLE',
+] as const
+
+/**
+ * Whether a role may build by default — the value every permission above takes for it when
+ * the creator has stored nothing. Only the room's MANAGERS (co-owner and up) may: a visitor,
+ * a host or a moderator in a room whose creator never opened the permissions screen must not
+ * be able to reset the room, delete everything in it or spawn into it. Serving `True` at
+ * Role 0 to everyone (as this once did) handed every visitor the delete-all button.
+ */
+const buildsByDefault = (role: number): boolean => role >= Role.CoOwner
+
+/**
+ * The caller's role in a room: Creator for its `CreatorAccountId`, otherwise the highest
+ * tier `Roles` names them at, otherwise None — a visitor.
+ */
+function roleIn(room: Room, accountId: number): number {
+	if (room.CreatorAccountId === accountId) return Role.Creator
+	return roomRoles(room)
+		.filter((r) => r.AccountId === accountId)
+		.reduce((best, r) => Math.max(best, r.Role), Role.None as number)
+}
+
+/**
+ * The role tiers a manager's permission table carries a row for, lowest first — every
+ * member of the `Role` enum. The permissions screen draws a cell per (permission, role) and
+ * reads each cell from the row at exactly that role, so every tier needs its rows whether
+ * or not anything is stored there.
+ */
+const PERMISSION_ROLES = [Role.None, Role.Host, Role.Moderator, Role.CoOwner, Role.Creator]
+
+/**
+ * Room permissions + Photon token the client needs to spawn into a room. `RoomInstanceId`
+ * is the caller's current instance from presence (null when they aren't in one).
+ * `PhotonAccessToken` stays empty — the reference server signs it via `ClientSecurity`,
+ * whose secret/algorithm we don't have; our Photon setup accepts an empty token.
  *
- * `overrides` are the permissions the room's creator saved on the subroom the caller is
- * in (see `PUT …/subrooms/{subRoomId}/permissions`). They are matched against the
- * defaults by (`Permission`, `Role`) — the same pair the client addresses an entry by —
- * and win, so a subroom that revokes the Role 0 maker pen revokes it for a dev account
- * standing in it as well.
+ * The table depends on who is asking, because two different screens read it:
+ *
+ * A MANAGER — the creator or a co-owner (`role` at or above {@link Role.CoOwner}, the same
+ * set `canManageRoom` admits) — gets the WHOLE table, one row per (permission, role) for
+ * every tier in {@link PERMISSION_ROLES}. The permissions screen (fed by
+ * `PUT …/subrooms/{subRoomId}/permissions`) draws a cell per pair and reads each cell from
+ * the row at exactly that role, so a stored entry is served at its own role with
+ * `Override: true`, and every other cell carries the value that reaches that role with
+ * `Override: false` — the entry stored at the highest lower role, else the default. A
+ * cell with no row snaps back to the default the moment it is toggled (a Host grant served
+ * only at Role 0 and the creator's own role, as this once did, did exactly that), and a
+ * default served with `Override: true` can never be un-overridden, so the flags matter as
+ * much as the values.
+ *
+ * Everyone else gets THEIR rows only: each permission's value for the role they hold — the
+ * override stored at their own role, else the one stored at the highest lower role (a grant
+ * to "everyone" reaches a host too), else the default — served at Role 0 AND, for a role
+ * holder, again at their role, every row `Override: true`. The client has been seen applying
+ * Role 0 rows to a visitor, and which rows it reads for a host or moderator is not known, so
+ * both readings land on the same values. Pairs stored under a role they don't hold are not
+ * theirs and are left out, so a visitor never sees — or gets — a co-owner's grants.
+ *
+ * Defaults: managers may build, nobody else may ({@link buildsByDefault}). The global maker
+ * pen stays with the hardcoded dev accounts, whatever the room says.
  */
 function photonAccessToken(
 	accountId: number,
 	roomInstanceId: number | null,
+	role: number = Role.None,
 	overrides: RoomPermission[] = []
 ) {
-	const perm = (Permission: string, Role: number, Override: boolean): RoomPermission => ({
-		Override,
-		Permission,
-		Role,
-		Type: 0,
-		Value: 'True',
-	})
-	const permissions: RoomPermission[] = [
-		perm('CAN_USE_ROOM_RESET_BUTTON', 0, true),
-		perm('CAN_USE_DELETE_ALL_BUTTON', 0, true),
-		perm('CAN_SAVE_INVENTIONS', 0, true),
-		perm('CAN_SPAWN_INVENTIONS', 0, true),
-		perm('CAN_USE_PLAY_GIZMOS_TOGGLE', 0, true),
-		perm('CAN_USE_MAKER_PEN', 30, false),
-		perm('CAN_USE_ROOM_RESET_BUTTON', 30, true),
-		perm('CAN_USE_DELETE_ALL_BUTTON', 30, true),
-		perm('CAN_SAVE_INVENTIONS', 30, true),
-		perm('CAN_SPAWN_INVENTIONS', 30, true),
-		perm('CAN_USE_PLAY_GIZMOS_TOGGLE', 30, true),
-	]
-
-	if (MAKER_PEN_ACCOUNT_IDS.has(accountId)) {
-		permissions.unshift(perm('CAN_USE_MAKER_PEN', 0, true))
+	const isBuild = (name: string): boolean =>
+		BUILD_PERMISSIONS.includes(name as (typeof BUILD_PERMISSIONS)[number])
+	const names = [...BUILD_PERMISSIONS, ...overrides.map((o) => o.Permission)].filter(
+		(name, i, all) => all.indexOf(name) === i
+	)
+	const storedAt = (permission: string, at: number): RoomPermission | undefined =>
+		overrides.find((o) => o.Permission === permission && o.Role === at)
+	// The override that reaches a role from below it: the highest role under `at` with one.
+	const reachingFromBelow = (permission: string, at: number): RoomPermission | undefined =>
+		overrides
+			.filter((o) => o.Permission === permission && o.Role < at)
+			.reduce<RoomPermission | undefined>(
+				(best, o) => (best && best.Role > o.Role ? best : o),
+				undefined
+			)
+	// The value a role holds for a permission with nothing stored at that role; undefined
+	// for a creator-added pair nothing below the role names either.
+	const inherited = (permission: string, at: number): string | undefined => {
+		const below = reachingFromBelow(permission, at)
+		if (below) return below.Value
+		return isBuild(permission) ? (buildsByDefault(at) ? 'True' : 'False') : undefined
 	}
+	const row = (
+		Permission: string,
+		Role: number,
+		Value: string,
+		Override: boolean,
+		Type = 0
+	): RoomPermission => ({ Override, Permission, Role, Type, Value })
 
-	// The subroom's stored table wins, applied LAST and over the dev grant too: a
-	// (Permission, Role) the table already carries is replaced in place — so the order
-	// doesn't shift under the client, and no pair is ever listed twice with two values —
-	// and one it doesn't (e.g. CAN_INVITE) is appended.
-	for (const override of overrides) {
-		const i = permissions.findIndex(
-			(p) => p.Permission === override.Permission && p.Role === override.Role
-		)
-		if (i === -1) permissions.push(override)
-		else permissions[i] = override
+	const permissions: RoomPermission[] = []
+	if (buildsByDefault(role)) {
+		// A manager: the whole table, grouped by role.
+		for (const at of PERMISSION_ROLES) {
+			for (const name of names) {
+				const own = storedAt(name, at)
+				if (own) permissions.push(row(name, at, own.Value, true, own.Type))
+				else {
+					const value = inherited(name, at)
+					if (value !== undefined) permissions.push(row(name, at, value, false))
+				}
+			}
+		}
+		if (MAKER_PEN_ACCOUNT_IDS.has(accountId)) {
+			const own = permissions.find((p) => p.Permission === 'CAN_USE_MAKER_PEN' && p.Role === role)
+			if (own) own.Value = 'True'
+		}
+	} else {
+		// Anyone else: their own values, at Role 0 and at their role.
+		const values = new Map<string, string>()
+		for (const name of names) {
+			const value = storedAt(name, role)?.Value ?? inherited(name, role)
+			if (value !== undefined) values.set(name, value)
+		}
+		if (MAKER_PEN_ACCOUNT_IDS.has(accountId)) values.set('CAN_USE_MAKER_PEN', 'True')
+		for (const at of role === Role.None ? [Role.None] : [Role.None, role]) {
+			for (const [name, value] of values) permissions.push(row(name, at, value, true))
+		}
 	}
 	return {
 		Permissions: permissions,
@@ -311,37 +410,43 @@ function photonAccessToken(
 }
 
 /**
- * Photon access-token handler. Auth-gated: resolves the caller, reads their current
- * room instance from the shared `presence` table (see @repo/domain), and returns the
- * permissions + token.
+ * Photon access-token handler. Auth-gated: resolves the caller, reads their current room
+ * instance from the shared `presence` table (see @repo/domain), works out their role in that
+ * room and the overrides stored on the subroom they are standing in, and returns the
+ * permissions + token. A player in no instance — sitting in the lobby, or an instance
+ * predating subroom tracking — is a visitor with the defaults.
  */
 async function handlePhotonAccessToken(c: Context<App>) {
 	const accountId = await authedAccountId(c)
 	if (accountId === null) return unauthorized(c)
 	const instance = (await getPresence<PresenceView>(c.env.DB, accountId))?.roomInstance
-	// The permission overrides are the ones saved on the subroom the caller is standing in.
-	// A player in no instance — sitting in the lobby, or an instance predating subroom
-	// tracking — gets the default table untouched.
+	const room =
+		typeof instance?.roomId === 'number' ? await getRoomById(c.env.DB, instance.roomId) : null
+	const role = room ? roleIn(room, accountId) : Role.None
 	const overrides =
 		typeof instance?.subRoomId === 'number'
 			? await getSubRoomPermissions(c.env.DB, instance.subRoomId)
 			: []
-	return c.json(photonAccessToken(accountId, instance?.roomInstanceId ?? null, overrides))
+	return c.json(photonAccessToken(accountId, instance?.roomInstanceId ?? null, role, overrides))
 }
 
 /**
- * May this caller read the room's saves? The room's creator always may. So may anyone
- * whose live presence puts them IN the room: they are already loading its scene, and the
- * client resolves which version to load — the published one or the creator's latest — from
- * the save list, so refusing everyone but the creator leaves a visitor unable to load what
- * the instance is actually running.
+ * May this caller read the room's saves? The room's creator and its co-owners always may:
+ * they are the ones who write and publish saves (`canManageRoom` gates both), and the
+ * client shows them the save history from the room's settings, wherever they are — a
+ * co-owner refused here sees the buttons and a list that never loads.
  *
- * Presence is the shared `presence` table the `match` heartbeat maintains, so this grant
+ * So may anyone whose live presence puts them IN the room: they are already loading its
+ * scene, and the client resolves which version to load — the published one or the latest —
+ * from the save list, so refusing everyone but the room's managers leaves a visitor unable
+ * to load what the instance is actually running.
+ *
+ * Presence is the shared `presence` table the `match` heartbeat maintains, so that grant
  * lasts only as long as the player is actually there (rows carry an absolute expiry and
- * expired ones don't read back). Co-owners get nothing extra from being co-owners — a
- * co-owner standing in the room passes because of where they are, not what they hold.
+ * expired ones don't read back).
  *
- * The presence read only happens for a non-creator, so the owner's own path stays one query.
+ * The presence read only happens for someone who doesn't manage the room, so the owner's
+ * and a co-owner's path stays one query.
  */
 async function canReadSaves(
 	c: Context<App>,
@@ -349,7 +454,7 @@ async function canReadSaves(
 	roomId: number,
 	accountId: number
 ): Promise<boolean> {
-	if (room.CreatorAccountId === accountId) return true
+	if (canManageRoom(room, accountId)) return true
 	const instance = (await getPresence<PresenceView>(c.env.DB, accountId))?.roomInstance
 	return instance?.roomId === roomId
 }
@@ -796,17 +901,20 @@ function roomResult(
  * versions, no moderation state, no asset arrays; but `unityAsset`/`unityAssetHash`
  * that `CurrentSave` never shows). Don't unify the two without checking the client.
  *
- * `unityAsset`/`unityAssetHash` are always null: we resolve no baked Unity assets.
+ * `unityAsset`/`unityAssetHash` name one baked main bundle when this save has a Studio
+ * build attached, and stay null for a maker-pen save. `target` null prefers Windows (0).
+ * A caller that named a target gets that platform or null, never the other one.
  */
-function toSaveResponse(save: Record<string, unknown>) {
+function toSaveResponse(save: Record<string, unknown>, target: number | null = null) {
 	const str = (v: unknown) => (typeof v === 'string' ? v : null)
 	const num = (v: unknown) => (typeof v === 'number' ? v : null)
+	const baked = pickBakedBundle(save, target)
 	return {
 		subRoomDataSaveId: num(save.SubRoomDataSaveId),
 		subRoomId: num(save.SubRoomId),
 		unityAssetId: str(save.UnityAssetId),
-		unityAsset: null,
-		unityAssetHash: null,
+		unityAsset: baked?.filename ?? null,
+		unityAssetHash: baked?.hash ?? null,
 		dataBlob: str(save.DataBlob) ?? '',
 		dataBlobHash: str(save.DataBlobHash),
 		savedByAccountId: num(save.SavedByAccountId),
@@ -814,6 +922,54 @@ function toSaveResponse(save: Record<string, unknown>) {
 		savedOnDeviceClass: num(save.SavedOnDeviceClass) ?? 0,
 		description: str(save.Description),
 		createdAt: str(save.CreatedAt) ?? '',
+	}
+}
+
+/** The `unityAssetTarget` query, or null when the caller did not name an integer. */
+function unityAssetTargetQuery(c: Context<App>): number | null {
+	const raw = c.req.query('unityAssetTarget')
+	if (raw === undefined || raw === '') return null
+	const target = Number(raw)
+	return Number.isInteger(target) ? target : null
+}
+
+/** One main bundle off a save: Windows when `target` is null, else that target only. */
+function pickBakedBundle(
+	save: Record<string, unknown>,
+	target: number | null
+): { filename: string; hash: string | null } | null {
+	if (!Array.isArray(save.UnitySubAssets)) return null
+	const rows = save.UnitySubAssets.filter(
+		(item): item is { Target?: unknown; Filename?: unknown; Hash?: unknown } =>
+			typeof item === 'object' && item !== null
+	)
+	const chosen =
+		target === null
+			? (rows.find((row) => row.Target === 0) ?? rows[0])
+			: rows.find((row) => row.Target === target)
+	if (!chosen || typeof chosen.Filename !== 'string' || chosen.Filename === '') return null
+	const hash = typeof chosen.Hash === 'string' && chosen.Hash !== '' ? chosen.Hash : null
+	return { filename: chosen.Filename, hash }
+}
+
+/** Drop baked bundles whose `Target` is not the one the caller asked for. */
+function keepUnityAssetTarget(save: Record<string, unknown>, target: number) {
+	if (!Array.isArray(save.UnitySubAssets)) return
+	save.UnitySubAssets = save.UnitySubAssets.filter((item) => {
+		if (typeof item !== 'object' || item === null) return false
+		return (item as { Target?: unknown }).Target === target
+	})
+}
+
+/** Narrow every subroom's current save to `target`. No-op when the caller named none. */
+function filterRoomUnityAssets(room: Record<string, unknown>, target: number | null) {
+	if (target === null || !Array.isArray(room.SubRooms)) return
+	for (const sub of room.SubRooms) {
+		if (typeof sub !== 'object' || sub === null) continue
+		const save = (sub as { CurrentSave?: unknown }).CurrentSave
+		if (typeof save === 'object' && save !== null) {
+			keepUnityAssetTarget(save as Record<string, unknown>, target)
+		}
 	}
 }
 
@@ -854,6 +1010,62 @@ function toSaveWithoutUnityAssets(save: Record<string, unknown>) {
 	}
 }
 
+/**
+ * One save as `GET …/subrooms/:sid/saves/:saveId` answers it — the PascalCase row the
+ * `…/saves` list serves, NOT the camelCase `subRoomDataSave` the room save that created
+ * it returned (an earlier version served that, and the client rendered a save whose
+ * values were all missing). Two things differ from the list row, both observed against
+ * the reference:
+ *
+ * - Each `UnitySubAssets` entry is `{ UnityAssetId, UnityAsset, UnityAssetHash }` — the
+ *   stored `Filename`/`Hash` under the names the client's save-detail decoder reads —
+ *   and the save's own main bundle is lifted to top-level `UnityAsset`/`UnityAssetHash`
+ *   (the named target's, Windows when none was named; both null for a maker-pen save).
+ * - No `Tags`, and `UnityAssetId` is always present (null when the save carried none).
+ *
+ * Built key by key like {@link toSaveWithoutUnityAssets}, for the same reason.
+ */
+function toSaveDetail(save: Record<string, unknown>, target: number | null) {
+	const str = (v: unknown) => (typeof v === 'string' ? v : null)
+	const num = (v: unknown) => (typeof v === 'number' ? v : null)
+	const main = pickBakedBundle(save, target)
+	const bundles = (Array.isArray(save.UnitySubAssets) ? save.UnitySubAssets : []).filter(
+		(item): item is Record<string, unknown> =>
+			typeof item === 'object' &&
+			item !== null &&
+			(target === null || (item as { Target?: unknown }).Target === target)
+	)
+	return {
+		UnitySubAssets: bundles.map((row) => ({
+			UnityAssetId: str(row.UnityAssetId),
+			UnityAsset: str(row.Filename),
+			UnityAssetHash: str(row.Hash),
+		})),
+		ReferencedUnityAssets: Array.isArray(save.ReferencedUnityAssets)
+			? save.ReferencedUnityAssets
+			: [],
+		UnityAsset: main?.filename ?? null,
+		UnityAssetHash: main?.hash ?? null,
+		SubRoomDataSaveId: num(save.SubRoomDataSaveId),
+		SubRoomId: num(save.SubRoomId),
+		UnityAssetId: str(save.UnityAssetId),
+		ReferencedUnityAssetIds: Array.isArray(save.ReferencedUnityAssetIds)
+			? save.ReferencedUnityAssetIds
+			: [],
+		DataBlob: str(save.DataBlob) ?? '',
+		DataBlobHash: str(save.DataBlobHash),
+		PersistenceVersion: num(save.PersistenceVersion) ?? 0,
+		OMVersion: num(save.OMVersion) ?? 0,
+		SavedByAccountId: num(save.SavedByAccountId),
+		SavedOnPlatform: num(save.SavedOnPlatform) ?? 0,
+		SavedOnDeviceClass: num(save.SavedOnDeviceClass) ?? 0,
+		Description: str(save.Description) ?? '',
+		ModerationState: num(save.ModerationState) ?? 0,
+		CreatedAt: str(save.CreatedAt) ?? '',
+		UgcSubVersion: num(save.UgcSubVersion) ?? 0,
+	}
+}
+
 /** Client envelope for room mutations: `{ success, error, value }` (lowercase). */
 function roomEnvelope(c: Context<App>, value: unknown, error = '') {
 	return c.json({ success: error === '', error, value })
@@ -873,6 +1085,9 @@ const banEnvelope = roomEnvelope
 function leaderboardEnvelope(c: Context<App>, error: string | null = null) {
 	return c.json({ Success: error === null, Error: error, error_id: null })
 }
+
+/** The same bare envelope for the room progression write (`POST /rooms/:id/experience`). */
+const experienceEnvelope = leaderboardEnvelope
 
 /** Rooms created/owned by the authed caller (shared by the createdby routes). */
 async function ownedRooms(c: Context<App>) {
@@ -894,19 +1109,6 @@ async function ownedRoomsExcludingDorm(c: Context<App>) {
 
 /** Suggestions `/rooms/autocomplete_search` returns when the client names no `take`. */
 const DEFAULT_SUGGESTION_COUNT = 10
-
-/**
- * The XP settings every room reports (`GET /rooms/{roomId}/experience`). Constants because
- * nothing stores them per room and nothing enforces them: the `api` worker's progression
- * grants XP without a room-scoped daily cap, so these are what the client is told, not a
- * limit this server applies.
- *
- * Disabled, which is the honest answer here — no room awards XP. `DailyLimit` is kept at
- * the reference's number rather than zeroed: it is the cap that WOULD apply, and the client
- * reads both keys whatever `Enabled` says.
- */
-const ROOM_XP_ENABLED = false
-const ROOM_XP_DAILY_LIMIT = 1000
 
 const app = new Hono<App>()
 	.use(
@@ -3455,7 +3657,8 @@ const app = new Hono<App>()
 	// A subroom's saved-data versions — the room-history / "restore a save" list. Every
 	// save is its own `subroom_save` row (nothing is overwritten), so this is real
 	// history, newest first, paged by skip/take. Auth-gated (401), and readable by the
-	// room's creator or anyone whose presence puts them in the room (see `canReadSaves`).
+	// room's creator, a co-owner, or anyone whose presence puts them in the room (see
+	// `canReadSaves`).
 	.get(
 		'/rooms/:roomId{[0-9]+}/subrooms/:subRoomId{[0-9]+}/saves',
 		describeRoute({
@@ -3465,11 +3668,12 @@ const app = new Hono<App>()
 				'The room-history / “restore a save” list, newest first. Every room save appends a',
 				'row rather than overwriting, so this is the subroom’s full history; it is empty',
 				'only when the subroom has never been saved.',
-				'`unityAssetTarget`/`unityAssetVersion` are accepted and ignored.',
+				'An integer `unityAssetTarget` keeps only `UnitySubAssets` for that target',
+				'(0 Windows, 2 Android/Quest). `unityAssetVersion` is accepted and ignored.',
 				'',
 				'The list includes STAGED saves that were never published, so it is not public:',
-				'the room’s creator may read it, and so may anyone standing IN the room (their live',
-				'presence says so). Anyone else is a 403. It is what the client reads to resolve',
+				'the room’s creator or a co-owner may read it, and so may anyone standing IN the room',
+				'(their live presence says so). Anyone else is a 403. It is what the client reads to resolve',
 				'“load the latest or the published version?” on entering a private instance — a',
 				'visitor who cannot read it cannot load what the instance is running.',
 				'',
@@ -3480,7 +3684,10 @@ const app = new Hono<App>()
 			parameters: [
 				roomIdParam,
 				subRoomIdParam,
-				stringQuery('unityAssetTarget', 'Accepted and ignored'),
+				stringQuery(
+					'unityAssetTarget',
+					'When an integer, `UnitySubAssets` on each row keeps only that target (0 Windows, 2 Android/Quest)'
+				),
 				stringQuery('unityAssetVersion', 'Accepted and ignored'),
 				stringQuery('skip', 'How many saves to skip (default 0)'),
 				stringQuery('take', 'How many saves to return (default all)'),
@@ -3509,6 +3716,10 @@ const app = new Hono<App>()
 			const take = Number.parseInt(c.req.query('take') ?? '', 10)
 			const from = Number.isNaN(skip) || skip < 0 ? 0 : skip
 			const page = saves.slice(from, Number.isNaN(take) || take < 0 ? undefined : from + take)
+			const target = unityAssetTargetQuery(c)
+			if (target !== null) {
+				for (const save of page) keepUnityAssetTarget(save, target)
+			}
 
 			return c.json({ Results: page, TotalResults: saves.length, TotalCount: saves.length })
 		}
@@ -3535,8 +3746,8 @@ const app = new Hono<App>()
 				'paged wrapper, with no `{ success, error, value }` envelope around it.',
 				'',
 				'Gated exactly like `…/saves`, and for the same reason: the list includes STAGED',
-				'saves that were never published, so it is the room’s creator or anyone whose live',
-				'presence puts them in the room, and anyone else is a 403.',
+				'saves that were never published, so it is the room’s creator, a co-owner, or anyone',
+				'whose live presence puts them in the room, and anyone else is a 403.',
 				'',
 				'`TotalResults` and `TotalCount` carry the same number — the client’s paged DTO and',
 				'the reference disagree on the name, so both are emitted.',
@@ -3592,20 +3803,34 @@ const app = new Hono<App>()
 			tags: ['Subrooms'],
 			summary: 'One of a subroom’s saves by id',
 			description: [
-				'A single save, in the SAME camelCase projection the room save that created it',
-				'returned — not the PascalCase rows `…/saves` lists. Save ids are globally',
-				'unique but resolved scoped to the subroom, so one subroom cannot read another’s',
-				'save by guessing an id: a save that belongs elsewhere is a 404, same as an unknown',
-				'one.',
+				'A single save as a PascalCase row like the ones `…/saves` lists — NOT the camelCase',
+				'`subRoomDataSave` the room save that created it returned (served that way, the',
+				'client showed a save with every value missing). It differs from the list row in',
+				'how it names bundles: each `UnitySubAssets` entry is `{ UnityAssetId, UnityAsset,',
+				'UnityAssetHash }`, the save’s main bundle is lifted to top-level `UnityAsset`/',
+				'`UnityAssetHash` (null for a maker-pen save), and there is no `Tags`. An integer',
+				'`unityAssetTarget` picks which target’s bundles those are (0 Windows, 2',
+				'Android/Quest); none named means every bundle in the list and Windows on top.',
+				'Save ids are globally unique but resolved scoped to the subroom, so one subroom',
+				'cannot read another’s save by guessing an id: a save that belongs elsewhere is a',
+				'404, same as an unknown one.',
 				'',
-				'Gated like the list it details — the room’s creator, or anyone whose presence puts',
-				'them in the room. A save id resolves whether or not it was ever published, so this',
+				'Gated like the list it details — the room’s creator, a co-owner, or anyone whose',
+				'presence puts them in the room. A save id resolves whether or not it was ever published, so this',
 				'reads unpublished work.',
 			].join(' '),
 			security: AUTHED,
-			parameters: [roomIdParam, subRoomIdParam, saveIdParam],
+			parameters: [
+				roomIdParam,
+				subRoomIdParam,
+				saveIdParam,
+				stringQuery(
+					'unityAssetTarget',
+					'When an integer, the bundles are that target’s only (0 Windows, 2 Android/Quest)'
+				),
+			],
 			responses: {
-				200: json(SubRoomDataSaveResponseDto, 'The save'),
+				200: json(SubRoomDataSaveDetailDto, 'The save'),
 				401: UNAUTHORIZED_RESPONSE,
 				403: FORBIDDEN_RESPONSE,
 				404: { description: 'No such room, subroom, or save on that subroom' },
@@ -3626,7 +3851,73 @@ const app = new Hono<App>()
 			if (!(await canReadSaves(c, room, roomId, accountId))) return c.body(null, 403)
 
 			const save = await getSubRoomSaveById(c.env.DB, subRoomId, saveId)
-			return save ? c.json(toSaveResponse(save)) : c.notFound()
+			return save ? c.json(toSaveDetail(save, unityAssetTargetQuery(c))) : c.notFound()
+		}
+	)
+
+	// Metadata for the unity asset on one of this subroom's saves. The editor calls
+	// this after a build; the game reads the same bundles from `CurrentSave` and then
+	// downloads `filename` from the CDN. Bare object, no envelope, no auth — the room
+	// document already names the files.
+	.get(
+		'/rooms/:roomId{[0-9]+}/subrooms/:subRoomId{[0-9]+}/unityasset',
+		describeRoute({
+			tags: ['Subrooms'],
+			summary: 'The unity asset attached to a subroom save',
+			description: [
+				'The baked Windows and Android bundles stored for `unityAssetId`, when that id is',
+				'on a save of this subroom. A bare object: `unityAssetId`, `createdByAccountId`,',
+				'`bakedUnityAssets` (one entry per main bundle), plus `filename` and `hash` for the',
+				'Windows bundle. Bytes are `GET /unityasset/{filename}` on the CDN.',
+				'',
+				'`target` is 0 for Windows and 2 for Android/Quest. Stripped bundles are stored and',
+				'not listed. An unknown room, subroom, or asset is a 404. No auth: `GET /rooms/{id}`',
+				'already includes the same filenames on `CurrentSave`.',
+			].join(' '),
+			parameters: [
+				roomIdParam,
+				subRoomIdParam,
+				stringQuery('unityAssetId', 'The save’s `UnityAssetId`'),
+			],
+			responses: {
+				200: json(UnityAssetWithSourceDto, 'The unity asset and its baked bundles'),
+				404: { description: 'No such room, subroom, or asset on that subroom' },
+			},
+		}),
+		async (c) => {
+			const roomId = Number.parseInt(c.req.param('roomId'), 10)
+			const subRoomId = Number.parseInt(c.req.param('subRoomId'), 10)
+			const unityAssetId = c.req.query('unityAssetId') ?? ''
+			if (unityAssetId === '') return c.notFound()
+
+			const sub = await getSubRoom(c.env.DB, roomId, subRoomId)
+			if (!sub) return c.notFound()
+			const saves = await getSubRoomSaves(c.env.DB, subRoomId)
+			const save = saves.find((row) => row.UnityAssetId === unityAssetId)
+			if (!save) return c.notFound()
+
+			const asset = await getStudioUnityAsset(c.env.DB, unityAssetId)
+			if (!asset) return c.notFound()
+
+			// Main bundles, Windows first; the Windows one (or the first there is) supplies
+			// the top-level `filename`/`hash`.
+			const mains = bakedUnityAssets(asset.builds)
+			const source = mains.find((build) => build.Target === 0) ?? mains[0]
+			if (!source) return c.notFound()
+
+			const savedBy = typeof save.SavedByAccountId === 'number' ? save.SavedByAccountId : 0
+			return c.json({
+				unityAssetId: asset.unityAssetId,
+				createdByAccountId: asset.createdByAccountId || savedBy,
+				bakedUnityAssets: mains.map((build) => ({
+					unityAssetId: build.UnityAssetId,
+					target: build.Target,
+					version: build.Version,
+					filename: build.Filename,
+				})),
+				filename: source.Filename,
+				hash: source.Hash,
+			})
 		}
 	)
 
@@ -3719,6 +4010,7 @@ const app = new Hono<App>()
 			// `value` carries BOTH the updated room and the save just created — and `error`
 			// is null here, not the empty string the other room envelopes use.
 			await pushRoomUpdate(c, accountId, result.room)
+			await attachStudioUnityAssets(c.env.DB, [result.save])
 			return c.json({
 				success: true,
 				error: null,
@@ -3952,9 +4244,16 @@ const app = new Hono<App>()
 	// body is a JSON ARRAY of the entries to change, keyed by (Permission, Role): `Override`
 	// is the client's checkbox, so true stores the entry for that pair and false clears it
 	// back to the default. The stored table then overwrites the matching defaults in
-	// `GET /photon_access_token`. Auth-gated (401) and creator-only (403), like the other
-	// subroom mutations. Answers an EMPTY 200 — the client fires this and re-reads nothing,
-	// so there is no envelope to match.
+	// `GET /photon_access_token`. Auth-gated (401) and gated to the room's MANAGERS — its
+	// creator or a co-owner (403), the same `canManageRoom` the other room-admin writes
+	// take; a creator-only check here locked out co-owners the client shows the screen to,
+	// and an owner whose room names them in `Roles` rather than `CreatorAccountId`. Answers
+	// the whole ROOM under `Value` in the PascalCase `{ Value, Success, Error, error_id }`
+	// envelope — the same reader the subroom move and max-player mode routes feed, and the
+	// same Room DTO `GET /rooms/{id}` serves (the permissions themselves aren't on it). A
+	// rejection is HTTP 200 with `Success: false` and the message in `Error`; only a
+	// missing token is a 401. This once answered an empty 200, which the client's reader
+	// couldn't decode.
 	.put(
 		'/rooms/:roomId{[0-9]+}/subrooms/:subRoomId{[0-9]+}/permissions',
 		describeRoute({
@@ -3969,43 +4268,55 @@ const app = new Hono<App>()
 				'',
 				'`Override` is the checkbox the client draws beside each permission, not data:',
 				'`true` stores `Value` for that pair, and `false` means “fall back to the default”, so',
-				'it DELETES any stored entry. Nothing is stored with `Override: false`, and reads',
-				'always serve `true`. `Value` is a string — usually `True`/`False`, but it is kept',
-				'verbatim, since not every permission’s UI is a True/False picker.',
+				'it DELETES any stored entry. Nothing is stored with `Override: false`; a stored entry',
+				'reads back with `true` at its own role. `Value` is a string — usually `True`/`False`,',
+				'but it is kept verbatim, since not every permission’s UI is a True/False picker.',
 				'',
-				'What this feeds is `GET /photon_access_token`: a stored entry replaces the default',
-				'with the same (`Permission`, `Role`) in the table the client applies when it spawns,',
-				'and one naming a pair the defaults don’t carry (e.g. `CAN_INVITE`) is added to it.',
-				'The overrides apply to the subroom the caller is standing in, resolved from presence.',
+				'What this feeds is `GET /photon_access_token`. For a manager it serves the WHOLE',
+				'table — a row per (permission, role) for every role tier, stored entries with',
+				'`Override: true` and the rest `false` — which is what this screen reads back: a',
+				'cell with no row at its exact role snaps back to the default as soon as it is',
+				'toggled. For everyone else it serves only the entries that reach THEIR role: one at',
+				'their role, else one at a lower role (a Role 0 grant reaches everyone), over the',
+				'role’s defaults. One naming a pair the defaults don’t carry (e.g. `CAN_INVITE`) is',
+				'served too. The overrides apply to the subroom the caller is standing in, resolved',
+				'from presence.',
 				'',
-				'Creator-only — co-owners may build in a room but not decide what a role may do.',
-				'The response body is EMPTY: the client doesn’t read one.',
+				'Gated to the room’s managers — its creator or a co-owner (`canManageRoom`), as the',
+				'other room-admin writes are. Answers the whole ROOM under `Value` in the PascalCase',
+				'`{ Value, Success, Error, error_id }` envelope — the same Room DTO `GET /rooms/{id}`',
+				'serves (the permission table itself is not part of it), and the same envelope the',
+				'subroom move and `max_player_calculation_mode` answer, NOT the lowercase',
+				'`{ success, error, value }` the other subroom mutations use. A rejection is HTTP 200',
+				'with `Success: false`, `Value: null` and the message in `Error`; only a missing',
+				'token is a 401.',
 			].join('\n'),
 			security: AUTHED,
 			parameters: [roomIdParam, subRoomIdParam],
 			requestBody: jsonBody(SubRoomPermissionsRequest, 'The permission entries to set'),
 			responses: {
-				200: { description: 'Stored (empty body)' },
-				401: UNAUTHORIZED_RESPONSE,
-				403: FORBIDDEN_RESPONSE,
-				404: { description: 'No such room or subroom' },
+				200: json(RoomPascalEnvelope, 'The room, or a rejection with `Success: false`'),
+				401: { description: 'No bearer token (empty body)' },
 			},
 		}),
 		async (c) => {
 			const accountId = await authedAccountId(c)
-			if (accountId === null) return unauthorized(c)
+			if (accountId === null) return c.body(null, 401)
+			const refuse = (error: string) =>
+				c.json({ Value: null, Success: false, Error: error, error_id: null })
 
 			const roomId = Number.parseInt(c.req.param('roomId'), 10)
 			const subRoomId = Number.parseInt(c.req.param('subRoomId'), 10)
 
 			// Scoped through the room so a subroom id from another room can't be written.
 			const room = await getRoomById(c.env.DB, roomId)
-			if (!room || !findSubRoom(room, subRoomId)) return c.notFound()
-			if (room.CreatorAccountId !== accountId) return c.body(null, 403)
+			if (!room) return refuse('This room does not exist!')
+			if (!findSubRoom(room, subRoomId)) return refuse('This subroom does not exist!')
+			if (!canManageRoom(room, accountId)) return refuse('You are not the owner of this room!')
 
 			const permissions = parseRoomPermissions(await c.req.json().catch(() => null))
 			await setSubRoomPermissions(c.env.DB, subRoomId, permissions)
-			return c.body(null, 200)
+			return c.json({ Value: room, Success: true, Error: null, error_id: null })
 		}
 	)
 
@@ -4342,14 +4653,9 @@ const app = new Hono<App>()
 	)
 
 	// A room's XP settings — whether players earn experience there and how much of it counts
-	// toward their day. Fixed values, the same for every room: progression lives in the `api`
-	// worker and applies no per-room daily cap, so there is nothing room-scoped to read and
-	// nothing here enforces the number. It is what the client displays and meters against.
-	//
-	// A bare two-key object, no `{ success, error, value }` envelope, and no auth — nothing
-	// in the answer is per-player (`experience/player` below is the per-player half). The
-	// room isn't looked up either: the answer would be the same for a room that doesn't
-	// exist, so a lookup would only add a way to fail.
+	// toward their day. Stored on the room blob by the POST below; a room that was never
+	// configured is off with a 0 cap. A bare two-key object, no envelope, and no auth —
+	// nothing in the answer is per-player (`experience/player` below is that half).
 	.get(
 		'/rooms/:roomId{[0-9]+}/experience',
 		describeRoute({
@@ -4357,37 +4663,177 @@ const app = new Hono<App>()
 			summary: 'A room’s XP settings',
 			description: [
 				'Whether players earn XP in the room (`Enabled`) and how much of it counts toward a',
-				'day (`DailyLimit`), as a bare two-key object. Fixed values, and `Enabled` is FALSE —',
-				'no room awards XP here. Progression is the `api` worker’s and applies no per-room',
-				'cap, so nothing is stored per room and nothing enforces the limit; the client is what',
-				'reads it. No auth: the answer is the same for every caller and every room.',
+				'day (`DailyLimit`), as a bare two-key object — the `progressionEnabled` and',
+				'`progressionDailyLimit` the room’s owner set with `POST /rooms/{roomId}/experience`.',
+				'A room that was never configured is off with a 0 cap. No auth: the answer is the',
+				'same for every caller. 404 for a room that does not exist.',
 			].join(' '),
 			parameters: [roomIdParam],
-			responses: { 200: json(RoomExperience, 'The room’s XP settings — always the same') },
+			responses: {
+				200: json(RoomExperience, 'The room’s XP settings'),
+				404: { description: 'No such room' },
+			},
 		}),
-		(c) => c.json({ Enabled: ROOM_XP_ENABLED, DailyLimit: ROOM_XP_DAILY_LIMIT })
+		async (c) => {
+			const roomId = Number.parseInt(c.req.param('roomId'), 10)
+			const room = await getRoomById(c.env.DB, roomId)
+			if (!room) return c.body(null, 404)
+			return c.json(roomProgression(room))
+		}
 	)
 
-	// The caller's per-room experience/progression. Stub → empty list.
+	// Turn a room's progression on or off and set its daily cap. Auth-gated (401) and
+	// owner/co-owner-only (403), like the leaderboard write, and answers the same bare
+	// `{ Success, Error, error_id }` envelope. Body is the client's .NET-style form:
+	// `enabled=True&dailyLimit=1000`.
+	.post(
+		'/rooms/:roomId{[0-9]+}/experience',
+		describeRoute({
+			tags: ['Room settings'],
+			summary: 'Set a room’s XP settings',
+			description: [
+				'Sets `progressionEnabled` and `progressionDailyLimit` on the room, which',
+				'`GET /rooms/{roomId}/experience` reads back as `Enabled`/`DailyLimit`. Owner or',
+				'co-owner only (403 otherwise). `enabled` is the client’s `True`/`False` string —',
+				'anything but a `true` reads false; `dailyLimit` is an integer, and a missing or',
+				'non-numeric one is 0.',
+				'',
+				'Answers a bare `{ Success, Error, error_id }` — PascalCase with a lowercase',
+				'`error_id`, like the leaderboard write, carrying no entity. An unknown room is a',
+				'rejection envelope, not a 404.',
+			].join('\n'),
+			security: AUTHED,
+			parameters: [roomIdParam],
+			requestBody: form(ExperienceRequest, 'The room’s XP settings'),
+			responses: {
+				200: json(LeaderboardResultEnvelope, 'Stored, or a rejection with `Success: false`'),
+				401: UNAUTHORIZED_RESPONSE,
+				403: FORBIDDEN_RESPONSE,
+			},
+		}),
+		async (c) => {
+			const accountId = await authedAccountId(c)
+			if (accountId === null) return unauthorized(c)
+
+			const roomId = Number.parseInt(c.req.param('roomId'), 10)
+			const room = await getRoomById(c.env.DB, roomId)
+			if (!room) return experienceEnvelope(c, 'This room does not exist!')
+			if (!canManageRoom(room, accountId)) return c.body(null, 403)
+
+			const body = (await c.req.parseBody().catch(() => ({}))) as Record<string, unknown>
+			const enabled = typeof body.enabled === 'string' && body.enabled.toLowerCase() === 'true'
+			const dailyLimit =
+				typeof body.dailyLimit === 'string' ? Number.parseInt(body.dailyLimit, 10) : Number.NaN
+
+			await setRoomProgression(c.env.DB, roomId, enabled, Number.isNaN(dailyLimit) ? 0 : dailyLimit)
+			return experienceEnvelope(c)
+		}
+	)
+
+	// The caller's experience in this room: the `room_xp` row for (room, caller), with the
+	// room's switch echoed so the client knows whether what it earns here counts. A player
+	// with no row is 0 XP — reading never writes a row. `ConcurrencyCode` is a GUID minted
+	// per response; it only travels in requests and is not stored.
 	.get(
 		'/rooms/:roomId{[0-9]+}/experience/player',
 		describeRoute({
 			tags: ['Rooms'],
 			summary: 'The caller’s per-room experience',
 			description: [
-				'Per-room experience/progression for the calling player. Nothing tracks any yet, so',
-				'this is an empty list — which the client reads as “no progress in this room”, where',
-				'a 404 would stall the room load. No auth: the answer is the same for every caller',
-				'until something writes here.',
+				'The calling player’s XP in this room (`Experience`), the room’s `Enabled` echoed as',
+				'`RoomExperienceEnabled`, and a `ConcurrencyCode` GUID minted for this response (not',
+				'stored). A player who has earned nothing here reads as 0 — no row is written on a read.',
+				'Auth-gated (401); 404 for a room that does not exist.',
 			].join(' '),
+			security: AUTHED,
 			parameters: [roomIdParam],
-			responses: { 200: json(RoomExperiencePlayer, 'An empty list') },
+			responses: {
+				200: json(RoomExperiencePlayer, 'The caller’s experience in the room'),
+				401: UNAUTHORIZED_RESPONSE,
+				404: { description: 'No such room' },
+			},
 		}),
-		(c) => c.json([])
+		async (c) => {
+			const accountId = await authedAccountId(c)
+			if (accountId === null) return unauthorized(c)
+
+			const roomId = Number.parseInt(c.req.param('roomId'), 10)
+			const room = await getRoomById(c.env.DB, roomId)
+			if (!room) return c.body(null, 404)
+
+			return c.json({
+				RoomExperienceEnabled: roomProgression(room).Enabled,
+				Experience: await getRoomExperience(c.env.DB, roomId, accountId),
+				ConcurrencyCode: crypto.randomUUID(),
+			})
+		}
 	)
 
-	// Single room by id. 404 when the room isn't in D1. Ignores the
-	// include/unityAsset* query params.
+	// Add to the caller's XP in this room. Auth-gated (401), 404 for no such room. Body is
+	// the client's form `increment=2500&concurrencyCode=<guid>`; the code is accepted and
+	// ignored (nothing is stored to check it against). Answers the read's DTO — with the
+	// NEW total and a fresh code — WRAPPED in the leaderboard write's `{ Value, Success,
+	// Error, error_id }` envelope; the read serves it bare. The room's switch and daily cap
+	// are not enforced here — the increment lands whatever they say.
+	.post(
+		'/rooms/:roomId{[0-9]+}/experience/player',
+		describeRoute({
+			tags: ['Rooms'],
+			summary: 'Add to the caller’s per-room experience',
+			description: [
+				'Adds `increment` to the calling player’s XP in this room, creating their `room_xp`',
+				'row on the first write, and answers the read’s DTO with the new total and a fresh',
+				'`ConcurrencyCode`, wrapped in `{ Value, Success, Error, error_id }` — the read serves',
+				'it bare. The posted `concurrencyCode` is accepted and ignored.',
+				'A missing or non-numeric `increment` adds 0. Neither the room’s `Enabled` nor its',
+				'`DailyLimit` is enforced. Auth-gated (401); 404 for a room that does not exist.',
+			].join(' '),
+			security: AUTHED,
+			parameters: [roomIdParam],
+			requestBody: form(ExperienceIncrementRequest, 'The XP to add'),
+			responses: {
+				200: json(
+					RoomExperiencePlayerEnvelope,
+					'The caller’s experience in the room, after the add'
+				),
+				401: UNAUTHORIZED_RESPONSE,
+				404: { description: 'No such room' },
+			},
+		}),
+		async (c) => {
+			const accountId = await authedAccountId(c)
+			if (accountId === null) return unauthorized(c)
+
+			const roomId = Number.parseInt(c.req.param('roomId'), 10)
+			const room = await getRoomById(c.env.DB, roomId)
+			if (!room) return c.body(null, 404)
+
+			const body = (await c.req.parseBody().catch(() => ({}))) as Record<string, unknown>
+			const increment =
+				typeof body.increment === 'string' ? Number.parseInt(body.increment, 10) : Number.NaN
+
+			const experience = await incrementRoomExperience(
+				c.env.DB,
+				roomId,
+				accountId,
+				Number.isNaN(increment) ? 0 : increment
+			)
+			return c.json({
+				Value: {
+					RoomExperienceEnabled: roomProgression(room).Enabled,
+					Experience: experience,
+					ConcurrencyCode: crypto.randomUUID(),
+				},
+				Success: true,
+				Error: null,
+				error_id: null,
+			})
+		}
+	)
+
+	// Single room by id. 404 when the room isn't in D1. A Studio save's
+	// `CurrentSave.UnitySubAssets` lists the baked bundles; `unityAssetTarget`
+	// narrows that list to the platform the caller asked for.
 	.get(
 		'/rooms/:roomId{[0-9]+}',
 		describeRoute({
@@ -4395,20 +4841,29 @@ const app = new Hono<App>()
 			summary: 'A room by id',
 			description: [
 				'The room as stored, with its `SubRooms` re-attached. Unlike `GET /rooms?id=`, an',
-				'unknown room here is a 404, not `{}`. The `include`/`unityAsset*` query params the',
-				'client sends are accepted and ignored.',
+				'unknown room here is a 404, not `{}`. A save that has a Rec Room Studio build',
+				'lists its main bundles on `CurrentSave.UnitySubAssets` (`Target` 0 Windows, 2',
+				'Android/Quest, `Filename` downloaded from the CDN at `/unityasset/{filename}`).',
+				'A maker-pen save keeps those arrays empty. An integer `unityAssetTarget` leaves',
+				'only the matching target, so a PC client is not also handed the Android bundle.',
+				'`include` and `unityAssetVersion` are accepted and ignored.',
 			].join(' '),
 			parameters: [
 				roomIdParam,
 				stringQuery('include', 'Accepted and ignored'),
-				stringQuery('unityAssetTarget', 'Accepted and ignored'),
+				stringQuery(
+					'unityAssetTarget',
+					'When an integer, each current save’s `UnitySubAssets` keeps only that target (0 Windows, 2 Android/Quest)'
+				),
 				stringQuery('unityAssetVersion', 'Accepted and ignored'),
 			],
 			responses: { 200: json(RoomDto, 'The room'), 404: { description: 'No such room' } },
 		}),
 		async (c) => {
 			const room = await getRoomById(c.env.DB, Number.parseInt(c.req.param('roomId'), 10))
-			return room ? c.json(room) : c.notFound()
+			if (!room) return c.notFound()
+			filterRoomUnityAssets(room, unityAssetTargetQuery(c))
+			return c.json(room)
 		}
 	)
 
@@ -4444,6 +4899,59 @@ const app = new Hono<App>()
 			})
 	)
 
+	// The baked asset bundles behind a room load. The client posts the unity asset ids its
+	// saves name, with the target it runs on and the asset version it wants, and gets back
+	// a BARE ARRAY of blob references — `Filename` is what it then downloads from the CDN.
+	// Form-encoded, `id` repeated once per GUID. No auth, like `…/unityasset`: the room
+	// document already names these files, and a 401 here would only make the room load
+	// nothing with no error anywhere — which is also what `[]` does, so an asset with no
+	// stored build is simply left out rather than answered with a blank row.
+	.post(
+		'/unity_assets/baked/bulk',
+		describeRoute({
+			tags: ['Subrooms'],
+			summary: 'The baked bundles for unity assets',
+			description: [
+				'The stored builds of the unity assets named by `id` (repeated once per GUID) on',
+				'`target` (0 Windows, 2 Android/Quest), as a bare array of',
+				'`{ UnityAssetId, Target, Version, Filename, Hash }` — one entry per asset that has a',
+				'build, in the order asked; `[]` when none does. `Filename` is the blob the client',
+				'downloads from the CDN, so an entry is never served without one.',
+				'',
+				'`version` is a preference, not a filter: an asset built more than once answers the',
+				'build at that version when there is one and its newest otherwise. A body naming no',
+				'ids, or a non-integer `target`, answers `[]`.',
+			].join(' '),
+			requestBody: form(BakedUnityAssetBulkRequest, 'The assets wanted, and for which target'),
+			responses: {
+				200: json(BakedUnityAssetBulkList, 'The baked bundles, one per asset found'),
+			},
+		}),
+		async (c) => {
+			const body = await c.req
+				.parseBody({ all: true })
+				.catch(() => ({}) as Record<string, string | string[] | File | File[]>)
+			const first = (v: unknown): string => {
+				const one = Array.isArray(v) ? v[0] : v
+				return typeof one === 'string' ? one.trim() : ''
+			}
+			const target = Number.parseInt(first(body.target), 10)
+			if (!Number.isInteger(target)) return c.json([])
+			// Absent or unparseable, the version prefers nothing and the newest build is served.
+			const version = Number.parseInt(first(body.version), 10)
+			// `all: true` keeps the repeated field a list; a single value arrives as a string.
+			const ids = [body.id, body.ids]
+				.flat()
+				.filter((v): v is string => typeof v === 'string')
+				.flatMap((v) => v.split(','))
+				.map((v) => v.trim())
+				.filter((v) => v !== '')
+			return c.json(
+				await getBakedUnityAssets(c.env.DB, ids, target, Number.isInteger(version) ? version : -1)
+			)
+		}
+	)
+
 	// Photon access token + room permissions the client needs to spawn into a room.
 	.get(
 		'/photon_access_token',
@@ -4455,9 +4963,23 @@ const app = new Hono<App>()
 				'`RoomInstanceId` is the caller’s current instance, read from the shared `presence`',
 				'table (null when they’re in none).',
 				'',
+				'The table depends on who asks. A MANAGER — the creator or a co-owner — gets the',
+				'whole table: a row per (permission, role) for every role tier (0, 10, 20, 30, 255),',
+				'because the permissions screen (`PUT …/subrooms/{subRoomId}/permissions`) reads',
+				'each cell from the row at exactly that role. An entry stored on the subroom is',
+				'served at its own role with `Override: true`; every other cell carries the value',
+				'that reaches that role (the entry at the highest lower role, else the default) with',
+				'`Override: false`, so an un-overridden cell shows and stays at its default.',
+				'',
+				'Everyone else gets their own rows only: each permission’s value for the role they',
+				'hold in the room they are standing in — the entry stored at their role, else one',
+				'stored at a lower role, else the default: managers may build, nobody else may.',
+				'Entries stored under a role they do not hold are left out. Every value is served at',
+				'Role 0 and, for a host or moderator, again at their role, all with `Override: true`.',
+				'',
 				'`PhotonAccessToken` is always empty: the reference server signs it with a',
 				'secret/algorithm we don’t have, and our Photon setup accepts an empty token. The',
-				'global (Role 0) maker pen is granted only to the hardcoded dev accounts.',
+				'global maker pen is granted only to the hardcoded dev accounts, whatever the table says.',
 			].join('\n'),
 			security: AUTHED,
 			responses: {

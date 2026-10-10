@@ -1,2 +1,4 @@
 worker-configuration.d.ts linguist-generated
 pnpm-lock.yaml linguist-generated
+# Provenance hashes use the exact upstream bytes on every platform.
+apps/discovery/cv2-schema/upstream/circuitsv2*.json text eol=lf

@@ -14,6 +14,8 @@
  *  - `GET  /api/roomcurrencies/v1/currencies?roomId=` lists a room's
  *  - `POST /api/roomcurrencies/v1/awardCurrency/bulk` pays players
  *  - the purchase offers below are the shop that sells the currency for other money
+ *    (`POST /api/roomcurrencies/v1/createPurchaseOffer` lists one, `…/deletePurchaseOffer`
+ *    takes it down)
  *  - `POST /api/roomCurrencies/v2/purchase` buys from that shop, with tokens
  *  - `POST /api/storefronts/v1/PurchaseRoomKeyWithCurrency` spends it, on a room key
  *
@@ -417,6 +419,48 @@ export async function findPurchaseOffer(
 
 	const [offer] = parsePurchaseOffers(row.currency_id, `[${row.offer}]`)
 	return offer ? { Offer: offer, RoomId: row.room_id } : null
+}
+
+/**
+ * Take a purchase offer down by its `CurrencyPurchaseOfferId`, returning the offer that was
+ * removed — beside its room, like {@link findPurchaseOffer} — or null when no shop lists it.
+ *
+ * The id is all the delete names, and the offer lives inside its currency's `purchase_offers`
+ * JSON, so this is a find (which says which row, and which room gates the delete) and then a
+ * rewrite of that ONE row's array without the offer. The rewrite is done in SQL —
+ * `json_group_array` over `json_each`, keeping every entry whose id is not this one — rather
+ * than read-modify-written here, so an offer being added to the same shop at the same moment
+ * is not lost under a stale copy of the list; `createPurchaseOffer` appends in SQL for the same
+ * reason. Filtered by id, not by position, so a concurrent append cannot shift the wrong entry
+ * under the delete. The match is case-insensitive like the find: the client has been seen
+ * sending ids in either case.
+ *
+ * A shop emptied by its last delete is left as `[]`, not reset to null: both read as "no
+ * offers", and nothing distinguishes a shop never built from one cleared out.
+ */
+export async function deletePurchaseOffer(
+	db: D1Database,
+	purchaseOfferId: string
+): Promise<FoundPurchaseOffer | null> {
+	const found = await findPurchaseOffer(db, purchaseOfferId)
+	if (!found) return null
+
+	const { meta } = await db
+		.prepare(
+			`UPDATE room_currency
+			 SET purchase_offers = (
+			   SELECT json_group_array(json(o.value))
+			   FROM json_each(room_currency.purchase_offers) AS o
+			   WHERE lower(json_extract(o.value, '$.CurrencyPurchaseOfferId')) <> lower(?2)
+			 )
+			 WHERE currency_id = ?1 AND json_valid(purchase_offers)`
+		)
+		.bind(found.Offer.CurrencyId, purchaseOfferId)
+		.run()
+
+	// The find said the row was there; a rewrite that touched nothing means it went away
+	// between the two (the currency deleted, say), and there is no offer to report removed.
+	return meta.changes > 0 ? found : null
 }
 
 /** One currency's shop — the group the batch read answers in, one per currency asked for. */

@@ -189,17 +189,23 @@ export const LoadScreenDto = z.object({
  * no moderation state, no asset arrays; but `unityAsset`/`unityAssetHash`/`dataBlobHash`
  * that `CurrentSave` doesn't show). The two are deliberately not unified.
  *
- * Also what `GET …/subrooms/{subRoomId}/saves/{saveId}` answers — one save fetched by id
- * is the same thing the save that created it returned, so both go through
- * `toSaveResponse`. Note the `…/saves` LIST is the third shape here: it serves the raw
- * PascalCase rows ({@link SubRoomDataSaveDto}), not this.
+ * ONLY the room save answers this. `GET …/subrooms/{subRoomId}/saves/{saveId}` once did
+ * too, and the client rendered that save with every value missing: the detail is a
+ * PascalCase row ({@link SubRoomDataSaveDetailDto}), like the `…/saves` LIST serves
+ * ({@link SubRoomDataSaveDto}).
  */
 export const SubRoomDataSaveResponseDto = z.object({
 	subRoomDataSaveId: z.int(),
 	subRoomId: z.int(),
 	unityAssetId: z.string().nullable().describe('Null unless the save carried one'),
-	unityAsset: z.string().nullable().describe('Always null — we resolve no baked assets'),
-	unityAssetHash: z.string().nullable().describe('Always null — we resolve no baked assets'),
+	unityAsset: z
+		.string()
+		.nullable()
+		.describe('Windows baked-bundle filename when this save has a Studio build; otherwise null'),
+	unityAssetHash: z
+		.string()
+		.nullable()
+		.describe('Base64 SHA-256 of `unityAsset` when that file is set; otherwise null'),
 	dataBlob: z.string(),
 	dataBlobHash: z.string().nullable().describe('Echoed from the request’s `SubRoomData.Hash`'),
 	savedByAccountId: z.int().nullable(),
@@ -218,11 +224,22 @@ export const SubRoomDataSaveResponseDto = z.object({
  * scene-data blob to download. This is the ONLY place the loader looks for it, so a
  * subroom whose `CurrentSave` is missing loads no saved content at all.
  *
- * The array fields are always empty here: we neither resolve nor record referenced Unity
- * assets. They are still emitted because the client's parser expects them present.
+ * `UnitySubAssets` is empty for a maker-pen save. A Rec Room Studio build fills it
+ * with one main bundle per platform. Referenced assets stay empty. The arrays are
+ * always emitted because the client's parser expects them present.
  */
+export const UnitySubAssetDto = z.object({
+	UnityAssetId: z.string(),
+	Target: z.int().describe('0 Windows, 2 Android/Quest — the game’s `unityAssetTarget`'),
+	Version: z.int(),
+	Filename: z.string().describe('Downloaded from the CDN at `/unityasset/{Filename}`'),
+	Hash: z.string().describe('Base64 SHA-256 of the bundle'),
+})
+
 export const SubRoomDataSaveDto = z.object({
-	UnitySubAssets: z.array(z.unknown()).describe('Always empty'),
+	UnitySubAssets: z
+		.array(UnitySubAssetDto)
+		.describe('Main Studio bundles for this save; empty for a maker-pen save'),
 	ReferencedUnityAssets: z.array(z.unknown()).describe('Always empty'),
 	SubRoomDataSaveId: z.int().describe('Numbered from 1, incremented on every save'),
 	SubRoomId: z.int().describe('The owning subroom — re-pointed when a subroom is cloned'),
@@ -392,15 +409,32 @@ export const SearchSuggestions = z
 
 /**
  * `GET /rooms/{roomId}/experience` — whether players earn XP in a room and how much of it
- * counts in a day. A bare two-key object, no envelope.
- *
- * Nothing here meters per-room XP: progression is the `api` worker's, and it applies no
- * room-scoped daily cap. So this is the config the client reads, not a limit this server
- * enforces — the same answer for every room.
+ * counts in a day. A bare two-key object, no envelope. Read off the room blob
+ * (`progressionEnabled` / `progressionDailyLimit`), which `POST /rooms/{roomId}/experience`
+ * sets; a room that has never been configured is off with a 0 cap.
  */
 export const RoomExperience = z.object({
-	Enabled: z.boolean().describe('Whether XP is earned in the room at all. Always false here'),
+	Enabled: z.boolean().describe('Whether XP is earned in the room at all'),
 	DailyLimit: z.int().describe('XP from this room that counts toward a player’s day'),
+})
+
+/** `POST /rooms/{roomId}/experience/player` — add XP to the caller’s total in the room. */
+export const ExperienceIncrementRequest = z.object({
+	increment: z.string().describe('XP to add, as an integer; a missing or non-numeric one adds 0'),
+	concurrencyCode: z
+		.string()
+		.optional()
+		.describe(
+			'The GUID from the last read. Accepted and ignored — nothing is stored to check it against'
+		),
+})
+
+/** `POST /rooms/{roomId}/experience` — the client’s .NET-style form body. */
+export const ExperienceRequest = z.object({
+	enabled: z.string().describe('`True` / `False`'),
+	dailyLimit: z
+		.string()
+		.describe('XP from this room that counts toward a player’s day, as an integer'),
 })
 
 /**
@@ -852,8 +886,9 @@ export const MoveSubRoomRequest = z.object({
  * A room in the PascalCase `{ Value, Success, Error, error_id }` envelope — the same mixed
  * casing the unprefixed isBanned check has ({@link IsBannedPascalEnvelope}), NOT the
  * lowercase `{ success, error, value }` most room mutations answer. The newer settings
- * routes (the subroom move, the max-player calculation mode) answer this one; the client
- * decodes them with a different reader, so the two are kept apart deliberately.
+ * routes (the subroom move, the max-player calculation mode, the subroom permissions)
+ * answer this one; the client decodes them with a different reader, so the two are kept
+ * apart deliberately.
  */
 export const RoomPascalEnvelope = z.object({
 	Value: RoomDto.nullable().describe('The room as it now stands; null on a rejection'),
@@ -956,6 +991,51 @@ export const SubRoomDataSaveNoUnityAssetsDto = z.object({
 })
 
 /**
+ * One save as `GET …/subrooms/{subRoomId}/saves/{saveId}` answers it — the PascalCase row
+ * of {@link SubRoomDataSaveDto}, with its bundles named the way the client's save-detail
+ * decoder reads them: each `UnitySubAssets` entry is `{ UnityAssetId, UnityAsset,
+ * UnityAssetHash }` rather than `Filename`/`Hash`, and the save's own main bundle is
+ * lifted to top-level `UnityAsset`/`UnityAssetHash`. No `Tags`; `UnityAssetId` is always
+ * present, null when the save carried none. NOT the camelCase
+ * {@link SubRoomDataSaveResponseDto} the room save returns — served that, the client
+ * showed a save with every value missing.
+ */
+export const SubRoomDataSaveDetailDto = z.object({
+	UnitySubAssets: z
+		.array(
+			z.object({
+				UnityAssetId: z.string().nullable(),
+				UnityAsset: z.string().nullable().describe('The bundle filename, from the CDN'),
+				UnityAssetHash: z.string().nullable().describe('Base64 SHA-256 of the bundle'),
+			})
+		)
+		.describe('Main Studio bundles for this save; empty for a maker-pen save'),
+	ReferencedUnityAssets: z.array(z.unknown()).describe('Always empty'),
+	UnityAsset: z
+		.string()
+		.nullable()
+		.describe(
+			'The main bundle for the named target (Windows when none); null for a maker-pen save'
+		),
+	UnityAssetHash: z.string().nullable().describe('Base64 SHA-256 of `UnityAsset`; null with it'),
+	SubRoomDataSaveId: z.int(),
+	SubRoomId: z.int(),
+	UnityAssetId: z.string().nullable().describe('Null unless the save carried one'),
+	ReferencedUnityAssetIds: z.array(z.string()).describe('Always empty — we record none'),
+	DataBlob: z.string().describe('The scene-data key the client downloads from the CDN'),
+	DataBlobHash: z.string().nullable(),
+	PersistenceVersion: z.int(),
+	OMVersion: z.int(),
+	SavedByAccountId: z.int().nullable(),
+	SavedOnPlatform: z.int().describe('0 — the save request carries no platform'),
+	SavedOnDeviceClass: z.int().describe('0 — the save request carries no device class'),
+	Description: z.string().describe('The save comment; empty string when none'),
+	ModerationState: z.int(),
+	CreatedAt: z.string(),
+	UgcSubVersion: z.int(),
+})
+
+/**
  * `GET /rooms/{roomId}/subrooms/{subRoomId}/saves/no_unity_assets` — the same history page
  * as {@link SubRoomSavesPage}, carrying the lighter rows. A BARE paged wrapper: no
  * `{ success, error, value }` envelope around it, unlike the room mutations.
@@ -966,11 +1046,65 @@ export const SubRoomSavesNoUnityAssetsPage = z.object({
 	TotalCount: z.int().describe('Same value as `TotalResults` — the two references disagree'),
 })
 
+/**
+ * `GET /rooms/{roomId}/subrooms/{subRoomId}/unityasset` — the editor's unity-asset
+ * document, camelCase. `bakedUnityAssets` are the main bundles; `filename`/`hash`
+ * name the Windows one. Bytes live on the CDN.
+ */
+export const BakedUnityAssetDto = z.object({
+	unityAssetId: z.string(),
+	target: z.int().describe('0 Windows, 2 Android/Quest'),
+	version: z.int(),
+	filename: z.string(),
+})
+
+export const UnityAssetWithSourceDto = z.object({
+	unityAssetId: z.string(),
+	createdByAccountId: z.int(),
+	bakedUnityAssets: z.array(BakedUnityAssetDto),
+	filename: z.string().describe('The Windows main bundle'),
+	hash: z.string().describe('Base64 SHA-256 of `filename`'),
+})
+
+/**
+ * `POST /unity_assets/baked/bulk` — form-encoded. `id` is REPEATED, once per unity asset
+ * (`target=0&version=3&id=<guid>&id=<guid>`); a comma-separated single value is accepted too.
+ */
+export const BakedUnityAssetBulkRequest = z.object({
+	target: z.string().describe('The build target wanted: 0 Windows, 2 Android/Quest'),
+	version: z
+		.string()
+		.optional()
+		.describe('The asset version the client wants — preferred when an asset has several builds'),
+	id: z.array(z.string()).describe('The unity asset GUIDs, repeated once per id'),
+})
+
+/**
+ * One baked bundle as `POST /unity_assets/baked/bulk` lists it — the client's five-key DTO
+ * in its order, PascalCase (unlike the editor's camelCase `bakedUnityAssets` above). The
+ * client downloads `Filename` from the CDN; an entry without one downloads nothing.
+ */
+export const BakedUnityAssetBulkDto = z.object({
+	UnityAssetId: z.string().describe('GUID, as asked for'),
+	Target: z.int().describe('0 Windows, 2 Android/Quest — the target asked for'),
+	Version: z.int().describe('The build’s version, which need not be the one asked for'),
+	Filename: z.string().describe('The storage blob path, `<date>/<guid>`'),
+	Hash: z.string().describe('Base64 SHA-256 of the blob'),
+})
+
+/** The bare array `POST /unity_assets/baked/bulk` answers — `[]` when nothing is stored. */
+export const BakedUnityAssetBulkList = z.array(BakedUnityAssetBulkDto)
+
 // ---- Session ---------------------------------------------------------------
 
 /** One entry of the permission table the client applies when it spawns into a room. */
 export const RoomPermissionDto = z.object({
-	Override: z.boolean().describe('Always true on an entry that came from a subroom’s overrides'),
+	Override: z
+		.boolean()
+		.describe(
+			'True on an entry the room’s creator stored on the subroom at this role; false on a ' +
+				'default or inherited cell of a manager’s table. Always true on a non-manager’s rows'
+		),
 	Permission: z.string().describe('e.g. `CAN_USE_MAKER_PEN`, `CAN_SAVE_INVENTIONS`'),
 	Role: z.int().describe('The role tier the permission applies to (0 = everyone)'),
 	Type: z.int(),
@@ -986,10 +1120,11 @@ export const RoomPermissionDto = z.object({
  * secret/algorithm we don't have, and our Photon setup accepts an empty token. The
  * global (Role 0) maker pen is granted only to the hardcoded dev accounts.
  *
- * `Permissions` is the default table with the overrides stored on the subroom the caller
- * is standing in merged over it (see
- * `PUT /rooms/{roomId}/subrooms/{subRoomId}/permissions`): an override replaces the
- * default with the same (`Permission`, `Role`), and one naming a new pair is appended.
+ * `Permissions` is built from the overrides stored on the subroom the caller is standing in
+ * (see `PUT /rooms/{roomId}/subrooms/{subRoomId}/permissions`). A manager (creator or
+ * co-owner) gets a row per (`Permission`, `Role`) for every role tier — what the permissions
+ * screen reads back cell by cell; everyone else gets only the values that reach their own
+ * role, at Role 0 and at their role.
  */
 export const PhotonAccessTokenDto = z.object({
 	Permissions: z.array(RoomPermissionDto),
@@ -1015,12 +1150,27 @@ export const PlayerDataRequest = z.object({
 })
 
 /**
- * `GET /rooms/{roomId}/experience/player` — the caller's per-room experience/progression
- * entries. Stubbed empty; the element shape is unknown until something stores one.
+ * `GET /rooms/{roomId}/experience/player` — the caller's experience in this room, from the
+ * `room_xp` row for (room, caller). No row is 0 XP. `ConcurrencyCode` is minted per
+ * response, not stored.
  */
-export const RoomExperiencePlayer = z
-	.array(z.unknown())
-	.describe('Always empty — no per-room experience is tracked')
+export const RoomExperiencePlayer = z.object({
+	RoomExperienceEnabled: z.boolean().describe('The room’s `Enabled`, echoed'),
+	Experience: z.int().describe('XP the caller has earned in this room; 0 when none is recorded'),
+	ConcurrencyCode: z.string().describe('A GUID minted for this response; not stored'),
+})
+
+/**
+ * What `POST /rooms/{roomId}/experience/player` answers: the read’s DTO wrapped in the
+ * leaderboard write’s bare envelope — PascalCase `Success`/`Error` with a lowercase
+ * `error_id` — with `Value` first. The read serves the DTO BARE; only the write wraps it.
+ */
+export const RoomExperiencePlayerEnvelope = z.object({
+	Value: RoomExperiencePlayer.describe('The caller’s experience in the room, after the add'),
+	Success: z.boolean(),
+	Error: z.string().nullable().describe('Null on success'),
+	error_id: z.string().nullable().describe('Null. Lowercase, unlike its siblings'),
+})
 
 /**
  * `GET /showcase/{playerId}` — the rooms a player showcases on their profile. Stubbed
