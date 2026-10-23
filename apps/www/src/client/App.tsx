@@ -30,6 +30,7 @@ import {
 import { DeviceLinkPage } from './DeviceLink'
 import { customAvatarItemIdFromPath, inventionIdFromPath, InventionPage, ItemPage } from './Item'
 import { ModerationPage, PlayerBanStatus } from './Moderation'
+import { PumpleBossFight } from './PumpleBossFight'
 import { StatsPage } from './Stats'
 import { StudioAccessPage } from './StudioAccess'
 
@@ -1777,11 +1778,18 @@ function halloweenActive(): boolean {
 }
 
 /** The sprite, 23x25 native pixels, drawn at 3x with hard edges. */
-const PUMPKIN_SRC =
-	'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAABcAAAAZCAYAAADaILXQAAAFD0lEQVR42pWVX2xcxRXGf2fu3Lu7jh0bO3FsnMQ2idP8gZoIGkootZsIGrUlVEVCTVW1qVREUPtSiTckYgQPqEIg1FZU6gtP8EJVAaZpIqE4UtrQOCSIkj+YVgRsp3E2mzisnb27OzOnD+uuE2yJZJ7u6J755jvf+eYc4SbX7qHBbNyjpe5VS5k4Nw3VZj4evcrFiWn+9fZxuTbW3Cw43WcxBMBCNYtYRYwiujDU3ijmwK++rWv7G7BSpLdrGf8Zv8TY+54kCuQ/v4IsckZuBPg7Twzq2ntq1IwXjvzlCz4cPv6VZxcN2LttTfXh9phKLPxtMmVnW7BqAiPnU2aipTzUFnjzonMiFhFn9747vihO9P+PoW29Dz7Yt3LD/sdl3dRl/9NmLRu1GJPzpqfFk2SV6ZIhGwlrVoBP1MQO0xQrQ/1N76/qXL7u4KeXxxbV3Jjwuveu1USGH98XOH44EIopu+7PECJBXGBmVpFKhr71JfqAD0cTVMGY5G1MukAJC/DM9l597IEmVsRTAJz4u2XrG+cxQGnPHuyOP6L797AxOYh1KdGmnYAhHPsrrjrLlq05dNTCtm71Jd82dGTiUh3cKDV7ac2ZAUP60moEB6ffQvfvQeucQt3Bd+3eAZlb+OCV1+n/Zpl3hpsAP8/86QdW6VM/tEjlCmWf8sizGcaiHB9thYQZgg+sfngYMPxuR46VpkS/exMRRQWE5bWL1fD9LsuhcV/Yu707febdz3I29gapBMg0467maG5pI3JlitaSAZaEIk1tHbXqNyxBowTT4IjK0zW72Qoyl7GmJdTPu8SC4dg/Krw6GrhcbeUDrYIY7v+th4uTnHxuaT3NR157j0CVvoN3cvo303PyBPRLjz3MSWiDwMvvrQACEpRg5v6oQVs3sfHFgEpg7NzxufRhbPIE0ZNw+NG1xDbHvnxA/+mR+kVz4Af9p/G31vjq5NkGyppjszpOYFFVQBERfmkNfvVmHIqo4e5cBBiy4RIVyhiRmhnUAG6+cY2M4FzSMNyQc9XWlgoiwi0mkAhkgO4AagUTZVkeWZZloSnyeHzNTdfIMeWgHMmBGbtkX12o5w+ceWj5ra7Y1j4LQK8qwZfRNGVbDgKWINCei+kVT1+Yt6XB4VGEwNEZoZKaXS8cOPWjBV1RCKAWpMLPlrYg1at4CWzf/DkXTt7K16qeFhNxVCI6br/Avrwl+Dw/6Grl5zMrWNbXQFquwpGJhf1cTJYnt16ou8BVpxm8q7bvvCPPW50T/L6rQMcd+TmPQ5rt4RezLdz7aCNrtwi5ZlMYeGKgdF0v2NR/W8FFcatUS/ykI8POzhasVf787/N8rzNi31TKRyu7KSyJicXw30/ykFiCEZbd1k6aFvn6fRmSOEsZ5ZPDbl4Wn2QxCmQa0VCiWrlMKjE+00g5MlQyEaXY4GyEw+EaDZFP8FJG1WGTLGhMpeJAPS5yNeYb7t543ZA6fexUPaP139ioEULcnqGtu5mKKOu3eFDDn84eihiiXt7BXw/o4HdXYnIlxicK12uuaHotMMCZ0VMSVClPpRTOzlL4rMjYUaGnq5nHewb8Y68O1ImpKucu5BmfrNXkpgb0lUK+oz3X1IRa1MiCoSwnTay2dEmI+fio1jRXleFIwYupLgZqggwDJMXkKhtwEEhLji+uKEhdFUZGRtztu3YeMBI1Znzxxgb0tWtw92BWGyitu8dzZlQxCof+cHhRnP8B5aopRAfi2ZcAAAAASUVORK5CYII='
-const PUMPKIN_SCALE = 3
-const PUMPKIN_W = 23 * PUMPKIN_SCALE
-const PUMPKIN_H = 25 * PUMPKIN_SCALE
+const PUMPKIN_FRAMES = [
+    new URL('./pumple-frames/frame-00.png', import.meta.url).href,
+    new URL('./pumple-frames/frame-01.png', import.meta.url).href,
+    new URL('./pumple-frames/frame-02.png', import.meta.url).href,
+    new URL('./pumple-frames/frame-03.png', import.meta.url).href,
+    new URL('./pumple-frames/frame-04.png', import.meta.url).href,
+    new URL('./pumple-frames/frame-05.png', import.meta.url).href,
+    new URL('./pumple-frames/frame-06.png', import.meta.url).href,
+    new URL('./pumple-frames/frame-07.png', import.meta.url).href,
+]
+const PUMPKIN_W = 150
+const PUMPKIN_H = 150
 const PUMPKIN_LINES = ['boo!', 'hehe', 'hey!', 'spooky!', 'happy halloween!', 'ow!', '🎃']
 
 const PUMPKIN_CSS = `
@@ -1793,16 +1801,7 @@ const PUMPKIN_CSS = `
         image-rendering: pixelated;
         transform-origin: 50% 100%;
 }
-.rf-pumpkin.is-walking img {
-        animation: rf-pumpkin-step 0.24s steps(2, end) infinite;
-}
-@keyframes rf-pumpkin-step {
-        0%, 100% { transform: translateY(0) scaleX(1); }
-        50% { transform: translateY(-1px) scaleX(0.96); }
-}
-@media (prefers-reduced-motion: reduce) {
-        .rf-pumpkin.is-walking img { animation: none; }
-}
+/* The animated GIF provides its own walking frames. */
 .rf-pumpkin-bubble { position: absolute; left: 50%; transform: translateX(-50%); margin: 6px 0; padding: 3px 8px;
 	border-radius: 10px; background: #fff3dc; color: #2a1608; font-size: 12px; font-weight: 600;
 	white-space: nowrap; opacity: 0; transition: opacity 0.15s; }
@@ -1816,13 +1815,15 @@ const PUMPKIN_CSS = `
 function LilPumpkin() {
 	const rootRef = useRef<HTMLDivElement>(null)
 	const flipRef = useRef<HTMLDivElement>(null)
+	const spriteRef = useRef<HTMLImageElement>(null)
 	const bubbleRef = useRef<HTMLDivElement>(null)
 
 	useEffect(() => {
 		const root = rootRef.current
 		const flip = flipRef.current
+		const sprite = spriteRef.current
 		const bubble = bubbleRef.current
-		if (!root || !flip || !bubble) return
+		if (!root || !flip || !sprite || !bubble) return
 		if (window.matchMedia('(prefers-reduced-motion: reduce)').matches) {
 			root.style.display = 'none'
 			return
@@ -1841,12 +1842,65 @@ function LilPumpkin() {
 		let jy = 0
 		let vy = 0
 		let walkTime = 0
+		let walkDistance = 0
+		let walkFrame = 0
 		let mouseX = -1
 		let mouseY = -1
 		let mouseAt = -Infinity
 		let speechTimer = 0
 		let last = performance.now()
 		let raf = 0
+                const effectNodes: HTMLElement[] = []
+
+                const spawnBatSwarm = () => {
+                        const flash = document.createElement('div')
+                        Object.assign(flash.style, {
+                                position: 'fixed', inset: '0',
+                                background: 'rgba(210, 0, 28, 0.32)',
+                                opacity: '1', transition: 'opacity 480ms ease-out',
+                                pointerEvents: 'none', zIndex: '100000',
+                        })
+                        document.body.appendChild(flash)
+                        effectNodes.push(flash)
+                        requestAnimationFrame(() => { flash.style.opacity = '0' })
+                        window.setTimeout(() => {
+                                flash.remove()
+                                const i = effectNodes.indexOf(flash)
+                                if (i !== -1) effectNodes.splice(i, 1)
+                        }, 520)
+
+                        const cx = x + PUMPKIN_W / 2
+                        const cy = y + jy + PUMPKIN_H / 2
+                        for (let i = 0; i < 22; i++) {
+                                const bat = document.createElement('span')
+                                const angle = Math.random() * Math.PI * 2
+                                const distance = 100 + Math.random() * 260
+                                const dx = Math.cos(angle) * distance
+                                const dy = Math.sin(angle) * distance
+                                Object.assign(bat.style, {
+                                        position: 'fixed', left: `${cx}px`, top: `${cy}px`,
+                                        fontSize: `${20 + Math.random() * 20}px`,
+                                        lineHeight: '1', pointerEvents: 'none',
+                                        zIndex: '100001', opacity: '1',
+                                        transform: 'translate(-50%, -50%) scale(0.4)',
+                                        transition: 'transform 850ms ease-out, opacity 850ms ease-out',
+                                        willChange: 'transform, opacity',
+                                })
+                                bat.textContent = '🦇'
+                                document.body.appendChild(bat)
+                                effectNodes.push(bat)
+                                requestAnimationFrame(() => {
+                                        bat.style.transform =
+                                                `translate(calc(-50% + ${dx}px), calc(-50% + ${dy}px)) rotate(${Math.random() * 100 - 50}deg) scale(1.2)`
+                                        bat.style.opacity = '0'
+                                })
+                                window.setTimeout(() => {
+                                        bat.remove()
+                                        const i = effectNodes.indexOf(bat)
+                                        if (i !== -1) effectNodes.splice(i, 1)
+                                }, 900)
+                        }
+                }
 
 		root.style.transform = `translate(${x}px, ${y}px)`
 
@@ -1870,14 +1924,30 @@ function LilPumpkin() {
 		const onLeave = () => {
 			mouseAt = -Infinity
 		}
+		let rapidClickCount = 0
+		let rapidClickStart = 0
 		const onClick = (e: MouseEvent) => {
 			const top = y + jy
+			const bob = 0
 			const hit =
-				e.clientX >= x - 6 &&
-				e.clientX <= x + PUMPKIN_W + 6 &&
-				e.clientY >= top - 6 &&
-				e.clientY <= top + PUMPKIN_H + 6
+				e.clientX >= x - 45 &&
+				e.clientX <= x + PUMPKIN_W + 45 &&
+				e.clientY >= top - bob - 45 &&
+				e.clientY <= top - bob + PUMPKIN_H + 45
 			if (!hit) return
+
+			const now = performance.now()
+			if (now - rapidClickStart > 5000) {
+				rapidClickStart = now
+				rapidClickCount = 0
+			}
+			rapidClickCount++
+			if (rapidClickCount >= 10) {
+				rapidClickCount = 0
+				rapidClickStart = 0
+				window.dispatchEvent(new CustomEvent('rf-pumple-boss'))
+			}
+			spawnBatSwarm()
 			if (jy === 0) vy = -430
 			say(PUMPKIN_LINES[Math.floor(Math.random() * PUMPKIN_LINES.length)])
 		}
@@ -1903,11 +1973,11 @@ function LilPumpkin() {
 				const dy = mouseY - (y + PUMPKIN_H / 2)
 				const dist = Math.hypot(dx, dy)
 				if (Math.abs(dx) > 4) facing = dx > 0 ? 1 : -1
-				if (dist > 110) {
+				if (dist > 85) {
 					// Walk toward the cursor but stop short, so it never ends up sitting under the pointer.
 					tx = clamp(mouseX - (dx / dist) * 80 - PUMPKIN_W / 2, 0, maxX())
 					ty = clamp(mouseY - (dy / dist) * 80 - PUMPKIN_H / 2, 0, maxY())
-					speed = 150
+					speed = 310
 				} else {
 					tx = x
 					ty = y
@@ -1920,7 +1990,7 @@ function LilPumpkin() {
 					ty = Math.random() * maxY()
 				}
 			} else {
-				speed = 60
+				speed = 145
 			}
 
 			const mx = tx - x
@@ -1932,6 +2002,15 @@ function LilPumpkin() {
 				x += (mx / md) * step
 				y += (my / md) * step
 				moving = true
+
+				// Advance the walk cycle according to distance actually traveled.
+				walkDistance += step
+				const nextFrame = Math.floor(walkDistance / 30) % PUMPKIN_FRAMES.length
+				if (nextFrame !== walkFrame) {
+				    walkFrame = nextFrame
+				    sprite.src = PUMPKIN_FRAMES[walkFrame]
+				}
+
 				if (!following && Math.abs(mx) > 4) facing = mx > 0 ? -1 : 1
 			} else if (speed > 0 && !following) {
 				pause = 1 + Math.random() * 2.5
@@ -1980,7 +2059,7 @@ function LilPumpkin() {
 			<div className="rf-pumpkin" ref={rootRef}>
 				<div className="rf-pumpkin-bubble" ref={bubbleRef} />
 				<div ref={flipRef} style={{ transformOrigin: '50% 100%' }}>
-					<img src={PUMPKIN_SRC} alt="" draggable={false} />
+					<img ref={spriteRef} src={PUMPKIN_FRAMES[0]} alt="" draggable={false} />
 				</div>
 			</div>
 		</>
@@ -2175,6 +2254,7 @@ export function App() {
 			)}
 			<SiteFooter />
 			<HalloweenOverlay />
+			<PumpleBossFight />
 		</>
 	)
 }
