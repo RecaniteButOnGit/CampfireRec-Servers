@@ -17,8 +17,12 @@ export type Env = SharedHonoEnv & {
 	// Shared `recflare-cdn` bucket. Local Studio builds land under
 	// `room/studio/<roomId>/`. The same bucket name the rooms and cdn workers bind.
 	CDN_ASSETS: R2Bucket
-	/** Private pull-worker credential; leave unset to disable cloud build dispatch. */
-	CLOUD_BUILD_KEY?: string
+	/**
+	 * Private pull-worker credential, out of the shared Secrets Store (same store as
+	 * JWT_SECRET). Read it through `cloudBuildKey()` in cloud-builds.ts, never `.get()`
+	 * directly: the value `off` (or an unreadable secret) means cloud building is disabled.
+	 */
+	CLOUD_BUILD_KEY: SecretsStoreSecret
 	CLOUD_BUILD_TARGETS?: string
 	CLOUD_BUILD_TEMPLATE_VERSION?: string
 	/** R2 key of an operator-published template catalog; unset disables downloads. */

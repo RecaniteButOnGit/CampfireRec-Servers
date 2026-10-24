@@ -140,6 +140,17 @@ wrangler secrets-store secret create <store-id> --name META_APP_SECRET --scopes 
 > with `wrangler secrets-store secret update` — no redeploy needed, the worker reads
 > the secret per request.
 
+The `studio` worker binds one more, `CLOUD_BUILD_KEY`: the credential the Rec Room
+Studio cloud-building host ([recflare/cloud-building](https://github.com/recflare/cloud-building),
+its `STUDIO_WORKER_KEY`) presents to claim queued builds. Same rule — it must exist for
+`studio` to deploy. Create it as the literal `off` to run without cloud builds; put a
+long random string in later when you set up a build host, and give that host the same
+string.
+
+```bash
+wrangler secrets-store secret create <store-id> --name CLOUD_BUILD_KEY --scopes workers --remote
+```
+
 Then apply the schema. `just migrate` will set up the database and populate it with data. This runs non-interactively, so be careful!
 
 ```bash

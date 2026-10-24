@@ -24,7 +24,7 @@ import {
 import { parseMultipart } from './multipart'
 
 import type { Context } from 'hono'
-import type { App } from './context'
+import type { App, Env } from './context'
 
 export const CLOUD_JOB_SCHEMA = `CREATE TABLE IF NOT EXISTS studio_cloud_build_job (
  cloud_build_id TEXT PRIMARY KEY, payload TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'queued',
@@ -122,7 +122,21 @@ function wire(row: CloudBuildRecord) {
 				: null,
 	}
 }
-async function privateAuth(request: Request, key: string | undefined) {
+/**
+ * The pull worker's credential, resolved per request from the Secrets Store. Returns ''
+ * when cloud building is off: the secret holds the literal `off` (the binding has to
+ * resolve for the worker to deploy, so that is how an operator opts out) or can't be read.
+ * Every gate on "is cloud building configured" goes through here.
+ */
+export async function cloudBuildKey(env: Env): Promise<string> {
+	try {
+		const key = (await env.CLOUD_BUILD_KEY.get()) ?? ''
+		return key === 'off' ? '' : key
+	} catch {
+		return ''
+	}
+}
+async function privateAuth(request: Request, key: string) {
 	if (!key) return false
 	const wanted = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(`Bearer ${key}`))
 	const got = await crypto.subtle.digest(
@@ -188,7 +202,7 @@ const app = new Hono<App>()
 		if (accountId === null) return c.body(null, 401)
 		if (!roles?.includes('betastudio'))
 			return c.json(fail('Studio upload authorization is required.'), 403)
-		if (!c.env.CLOUD_BUILD_KEY) return c.json(fail('Cloud building is not configured.'), 503)
+		if (!(await cloudBuildKey(c.env))) return c.json(fail('Cloud building is not configured.'), 503)
 		const form = await c.req.parseBody()
 		const ids = ['roomId', 'subRoomId', 'subRoomDataSaveId'].map((key) => textField(form[key]))
 		if (ids.some((id) => !ID.test(id) || !Number.isSafeInteger(Number(id))))
@@ -358,7 +372,7 @@ const app = new Hono<App>()
 		return c.json(ok(null))
 	})
 	.use('/internal/cloud-builds/*', async (c, next) => {
-		if (!(await privateAuth(c.req.raw, c.env.CLOUD_BUILD_KEY))) return c.body(null, 401)
+		if (!(await privateAuth(c.req.raw, await cloudBuildKey(c.env)))) return c.body(null, 401)
 		return next()
 	})
 	.post('/internal/cloud-builds/claim', async (c) => {
@@ -684,7 +698,7 @@ async function enqueueAvatar(
 		!((await avatarStudioFlags(c.env.DB, accountId)) & avatarItemAccessBit(item.OutfitType))
 	)
 		return c.body(null, 403)
-	if (!c.env.CLOUD_BUILD_KEY) return c.json(fail('Cloud building is not configured.'), 503)
+	if (!(await cloudBuildKey(c.env))) return c.json(fail('Cloud building is not configured.'), 503)
 	const pending = await pendingAvatarBuild(c.env.DB, itemId, saveId)
 	if (pending) return c.json(ok(wire(pending)))
 	const object = await c.env.CDN_ASSETS.get('avatarunityasset/' + save.source_filename)

@@ -83,12 +83,16 @@ build ID with a null completion time. Repeated requests for an in-progress save
 reuse its job. `GET /cloud-builds?cloudBuildId=...` reads the status;
 `PUT /cloud-builds/cancel` cancels a queued or running job.
 
-Apply migration `0003_studio_cloud_build_job.sql`. Configure a private
-`CLOUD_BUILD_KEY` and run the outbound worker from `recflare/cloud-building` with
-the matching credential. Without a key, creation returns an explicit unavailable
-response. `CLOUD_BUILD_TARGETS` defaults to `0,2` (Windows and Android), and
-`CLOUD_BUILD_TEMPLATE_VERSION` defaults to 169. Match installed editor modules to
-the enabled targets.
+Apply migration `0003_studio_cloud_build_job.sql`. Create the private
+`CLOUD_BUILD_KEY` in the shared Secrets Store (the one `JWT_SECRET` lives in — see
+`.env.example`) and run the outbound worker from `recflare/cloud-building` with the
+same value as its `STUDIO_WORKER_KEY`. The binding must exist for the worker to
+deploy; a value of `off` disables cloud building, and creation then returns an
+explicit unavailable response. `CLOUD_BUILD_TARGETS` defaults to `0,2` (Windows and
+Android), and `CLOUD_BUILD_TEMPLATE_VERSION` defaults to 169 — the cloud-building
+worker claims only jobs for its own configured template version (171 by default),
+so set this to match or jobs queue and are never claimed. Match installed editor
+modules to the enabled targets.
 
 The private `/internal/cloud-builds/claim`, `/:id/heartbeat`, and `/:id/finish`
 routes lease jobs to that worker. Only validated UnityFS artifacts for the

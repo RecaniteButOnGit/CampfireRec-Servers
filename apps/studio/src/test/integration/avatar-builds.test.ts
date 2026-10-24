@@ -36,7 +36,7 @@ const manifest = {
 }
 beforeAll(async () => {
 	await adminSecretsStore(env.JWT_SECRET).create('test-key')
-	env.CLOUD_BUILD_KEY = 'private-avatar-worker-key'
+	await adminSecretsStore(env.CLOUD_BUILD_KEY).create('private-avatar-worker-key')
 	env.CLOUD_BUILD_TARGETS = '0,2'
 	for (const sql of [
 		...SCHEMA_DDL,

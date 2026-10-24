@@ -49,7 +49,7 @@ async function auth(id = 42, studio = true) {
 }
 beforeAll(async () => {
 	await adminSecretsStore(env.JWT_SECRET).create('test-key')
-	env.CLOUD_BUILD_KEY = key
+	await adminSecretsStore(env.CLOUD_BUILD_KEY).create(key)
 	env.CLOUD_BUILD_TARGETS = '0'
 	for (const sql of [
 		...ROOM_SCHEMA_DDL,
