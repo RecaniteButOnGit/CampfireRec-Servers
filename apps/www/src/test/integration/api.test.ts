@@ -44,9 +44,11 @@ import {
 	countAccountsForPlatformIdentity,
 	getLinksForAccount,
 	getLinksForPlatform,
+	hasRecordedRoles,
 	isPlatformIdentityLinked,
 	linkPlatformIdentity,
 	PLATFORM_SCHEMA_DDL,
+	recordFirstRoles,
 } from '../../../../auth/src/platform-db'
 import {
 	BALANCE_SCHEMA_DDL,
@@ -68,7 +70,13 @@ import {
 	INVENTORY_CUSTOM_SCHEMA_DDL,
 	ownedCustomAvatarItemIds,
 } from '../../../../econ/src/inventory-custom-db'
-import { discordConfig, parseRoleIds, qualifies } from '../../discord'
+import {
+	discordConfig,
+	loginRedirectUri,
+	parseRoleIds,
+	qualifies,
+	redirectUri,
+} from '../../discord'
 import { fetchMemberRoles, refreshDiscordRoles } from '../../discord-roles'
 import { DOCUMENTED_SERVICES } from '../../docs'
 import { DISCORD_INVITE, ISSUES_URL, PRIVACY_EMAIL } from '../../links'
@@ -167,6 +175,8 @@ it('advertises signup and where the other workers live', async () => {
 		// even be started. Note the client id is NOT leaked by a closed config.
 		benefitsEnabled: false,
 		discordAuthorizeUrl: null,
+		// "Sign in with Discord" is on the same switch, and closed with it.
+		discordLoginUrl: null,
 		hosts: {
 			auth: 'https://auth.rec.example.com',
 			accounts: 'https://accounts.rec.example.com',
@@ -671,14 +681,75 @@ it('reports where an account stands on benefits', async () => {
 	expect(res.status).toBe(200)
 	expect(await res.json()).toEqual({ hasPlus: false, linked: false })
 
+	// A bare link — what "Sign in with Discord" leaves on an account it just made — is NOT a
+	// claim: no roles were ever recorded, so the page must still offer the claim.
 	await updateAccount(env.DB, 4003, { hasPlus: true })
 	await linkPlatformIdentity(env.DB, 4003, PlatformType.Discord, '99001')
 	res = await SELF.fetch('https://example.com/api/benefits/status', {
 		headers: { authorization: `Bearer ${token}` },
 	})
-	// `linked` says THAT a Discord identity is attached, never which one — the id is of no
-	// use to the page, and an account's linked identities have no business on the wire.
+	expect(await res.json()).toEqual({ hasPlus: true, linked: false })
+
+	// Claimed (roles recorded, even none). `linked` says THAT a Discord identity has claimed,
+	// never which one — the id is of no use to the page, and an account's linked identities
+	// have no business on the wire.
+	await linkPlatformIdentity(env.DB, 4003, PlatformType.Discord, '99001', [])
+	res = await SELF.fetch('https://example.com/api/benefits/status', {
+		headers: { authorization: `Bearer ${token}` },
+	})
 	expect(await res.json()).toEqual({ hasPlus: true, linked: true })
+})
+
+// How the claim decides "first claim" now that a Discord link can predate it: a link made by
+// "Sign in with Discord" has no roles, and writing the first roles onto it is a one-shot
+// flip — the single-winner write the gift is gated on, which a fresh link gets from its
+// INSERT instead. Exercised at the helpers, since the route runs through discord.com.
+it('tells a sign-in’s bare link from a claim, and records the first roles once', async () => {
+	await expect(hasRecordedRoles(env.DB, 4010, PlatformType.Discord)).resolves.toBe(false)
+	await linkPlatformIdentity(env.DB, 4010, PlatformType.Discord, '99010')
+	await expect(hasRecordedRoles(env.DB, 4010, PlatformType.Discord)).resolves.toBe(false)
+
+	// Nothing to flip on a link that isn't there.
+	await expect(recordFirstRoles(env.DB, 4010, PlatformType.Discord, '99011', ['r1'])).resolves.toBe(
+		false
+	)
+	// The first write wins; the second finds roles already recorded and writes nothing.
+	await expect(recordFirstRoles(env.DB, 4010, PlatformType.Discord, '99010', ['r1'])).resolves.toBe(
+		true
+	)
+	await expect(recordFirstRoles(env.DB, 4010, PlatformType.Discord, '99010', ['r2'])).resolves.toBe(
+		false
+	)
+	await expect(hasRecordedRoles(env.DB, 4010, PlatformType.Discord)).resolves.toBe(true)
+	const [link] = await getLinksForAccount(env.DB, 4010)
+	expect(link.roles).toEqual(['r1'])
+
+	// A claim on a FRESH link records roles in the insert itself — an empty list included.
+	await linkPlatformIdentity(env.DB, 4011, PlatformType.Discord, '99012', [])
+	await expect(hasRecordedRoles(env.DB, 4011, PlatformType.Discord)).resolves.toBe(true)
+})
+
+// ---- Sign in with Discord ------------------------------------------------
+
+// Closed on the same switch as the claim, and refused the same way: the half-configured
+// app the tests run with has a client id and secret and nothing else.
+it('refuses a discord sign-in while the discord app is only half configured', async () => {
+	const res = await SELF.fetch('https://example.com/api/login/discord', {
+		method: 'POST',
+		headers: { 'content-type': 'application/json' },
+		body: JSON.stringify({ code: 'whatever' }),
+	})
+	expect(res.status).toBe(403)
+	expect(await res.json()).toEqual({ error: 'Signing in with Discord is not available here.' })
+})
+
+// The two return legs are different registered redirects, both derived from the request's
+// own origin (never the body). A sign-in can't come back to `/claim`: that page wants a
+// session before it does anything, and a sign-in is how one gets made.
+it('sends a sign-in back to its own redirect, derived from the request origin', () => {
+	const request = new Request('https://play.example.com/api/config')
+	expect(redirectUri(request)).toBe('https://play.example.com/claim')
+	expect(loginRedirectUri(request)).toBe('https://play.example.com/login/discord')
 })
 
 // The once-only guard the claim is built on. Without it, one Discord member holding the

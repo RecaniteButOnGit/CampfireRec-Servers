@@ -143,10 +143,12 @@ export const TokenRequest = z.object({
 			'refresh_token',
 			'password',
 			'urn:ietf:params:oauth:grant-type:device_code',
+			'identity_assertion',
 		])
 		.describe(
 			'Anything unrecognised (including absent) is treated as a password grant, except the ' +
-				'Studio device-code URN, which polls a code from POST /connect/deviceauthorization'
+				'Studio device-code URN, which polls a code from POST /connect/deviceauthorization, ' +
+				'and identity_assertion, the website’s Discord sign-in'
 		),
 	account_id: z.string().optional().describe('Numeric account id, as a string'),
 	username: z
@@ -183,6 +185,13 @@ export const TokenRequest = z.object({
 		.string()
 		.optional()
 		.describe('Studio device-code grant: the device_code from /connect/deviceauthorization'),
+	assertion: z
+		.string()
+		.optional()
+		.describe(
+			'identity_assertion grant: the HS256 assertion `www` minted with the shared JWT_SECRET ' +
+				'after completing a Discord OAuth2 exchange, naming the platform and platform_id it proved'
+		),
 	device_id: z
 		.string()
 		.optional()

@@ -16,7 +16,12 @@ import {
 	SUBROOM_SCHEMA_DDL,
 	updateAccount,
 } from '@repo/domain'
-import { TOKEN_TTL_SECONDS } from '@repo/jwt'
+import {
+	generateIdentityAssertion,
+	generateToken,
+	TOKEN_TTL_SECONDS,
+	validateIdentityAssertion,
+} from '@repo/jwt'
 
 import {
 	banFromReport,
@@ -2577,5 +2582,147 @@ describe('staff login audit', () => {
 
 		expect((await postToken(`account_id=9605&password=${LOGIN_PASSWORD}`)).status).toBe(200)
 		expect(await staffLogins(9605)).toHaveLength(1)
+	})
+})
+
+// The website's "Sign in with Discord". `www` proves the Discord user (it holds the client
+// secret) and posts an identity ASSERTION signed with the shared JWT_SECRET; this grant
+// resolves it through the link table like a cached_login, or makes the account when there
+// is none. Everything here mints the assertion the way www does, with the test key.
+describe('identity_assertion grant', () => {
+	const SIGNING_KEY = 'test-signing-key'
+	const assertionFor = (platformId: string, platform = PlatformType.Discord) =>
+		generateIdentityAssertion({ platform, platformId }, SIGNING_KEY)
+	const redeem = async (assertion: string, ip?: string) =>
+		postToken(`grant_type=identity_assertion&assertion=${encodeURIComponent(assertion)}`, ip)
+
+	test('an assertion round-trips, and nothing else passes as one', async () => {
+		const assertion = await assertionFor('700000000000000001')
+		await expect(validateIdentityAssertion(assertion, SIGNING_KEY)).resolves.toEqual({
+			platform: PlatformType.Discord,
+			platformId: '700000000000000001',
+		})
+		// A different key, and an access token signed with the RIGHT key: both refused. The
+		// second is the one that matters — the same secret signs sessions, so the audience is
+		// what keeps a stolen token from being replayed as proof of a platform identity.
+		await expect(validateIdentityAssertion(assertion, 'another-key')).resolves.toBeNull()
+		const session = await generateToken('42', '', 4, SIGNING_KEY)
+		await expect(validateIdentityAssertion(session, SIGNING_KEY)).resolves.toBeNull()
+		// And the other direction: an assertion carries no `sub`, so it is no session.
+		const res = await exports.default.fetch(`${ORIGIN}/connect/device/approve`, {
+			method: 'POST',
+			headers: {
+				'Content-Type': 'application/x-www-form-urlencoded',
+				Authorization: `Bearer ${assertion}`,
+			},
+			body: 'user_code=ABCDEFGH',
+		})
+		expect(res.status).toBe(401)
+	})
+
+	test('signs into the one account the identity is linked to', async () => {
+		await seedAccount(9400, 'DiscordLinked')
+		// Linked the way the benefits claim links: with roles recorded.
+		await linkPlatformIdentity(env.DB, 9400, PlatformType.Discord, '700000000000009400', [])
+		const res = await redeem(await assertionFor('700000000000009400'))
+		expect(res.status).toBe(200)
+		expect(decodePayload(res.json.access_token as string).sub).toBe('9400')
+		expect(res.json).not.toHaveProperty('created')
+		expect(typeof res.json.refresh_token).toBe('string')
+	})
+
+	test('refuses a missing, forged or replayed-session assertion', async () => {
+		expect((await postToken('grant_type=identity_assertion')).status).toBe(400)
+		const forged = await generateIdentityAssertion(
+			{ platform: PlatformType.Discord, platformId: '700000000000009400' },
+			'not-the-key'
+		)
+		const res = await redeem(forged)
+		expect(res.status).toBe(400)
+		expect(res.json.error_description).toBe('invalid or expired identity assertion')
+		// An access token for the linked account, presented as the assertion.
+		const session = await generateToken('9400', '', 4, SIGNING_KEY)
+		expect((await redeem(session)).status).toBe(400)
+	})
+
+	test('creates and links an account when the identity opens none, once', async () => {
+		const discordId = '700000000000009401'
+		const first = await redeem(await assertionFor(discordId))
+		expect(first.status).toBe(200)
+		expect(first.json.created).toBe(true)
+		const accountId = Number(decodePayload(first.json.access_token as string).sub)
+		expect(accountId).toBeGreaterThan(0)
+
+		// Linked on the Discord platform, and ONLY there: the blob carries no platform
+		// identity (the snowflake stays off the DTO and the token), like a password account.
+		const links = await getLinksForAccount(env.DB, accountId)
+		expect(links.map((l) => [l.platform, l.platformId])).toEqual([
+			[PlatformType.Discord, discordId],
+		])
+		const row = await env.DB.prepare('SELECT data FROM account WHERE account_id = ?1')
+			.bind(accountId)
+			.first<{ data: string }>()
+		const blob = JSON.parse(row!.data) as Record<string, unknown>
+		expect(blob.platformId).toBeUndefined()
+		expect(blob.passwordHash).toBeUndefined()
+		// Placed in Orientation like any signup.
+		const presence = await env.DB.prepare('SELECT 1 AS ok FROM presence WHERE account_id = ?1')
+			.bind(accountId)
+			.first()
+		expect(presence).not.toBeNull()
+
+		// The same Discord again is a sign-IN to that account, not a second account.
+		const again = await redeem(await assertionFor(discordId))
+		expect(again.status).toBe(200)
+		expect(again.json).not.toHaveProperty('created')
+		expect(decodePayload(again.json.access_token as string).sub).toBe(String(accountId))
+		await expect(
+			countAccountsForPlatformIdentity(env.DB, PlatformType.Discord, discordId)
+		).resolves.toBe(1)
+	})
+
+	// The stretch of the feature: a Discord-made account has no password, and a password is
+	// what signs it into the game (a sideloaded Quest has no Meta nonce to offer). The
+	// website's password form posts with an EMPTY old password the first time.
+	test('a Discord-made account can set a password and then sign in with it', async () => {
+		const created = await redeem(await assertionFor('700000000000009402'))
+		const accountId = decodePayload(created.json.access_token as string).sub as string
+		expect((await postToken(`account_id=${accountId}&password=hunter22`)).status).toBe(400)
+
+		const set = await changePassword(
+			'oldPassword=&newPassword=hunter22',
+			created.json.access_token as string
+		)
+		expect(set.status).toBe(200)
+		const login = await postToken(`grant_type=password&account_id=${accountId}&password=hunter22`)
+		expect(login.status).toBe(200)
+		expect(decodePayload(login.json.access_token as string).sub).toBe(accountId)
+	})
+
+	test('refuses an identity that opens several accounts rather than guessing', async () => {
+		await seedAccount(9403, 'TwoLinksA')
+		await seedAccount(9404, 'TwoLinksB')
+		await linkPlatformIdentity(env.DB, 9403, PlatformType.Discord, '700000000000009403', [])
+		await linkPlatformIdentity(env.DB, 9404, PlatformType.Discord, '700000000000009403', [])
+		const res = await redeem(await assertionFor('700000000000009403'))
+		expect(res.status).toBe(400)
+		expect(res.json.error_description).toBe('platform identity is linked to more than one account')
+	})
+
+	// The signup caps reach this path as they reach create_account — www forwards the
+	// browser's real address over the service binding, so the per-IP cap counts browsers.
+	test('the per-IP signup cap applies to accounts made this way', async () => {
+		const ip = '198.51.100.77'
+		for (let i = 0; i < 3; i++) {
+			const res = await redeem(await assertionFor(`70000000000000950${i}`), ip)
+			expect(res.status).toBe(200)
+			expect(res.json.created).toBe(true)
+		}
+		const fourth = await redeem(await assertionFor('700000000000009509'), ip)
+		expect(fourth.status).toBe(400)
+		expect(fourth.json.error_description).toBe('too many accounts created from this network')
+		// Signing IN from that network is untouched: the cap is on creation.
+		const existing = await redeem(await assertionFor('700000000000009500'), ip)
+		expect(existing.status).toBe(200)
 	})
 })

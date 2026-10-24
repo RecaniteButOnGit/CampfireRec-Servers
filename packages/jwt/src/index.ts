@@ -9,6 +9,9 @@ export {
 	validateStudioBuildValidationToken,
 	studioBuildValidationId,
 	generatePhotonAuthToken,
+	generateIdentityAssertion,
+	validateIdentityAssertion,
+	IDENTITY_ASSERTION_TTL_SECONDS,
 	TOKEN_TTL_SECONDS,
 } from './jwt'
-export type { PhotonAuthClaims } from './jwt'
+export type { IdentityAssertion, PhotonAuthClaims } from './jwt'

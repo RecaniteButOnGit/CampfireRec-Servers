@@ -37,7 +37,12 @@ import {
 	withNotFound,
 	withOnError,
 } from '@repo/hono-helpers'
-import { generateToken, TOKEN_TTL_SECONDS, validateAndGetAccountId } from '@repo/jwt'
+import {
+	generateToken,
+	TOKEN_TTL_SECONDS,
+	validateAndGetAccountId,
+	validateIdentityAssertion,
+} from '@repo/jwt'
 
 // The account-wide ban lives on a `report` row, whose table the api worker owns; its db
 // module is plain D1 queries with no runtime deps, so it imports cleanly here.
@@ -67,6 +72,7 @@ import {
 import {
 	countAccountsForPlatformIdentity,
 	getLinksForAccount,
+	getLinksForIdentity,
 	getLinksForPlatformId,
 	getLinksForPlatformIdentity,
 	isPlatformIdentityLinked,
@@ -107,6 +113,21 @@ const TOKEN_SCOPE =
  * and `match` is what holds a blocked player to their dorm.
  */
 const BLOCKED_DESCRIPTION = 'this device or network is blocked'
+
+/**
+ * The website's "Sign in with Discord". `www` completes the Discord OAuth2 exchange (it
+ * alone holds the client secret), then posts an `assertion` — an HS256 token signed with
+ * the shared JWT_SECRET naming the platform identity it just proved (see `@repo/jwt`'s
+ * `generateIdentityAssertion`). This grant trusts the assertion the way `cached_login`
+ * trusts a Steam ticket, resolves it through the link table, and issues the ordinary
+ * session. No account linked to the identity means a NEW one is made and linked, so a
+ * Discord account is a way to join without Steam or Meta; the player then sets a password
+ * on the website and signs in with it anywhere — a sideloaded Quest included.
+ */
+const IDENTITY_ASSERTION_GRANT = 'identity_assertion'
+
+/** What the grant answers when one identity opens several accounts; never true today. */
+const AMBIGUOUS_IDENTITY_DESCRIPTION = 'platform identity is linked to more than one account'
 
 /**
  * The platform id a SIDELOADED Oculus APK reports. It is not an identity: a sideloaded
@@ -443,7 +464,13 @@ function oauthError(
  * already been authenticated — here, because the player approved a Studio code
  * on the website. Studio reads `expires_in` as seconds (`TimeSpan.FromSeconds`).
  */
-async function issueSession(c: Context<App>, accountId: number, grantType: string) {
+async function issueSession(
+	c: Context<App>,
+	accountId: number,
+	grantType: string,
+	/** Extra top-level fields on the token body — `created: true` on an identity signup. */
+	extra: Record<string, unknown> = {}
+) {
 	const clientIp = c.req.header('cf-connecting-ip') ?? ''
 	const ban = await resolveBan(c.env.DB, accountId, {
 		identity: { ip: clientIp },
@@ -516,7 +543,107 @@ async function issueSession(c: Context<App>, accountId: number, grantType: strin
 		refresh_token: refreshToken,
 		scope: TOKEN_SCOPE,
 		key: '8oQ+e+WQaOBPbEcakhqs3dwZZdOmmyDUmJSD9u4AHMY=',
+		...extra,
 	})
+}
+
+/**
+ * The `identity_assertion` grant: sign into — or create — the account behind a platform
+ * identity another worker has verified and signed for. See IDENTITY_ASSERTION_GRANT.
+ *
+ * Handled before the password fallback and outside the version/rollout gates, like the
+ * Studio device grant: nothing here posts a `ver`, and the credential is the assertion
+ * alone. The assertion names an IDENTITY, not an account; which account that is (or that
+ * there is none yet) is decided here, from the same table `cached_login` reads, so the
+ * website can never choose an account id for itself.
+ *
+ * Creating an account when the identity opens none is deliberate — it is the Discord
+ * sign-up — and takes the same guards `create_account` does for a verified platform
+ * identity: the evasion arms (a banned player's next move is a new account), the per-IP
+ * cap (`www` forwards the browser's real address over the service binding) and the
+ * per-identity cap. NOT the PASSWORD_SIGNUP switch: that exists because a password account
+ * has no identity but its address, and this one has a Discord user Discord itself vouched
+ * for, one account per user. The new account carries no `platform`/`platformId` on its
+ * blob — only the link — so its DTO and token read like a password account's and the
+ * Discord snowflake stays off the wire, exactly as the benefits claim keeps it.
+ */
+async function identityAssertionGrant(c: Context<App>, body: Record<string, unknown>) {
+	const assertion = typeof body.assertion === 'string' ? body.assertion : ''
+	const jwtSecret = await c.env.JWT_SECRET.get()
+	if (jwtSecret === '') {
+		logger.error('refusing an identity assertion: JWT_SECRET is empty')
+		return oauthError(c, 'server_error', 'token signing is not configured', 500)
+	}
+	const identity = assertion ? await validateIdentityAssertion(assertion, jwtSecret) : null
+	if (identity === null) {
+		return oauthError(c, 'invalid_grant', 'invalid or expired identity assertion')
+	}
+
+	const links = await getLinksForIdentity(c.env.DB, identity.platform, identity.platformId)
+	if (links.length > 1) {
+		// The benefits claim keeps a Discord identity on one account, so this is a data
+		// problem rather than a player's choice to make; refused rather than guessed.
+		logger.error('identity assertion names an identity linked to several accounts', {
+			platform: identity.platform,
+			accountIds: links.map((l) => l.accountId),
+		})
+		return oauthError(c, 'invalid_grant', AMBIGUOUS_IDENTITY_DESCRIPTION)
+	}
+	if (links.length === 1) {
+		return issueSession(c, links[0].accountId, IDENTITY_ASSERTION_GRANT)
+	}
+
+	// Nobody yet: the sign-up. Everything below mirrors create_account's platform path.
+	const clientIp = c.req.header('cf-connecting-ip') ?? ''
+	const blocked = await resolveBan(c.env.DB, null, {
+		identity: { ip: clientIp, platform: identity.platform, platformId: identity.platformId },
+		arms: banEvasionMatch(c.env.BAN_EVASION_MATCH),
+	})
+	if (blocked) {
+		logger.info('identity signup refused: player banned', {
+			via: blocked.via,
+			bannedAccountId: blocked.bannedAccountId,
+			ip: clientIp,
+			platform: identity.platform,
+		})
+		return oauthError(c, 'invalid_grant', BLOCKED_DESCRIPTION)
+	}
+	const maxPerPlatformId = intVar(
+		c.env.MAX_ACCOUNTS_PER_PLATFORM_ID,
+		DEFAULT_MAX_ACCOUNTS_PER_PLATFORM_ID
+	)
+	if (
+		maxPerPlatformId > 0 &&
+		(await countAccountsForPlatformIdentity(c.env.DB, identity.platform, identity.platformId)) >=
+			maxPerPlatformId
+	) {
+		logger.info('identity signup rejected: platform account limit', { platform: identity.platform })
+		return oauthError(c, 'invalid_grant', 'account limit reached for this platform account')
+	}
+	const maxPerIp = intVar(c.env.MAX_ACCOUNTS_PER_IP, DEFAULT_MAX_ACCOUNTS_PER_IP)
+	if (
+		maxPerIp > 0 &&
+		clientIp !== '' &&
+		(await countAccountsBySignupIp(c.env.DB, clientIp)) >= maxPerIp
+	) {
+		logger.info('identity signup rejected: per-IP account limit', { ip: clientIp })
+		return oauthError(c, 'invalid_grant', 'too many accounts created from this network')
+	}
+
+	const account = await createAccount(c.env.DB, {
+		platforms: 0,
+		lastLoginTime: new Date().toISOString(),
+		signupIp: clientIp || undefined,
+		lastLoginIp: clientIp || undefined,
+	})
+	await linkPlatformIdentity(c.env.DB, account.accountId, identity.platform, identity.platformId)
+	await placeNewPlayerInOrientation(c.env, account.accountId, 0)
+	logger.info('created an account from an identity assertion', {
+		accountId: account.accountId,
+		platform: identity.platform,
+		ip: clientIp,
+	})
+	return issueSession(c, account.accountId, IDENTITY_ASSERTION_GRANT, { created: true })
 }
 
 async function decideDeviceCode(c: Context<App>, decide: typeof approveDeviceGrant) {
@@ -922,7 +1049,7 @@ const app = new Hono<App>()
 			tags: ['Token'],
 			summary: 'OAuth token endpoint — issues a JWT',
 			description: [
-				'Issues an access token (plus a single-use refresh token) for one of four grants,',
+				'Issues an access token (plus a single-use refresh token) for one of six grants,',
 				'selected by `grant_type`. Every grant returns the same body on success.',
 				'',
 				'**`create_account`** — mints a new account with an auto-assigned random username',
@@ -944,6 +1071,17 @@ const app = new Hono<App>()
 				'',
 				'**`refresh_token`** — redeems a stored single-use refresh token, rotating it. The',
 				'platform and platform id come from what was stored at issue time, not the body.',
+				'',
+				'**`identity_assertion`** — the website’s "Sign in with Discord". `www` completes the',
+				'Discord OAuth2 code exchange (it alone holds the client secret) and posts an',
+				'`assertion`: an HS256 token signed with the shared JWT_SECRET naming the platform',
+				'(`101`) and platform id it proved, good for a minute. The identity is resolved through',
+				'the same link table as `cached_login`: one linked account is signed into; none means a',
+				'NEW account is created and linked (the body then carries `created: true`), under the',
+				'evasion check and the per-IP and per-identity signup caps but NOT the PASSWORD_SIGNUP',
+				'switch — the Discord user is the identity a password account lacks. The new account',
+				'has no password until its owner sets one on the website; with one, it signs in',
+				'anywhere the `password` grant does. Several linked accounts is refused.',
 				'',
 				'**`password`** (the fallback for any unrecognised or absent `grant_type`) —',
 				'identifies the account by `username` or numeric `account_id` and requires the',
@@ -1072,6 +1210,9 @@ const app = new Hono<App>()
 				}
 				return issueSession(c, polled.accountId, DEVICE_CODE_GRANT)
 			}
+			// The website's Discord sign-in, likewise before the fallback — and before the
+			// version gates, which it never posts a `ver` for. See identityAssertionGrant.
+			if (grantType === IDENTITY_ASSERTION_GRANT) return identityAssertionGrant(c, body)
 			// `platform`/`platform_id` come from the body for a fresh login; a refresh
 			// grant overrides them below with what was stored when the token was issued.
 			let platformId = typeof body.platform_id === 'string' ? body.platform_id : ''

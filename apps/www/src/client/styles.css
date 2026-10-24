@@ -2074,3 +2074,19 @@ button[type='submit']:disabled {
 	border-radius: 3px;
 	border: 1px solid var(--line);
 }
+
+/* The login card's second door, under the password form: an "or" and the Discord button,
+   separated from the form by a rule so the two aren't read as one. */
+.alt-signin {
+	margin-top: 20px;
+	padding-top: 16px;
+	border-top: 1px solid var(--line);
+	display: flex;
+	flex-direction: column;
+	gap: 10px;
+	align-items: flex-start;
+}
+
+.alt-signin > .muted:first-child {
+	margin: 0;
+}

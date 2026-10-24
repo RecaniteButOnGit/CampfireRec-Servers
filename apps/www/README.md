@@ -220,11 +220,40 @@ won't pick up newly created secrets until it restarts.
 which one is missing. `wrangler tail www` shows it.
 
 In the [Discord developer portal](https://discord.com/developers/applications),
-add `https://<your domain>/claim` to the app's **Redirects**. It has to match byte
-for byte: `www` derives the redirect URI from the incoming request's own origin
-(never from the request body, which would turn the client secret into a redemption
-oracle for someone else's app), so add `http://localhost:5173/claim` too if you
-want the flow to work under `pnpm turbo dev`.
+add `https://<your domain>/claim` **and** `https://<your domain>/login/discord` to the
+app's **Redirects**. Each has to match byte for byte: `www` derives the redirect URI
+from the incoming request's own origin (never from the request body, which would turn
+the client secret into a redemption oracle for someone else's app), so add the
+`http://localhost:5173/…` pair too if you want the flows to work under `pnpm turbo dev`.
+
+### Sign in with Discord
+
+The same app also serves the login page's **Sign in with Discord** button, on the same
+switch (`/api/config` serves `discordLoginUrl` beside `discordAuthorizeUrl`, both null
+while the claim is closed). It asks Discord for the `identify` scope only and returns to
+`/login/discord`, where the SPA posts the code to `POST /api/login/discord`. `www`
+exchanges it, reads `GET /users/@me` for the Discord user id, revokes the token, and
+mints an **identity assertion** — a one-minute HS256 token signed with the shared
+`JWT_SECRET` naming platform `101` and that id — which it posts to `auth`'s
+`identity_assertion` grant over the service binding. `auth` resolves the id through
+`platform_account`:
+
+- **One linked account** (a player who claimed benefits on it) — signed in; the ordinary
+  token body comes back and the SPA stores it like a password sign-in's.
+- **No linked account** — `auth` **creates** one and links the Discord to it, under the
+  ban-evasion check and the per-IP / per-identity signup caps (but not `PASSWORD_SIGNUP`:
+  that switch exists because a password account has no identity but its address). The
+  body carries `created: true`, and the SPA stops to say so: the account has **no
+  password**, and setting one on the account page is what lets it sign in to the game —
+  on a sideloaded Quest without a Meta account, which is the case this is for. Its first
+  benefits claim still pays the welcome gift: the claim keys "first" on roles being
+  recorded on a Discord link, not on the link existing.
+- **Several linked accounts** — refused; the claim never produces this.
+
+`www` never chooses the account id: the assertion names an identity, and which account
+that is (or that there is none) is `auth`'s decision from the same table `cached_login`
+reads. The Discord snowflake stays off the new account's blob and token, as it does
+after a claim.
 
 ### Discord role refresh (cron)
 

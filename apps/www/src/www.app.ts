@@ -6,7 +6,7 @@ import { PlatformType } from '@repo/domain/src/enums'
 import { countOnlinePlayers } from '@repo/domain/src/presence-db'
 import { getStatSeries } from '@repo/domain/src/stats-db'
 import { intVar, logger, withDefaultCors, withOnError } from '@repo/hono-helpers'
-import { validateAndGetAccountId } from '@repo/jwt'
+import { generateIdentityAssertion, validateAndGetAccountId } from '@repo/jwt'
 
 // The `platform_account` link table, owned (and migrated) by the `auth` worker. A claimed
 // Discord identity is stored there as a PlatformType.Discord link — it is an account ↔
@@ -16,9 +16,10 @@ import { validateAndGetAccountId } from '@repo/jwt'
 // verify, and its picker lists only the platforms that can be (CACHED_LOGIN_PLATFORMS).
 import {
 	countAccountsForPlatformIdentity,
-	getLinksForAccount,
+	hasRecordedRoles,
 	isPlatformIdentityLinked,
 	linkPlatformIdentity,
+	recordFirstRoles,
 } from '../../auth/src/platform-db'
 // The signup grant's default and the Discord supporter gift, both `econ`'s. The gift is
 // econ's cron paid on demand: the first time an account links its Discord, the claim hands
@@ -31,6 +32,9 @@ import {
 	discordConfig,
 	exchangeCode,
 	fetchGuildMembership,
+	fetchUser,
+	LOGIN_SCOPES,
+	loginRedirectUri,
 	qualifies,
 	redirectUri,
 	revokeToken,
@@ -132,14 +136,27 @@ const claimant = async (c: Context<App>): Promise<number | null> =>
  * (see App.tsx). Everything else about the request is fixed by the server.
  */
 function authorizeUrl(request: Request, clientId: string): string {
+	return consentUrl(clientId, SCOPES, redirectUri(request))
+}
+
+/**
+ * The consent URL for "Sign in with Discord": the same app, the narrower `identify` scope,
+ * and the sign-in's own return leg (`/login/discord`). Served beside the claim's URL so the
+ * SPA never assembles either.
+ */
+function loginAuthorizeUrl(request: Request, clientId: string): string {
+	return consentUrl(clientId, LOGIN_SCOPES, loginRedirectUri(request))
+}
+
+function consentUrl(clientId: string, scope: string, redirect: string): string {
 	const url = new URL(AUTHORIZE_URL)
 	url.search = new URLSearchParams({
 		client_id: clientId,
 		response_type: 'code',
-		scope: SCOPES,
-		redirect_uri: redirectUri(request),
+		scope,
+		redirect_uri: redirect,
 		// Skip Discord's "you've already authorized this app, continue?" interstitial on a
-		// repeat claim; the player has already pressed a button that says what this does.
+		// repeat visit; the player has already pressed a button that says what this does.
 		prompt: 'none',
 	}).toString()
 	return url.toString()
@@ -195,6 +212,10 @@ const app = new Hono<App>()
 			// ids never leave the worker, since it's the worker that asks Discord the question.
 			benefitsEnabled: discord !== null,
 			discordAuthorizeUrl: discord ? authorizeUrl(c.req.raw, discord.clientId) : null,
+			// "Sign in with Discord", on the SAME switch: the sign-in resolves (or makes) the
+			// account through the Discord link, and only the claim ever writes one with roles, so
+			// an operator who hasn't set the claim up has no reason to offer the door either.
+			discordLoginUrl: discord ? loginAuthorizeUrl(c.req.raw, discord.clientId) : null,
 			hosts: {
 				auth: authBase(c.env),
 				accounts: accountsBase(c.env),
@@ -344,6 +365,90 @@ const app = new Hono<App>()
 		return c.json(token)
 	})
 
+	// ---- Sign in with Discord -----------------------------------------------
+
+	/**
+	 * Redeem a Discord authorization code from the SIGN-IN consent (`/login/discord`), prove
+	 * who the Discord user is, and ask `auth` for a session on the account linked to them —
+	 * or, when there is none, for a brand-new account linked to them.
+	 *
+	 * The browser sends ONLY the code, as it does for the claim, and for the same reason: the
+	 * exchange needs the client secret. What is different is what comes after. The claim acts
+	 * on a session the caller already has; this is how one GETS a session, so there is no
+	 * bearer token and nothing here writes to the account. Instead the proven identity is
+	 * signed into an ASSERTION with the shared JWT_SECRET and posted to `auth`'s
+	 * `identity_assertion` grant, which resolves it through the link table exactly as
+	 * `cached_login` resolves a Steam ticket, and answers the ordinary token body. Resolving
+	 * the account — and minting one — stays `auth`'s: www never picks an account id.
+	 *
+	 * Posted over the service binding with the browser's real IP forwarded, like signup, so
+	 * the per-IP cap on the sign-up path counts the browser and not Cloudflare. The token
+	 * response is relayed verbatim; `created: true` on it is the SPA's cue to say an account
+	 * was just made and that setting a password is what makes it usable in the game.
+	 */
+	.post('/api/login/discord', async (c) => {
+		const config = await discordConfig(c.env)
+		if (!config) return c.json({ error: 'Signing in with Discord is not available here.' }, 403)
+
+		type LoginBody = { code?: string }
+		const { code } = await c.req.json<LoginBody>().catch(() => ({}) as LoginBody)
+		if (!code) return c.json({ error: 'No Discord authorization code was provided.' }, 400)
+
+		const accessToken = await exchangeCode(config, code, loginRedirectUri(c.req.raw))
+		if (accessToken === null) {
+			return c.json(
+				{ error: 'That Discord sign-in could not be completed. Please try again.' },
+				400
+			)
+		}
+		const user = await fetchUser(accessToken)
+		await revokeToken(config, accessToken)
+		if (user === null) {
+			return c.json(
+				{ error: 'That Discord sign-in could not be completed. Please try again.' },
+				400
+			)
+		}
+
+		const jwtSecret = await c.env.JWT_SECRET.get().catch(() => '')
+		if (jwtSecret === '') {
+			logger.error('cannot sign an identity assertion: JWT_SECRET is unreadable')
+			return c.json({ error: authUnreachable('login') }, 502)
+		}
+		const assertion = await generateIdentityAssertion(
+			{ platform: PlatformType.Discord, platformId: user.id },
+			jwtSecret
+		)
+		const res = await postAuthForm(
+			c.env,
+			'/connect/token',
+			{ grant_type: 'identity_assertion', assertion },
+			{ clientIp: c.req.header('cf-connecting-ip') }
+		).catch(() => null)
+		if (res === null) {
+			logger.error('could not reach auth to redeem an identity assertion')
+			return c.json({ error: authUnreachable('login') }, 502)
+		}
+		if (!res.ok) {
+			const failure = await readAuthError(res, 'login')
+			logger.info('auth refused a discord sign-in', {
+				status: res.status,
+				upstream: failure.upstream,
+			})
+			return c.json({ error: failure.message }, failure.status)
+		}
+		const token = (await res.json().catch(() => null)) as {
+			access_token?: string
+			created?: boolean
+		} | null
+		if (!token?.access_token) {
+			logger.error('auth answered a discord sign-in with no access_token')
+			return c.json({ error: authUnreachable('login') }, 502)
+		}
+		logger.info(token.created ? 'created an account from a discord sign-in' : 'discord sign-in')
+		return c.json({ ...token, discordUsername: user.username })
+	})
+
 	// ---- Discord benefits claim ---------------------------------------------
 
 	/**
@@ -358,16 +463,18 @@ const app = new Hono<App>()
 	.get('/api/benefits/status', async (c) => {
 		const accountId = await claimant(c)
 		if (accountId === null) return c.body(null, 401)
-		const [account, links] = await Promise.all([
+		const [account, claimed] = await Promise.all([
 			getAccount(c.env.DB, accountId),
-			getLinksForAccount(c.env.DB, accountId),
+			hasRecordedRoles(c.env.DB, accountId, PlatformType.Discord),
 		])
 		return c.json({
 			hasPlus: account?.hasPlus ?? false,
-			// Whether this account is already tied to a Discord identity — not WHICH one. The
-			// player knows their own Discord; the id is of no use to the page and every reason
-			// to keep an account's linked identities off the wire.
-			linked: links.some((link) => link.platform === PlatformType.Discord),
+			// Whether this account has CLAIMED through a Discord identity — a link with roles
+			// recorded — not WHICH one. The player knows their own Discord; the id is of no use to
+			// the page and every reason to keep an account's linked identities off the wire. A
+			// bare link, which "Sign in with Discord" leaves on a new account, reads as not yet
+			// claimed: the page then offers the claim, which is what that player still has to do.
+			linked: claimed,
 		})
 	})
 
@@ -456,12 +563,6 @@ const app = new Hono<App>()
 			PlatformType.Discord,
 			membership.userId
 		)
-		// Whether this claim is the account's FIRST Discord link — what the one-time gift below
-		// keys on. Decided before the write, from the table: an account re-claiming with the
-		// same Discord is not first (`alreadyMine`), and neither is one that already carries a
-		// DIFFERENT Discord identity, which the once-only guard doesn't stop. Only asked when
-		// it could be true, to spare the re-claim a query.
-		let firstLink = false
 		if (!alreadyMine) {
 			const claimedElsewhere = await countAccountsForPlatformIdentity(
 				c.env.DB,
@@ -477,9 +578,26 @@ const app = new Hono<App>()
 					409
 				)
 			}
-			const links = await getLinksForAccount(c.env.DB, accountId)
-			firstLink = !links.some((link) => link.platform === PlatformType.Discord)
 		}
+		// Whether this is the account's FIRST CLAIM — what the one-time gift below keys on.
+		// Decided before the write, from the table: a claim is recorded as roles on a Discord
+		// link, so an account with any Discord link carrying roles (this identity's, or a
+		// DIFFERENT one the once-only guard doesn't stop) has claimed before. A link with NO
+		// roles has not: that is what "Sign in with Discord" leaves on an account it just made,
+		// and that player's first claim is still their first.
+		const firstClaim = !(await hasRecordedRoles(c.env.DB, accountId, PlatformType.Discord))
+		// On a link that already exists without roles, writing them is the claim's one-shot
+		// write — the single-winner guard a fresh link gets from its INSERT below. Asked only
+		// when the link is the caller's: on anyone else's it would be refused above.
+		const recordedFirst =
+			alreadyMine &&
+			(await recordFirstRoles(
+				c.env.DB,
+				accountId,
+				PlatformType.Discord,
+				membership.userId,
+				membership.roles
+			))
 
 		// The link is written for EVERY guild member, qualifying role or not, and it is
 		// idempotent: INSERT OR IGNORE (so `linkedAt` keeps the FIRST claim's time), with the
@@ -519,13 +637,14 @@ const app = new Hono<App>()
 		}
 
 		// The one-time supporter gift: the box econ's cron would hand this member, paid now,
-		// once. Gated on the insert having happened too (`created`), so two claims racing on
+		// once. Gated on a single-winner write having happened too — the insert (`created`), or
+		// the first roles onto a sign-in's bare link (`recordedFirst`) — so two claims racing on
 		// one fresh account can't both pay. Best-effort AFTER Plus is granted and the link is
 		// written: a grant that fails partway is logged with what to check, as econ's cron
 		// logs its own, and the claim still answers — the player got what they came for, and
 		// a retry that also failed partway is how a balance gets credited twice.
 		let tokensAwarded: number | null = null
-		if (created && firstLink) {
+		if ((created || recordedFirst) && firstClaim) {
 			try {
 				const role = await grantDiscordRoleGift(
 					c.env,

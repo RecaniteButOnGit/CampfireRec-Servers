@@ -57,6 +57,12 @@ interface SiteConfig {
 	 * benefits are off. The `state` nonce is appended here — see `startDiscordAuth`.
 	 */
 	discordAuthorizeUrl: string | null
+	/**
+	 * The consent URL for "Sign in with Discord" — same app, `identify` scope only, and its own
+	 * return leg (`/login/discord`). On the same switch as the claim, so null whenever
+	 * `benefitsEnabled` is false. See `DiscordLoginPage`.
+	 */
+	discordLoginUrl: string | null
 }
 
 /** The private self DTO from `accounts` (`GET /account/me`). */
@@ -594,18 +600,49 @@ const claimBenefits = (code: string): Promise<ClaimResult> =>
 const OAUTH_STATE_KEY = 'rf_discord_state'
 
 /**
+ * Where to land after a Discord SIGN-IN — the `?next=` the login page was opened with.
+ * Stashed beside the nonce because the round trip through Discord loses the query string,
+ * and read back by `DiscordLoginPage` exactly once.
+ */
+const OAUTH_NEXT_KEY = 'rf_discord_next'
+
+/**
  * Send the browser to Discord's consent screen.
  *
  * A real navigation, not a client-side route — Discord is another origin. The `state` is
  * minted here and stashed for the return leg; `www` built everything else about the URL
- * (see `/api/config`), so this only ever appends the one parameter it owns.
+ * (see `/api/config`), so this only ever appends the one parameter it owns. `next` is the
+ * sign-in's post-login destination; the claim passes none.
  */
-function startDiscordAuth(authorizeUrl: string) {
+function startDiscordAuth(authorizeUrl: string, next?: string) {
 	const state = crypto.randomUUID()
 	sessionStorage.setItem(OAUTH_STATE_KEY, state)
+	if (next) sessionStorage.setItem(OAUTH_NEXT_KEY, next)
+	else sessionStorage.removeItem(OAUTH_NEXT_KEY)
 	const url = new URL(authorizeUrl)
 	url.searchParams.set('state', state)
 	window.location.assign(url.toString())
+}
+
+/** What `/api/login/discord` answers: auth's token body, plus who signed in and whether it made them. */
+interface DiscordSignIn {
+	access_token?: string
+	/** True when no account was linked to this Discord and `auth` created one just now. */
+	created?: boolean
+	/** The Discord username, for the confirmation line only. */
+	discordUsername?: string
+}
+
+/**
+ * Redeem the sign-in's authorization code. Goes through `www`, like signup and the claim,
+ * because the exchange needs the Discord client secret; `www` then has `auth` issue the
+ * session and relays the token body, which is stored exactly as a password sign-in's is.
+ */
+async function signInWithDiscord(code: string): Promise<DiscordSignIn> {
+	const data = await call<DiscordSignIn>('/api/login/discord', { json: { code } })
+	if (typeof data.access_token !== 'string') throw new Error(authUnreachable('login'))
+	setToken(data.access_token)
+	return data
 }
 
 /**
@@ -2164,6 +2201,7 @@ export function App() {
 					turnstileSiteKey: null,
 					benefitsEnabled: false,
 					discordAuthorizeUrl: null,
+					discordLoginUrl: null,
 				})
 				setAccount(null)
 			})
@@ -2181,7 +2219,12 @@ export function App() {
 	return (
 		<>
 			<NavBar account={account} path={path} navigate={navigate} onLogout={logout} />
-			{path === '/login' || path === '/signup' ? (
+			{path === '/login/discord' ? (
+				// Discord's registered redirect for a SIGN-IN (the claim's is `/claim`). Matched
+				// before `/login`, which it would otherwise never reach; a cold load falls through
+				// to the SPA shell like every other client-side route.
+				<DiscordLoginPage config={config} navigate={navigate} onAuthed={setAccount} />
+			) : path === '/login' || path === '/signup' ? (
 				// One page, two doors. `/signup` exists so the homepage's create-account link
 				// lands on that tab instead of dropping people on sign-in to find it — and so
 				// the URL is linkable. Unknown paths fall back to index.html (see the assets
@@ -2643,6 +2686,7 @@ function LoginPage({
 	}
 
 	const siteKey = config?.signupEnabled ? config.turnstileSiteKey : null
+	const discordLoginUrl = config?.discordLoginUrl ?? null
 
 	return (
 		<main className="shell">
@@ -2689,6 +2733,25 @@ function LoginPage({
 							your Steam ID — set a password on it and it signs in here too.
 						</p>
 						<LoginForm onAuthed={authed} />
+						{/* The other door. Shown on the server's say-so like the signup tab: the URL is
+						    null until the Discord app is configured. `next` rides along through Discord in
+						    sessionStorage, since the round trip drops the query. */}
+						{discordLoginUrl && (
+							<div className="alt-signin">
+								<p className="muted">or</p>
+								<button
+									type="button"
+									className="cta discord"
+									onClick={() => startDiscordAuth(discordLoginUrl, next)}
+								>
+									Sign in with Discord
+								</button>
+								<p className="muted">
+									Signs you into the account your Discord is linked to. No account yet? This makes
+									one — set a password on it afterwards and it signs in to the game too.
+								</p>
+							</div>
+						)}
 						{/* The tabs above already offer this; the line under the button is where
 						    someone who just found out they have no account is actually looking.
 						    Gated on the same key, so it can't point at a door that isn't there. */}
@@ -2701,6 +2764,109 @@ function LoginPage({
 							</p>
 						)}
 					</>
+				)}
+			</section>
+		</main>
+	)
+}
+
+/**
+ * `/login/discord` — the page Discord redirects a SIGN-IN back to. Its own route rather than
+ * `/claim`, because that page wants a session before it does anything and this is how one
+ * gets made; it is the app's second registered `redirect_uri`, so like `/claim` it has to
+ * work on a cold load.
+ *
+ * The return leg mirrors the claim's: check the nonce this tab minted, strip the code off
+ * the URL before anything else, redeem it exactly once. What differs is the outcome. A
+ * sign-in to an existing account just goes where the login page was headed. A sign-in that
+ * CREATED an account (`created`) stops here first: that account has no password, and
+ * without one it can't sign in to the game — on a Quest without a Meta account, which is
+ * the whole point of making it this way — so the one thing to tell a brand-new player is
+ * where to set one.
+ */
+function DiscordLoginPage({
+	config,
+	navigate,
+	onAuthed,
+}: {
+	config: SiteConfig | undefined
+	navigate: Navigate
+	onAuthed: (a: SelfAccount) => void
+}) {
+	const [error, setError] = useState('')
+	const [created, setCreated] = useState<SelfAccount | null>(null)
+	// StrictMode runs effects twice in dev, and a Discord code is single-use — see BenefitsPanel.
+	const redeemed = useRef(false)
+
+	useEffect(() => {
+		const params = new URLSearchParams(window.location.search)
+		const code = params.get('code')
+		const state = params.get('state')
+		const expected = sessionStorage.getItem(OAUTH_STATE_KEY)
+		const next = safeNextPath(sessionStorage.getItem(OAUTH_NEXT_KEY)) ?? '/account'
+
+		if (code === null) {
+			// Opened directly, or Discord sent the player back with `?error=access_denied`
+			// because they cancelled. Nothing to redeem; back to the door.
+			navigate('/login')
+			return
+		}
+
+		window.history.replaceState(null, '', '/login/discord')
+		if (redeemed.current) return
+		redeemed.current = true
+		sessionStorage.removeItem(OAUTH_STATE_KEY)
+		sessionStorage.removeItem(OAUTH_NEXT_KEY)
+
+		if (state === null || expected === null || state !== expected) {
+			setError('That Discord sign-in did not match this browser. Please start again.')
+			return
+		}
+
+		signInWithDiscord(code)
+			.then(async (result) => {
+				const me = await fetchMe()
+				onAuthed(me)
+				if (result.created) setCreated(me)
+				else navigate(next)
+			})
+			.catch((err: unknown) => setError(err instanceof Error ? err.message : String(err)))
+	}, [navigate, onAuthed])
+
+	if (created) {
+		return (
+			<main className="shell">
+				<section className="card">
+					<h2>Welcome to RecFlare</h2>
+					<p>
+						Your account is ready, linked to your Discord. Your username is{' '}
+						<strong>@{created.username}</strong> — you can change it on your account page.
+					</p>
+					<p className="muted">
+						It has no password yet. Set one on your account page: your username and that password
+						are how you sign in to the game — including on a Quest without a Meta account.
+					</p>
+					<Link to="/account" navigate={navigate} className="cta">
+						Go to my account
+					</Link>
+				</section>
+			</main>
+		)
+	}
+
+	return (
+		<main className="shell">
+			<section className="card">
+				<h2>Signing in with Discord</h2>
+				{error ? (
+					<>
+						<p className="error">{error}</p>
+						<Link to="/login" navigate={navigate} className="cta ghost">
+							Back to sign in
+						</Link>
+					</>
+				) : (
+					<p className="muted">{config === undefined ? 'Loading…' : 'One moment…'}</p>
 				)}
 			</section>
 		</main>

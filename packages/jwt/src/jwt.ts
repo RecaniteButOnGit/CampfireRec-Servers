@@ -328,3 +328,82 @@ export async function generateToken(
 		secret
 	)
 }
+
+/**
+ * The `aud` of an identity assertion — what tells one apart from every other token this
+ * key signs. An access token's audience is the auth host; a Studio build token's is
+ * `studio-build-validation`. Checked on validation, so neither can be replayed as an
+ * assertion, and an assertion — which carries no `sub` — satisfies none of the
+ * `validateAndGet*` readers either.
+ */
+const IDENTITY_ASSERTION_AUDIENCE = 'recflare:identity-assertion'
+
+/**
+ * How long an assertion is good for. It is minted and redeemed within one request on the
+ * server side (www proves the identity, then posts the assertion to auth), so a minute
+ * covers clock skew between two Workers and nothing else.
+ */
+export const IDENTITY_ASSERTION_TTL_SECONDS = 60
+
+/** A platform identity one worker has verified and is vouching for to `auth`. */
+export interface IdentityAssertion {
+	/** PlatformType int — Discord (101) today. */
+	platform: number
+	/** The platform's own id for the user — a Discord snowflake, as a string. */
+	platformId: string
+}
+
+/**
+ * Mint a short-lived, signed statement that the caller has VERIFIED this platform
+ * identity — the credential behind `auth`'s `identity_assertion` grant.
+ *
+ * This exists so a worker other than `auth` can prove an identity `auth` cannot: www
+ * completes a Discord OAuth2 code exchange (which needs the Discord client secret, bound
+ * only to www) and hands `auth` the result, rather than `auth` learning Discord. Signing it
+ * with the shared `JWT_SECRET` adds no trust that didn't exist — a holder of that key can
+ * already mint access tokens outright — and it means the grant works the same over the
+ * service binding and over the public hostname. The assertion names an identity, never an
+ * account: resolving it to one (or minting one) stays `auth`'s decision.
+ */
+export async function generateIdentityAssertion(
+	identity: IdentityAssertion,
+	secret: string
+): Promise<string> {
+	const now = Math.floor(Date.now() / 1000)
+	return sign(
+		{
+			aud: IDENTITY_ASSERTION_AUDIENCE,
+			platform: identity.platform,
+			platform_id: identity.platformId,
+			iat: now,
+			nbf: now,
+			exp: now + IDENTITY_ASSERTION_TTL_SECONDS,
+			jti: crypto.randomUUID(),
+		},
+		secret,
+		'HS256'
+	)
+}
+
+/**
+ * Validate an identity assertion and return the identity it vouches for, or null when
+ * the token is malformed, mis-signed, expired, or not an assertion at all. The audience
+ * check is what refuses an access token presented here, and a missing `sub` is required
+ * for the same reason in the other direction: an assertion must never pass as a session.
+ */
+export async function validateIdentityAssertion(
+	token: string,
+	secret: string
+): Promise<IdentityAssertion | null> {
+	try {
+		const payload = await verify(token, secret, 'HS256') // checks exp/nbf/signature
+		if (payload.aud !== IDENTITY_ASSERTION_AUDIENCE || payload.sub !== undefined) return null
+		const platform = payload.platform
+		const platformId = payload.platform_id
+		if (typeof platform !== 'number' || !Number.isInteger(platform) || platform < 0) return null
+		if (typeof platformId !== 'string' || platformId === '') return null
+		return { platform, platformId }
+	} catch {
+		return null
+	}
+}

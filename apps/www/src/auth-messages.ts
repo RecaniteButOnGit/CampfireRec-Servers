@@ -40,6 +40,14 @@ const AUTH_MESSAGES: Record<string, string> = {
 		'That platform cannot be verified — only Steam and Meta are supported.',
 	'no linked account for this platform identity':
 		'No account is linked to this platform sign-in yet. Sign in with your password once to link it.',
+	// The website's Discord sign-in found the Discord user on several accounts — a state the
+	// benefits claim never produces, so this is for an operator to untangle, not the player.
+	'platform identity is linked to more than one account':
+		'That Discord account is linked to more than one RecFlare account. Sign in with your username and password instead.',
+	// www minted the assertion a moment ago, so this is a key mismatch between www and auth
+	// (or a clock a minute out), never something the player did.
+	'invalid or expired identity assertion':
+		'Sign-in is unavailable right now. This is a problem on our end — please try again later.',
 	'refresh_token is invalid or expired': 'Your session has expired. Please sign in again.',
 	// An account that shares a device or network with a BANNED one. Phrased for BOTH the
 	// person evading a ban and the housemate of one — the IP arm cannot tell them apart —
