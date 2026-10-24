@@ -29,7 +29,7 @@
 
 import { COACH_ACCOUNT_ID } from './custom-avatar-items-load'
 
-/** Schema DDL (mirror of migrations/0022_custom_avatar_item_json.sql). */
+/** Schema DDL (mirror of migrations/0022_custom_avatar_item_json.sql and 0035_custom_avatar_item_badge_room.sql). */
 export const SCHEMA_DDL: string[] = [
 	`CREATE TABLE IF NOT EXISTS custom_avatar_item (
 		data TEXT NOT NULL,
@@ -45,6 +45,9 @@ export const SCHEMA_DDL: string[] = [
 	)`,
 	`CREATE UNIQUE INDEX IF NOT EXISTS idx_custom_avatar_item_id ON custom_avatar_item (custom_avatar_item_id)`,
 	`CREATE INDEX IF NOT EXISTS idx_custom_avatar_item_creator ON custom_avatar_item (creator_account_id)`,
+	// The room-badge lookup (`attachBadges`, packages/domain/src/rooms-db.ts) runs on every room
+	// page; partial over the badge rows, keyed by the badge's room (migrations/0035).
+	`CREATE INDEX IF NOT EXISTS idx_custom_avatar_item_badge_room ON custom_avatar_item (json_extract(data, '$.CustomBadgeMetadata.RoomId')) WHERE outfit_type = 1000`,
 ]
 
 /**

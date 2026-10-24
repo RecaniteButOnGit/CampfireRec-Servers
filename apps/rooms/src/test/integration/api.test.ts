@@ -34,6 +34,7 @@ import {
 	UNITY_ASSET_SCHEMA_DDL,
 } from '@repo/domain'
 
+import { SCHEMA_DDL as CUSTOM_AVATAR_ITEM_SCHEMA_DDL } from '../../../../api/src/custom-avatar-items-db'
 import { SCHEMA_DDL as INVENTION_SCHEMA_DDL } from '../../../../api/src/inventions-db'
 import { SCHEMA_DDL as ROOM_VOTE_SCHEMA_DDL } from '../../../../api/src/votes-db'
 import { NotificationType } from '../../../../notify/src/notification-types'
@@ -134,6 +135,7 @@ beforeAll(async () => {
 	for (const stmt of ROOM_VOTE_SCHEMA_DDL) await env.DB.prepare(stmt).run()
 	// Inventions (owned by the api worker) — a room save writes each one's room count.
 	for (const stmt of INVENTION_SCHEMA_DDL) await env.DB.prepare(stmt).run()
+	for (const stmt of CUSTOM_AVATAR_ITEM_SCHEMA_DDL) await env.DB.prepare(stmt).run()
 	for (const stmt of ROOM_INVITE_SCHEMA_DDL) await env.DB.prepare(stmt).run()
 	// Baked unity asset bundles — what `POST /unity_assets/baked/bulk` serves.
 	for (const stmt of UNITY_ASSET_SCHEMA_DDL) await env.DB.prepare(stmt).run()
@@ -7208,4 +7210,40 @@ it('omits hydrated Badges when persisting a room settings edit', async () => {
 		data: string
 	}>()
 	expect(JSON.parse(stored!.data)).not.toHaveProperty('Badges')
+})
+
+// The badge lookup runs on every room page, served by a partial index over the badge rows
+// (api migrations/0035, mirrored in SCHEMA_DDL above). Only a PUBLISHED badge with a built save
+// hydrates; a draft stays on its creator's Studio shelf.
+it('GET /rooms/:id hydrates the room\'s published badges', async () => {
+	await seedRoomWithSubRooms(env.DB, {
+		RoomId: 987671,
+		Name: 'BadgeHydration',
+		CreatorAccountId: 987671,
+		SubRooms: [],
+	})
+	const badge = (id: string, roomId: number, accessibility: number, saves: unknown[]) =>
+		JSON.stringify({
+			CustomAvatarItemId: id,
+			CreatorAccountId: 987671,
+			Name: id,
+			OutfitType: 1000,
+			Accessibility: accessibility,
+			CurrentSaves: saves,
+			CustomBadgeMetadata: { RoomId: roomId },
+		})
+	const insert = env.DB.prepare('INSERT INTO custom_avatar_item (data) VALUES (?)')
+	await env.DB.batch([
+		insert.bind(badge('badge-published', 987671, 1, [{ BodyType: 0 }])),
+		insert.bind(badge('badge-draft', 987671, 0, [{ BodyType: 0 }])),
+		insert.bind(badge('badge-unbuilt', 987671, 1, [])),
+		insert.bind(badge('badge-other-room', 987670, 1, [{ BodyType: 0 }])),
+	])
+	// Twice: the second read takes the path that remembers the table exists.
+	for (let i = 0; i < 2; i++) {
+		const res = await SELF.fetch(`${ORIGIN}/rooms/987671`)
+		expect(res.status).toBe(200)
+		const room = (await res.json()) as { Badges: Array<{ CustomAvatarItemId: string }> }
+		expect(room.Badges.map((b) => b.CustomAvatarItemId)).toEqual(['badge-published'])
+	}
 })
