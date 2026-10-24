@@ -145,6 +145,14 @@ export type Env = SharedHonoEnv & {
 	 */
 	DISCORD_BENEFITS_ROLE_IDS?: string
 	/**
+	 * Discord role ids whose holders have Rec Room Studio upload access without the
+	 * account's `hasStudio` flag (`RECFLARE_STUDIO_ROLLOUT` in the root `.env`; the var
+	 * `auth` stamps `betastudio` from). `/api/studio-access` answers `granted` through the
+	 * same `hasStudioAccess`, so the Studio settings page agrees with the token. The staff
+	 * list and its add/remove still manage the flag alone.
+	 */
+	STUDIO_ROLLOUT?: string
+	/**
 	 * The bot user's token for the scheduled role refresh (discord-roles.ts). Optional in
 	 * effect: the binding must exist for the deploy, but a placeholder value just leaves the
 	 * sweep off. The claim never reads it.

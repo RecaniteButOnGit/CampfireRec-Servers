@@ -11,6 +11,7 @@ import {
 import { withNotFound, withOnError } from '@repo/hono-helpers'
 import { studioBuildValidationId, validateAndGetAccountId, validateAndGetRoles } from '@repo/jwt'
 
+import { hasStudioAccess } from '../../auth/src/platform-db'
 import cloudBuilds from './cloud-builds'
 import distribution from './distribution'
 import { getUserBuildCount, listCloudBuilds, storeLocalCloudBuild } from './local-builds'
@@ -203,7 +204,7 @@ const app = new Hono<App>()
 			if (!(await getRoomCoOwnerIds(c.env.DB, payload.roomId))?.includes(id))
 				return c.body(null, 403)
 			const account = await getAccount(c.env.DB, id)
-			roles = account?.hasStudio ? ['betastudio'] : []
+			roles = (await hasStudioAccess(c.env.DB, account, c.env.STUDIO_ROLLOUT)) ? ['betastudio'] : []
 		}
 		if (
 			caller !== null &&
@@ -223,7 +224,13 @@ const app = new Hono<App>()
 		}
 		// Inspection authorization above belongs to the caller; this grant belongs to the target.
 		if (caller !== null && caller !== id)
-			roles = (await getAccount(c.env.DB, id))?.hasStudio ? ['betastudio'] : []
+			roles = (await hasStudioAccess(
+				c.env.DB,
+				await getAccount(c.env.DB, id),
+				c.env.STUDIO_ROLLOUT
+			))
+				? ['betastudio']
+				: []
 		const grant = await c.env.DB.prepare(
 			'SELECT flags,created_at,modified_at FROM avatar_studio_access WHERE account_id=?'
 		)

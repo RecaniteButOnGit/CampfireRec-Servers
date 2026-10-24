@@ -63,8 +63,11 @@ claim, so developer/moderator powers refresh on every login and every refresh gr
 Grant those flags with `runx admin grant-developer` / `grant-moderator`.
 
 `betastudio` is a separate claim. RecFlare Studio treats it as permission to upload,
-and developer does not include it. It is stamped from the account's `hasStudio` flag.
-Staff add and remove people at `/settings/recroomstudio` on the website (or
+and developer does not include it. It is stamped from the account's `hasStudio` flag,
+or from a Discord link holding a role named in `STUDIO_ROLLOUT`
+(`RECFLARE_STUDIO_ROLLOUT` in the root `.env`) — a staged Studio rollout to a Discord
+role, read from the same role snapshot as the build rollout gate. Staff add and remove
+individual people at `/settings/recroomstudio` on the website (or
 `runx admin grant-studio`). A player already signed into Studio keeps the old token
 until the next sign-in or refresh.
 

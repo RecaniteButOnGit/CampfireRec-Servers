@@ -70,13 +70,15 @@ import {
 	TokenResponse,
 } from './openapi'
 import {
+	accountHoldsDiscordRole,
 	countAccountsForPlatformIdentity,
-	getLinksForAccount,
 	getLinksForIdentity,
 	getLinksForPlatformId,
 	getLinksForPlatformIdentity,
+	hasStudioAccess,
 	isPlatformIdentityLinked,
 	linkPlatformIdentity,
+	parseRoleIdList,
 } from './platform-db'
 import { consumeRefreshToken, issueRefreshToken } from './refresh-db'
 import { verifySteamTicket } from './steam-ticket'
@@ -230,16 +232,11 @@ const UNSUPPORTED_BUILD_DESCRIPTION =
 
 /**
  * `DISCORD_ROLLOUT_ROLE_IDS` as a list of role ids: snowflakes separated by commas and/or
- * whitespace (the same grammar `www`'s parseRoleIds reads DISCORD_BENEFITS_ROLE_IDS with).
- * Unset or blank parses to an empty list, which `accountMayUseRolloutBuild` treats as a
- * gate closed to everyone but staff.
+ * whitespace (`parseRoleIdList`, the grammar `www`'s parseRoleIds reads
+ * DISCORD_BENEFITS_ROLE_IDS with). Unset or blank parses to an empty list, which
+ * `accountMayUseRolloutBuild` treats as a gate closed to everyone but staff.
  */
-function rolloutRoleIds(raw: string | undefined): string[] {
-	return (raw ?? '')
-		.split(/[\s,]+/)
-		.map((id) => id.trim())
-		.filter((id) => id !== '')
-}
+const rolloutRoleIds = parseRoleIdList
 
 /**
  * Whether an account may sign in on a rollout-gated build. STAFF — a developer or moderator
@@ -260,11 +257,7 @@ async function accountMayUseRolloutBuild(
 ): Promise<boolean> {
 	const account = await getAccount(db, accountId)
 	if (account && (holdsRole(account, 'developer') || holdsRole(account, 'moderator'))) return true
-	if (roleIds.length === 0) return false
-	const links = await getLinksForAccount(db, accountId)
-	return links.some(
-		(link) => link.platform === PlatformType.Discord && link.roles.some((r) => roleIds.includes(r))
-	)
+	return accountHoldsDiscordRole(db, accountId, roleIds)
 }
 
 /** New players start in the Orientation room (RoomId 13) — the new-user flow. */
@@ -394,25 +387,25 @@ async function roleFilterAnswer(c: Context<App>, role: 'developer' | 'moderator'
  * is unconditional (even with no account resolved). The rest are the operator-granted
  * extras, plus `junior` off the account's own `isJunior` flag.
  *
- * `betastudio` rides on the account's `hasStudio` flag, and developer does not imply it.
- * RecFlare Studio treats that exact claim as Full access, which is what lets the editor
- * upload; staff set the flag from the website. `influencer` rides on `isInfluencer`
- * (`runx admin grant-influencer`) and lives only in the token — no `/role/*` lookup
- * answers it. Order is stable so tokens are deterministic: screenshare, developer,
- * moderator, junior, betastudio, then influencer.
+ * `betastudio` rides on `studio` — the account's Studio access as `hasStudioAccess`
+ * resolves it: the `hasStudio` flag staff set from the website, OR a Discord link holding
+ * a role in the `STUDIO_ROLLOUT` var — and developer does not imply it. RecFlare Studio
+ * treats that exact claim as Full access, which is what lets the editor upload. The
+ * caller resolves it (it costs a link read) so this stays a pure projection of the
+ * account. `influencer` rides on `isInfluencer` (`runx admin grant-influencer`) and lives
+ * only in the token — no `/role/*` lookup answers it. Order is stable so tokens are
+ * deterministic: screenshare, developer, moderator, junior, betastudio, then influencer.
  */
 function accountRoles(
-	account: Pick<
-		Account,
-		'isDeveloper' | 'isModerator' | 'isJunior' | 'hasStudio' | 'isInfluencer'
-	> | null
+	account: Pick<Account, 'isDeveloper' | 'isModerator' | 'isJunior' | 'isInfluencer'> | null,
+	studio: boolean
 ): string[] {
 	const roles = ['screenshare']
 	if (!account) return roles
 	if (account.isDeveloper) roles.push('developer')
 	if (account.isModerator) roles.push('moderator')
 	if (account.isJunior) roles.push('junior')
-	if (account.hasStudio) roles.push('betastudio')
+	if (studio) roles.push('betastudio')
 	if (account.isInfluencer) roles.push('influencer')
 	return roles
 }
@@ -500,7 +493,7 @@ async function issueSession(
 		roleAccount.platformId ?? '',
 		accountPlatform(roleAccount),
 		jwtSecret,
-		accountRoles(roleAccount),
+		accountRoles(roleAccount, await hasStudioAccess(c.env.DB, roleAccount, c.env.STUDIO_ROLLOUT)),
 		accountPrivileges(roleAccount),
 		GAME_VERSION,
 		roleAccount.hasPlus === true
@@ -1112,7 +1105,8 @@ const app = new Hono<App>()
 				'powers refresh on every login and every refresh grant. `junior` rides along for an',
 				'account flagged `isJunior`, and `screenshare` is on every token — it is a feature',
 				'gate the client reads, not a privilege anyone is granted. `betastudio` is stamped',
-				'from the account’s `hasStudio` flag (staff set it on the website). RecFlare Studio',
+				'from the account’s `hasStudio` flag (staff set it on the website) or from a Discord',
+				'link holding a role in the `STUDIO_ROLLOUT` var. RecFlare Studio',
 				'treats that claim as permission to upload; `developer` does not confer it. A junior',
 				'also carries',
 				'the `rn.privilege` CLAIM (`BanVChat`, `BanRmChat`) — scope-shaped name, but the',
@@ -1706,7 +1700,10 @@ const app = new Hono<App>()
 				platformId,
 				platform,
 				jwtSecret,
-				accountRoles(roleAccount),
+				accountRoles(
+					roleAccount,
+					await hasStudioAccess(c.env.DB, roleAccount, c.env.STUDIO_ROLLOUT)
+				),
 				accountPrivileges(roleAccount),
 				version,
 				// Rec Room Plus, off the same account read as the roles above — `econ` decides the

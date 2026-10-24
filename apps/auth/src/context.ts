@@ -65,6 +65,18 @@ export type Env = SharedHonoEnv & {
 	 */
 	DISCORD_ROLLOUT_ROLE_IDS?: string
 	/**
+	 * The Discord role ids whose holders get Rec Room Studio upload access — stamped into the
+	 * token as `betastudio` exactly as the account's `hasStudio` flag is, so a whole Discord
+	 * role can be let into Studio without touching anyone's account. Same grammar as
+	 * DISCORD_ROLLOUT_ROLE_IDS above (snowflakes, commas and/or whitespace; ANY one qualifies),
+	 * read from the same Discord link snapshot. Set for every worker from the root `.env`
+	 * (`RECFLARE_STUDIO_ROLLOUT`): `studio` and `www` read it through the same
+	 * `hasStudioAccess`, so what the token says, what the editor's access lookup says and
+	 * what the website's `/api/studio-access` says agree. Unset, or naming no role, grants
+	 * nobody — the flag alone decides. The flag still works beside it.
+	 */
+	STUDIO_ROLLOUT?: string
+	/**
 	 * The client builds a `/connect/token` grant may post as `ver` and still get a token:
 	 * a comma-separated list of builds (`20230414,20250718`), or `off` for none. Unset means
 	 * the default `SUPPORTED_GAME_VERSIONS` in @repo/domain. Set for every worker from the

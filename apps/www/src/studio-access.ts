@@ -8,6 +8,8 @@ import {
 import { logger } from '@repo/hono-helpers'
 import { validateAndGetAccountId } from '@repo/jwt'
 
+import { hasStudioAccess } from '../../auth/src/platform-db'
+
 import type { Context } from 'hono'
 import type { Account } from '@repo/domain'
 import type { App } from './context'
@@ -20,15 +22,18 @@ import type { App } from './context'
  * the signed-in player. Staff add and remove people through the routes under
  * `/api/staff/studio-access`, behind the same `requireStaff` gate as moderation.
  * The grant is the account's `hasStudio` flag; `auth` stamps `betastudio` from it
- * on the next Studio sign-in or refresh. Who granted what is on `audit_log`.
+ * on the next Studio sign-in or refresh. Who granted what is on `audit_log`. A Discord
+ * role in the `STUDIO_ROLLOUT` var grants the same access without the flag
+ * (`hasStudioAccess`); the status below reports it, the staff list does not — that list
+ * is the accounts staff added by hand.
  */
 
-/** The signed-in player's own flag, and nothing else. 401 with no session. */
+/** Whether the signed-in player can upload — flag or rollout role. 401 with no session. */
 export async function studioAccessStatusHandler(c: Context<App>) {
 	const accountId = await validateAndGetAccountId(c.req.raw, await c.env.JWT_SECRET.get())
 	if (accountId === null) return c.json({ error: 'Unauthorized' }, 401)
 	const account = await getAccount(c.env.DB, accountId)
-	return c.json({ granted: account?.hasStudio === true })
+	return c.json({ granted: await hasStudioAccess(c.env.DB, account, c.env.STUDIO_ROLLOUT) })
 }
 
 /** Every account with the flag set. */

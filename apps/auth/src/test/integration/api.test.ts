@@ -7,6 +7,7 @@ import '../../auth.app'
 import {
 	AUDIT_LOG_SCHEMA_DDL,
 	GAME_VERSION,
+	getAccount,
 	getAccountsByDeviceId,
 	hashPassword,
 	PRESENCE_SCHEMA_DDL,
@@ -821,6 +822,53 @@ describe('auth worker routes', () => {
 		)
 		expect(refreshed.status).toBe(200)
 		expect(decodePayload(refreshed.json.access_token as string).role).not.toContain('betastudio')
+	})
+
+	// STUDIO_ROLLOUT opens Studio to a Discord ROLE: a holder is stamped `betastudio` exactly
+	// as a flagged account is, with no account flag involved, from the same Discord link
+	// snapshot the build rollout gate reads. Unset, the flag alone decides.
+	test('POST /connect/token stamps betastudio for a Discord role in STUDIO_ROLLOUT', async () => {
+		const studioRole = '1077000000000000031'
+		const otherRole = '1077000000000000032'
+		await seedAccount(9813, 'StudioRoleHolder')
+		await linkPlatformIdentity(env.DB, 9813, PlatformType.Discord, '500000000000009813', [
+			studioRole,
+		])
+		await seedAccount(9814, 'StudioRoleOutsider')
+		await linkPlatformIdentity(env.DB, 9814, PlatformType.Discord, '500000000000009814', [
+			otherRole,
+		])
+		const login = (id: number) => tokenFor(`account_id=${id}&password=${LOGIN_PASSWORD}`)
+
+		const original = env.STUDIO_ROLLOUT
+		try {
+			// Unset, or naming no role: the link grants nothing.
+			delete env.STUDIO_ROLLOUT
+			expect((await login(9813)).role).not.toContain('betastudio')
+			env.STUDIO_ROLLOUT = ' , '
+			expect((await login(9813)).role).not.toContain('betastudio')
+
+			// Same list grammar as DISCORD_ROLLOUT_ROLE_IDS; any one named role qualifies.
+			env.STUDIO_ROLLOUT = ` ${otherRole}x ,\n${studioRole} `
+			expect((await login(9813)).role).toEqual(['gameClient', 'screenshare', 'betastudio'])
+			// A Discord link holding only other roles is not in the rollout.
+			expect((await login(9814)).role).not.toContain('betastudio')
+			// The account flag never moved: this is the var, not a grant written anywhere.
+			expect((await getAccount(env.DB, 9813))?.hasStudio).toBeUndefined()
+
+			// The refresh grant re-resolves it, so ending the rollout drops the claim on the
+			// next refresh — the same path a revoked flag takes.
+			const session = await postToken(`account_id=9813&password=${LOGIN_PASSWORD}`)
+			delete env.STUDIO_ROLLOUT
+			const refreshed = await postToken(
+				`grant_type=refresh_token&refresh_token=${encodeURIComponent(session.json.refresh_token as string)}`
+			)
+			expect(refreshed.status).toBe(200)
+			expect(decodePayload(refreshed.json.access_token as string).role).not.toContain('betastudio')
+		} finally {
+			if (original === undefined) delete env.STUDIO_ROLLOUT
+			else env.STUDIO_ROLLOUT = original
+		}
 	})
 
 	// Rec Room Plus rides on the token as `rn.plus`, stamped from `account.hasPlus` — which

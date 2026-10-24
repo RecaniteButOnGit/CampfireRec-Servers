@@ -27,6 +27,13 @@ export type Env = SharedHonoEnv & {
 	CLOUD_BUILD_TEMPLATE_VERSION?: string
 	/** R2 key of an operator-published template catalog; unset disables downloads. */
 	STUDIO_DISTRIBUTION_MANIFEST?: string
+	/**
+	 * Discord role ids whose holders have Studio upload access without the account's
+	 * `hasStudio` flag (`RECFLARE_STUDIO_ROLLOUT` in the root `.env`; the same var `auth`
+	 * stamps `betastudio` from). The access lookups here rebuild the role from the account
+	 * rather than a token, so they read it through the same `hasStudioAccess`.
+	 */
+	STUDIO_ROLLOUT?: string
 }
 
 /** Variables can be extended */

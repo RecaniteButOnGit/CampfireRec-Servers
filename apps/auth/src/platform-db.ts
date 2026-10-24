@@ -395,6 +395,66 @@ export async function recordFirstRoles(
 	return res.meta.changes > 0
 }
 
+/**
+ * A list of Discord role ids out of an operator var — numeric snowflakes separated by
+ * commas and/or whitespace, the grammar every `*_ROLE_IDS`-shaped var here shares
+ * (`auth`'s DISCORD_ROLLOUT_ROLE_IDS, `STUDIO_ROLLOUT`; `www` reads
+ * DISCORD_BENEFITS_ROLE_IDS the same way). Unset or blank parses to an empty list.
+ */
+export function parseRoleIdList(raw: string | undefined): string[] {
+	return (raw ?? '')
+		.split(/[\s,]+/)
+		.map((id) => id.trim())
+		.filter((id) => id !== '')
+}
+
+/**
+ * Whether an account's Discord link records ANY of `roleIds`. False with none configured —
+ * the link read is skipped, so a var that names no role grants nobody anything. Roles are
+ * the SNAPSHOT the website's benefits claim and `www`'s daily sweep keep (see
+ * {@link PlatformLink.roles}), so a role granted in Discord today counts once the player
+ * re-claims or the sweep runs — not instantly.
+ */
+export async function accountHoldsDiscordRole(
+	db: D1Database,
+	accountId: number,
+	roleIds: readonly string[]
+): Promise<boolean> {
+	if (roleIds.length === 0) return false
+	const links = await getLinksForAccount(db, accountId)
+	return links.some(
+		(link) => link.platform === PlatformType.Discord && link.roles.some((r) => roleIds.includes(r))
+	)
+}
+
+/**
+ * Whether an account has Rec Room Studio upload access — what `auth` stamps into the
+ * token as the `betastudio` role, `studio` answers on its access lookups and `www`'s
+ * `/api/studio-access` reports. Two grants, either suffices:
+ *
+ *  - the account's own `hasStudio` flag, set by staff on the website or
+ *    `runx admin grant-studio`;
+ *  - the STUDIO ROLLOUT: a Discord link holding a role named in the `STUDIO_ROLLOUT` var
+ *    (`RECFLARE_STUDIO_ROLLOUT` in the root `.env`, reaching every worker), which hands a
+ *    whole Discord role the same access without touching anyone's account. Unset, or
+ *    naming no role, it grants nobody — the flag alone decides, as before.
+ *
+ * Every reader goes through this so the three surfaces cannot disagree: a role holder
+ * whom `auth` stamps `betastudio` for must also be told "granted" by the website, and
+ * `studio`'s lookups (which rebuild the role from the account rather than a token) must
+ * see the same answer. The flag is checked first so an account that has it costs no
+ * link read.
+ */
+export async function hasStudioAccess(
+	db: D1Database,
+	account: { accountId: number; hasStudio?: boolean } | null | undefined,
+	studioRolloutRoleIds: string | undefined
+): Promise<boolean> {
+	if (!account) return false
+	if (account.hasStudio === true) return true
+	return accountHoldsDiscordRole(db, account.accountId, parseRoleIdList(studioRolloutRoleIds))
+}
+
 /** Every platform identity linked to an account (a player's PC and headset, say). */
 export async function getLinksForAccount(
 	db: D1Database,

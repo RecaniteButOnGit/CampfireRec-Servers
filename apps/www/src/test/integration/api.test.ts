@@ -3094,6 +3094,27 @@ it('tells a signed-in player whether they can upload, and nobody else', async ()
 	})
 	expect(res.status).toBe(200)
 	expect(await res.json()).toEqual({ granted: false })
+
+	// A Discord role named in STUDIO_ROLLOUT grants the same access without the flag, and the
+	// page reads it from the same helper `auth` stamps `betastudio` from, so the two agree.
+	// The account has to exist: a link alone, with no account behind it, grants nothing.
+	await updateAccount(env.DB, 8601, { username: 'StudioFan' })
+	await linkPlatformIdentity(env.DB, 8601, PlatformType.Discord, '500000000000008601', [
+		'1077000000000000031',
+	])
+	const original = env.STUDIO_ROLLOUT
+	try {
+		env.STUDIO_ROLLOUT = '1077000000000000031'
+		const rolled = await SELF.fetch('https://example.com/api/studio-access', {
+			headers: { authorization: `Bearer ${await tokenFor(8601, ['gameClient'])}` },
+		})
+		expect(await rolled.json()).toEqual({ granted: true })
+		// The flag itself never moved; the staff list is still empty of this account.
+		expect((await getAccount(env.DB, 8601))?.hasStudio).not.toBe(true)
+	} finally {
+		if (original === undefined) delete env.STUDIO_ROLLOUT
+		else env.STUDIO_ROLLOUT = original
+	}
 })
 
 it('lets staff add, list, and remove studio upload access', async () => {

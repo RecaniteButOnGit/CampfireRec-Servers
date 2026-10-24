@@ -56,7 +56,8 @@ bun runx admin grant-moderator --username alice --remote
 Sets the account's `hasStudio` flag, which `auth` stamps into the token as the
 `betastudio` role — the claim RecFlare Studio reads as permission to upload. Staff
 normally manage this from the website (`/settings/recroomstudio`); this is the
-operator's way in. Takes effect on the player's next Studio sign-in or refresh.
+operator's way in. Takes effect on the player's next Studio sign-in or refresh. To open
+Studio to a whole Discord role instead, name it in `RECFLARE_STUDIO_ROLLOUT` (`.env`).
 
 ```sh
 bun runx admin grant-studio --username alice
