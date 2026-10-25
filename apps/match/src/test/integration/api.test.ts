@@ -26,6 +26,7 @@ import {
 	SUBROOM_SCHEMA_DDL,
 } from '@repo/domain'
 
+import { SCHEMA_DDL as CUSTOM_AVATAR_ITEM_SCHEMA_DDL } from '../../../../api/src/custom-avatar-items-db'
 import { SCHEMA_DDL as EVENTS_SCHEMA_DDL } from '../../../../api/src/events-db'
 import {
 	banFromReport,
@@ -289,6 +290,9 @@ beforeAll(async () => {
 	// Platform identity links (owned by the auth worker) — a ban also reaches the
 	// accounts sharing a proven identity with the banned one.
 	for (const stmt of PLATFORM_SCHEMA_DDL) await env.DB.prepare(stmt).run()
+	// Custom avatar items (owned by the api worker) — every room read joins the published
+	// room badges from this table.
+	for (const stmt of CUSTOM_AVATAR_ITEM_SCHEMA_DDL) await env.DB.prepare(stmt).run()
 })
 
 /**

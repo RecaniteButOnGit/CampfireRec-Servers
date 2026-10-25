@@ -2846,27 +2846,11 @@ async function hydrateRooms(db: D1Database, rooms: Room[]): Promise<Room[]> {
 	return rooms
 }
 
-/**
- * Whether `custom_avatar_item` has been seen on this database. API owns that table's migration
- * and room deployments can precede it, so {@link attachBadges} probes for it — but a table
- * never goes away once created, so a hit is remembered and the probe (a scan of
- * `sqlite_master`, on every room page) runs only until the first hit.
- */
-let badgeTableSeen = false
-
 /** Published room-linked image badges; drafts remain on the creator's Studio shelf. */
 async function attachBadges(db: D1Database, rooms: Room[]): Promise<void> {
 	if (!rooms.length) return
-	if (!badgeTableSeen) {
-		const exists = await db
-			.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='custom_avatar_item'")
-			.first()
-		if (!exists) {
-			for (const room of rooms) room.Badges = []
-			return
-		}
-		badgeTableSeen = true
-	}
+	// `custom_avatar_item` is owned by api's migrations (0015, badge index 0035), both long
+	// applied to the shared database; this no longer probes `sqlite_master` for it.
 	// Served by `idx_custom_avatar_item_badge_room` (api migrations/0035), a PARTIAL index over
 	// `outfit_type = 1000` keyed by the `json_extract(data,'$.CustomBadgeMetadata.RoomId')`
 	// expression. SQLite matches both only as written: drop or rephrase either term and this

@@ -153,6 +153,24 @@ describe('public endpoints', () => {
 		expect(await empty.json()).toEqual([])
 	})
 
+	test('GET /account/username/:name is an exact, case-insensitive lookup', async () => {
+		const res = await exports.default.fetch(`${ORIGIN}/account/username/coach`)
+		expect(res.status).toBe(200)
+		const account = (await res.json()) as { accountId: number; username: string }
+		expect(account).toMatchObject({ accountId: 1, username: 'Coach' })
+		// A leading `@` is tolerated — staff fields take names in that form.
+		const at = await exports.default.fetch(
+			`${ORIGIN}/account/username/${encodeURIComponent('@Coach')}`
+		)
+		expect(((await at.json()) as { accountId: number }).accountId).toBe(1)
+		// A prefix is NOT a match: that's what `/account/search` is for.
+		const prefix = await exports.default.fetch(`${ORIGIN}/account/username/coa`)
+		expect(prefix.status).toBe(404)
+		const missing = await exports.default.fetch(`${ORIGIN}/account/username/zzzznope`)
+		expect(missing.status).toBe(404)
+		expect(await missing.json()).toEqual({ error: "There's no player called @zzzznope." })
+	})
+
 	test('GET /account/:id/bio returns an empty bio', async () => {
 		const res = await exports.default.fetch(`${ORIGIN}/account/7/bio`)
 		expect(await res.json()).toEqual({ accountId: 7, bio: '' })
@@ -689,6 +707,7 @@ describe('auth-gated endpoints', () => {
 			'GET /account/bulk',
 			'GET /account/me',
 			'GET /account/search',
+			'GET /account/username/{name}',
 			'GET /account/{id}',
 			'GET /account/{id}/bio',
 			'GET /accountprivacysettings/{id}',

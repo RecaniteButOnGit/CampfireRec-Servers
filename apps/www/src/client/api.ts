@@ -219,23 +219,32 @@ export function useAction() {
 }
 
 /**
- * Resolve an `@username` to the account id the workers address a player by.
- *
- * `accounts` serves no exact-name lookup, so this goes through the PREFIX search and
- * keeps only an exact (case-insensitive) hit: a prefix match is a different player, and
- * acting on whoever happened to sort first would be worse than refusing. The exact name
- * always sorts first among its own prefixes, so it's inside the search limit whenever it
- * exists.
+ * The public account behind an exact `@username`, or null when nobody has the name.
+ * `accounts`' `GET /account/username/:name` is an indexed equality lookup — NOT the
+ * prefix search, which this once went through and filtered client-side; one profile view
+ * then cost a 20-row index walk, and the search bar's typeahead already keeps that query
+ * busy enough. A 404 is the one non-ok answer that means "no such player"; anything else
+ * is a real failure and throws.
+ */
+export async function accountByUsername(input: string): Promise<PublicAccount | null> {
+	const name = input.trim().replace(/^@/, '')
+	if (name === '') return null
+	const res = await fetch(`${where().accounts}/account/username/${encodeURIComponent(name)}`)
+	if (res.status === 404) return null
+	const data = (await res.json().catch(() => ({}))) as Record<string, unknown>
+	if (!res.ok) throw new Error(errorMessage(data, res.status))
+	return data as unknown as PublicAccount
+}
+
+/**
+ * Resolve an `@username` to the account id the workers address a player by. An exact
+ * match only: a prefix match is a different player, and acting on whoever happened to
+ * sort first would be worse than refusing.
  */
 export async function accountIdForUsername(input: string): Promise<number> {
 	const name = input.trim().replace(/^@/, '')
 	if (name === '') throw new Error('Enter a username.')
-	const matches = await call<Array<{ accountId?: number; username?: string }>>(
-		`${where().accounts}/account/search?name=${encodeURIComponent(name)}`
-	)
-	const found = Array.isArray(matches)
-		? matches.find((m) => m.username?.toLowerCase() === name.toLowerCase())
-		: undefined
+	const found = await accountByUsername(name)
 	if (typeof found?.accountId !== 'number') throw new Error(`There's no player called @${name}.`)
 	return found.accountId
 }
@@ -245,6 +254,9 @@ export interface PublicAccount {
 	accountId: number
 	username: string
 	displayName: string
+	profileImage: string
+	bannerImage: string
+	createdAt: string
 }
 
 /**

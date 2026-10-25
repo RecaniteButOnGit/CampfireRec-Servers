@@ -24,6 +24,7 @@ import {
 	validateIdentityAssertion,
 } from '@repo/jwt'
 
+import { SCHEMA_DDL as CUSTOM_AVATAR_ITEM_SCHEMA_DDL } from '../../../../api/src/custom-avatar-items-db'
 import {
 	banFromReport,
 	createReport,
@@ -108,6 +109,9 @@ beforeAll(async () => {
 	// Report table (owned by the api worker) — a ban is a report row with `banned` set;
 	// the token grant reads it for the evasion arms.
 	for (const stmt of REPORTS_SCHEMA_DDL) await env.DB.prepare(stmt).run()
+	// Custom avatar items (owned by the api worker) — every room read joins the published
+	// room badges from this table.
+	for (const stmt of CUSTOM_AVATAR_ITEM_SCHEMA_DDL) await env.DB.prepare(stmt).run()
 	for (const stmt of STUDIO_DEVICE_SCHEMA_DDL) await env.DB.prepare(stmt).run()
 })
 

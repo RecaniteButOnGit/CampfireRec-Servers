@@ -293,9 +293,26 @@ export const SEARCH_LIMIT = 20
 const escapeLike = (s: string): string => s.replace(/[\\%_]/g, '\\$&')
 
 /**
+ * The smallest string that sorts after every string beginning with `prefix` under
+ * SQLite's default BINARY (byte-wise) collation: the prefix followed by U+10FFFF, whose
+ * UTF-8 encoding (F4 8F BF BF) is the highest valid sequence. The pair
+ * `>= prefix AND < prefixUpperBound(prefix)` is the prefix match as a range.
+ */
+const prefixUpperBound = (prefix: string): string => `${prefix}\u{10FFFF}`
+
+/**
  * Prefix-search accounts by username (case-insensitive, "begins with"), ordered
- * alphabetically. Backed by the indexed `username_lower` generated column, so the
- * `name%` LIKE stays index-friendly. Returns up to `limit` matches.
+ * alphabetically. Returns up to `limit` matches.
+ *
+ * The prefix is applied as a RANGE on the indexed `username_lower` generated column
+ * (`>= name AND < name+U+10FFFF`), not as `LIKE 'name%'`. SQLite only turns a LIKE into
+ * an index seek when the LIKE is case-sensitive or the index is NOCASE, and never when
+ * it carries an ESCAPE clause, so the LIKE form was a full index scan on every call —
+ * 48k rows read per keystroke in the site's search bar, tens of millions a day on D1's
+ * meter. The range is a seek (`SEARCH … (username_lower>? AND username_lower<?)`) and
+ * walks the index in `ORDER BY` order, so the LIMIT stops it after `limit` rows. The
+ * LIKE stays as a residual filter on those rows so the match is exactly "begins with",
+ * with the user's `%`/`_` taken literally.
  */
 export async function searchAccounts(
 	db: D1Database,
@@ -306,9 +323,11 @@ export async function searchAccounts(
 	if (q === '') return []
 	const { results } = await db
 		.prepare(
-			`SELECT data FROM account WHERE username_lower LIKE ?1 ESCAPE '\\' ORDER BY username_lower LIMIT ?2`
+			`SELECT data FROM account
+			 WHERE username_lower >= ?1 AND username_lower < ?2 AND username_lower LIKE ?3 ESCAPE '\\'
+			 ORDER BY username_lower LIMIT ?4`
 		)
-		.bind(`${escapeLike(q)}%`, limit)
+		.bind(q, prefixUpperBound(q), `${escapeLike(q)}%`, limit)
 		.all<AccountRow>()
 	return parseAll(results)
 }

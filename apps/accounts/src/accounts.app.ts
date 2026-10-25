@@ -347,6 +347,40 @@ const app = new Hono<App>()
 		}
 	)
 
+	// Exact lookup by username — what the site's `/u/<name>` profile pages and the staff
+	// `@username` fields resolve a player through. An indexed equality on `username_lower`;
+	// before this existed they went through the prefix search above and filtered the
+	// exact hit client-side, which cost a 20-row index walk per profile view. Same path
+	// as the official API's `GET /account/username/{username}`.
+	.get(
+		'/account/username/:name',
+		describeRoute({
+			tags: ['Lookup'],
+			summary: 'A single public account, by exact username',
+			description:
+				'Case-insensitive exact match; a leading `@` is ignored. 404 when no account has the name.',
+			parameters: [
+				{
+					name: 'name',
+					in: 'path',
+					required: true,
+					description: 'The username, exactly (case-insensitive)',
+					schema: { type: 'string' },
+				},
+			],
+			responses: {
+				200: json(AccountDto, 'The public account'),
+				404: { description: 'No account has that username' },
+			},
+		}),
+		async (c) => {
+			const name = c.req.param('name').trim().replace(/^@/, '')
+			const account = name === '' ? null : await getAccountByUsername(c.env.DB, name)
+			if (!account) return c.json({ error: `There's no player called @${name}.` }, 404)
+			return c.json(toAccountDto(account))
+		}
+	)
+
 	// ---- Bulk / single lookup ------------------------------------------------
 	// Register the static `bulk` path before the `/account/:id` param route.
 	.get('/account/bulk', describeRoute(bulkRouteSpec('query')), bulkAccounts)

@@ -16,6 +16,7 @@ import { downgradeRoom, needsDowngrade } from '../room-converter'
 // The session token, the worker hostnames and the `call` every request goes through —
 // see api.ts for why they're a module of their own rather than defined here.
 import {
+	accountByUsername,
 	accountIdForUsername,
 	call,
 	hasToken,
@@ -35,7 +36,7 @@ import { StatsPage } from './Stats'
 import { StudioAccessPage } from './StudioAccess'
 
 import type { ReactNode } from 'react'
-import type { Hosts } from './api'
+import type { Hosts, PublicAccount } from './api'
 
 /**
  * Site config from `www`. `signupEnabled` is false when the operator has no Turnstile
@@ -990,16 +991,6 @@ function roomIdFromPath(path: string): number | null {
 	return match ? Number.parseInt(match[1], 10) : null
 }
 
-/** Public account shape, from `GET /account/:id` or `/account/search`. */
-interface PublicAccount {
-	accountId: number
-	username: string
-	displayName: string
-	profileImage: string
-	bannerImage: string
-	createdAt: string
-}
-
 /**
  * A player's photo, from the `ImagesPlayer` projection. Public unless the list was the
  * viewer's own (see fetchPlayerPhotos), which is the one way a private one gets here —
@@ -1029,10 +1020,9 @@ async function searchPlayers(query: string): Promise<PublicAccount[]> {
 	)
 }
 
+/** The profile page's account: an exact lookup, not the search bar's prefix query. */
 const fetchPublicAccount = (username: string): Promise<PublicAccount | null> =>
-	searchPlayers(username).then(
-		(matches) => matches.find((m) => m.username.toLowerCase() === username.toLowerCase()) ?? null
-	)
+	accountByUsername(username)
 
 /**
  * The photos a player has taken. Sent WITH the session token when there is one: `api`
@@ -1816,14 +1806,14 @@ function halloweenActive(): boolean {
 
 /** The sprite, 23x25 native pixels, drawn at 3x with hard edges. */
 const PUMPKIN_FRAMES = [
-    new URL('./pumple-frames/frame-00.png', import.meta.url).href,
-    new URL('./pumple-frames/frame-01.png', import.meta.url).href,
-    new URL('./pumple-frames/frame-02.png', import.meta.url).href,
-    new URL('./pumple-frames/frame-03.png', import.meta.url).href,
-    new URL('./pumple-frames/frame-04.png', import.meta.url).href,
-    new URL('./pumple-frames/frame-05.png', import.meta.url).href,
-    new URL('./pumple-frames/frame-06.png', import.meta.url).href,
-    new URL('./pumple-frames/frame-07.png', import.meta.url).href,
+	new URL('./pumple-frames/frame-00.png', import.meta.url).href,
+	new URL('./pumple-frames/frame-01.png', import.meta.url).href,
+	new URL('./pumple-frames/frame-02.png', import.meta.url).href,
+	new URL('./pumple-frames/frame-03.png', import.meta.url).href,
+	new URL('./pumple-frames/frame-04.png', import.meta.url).href,
+	new URL('./pumple-frames/frame-05.png', import.meta.url).href,
+	new URL('./pumple-frames/frame-06.png', import.meta.url).href,
+	new URL('./pumple-frames/frame-07.png', import.meta.url).href,
 ]
 const PUMPKIN_W = 150
 const PUMPKIN_H = 150
@@ -1887,57 +1877,65 @@ function LilPumpkin() {
 		let speechTimer = 0
 		let last = performance.now()
 		let raf = 0
-                const effectNodes: HTMLElement[] = []
+		const effectNodes: HTMLElement[] = []
 
-                const spawnBatSwarm = () => {
-                        const flash = document.createElement('div')
-                        Object.assign(flash.style, {
-                                position: 'fixed', inset: '0',
-                                background: 'rgba(210, 0, 28, 0.32)',
-                                opacity: '1', transition: 'opacity 480ms ease-out',
-                                pointerEvents: 'none', zIndex: '100000',
-                        })
-                        document.body.appendChild(flash)
-                        effectNodes.push(flash)
-                        requestAnimationFrame(() => { flash.style.opacity = '0' })
-                        window.setTimeout(() => {
-                                flash.remove()
-                                const i = effectNodes.indexOf(flash)
-                                if (i !== -1) effectNodes.splice(i, 1)
-                        }, 520)
+		const spawnBatSwarm = () => {
+			const flash = document.createElement('div')
+			Object.assign(flash.style, {
+				position: 'fixed',
+				inset: '0',
+				background: 'rgba(210, 0, 28, 0.32)',
+				opacity: '1',
+				transition: 'opacity 480ms ease-out',
+				pointerEvents: 'none',
+				zIndex: '100000',
+			})
+			document.body.appendChild(flash)
+			effectNodes.push(flash)
+			requestAnimationFrame(() => {
+				flash.style.opacity = '0'
+			})
+			window.setTimeout(() => {
+				flash.remove()
+				const i = effectNodes.indexOf(flash)
+				if (i !== -1) effectNodes.splice(i, 1)
+			}, 520)
 
-                        const cx = x + PUMPKIN_W / 2
-                        const cy = y + jy + PUMPKIN_H / 2
-                        for (let i = 0; i < 22; i++) {
-                                const bat = document.createElement('span')
-                                const angle = Math.random() * Math.PI * 2
-                                const distance = 100 + Math.random() * 260
-                                const dx = Math.cos(angle) * distance
-                                const dy = Math.sin(angle) * distance
-                                Object.assign(bat.style, {
-                                        position: 'fixed', left: `${cx}px`, top: `${cy}px`,
-                                        fontSize: `${20 + Math.random() * 20}px`,
-                                        lineHeight: '1', pointerEvents: 'none',
-                                        zIndex: '100001', opacity: '1',
-                                        transform: 'translate(-50%, -50%) scale(0.4)',
-                                        transition: 'transform 850ms ease-out, opacity 850ms ease-out',
-                                        willChange: 'transform, opacity',
-                                })
-                                bat.textContent = '🦇'
-                                document.body.appendChild(bat)
-                                effectNodes.push(bat)
-                                requestAnimationFrame(() => {
-                                        bat.style.transform =
-                                                `translate(calc(-50% + ${dx}px), calc(-50% + ${dy}px)) rotate(${Math.random() * 100 - 50}deg) scale(1.2)`
-                                        bat.style.opacity = '0'
-                                })
-                                window.setTimeout(() => {
-                                        bat.remove()
-                                        const i = effectNodes.indexOf(bat)
-                                        if (i !== -1) effectNodes.splice(i, 1)
-                                }, 900)
-                        }
-                }
+			const cx = x + PUMPKIN_W / 2
+			const cy = y + jy + PUMPKIN_H / 2
+			for (let i = 0; i < 22; i++) {
+				const bat = document.createElement('span')
+				const angle = Math.random() * Math.PI * 2
+				const distance = 100 + Math.random() * 260
+				const dx = Math.cos(angle) * distance
+				const dy = Math.sin(angle) * distance
+				Object.assign(bat.style, {
+					position: 'fixed',
+					left: `${cx}px`,
+					top: `${cy}px`,
+					fontSize: `${20 + Math.random() * 20}px`,
+					lineHeight: '1',
+					pointerEvents: 'none',
+					zIndex: '100001',
+					opacity: '1',
+					transform: 'translate(-50%, -50%) scale(0.4)',
+					transition: 'transform 850ms ease-out, opacity 850ms ease-out',
+					willChange: 'transform, opacity',
+				})
+				bat.textContent = '🦇'
+				document.body.appendChild(bat)
+				effectNodes.push(bat)
+				requestAnimationFrame(() => {
+					bat.style.transform = `translate(calc(-50% + ${dx}px), calc(-50% + ${dy}px)) rotate(${Math.random() * 100 - 50}deg) scale(1.2)`
+					bat.style.opacity = '0'
+				})
+				window.setTimeout(() => {
+					bat.remove()
+					const i = effectNodes.indexOf(bat)
+					if (i !== -1) effectNodes.splice(i, 1)
+				}, 900)
+			}
+		}
 
 		root.style.transform = `translate(${x}px, ${y}px)`
 
@@ -2044,8 +2042,8 @@ function LilPumpkin() {
 				walkDistance += step
 				const nextFrame = Math.floor(walkDistance / 30) % PUMPKIN_FRAMES.length
 				if (nextFrame !== walkFrame) {
-				    walkFrame = nextFrame
-				    sprite.src = PUMPKIN_FRAMES[walkFrame]
+					walkFrame = nextFrame
+					sprite.src = PUMPKIN_FRAMES[walkFrame]
 				}
 
 				if (!following && Math.abs(mx) > 4) facing = mx > 0 ? -1 : 1
