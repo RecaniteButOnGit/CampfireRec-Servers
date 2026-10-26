@@ -106,6 +106,8 @@ import {
 	ConsumeConsumableRequest,
 	ConsumeEnvelope,
 	ConsumeGiftRequest,
+	ConsumeRoomConsumableRequest,
+	ConsumeRoomConsumableResponse,
 	CreatePurchaseOfferRequest,
 	CreateRoomCurrencyRequest,
 	CreateRoomKeyRequest,
@@ -177,6 +179,7 @@ import {
 import { claimAllowance, claimReward, DAILY_REWARD_COOLDOWN_MS } from './reward-db'
 import {
 	awardRoomConsumable,
+	consumeRoomConsumable,
 	getRoomConsumable,
 	getRoomConsumables,
 	getRoomInventory,
@@ -4218,6 +4221,65 @@ const app = new Hono<App>({ strict: false })
 			const roomId = Number.parseInt(c.req.param('roomId'), 10)
 			if (!Number.isInteger(roomId)) return c.json([])
 			return c.json(await getRoomInventory(c.env.DB, roomId, id))
+		}
+	)
+	// Use up one of a room consumable the CALLER holds — drinking the Health Potion. Auth-gated
+	// (401); a refusal is a 200 in the same shape, as the purchase's is.
+	.put(
+		'/api/roomconsumables/v1/roomConsumable/:id/consume',
+		describeRoute({
+			tags: ['Econ'],
+			summary: 'Consume a room consumable',
+			description: [
+				'Takes ONE of the consumable named in the path from what the caller holds. The body',
+				'is only `{ CurrentConcurrencyCode, NewConcurrencyCode }`, at the top level; there is',
+				'no quantity. `NewConcurrencyCode` is stored and served back as the item’s',
+				'`ConcurrencyCode`; `CurrentConcurrencyCode` is accepted and NOT checked.',
+				'',
+				'Answers `{ Status, InventoryItem }` — the purchase’s `OperationResult` — with the',
+				'`RoomConsumableInventoryItem` the caller now holds: `Count` the RESULTING total, 0',
+				'when they used their last (after which `…/room/{roomId}/me` omits it).',
+				'',
+				'A consumable that does not exist, or one the caller holds none of, is `Status` 1',
+				'with a null `InventoryItem`, and nothing is written. The refusal form is an',
+				'ASSUMPTION — only success has been observed.',
+			].join('\n'),
+			security: AUTHED,
+			parameters: [
+				{
+					name: 'id',
+					in: 'path',
+					required: true,
+					description: 'The consumable to use — a `room_consumable` id',
+					schema: { type: 'string' },
+				},
+			],
+			requestBody: jsonBody(ConsumeRoomConsumableRequest, 'The concurrency pair'),
+			responses: {
+				200: json(ConsumeRoomConsumableResponse, 'What the caller now holds, or a refusal'),
+				401: UNAUTHORIZED_RESPONSE,
+			},
+		}),
+		async (c) => {
+			const id = await authedId(c)
+			if (id === null) return unauthorized(c)
+
+			const body = await c.req.json<{ NewConcurrencyCode?: unknown }>().catch(() => null)
+			const newCode =
+				body !== null && typeof body === 'object' && typeof body.NewConcurrencyCode === 'string'
+					? body.NewConcurrencyCode
+					: null
+			// Every key is always sent: an omitted `Status` reads as its enum's 0, success.
+			const refused = () => c.json({ Status: ROOM_KEY_STATUS_FAILED, InventoryItem: null })
+
+			const consumable = await getRoomConsumable(c.env.DB, c.req.param('id'))
+			if (!consumable) return refused()
+			const held = await consumeRoomConsumable(c.env.DB, id, consumable.RoomConsumableId, newCode)
+			if (!held) return refused()
+			return c.json({
+				Status: ROOM_KEY_STATUS_OK,
+				InventoryItem: toInventoryItem(id, held, consumable),
+			})
 		}
 	)
 	// The custom currencies a room has minted. Public, like the room itself: a room's

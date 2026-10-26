@@ -1160,6 +1160,27 @@ export const PurchaseRoomConsumableResponse = z.object({
 })
 
 /**
+ * `PUT /api/roomconsumables/v1/roomConsumable/{id}/consume` — just the concurrency pair, at the
+ * TOP level (not nested under `ConcurrencyCodes` as the purchase sends it). Uses up one.
+ */
+export const ConsumeRoomConsumableRequest = z.object({
+	CurrentConcurrencyCode: z.string().nullable().optional().describe('Accepted and NOT checked'),
+	NewConcurrencyCode: z
+		.string()
+		.nullable()
+		.optional()
+		.describe('Stored and echoed back as the item’s `ConcurrencyCode`'),
+})
+
+/** The consume's answer: the purchase's `OperationResult`, alone. */
+export const ConsumeRoomConsumableResponse = z.object({
+	Status: z.int().describe('0 on success; 1 on a refusal. Always sent — omitted reads as 0'),
+	InventoryItem: RoomConsumableInventoryItemDto.nullable().describe(
+		'What the caller holds afterwards (`Count` the resulting total, 0 included); null on a refusal'
+	),
+})
+
+/**
  * The envelope the consumable write answers in — the same
  * `{ Value, Success, Error, error_id }` the room-currency writes use.
  */

@@ -13,6 +13,7 @@
  *  - `POST /api/roomconsumables/v1/roomConsumable/awardBulk` gives one to a player
  *  - `PUT /api/roomconsumables/v1/roomconsumable/{id}/purchase/tokens` and `…/purchase/currency`
  *    sell one, in tokens or the listing's room currency
+ *  - `PUT /api/roomconsumables/v1/roomConsumable/{id}/consume` uses up one the caller holds
  *
  * `PurchaseCurrencyId` is a `room_currency`, so a room prices its goods in its own money. It
  * is nullable — `Guid?` in the client's model — for a listing that names no currency, and
@@ -342,6 +343,42 @@ export async function awardRoomConsumable(
 		concurrencyCode: row?.concurrency_code ?? null,
 		modifiedAt: row?.modified_at ?? null,
 	}
+}
+
+/**
+ * Use up ONE of a consumable a player holds, returning what they hold afterwards — or null
+ * when they hold none, and nothing was written. `concurrencyCode` is the request's
+ * `NewConcurrencyCode`, stored to be served back; null leaves the stored one.
+ *
+ * A single conditional UPDATE: the `quantity >= 1` guard is what refuses, so two consumes
+ * racing over the last one cannot both succeed. Here an empty `RETURNING` is exactly the
+ * answer wanted — "you had none" — unlike the award, where it would be ambiguous.
+ */
+export async function consumeRoomConsumable(
+	db: D1Database,
+	playerId: number,
+	consumableId: string,
+	concurrencyCode: string | null = null
+): Promise<RoomInventoryHolding | null> {
+	const row = await db
+		.prepare(
+			`UPDATE room_inventory SET
+			   quantity = quantity - 1,
+			   concurrency_code = COALESCE(?3, concurrency_code),
+			   modified_at = ?4
+			 WHERE player_id = ?1 AND consumable_id = ?2 AND quantity >= 1
+			 RETURNING quantity, concurrency_code, modified_at`
+		)
+		.bind(playerId, consumableId, concurrencyCode, new Date().toISOString())
+		.first<{ quantity: number; concurrency_code: string | null; modified_at: string | null }>()
+
+	return row
+		? {
+				quantity: row.quantity,
+				concurrencyCode: row.concurrency_code,
+				modifiedAt: row.modified_at,
+			}
+		: null
 }
 
 /**

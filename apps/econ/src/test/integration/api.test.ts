@@ -1773,6 +1773,77 @@ describe('econ endpoints', () => {
 			await env.DB.prepare('DELETE FROM room_balance WHERE currency_id = ?1').bind(coin).run()
 		})
 
+		test('PUT roomConsumable/:id/consume uses up one the caller holds', async () => {
+			const potion = (
+				await envOf(await save({ ...body, Name: 'Drinkable potion' }, await bearer('1')))
+			).Value!
+			await env.DB.prepare(
+				'INSERT INTO room_inventory (player_id, consumable_id, quantity) VALUES (7801, ?1, 2)'
+			)
+				.bind(potion.RoomConsumableId)
+				.run()
+
+			const consume = async (sub: string | null, consumableId: string, code: string) =>
+				exports.default.fetch(
+					`${ORIGIN}/api/roomconsumables/v1/roomConsumable/${consumableId}/consume`,
+					{
+						method: 'PUT',
+						headers: {
+							'Content-Type': 'application/json',
+							...(sub === null ? {} : await bearer(sub)),
+						},
+						body: JSON.stringify({
+							CurrentConcurrencyCode: '872adb91-b163-4f2c-aa8f-4f5d828078cb',
+							NewConcurrencyCode: code,
+						}),
+					}
+				)
+			const held = async () =>
+				(
+					await env.DB.prepare(
+						'SELECT quantity FROM room_inventory WHERE player_id = 7801 AND consumable_id = ?1'
+					)
+						.bind(potion.RoomConsumableId)
+						.first<{ quantity: number }>()
+				)?.quantity
+
+			expect((await consume(null, potion.RoomConsumableId, 'a')).status).toBe(401)
+
+			const res = await consume('7801', potion.RoomConsumableId, 'code-1')
+			expect(res.status).toBe(200)
+			expect(await res.json()).toEqual({
+				Status: 0,
+				InventoryItem: {
+					RoomConsumableId: potion.RoomConsumableId,
+					AccountId: 7801,
+					Count: 1,
+					ConcurrencyCode: 'code-1',
+					ModifiedAt: expect.any(String),
+					Consumable: { ...potion, ImageName: '', IsGiftable: false, Visibility: 0 },
+				},
+			})
+
+			// The last one answers Count 0; after that there is nothing to use.
+			const last = (await (await consume('7801', potion.RoomConsumableId, 'code-2')).json()) as {
+				Status: number
+				InventoryItem: { Count: number; ConcurrencyCode: string } | null
+			}
+			expect(last).toMatchObject({
+				Status: 0,
+				InventoryItem: { Count: 0, ConcurrencyCode: 'code-2' },
+			})
+			const refusal = { Status: 1, InventoryItem: null }
+			expect(await (await consume('7801', potion.RoomConsumableId, 'code-3')).json()).toEqual(
+				refusal
+			)
+			expect(await held()).toBe(0)
+			// Someone who never had one, and an unknown consumable, are refused too.
+			expect(await (await consume('7802', potion.RoomConsumableId, 'x')).json()).toEqual(refusal)
+			expect(await (await consume('7801', 'nope', 'x')).json()).toEqual(refusal)
+
+			await env.DB.prepare('DELETE FROM room_inventory').run()
+		})
+
 		test('GET roomConsumable/room/:id is public and empty for an unknown room', async () => {
 			expect(await shopOf(99999)).toEqual([])
 			const res = await exports.default.fetch(
@@ -8047,6 +8118,7 @@ describe('econ endpoints', () => {
 			'POST /api/ugcPurchasables/v1/items/bulk',
 			'PUT /api/equipment/v1/update',
 			'PUT /api/roomconsumables/v1/roomConsumable',
+			'PUT /api/roomconsumables/v1/roomConsumable/{id}/consume',
 			'PUT /api/roomconsumables/v1/roomconsumable/{id}/purchase/{via}',
 			'PUT /api/roomkeys/v1/updateAll',
 		])
