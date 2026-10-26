@@ -70,6 +70,7 @@ import {
 	roomRoles,
 	saveSubRoomData,
 	searchRooms,
+	searchRoomsByName,
 	setPlayerData,
 	setRoomDescription,
 	setRoomImage,
@@ -1208,6 +1209,9 @@ async function ownedRoomsExcludingDorm(c: Context<App>) {
 /** Suggestions `/rooms/autocomplete_search` returns when the client names no `take`. */
 const DEFAULT_SUGGESTION_COUNT = 10
 
+/** Cap on `/rooms/search/name`'s `take`: a type-ahead list, so the seek stays a few rows. */
+const NAME_SEARCH_MAX = 10
+
 const app = new Hono<App>()
 	.use(
 		'*',
@@ -1432,6 +1436,38 @@ const app = new Hono<App>()
 			const skip = Number.parseInt(c.req.query('skip') ?? '0', 10) || 0
 			const take = Number.parseInt(c.req.query('take') ?? '30', 10) || 30
 			return c.json(serveRoomPage(await searchRooms(c.env.DB, query, skip, take)))
+		}
+	)
+
+	// The website's header search: searchable rooms whose name STARTS with `query`, A–Z,
+	// as a bare array. Not the game's search (`/rooms/search` is a substring match that
+	// reads every searchable room); this is an index seek that reads only the rows it
+	// returns, which is what lets the site ask on every pause in typing. Un-hydrated rooms.
+	.get(
+		'/rooms/search/name',
+		describeRoute({
+			tags: ['Discovery'],
+			summary: 'Prefix-search rooms by name',
+			description: [
+				'Searchable rooms (public, non-dorm, not `ExcludeFromSearch`) whose name begins',
+				'with `query`, case-insensitive, alphabetically — a bare array. An index seek, so',
+				'it reads only the rooms it returns. Rooms are served without subrooms, tags or',
+				'badges. The game’s substring search is `/rooms/search`.',
+			].join(' '),
+			parameters: [
+				stringQuery('query', 'Name prefix'),
+				intQuery('take', `How many rooms to return (default and max ${NAME_SEARCH_MAX})`),
+			],
+			responses: { 200: json(RoomDto.array(), 'The matching rooms, A–Z') },
+		}),
+		async (c) => {
+			const take = Number.parseInt(c.req.query('take') ?? '', 10)
+			const rooms = await searchRoomsByName(
+				c.env.DB,
+				c.req.query('query') ?? '',
+				Number.isNaN(take) ? NAME_SEARCH_MAX : Math.min(take, NAME_SEARCH_MAX)
+			)
+			return c.json(serveRooms(rooms))
 		}
 	)
 

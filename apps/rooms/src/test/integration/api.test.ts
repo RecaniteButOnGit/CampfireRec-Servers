@@ -681,6 +681,46 @@ describe('rooms endpoints', () => {
 		expect(body.Results.some((r) => r.Name === 'RecCenter')).toBe(true)
 	})
 
+	it('GET /rooms/search/name prefix-matches searchable rooms A–Z through the partial index', async () => {
+		const search = async (query: string, extra = '') =>
+			(await (
+				await SELF.fetch(`${ORIGIN}/rooms/search/name?query=${encodeURIComponent(query)}${extra}`)
+			).json()) as Array<{ Name: string; IsDorm?: boolean; Stats: { VisitCount: number } }>
+
+		// A bare array of whole rooms, case-insensitive, every name starting with the query, A–Z.
+		const rec = await search('REC', '&take=10')
+		expect(rec.some((r) => r.Name === 'RecCenter')).toBe(true)
+		for (const r of rec) expect(r.Name.toLowerCase().startsWith('rec')).toBe(true)
+		const names = rec.map((r) => r.Name.toLowerCase())
+		expect(names).toEqual([...names].sort())
+		expect(typeof rec[0]?.Stats.VisitCount).toBe('number')
+
+		// A prefix, not a substring: "center" is inside RecCenter but doesn't start it.
+		expect((await search('center')).some((r) => r.Name === 'RecCenter')).toBe(false)
+		// `take` caps it, and is itself capped at 10; empty and wildcard queries find nothing.
+		expect((await search('r', '&take=2')).length).toBeLessThanOrEqual(2)
+		expect(await search('', '&take=500')).toEqual([])
+		expect(await search('%')).toEqual([])
+		expect((await search('r', '&take=500')).length).toBeLessThanOrEqual(10)
+		// Dorms (named `@user's Dorm`) are never served.
+		expect((await search('@')).every((r) => r.IsDorm !== true)).toBe(true)
+
+		// The point of the endpoint: a SEEK on the partial index, so D1 reads only the rows it
+		// returns. Fall back to a scan (or the unfiltered name index) and every call is billed
+		// for every room again.
+		const plan = await env.DB.prepare(
+			`EXPLAIN QUERY PLAN SELECT data FROM room
+			 WHERE is_dorm IS NOT 1 AND accessibility = 1 AND exclude_from_search IS NOT 1
+			   AND name_lower >= ?1 AND name_lower < ?2 AND name_lower LIKE ?3 ESCAPE '\\'
+			 ORDER BY name_lower LIMIT 5`
+		)
+			.bind('r', 'r\u{10FFFF}', 'r%')
+			.all<{ detail: string }>()
+		const detail = plan.results.map((r) => r.detail).join('\n')
+		expect(detail).toContain('SEARCH room USING INDEX idx_room_search_name')
+		expect(detail).not.toContain('TEMP B-TREE')
+	})
+
 	it('GET /rooms/autocomplete_search suggests names and tags as plain strings', async () => {
 		const suggest = async (query: string, extra = '') =>
 			(await (
@@ -6251,6 +6291,7 @@ describe('rooms endpoints', () => {
 			'GET /rooms/ownedby/{accountId}',
 			'GET /rooms/recommendations',
 			'GET /rooms/search',
+			'GET /rooms/search/name',
 			'GET /rooms/visitedby/me',
 			'GET /rooms/visitedby/{playerId}',
 			'GET /rooms/{roomId}',

@@ -216,10 +216,10 @@ export function ItemPage({
 						<p className="room-hero-by">
 							by{' '}
 							<a
-								href={`/u/${encodeURIComponent(creator.username)}`}
+								href={`/user/${encodeURIComponent(creator.username)}`}
 								onClick={(e) => {
 									e.preventDefault()
-									navigate(`/u/${encodeURIComponent(creator.username)}`)
+									navigate(`/user/${encodeURIComponent(creator.username)}`)
 								}}
 							>
 								{creator.displayName || creator.username}
@@ -379,10 +379,10 @@ export function InventionPage({
 						<p className="room-hero-by">
 							by{' '}
 							<a
-								href={`/u/${encodeURIComponent(creator.username)}`}
+								href={`/user/${encodeURIComponent(creator.username)}`}
 								onClick={(e) => {
 									e.preventDefault()
-									navigate(`/u/${encodeURIComponent(creator.username)}`)
+									navigate(`/user/${encodeURIComponent(creator.username)}`)
 								}}
 							>
 								{creator.displayName || creator.username}

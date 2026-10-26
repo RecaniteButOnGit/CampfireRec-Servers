@@ -308,7 +308,7 @@ export async function getAccountByUsername(
 export const SEARCH_LIMIT = 20
 
 /** Escape LIKE wildcards so user input is matched literally (using `\` as the escape char). */
-const escapeLike = (s: string): string => s.replace(/[\\%_]/g, '\\$&')
+export const escapeLike = (s: string): string => s.replace(/[\\%_]/g, '\\$&')
 
 /**
  * The smallest string that sorts after every string beginning with `prefix` under
@@ -316,7 +316,7 @@ const escapeLike = (s: string): string => s.replace(/[\\%_]/g, '\\$&')
  * UTF-8 encoding (F4 8F BF BF) is the highest valid sequence. The pair
  * `>= prefix AND < prefixUpperBound(prefix)` is the prefix match as a range.
  */
-const prefixUpperBound = (prefix: string): string => `${prefix}\u{10FFFF}`
+export const prefixUpperBound = (prefix: string): string => `${prefix}\u{10FFFF}`
 
 /**
  * Prefix-search accounts by username (case-insensitive, "begins with"), ordered

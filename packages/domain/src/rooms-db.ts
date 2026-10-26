@@ -17,6 +17,7 @@
  * database read-only and uses `getRoomById`. Each imports the subset it needs.
  */
 
+import { escapeLike, prefixUpperBound } from './accounts-db'
 import { chunkForBinds, MAX_BOUND_PARAMS } from './d1-binds'
 import { Accessibility, Role } from './enums'
 import { countPlayersByRoom } from './presence-db'
@@ -72,6 +73,13 @@ export const ROOM_SCHEMA_DDL: string[] = [
 	// feeds all order by it eventually; the WHERE clause is the point, not the key.
 	`CREATE INDEX IF NOT EXISTS idx_room_public ON room (room_id)
 	 WHERE is_dorm IS NOT 1 AND accessibility = 1`,
+	// The searchable rooms by lowercased name (migrations/0032_room_search_name.sql) — what
+	// {@link searchRoomsByName} seeks. PARTIAL over exactly {@link SEARCHABLE_WHERE}, so the
+	// walk never steps over a dorm or a private room: the rows it reads are the rows it
+	// serves. `idx_rooms_name_lower` can't do that — it holds every dorm, and a prefix seek
+	// on it checks each private room it passes against the blob.
+	`CREATE INDEX IF NOT EXISTS idx_room_search_name ON room (name_lower)
+	 WHERE is_dorm IS NOT 1 AND accessibility = 1 AND exclude_from_search IS NOT 1`,
 	// A room's tags, one row per tag (migrations/0013_room_tag.sql). Modelled on the
 	// `api` worker's `event_tag`, and the table is AUTHORITATIVE: `serializeRoom` strips
 	// `Tags` from the blob and the reads re-attach it, the same arrangement `subroom` and
@@ -3689,6 +3697,38 @@ export async function searchRooms(
 		Results: await hydrateRooms(db, rooms.slice(skip, skip + take)),
 		TotalResults: rooms.length,
 	}
+}
+
+/**
+ * Searchable rooms whose name BEGINS with `query` (case-insensitive), alphabetically, at
+ * most `take` — the website's header search, which asks on every pause in typing.
+ *
+ * Not {@link searchRooms}: that is the game's search, a SUBSTRING match no index can
+ * serve, so it reads every searchable room per call. This is a range seek on
+ * `idx_room_search_name` (`>= q AND < q+U+10FFFF`, as {@link searchAccounts} does for
+ * usernames), walked in `ORDER BY` order so the LIMIT stops it: D1 bills `take` rows
+ * however many rooms exist. The WHERE repeats {@link SEARCHABLE_WHERE} verbatim because
+ * SQLite only uses a partial index whose condition the query states; the LIKE is a
+ * residual so `%`/`_` match literally. Rooms come back un-hydrated (no subrooms, tags or
+ * badges) — the caller draws a name, a picture and the counters.
+ */
+export async function searchRoomsByName(
+	db: D1Database,
+	query: string,
+	take: number
+): Promise<Room[]> {
+	const q = query.trim().toLowerCase()
+	if (q === '' || take <= 0) return []
+	const { results } = await db
+		.prepare(
+			`SELECT ${ROOM_COLUMNS} FROM room
+			 WHERE ${SEARCHABLE_WHERE}
+			   AND name_lower >= ?1 AND name_lower < ?2 AND name_lower LIKE ?3 ESCAPE '\\'
+			 ORDER BY name_lower LIMIT ?4`
+		)
+		.bind(q, prefixUpperBound(q), `${escapeLike(q)}%`, take)
+		.all<RoomRow>()
+	return parseAll(results).filter(isSearchable)
 }
 
 /**

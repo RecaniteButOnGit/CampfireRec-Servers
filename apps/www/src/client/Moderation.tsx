@@ -369,7 +369,7 @@ function BanSummary({
 }
 
 /**
- * One line for a player's profile page (`/u/<username>`): whether a ban blocks them right
+ * One line for a player's profile page (`/user/<username>`): whether a ban blocks them right
  * now — their own or a linked account's — and a link to their full history here.
  */
 export function PlayerBanStatus({

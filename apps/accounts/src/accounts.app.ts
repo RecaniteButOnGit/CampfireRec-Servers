@@ -9,6 +9,7 @@ import {
 	getAccount,
 	getAccountByUsername,
 	getAccountsByIds,
+	SEARCH_LIMIT,
 	searchAccounts,
 	updateAccount,
 } from '@repo/domain'
@@ -337,17 +338,28 @@ const app = new Hono<App>()
 					description: 'Username prefix; empty matches nothing meaningful',
 					schema: { type: 'string' },
 				},
+				{
+					name: 'take',
+					in: 'query',
+					required: false,
+					description: `How many to return (default and max ${SEARCH_LIMIT}); fewer reads fewer rows`,
+					schema: { type: 'integer' },
+				},
 			],
 			responses: { 200: json(AccountDto.array(), 'Matching public accounts') },
 		}),
 		async (c) => {
 			const name = c.req.query('name') ?? ''
-			const accounts = await searchAccounts(c.env.DB, name)
+			// The seek stops at the LIMIT, so a caller that draws five (the site's header
+			// search) is billed five rows rather than the default twenty.
+			const take = Number.parseInt(c.req.query('take') ?? '', 10)
+			const limit = Number.isNaN(take) ? SEARCH_LIMIT : Math.max(1, Math.min(take, SEARCH_LIMIT))
+			const accounts = await searchAccounts(c.env.DB, name, limit)
 			return c.json(accounts.map(toAccountDto))
 		}
 	)
 
-	// Exact lookup by username — what the site's `/u/<name>` profile pages and the staff
+	// Exact lookup by username — what the site's `/user/<name>` profile pages and the staff
 	// `@username` fields resolve a player through. An indexed equality on `username_lower`;
 	// before this existed they went through the prefix search above and filtered the
 	// exact hit client-side, which cost a 20-row index walk per profile view. Same path

@@ -1129,11 +1129,11 @@ interface PublicRoom {
 	Stats: { VisitCount: number; CheerCount: number; FavoriteCount: number }
 }
 
-/** Prefix-search accounts by username — backs the header search bar. */
-async function searchPlayers(query: string): Promise<PublicAccount[]> {
+/** Prefix-search accounts by username — backs the header search. */
+async function searchPlayers(query: string, take: number): Promise<PublicAccount[]> {
 	if (query.trim() === '') return []
 	return call<PublicAccount[]>(
-		`${where().accounts}/account/search?name=${encodeURIComponent(query.trim())}`
+		`${where().accounts}/account/search?name=${encodeURIComponent(query.trim())}&take=${take}`
 	)
 }
 
@@ -1145,7 +1145,7 @@ const fetchPublicAccount = (username: string): Promise<PublicAccount | null> =>
  * The photos a player has taken. Sent WITH the session token when there is one: `api`
  * reads it and, only when the list is the caller's own, includes the photos they keep
  * private — so a signed-in player sees all of theirs, on `/account` and on their own
- * `/u/<name>`, while everyone else's profile is the public list either way. Nothing
+ * `/user/<name>`, while everyone else's profile is the public list either way. Nothing
  * here decides who the viewer is; the worker does, from the token.
  */
 const fetchPlayerPhotos = (accountId: number): Promise<PublicPhoto[]> =>
@@ -1218,91 +1218,199 @@ async function setRoomExcluded(roomId: number, excluded: boolean): Promise<Owned
 	return result.value
 }
 
-/** The `/u/<username>` path, or null for any other path. */
+/** The `/user/<username>` path (or the old `/u/<username>`), or null for any other path. */
 function usernameFromPath(path: string): string | null {
-	const match = /^\/u\/([^/]+)$/.exec(path)
+	const match = /^\/(?:user|u)\/([^/]+)$/.exec(path)
 	return match ? decodeURIComponent(match[1]) : null
 }
 
-// The nav's player search. `/u/:name` profiles stay reachable by URL either way; this only
-// decides whether the search bar that leads to them is shown.
-const SHOW_PLAYER_SEARCH: boolean = true
+// The nav's search. `/user/:name` and `/rooms/:id` stay reachable by URL either way; this
+// only decides whether the search button that leads to them is shown.
+const SHOW_SEARCH: boolean = true
+
+/** How many of each kind the search panel lists. */
+const SEARCH_TAKE = 5
 
 /**
- * The header search bar — a rec.net-style bubble dropdown of matching players as you
- * type. Debounced so it doesn't fire a search per keystroke; closes on selecting a
- * result, on Escape, or on clicking outside it.
+ * Rooms whose name starts with `query`. The prefix endpoint, not the game's `/rooms/search`:
+ * that one's substring match reads every public room per call, which a search fired on
+ * every pause in typing can't afford; this one is an index seek billed per row returned.
  */
-function PlayerSearch({ navigate }: { navigate: Navigate }) {
-	const [query, setQuery] = useState('')
-	const [results, setResults] = useState<PublicAccount[]>([])
+const searchRooms = (query: string, take: number): Promise<PublicRoom[]> =>
+	query.trim() === ''
+		? Promise.resolve([])
+		: call<PublicRoom[]>(
+				`${where().rooms}/rooms/search/name?query=${encodeURIComponent(query.trim())}&take=${take}`
+			)
+
+function SearchIcon() {
+	return (
+		<svg viewBox="0 0 24 24" width="20" height="20" aria-hidden="true" focusable="false">
+			<circle cx="11" cy="11" r="6.5" fill="none" stroke="currentColor" strokeWidth="2.2" />
+			<path
+				d="M16 16l4.5 4.5"
+				fill="none"
+				stroke="currentColor"
+				strokeWidth="2.2"
+				strokeLinecap="round"
+			/>
+		</svg>
+	)
+}
+
+/**
+ * The header search: a magnifier button that opens a panel searching players and rooms
+ * together as you type. A button rather than an always-on bar so it fits a phone's nav.
+ * Debounced so it doesn't fire per keystroke; closes on picking a result, on Escape, or
+ * on a tap outside it. Enter takes the first player, else the first room.
+ */
+function SiteSearch({ navigate }: { navigate: Navigate }) {
 	const [open, setOpen] = useState(false)
+	const [query, setQuery] = useState('')
+	const [players, setPlayers] = useState<PublicAccount[]>([])
+	const [rooms, setRooms] = useState<PublicRoom[]>([])
+	// The query the results on screen answer, so "nothing found" waits for the answer.
+	const [answered, setAnswered] = useState('')
 	const containerRef = useRef<HTMLDivElement>(null)
+	const inputRef = useRef<HTMLInputElement>(null)
+	// Answers by normalized query, for the panel's lifetime on the page: backspacing to a
+	// query already asked redraws it without another request (and another D1 read).
+	const cache = useRef(new Map<string, [PublicAccount[], PublicRoom[]]>())
 
 	useEffect(() => {
-		if (query.trim() === '') {
-			setResults([])
+		const key = query.trim().toLowerCase()
+		const show = ([p, r]: [PublicAccount[], PublicRoom[]]) => {
+			setPlayers(p.slice(0, SEARCH_TAKE))
+			setRooms(r.slice(0, SEARCH_TAKE))
+			setAnswered(query)
+		}
+		if (key === '') {
+			setPlayers([])
+			setRooms([])
+			setAnswered('')
 			return
 		}
+		const known = cache.current.get(key)
+		if (known) {
+			show(known)
+			return
+		}
+		let stale = false
 		const timeout = setTimeout(() => {
-			void searchPlayers(query)
-				.then((r) => setResults(r.slice(0, 6)))
-				.catch(() => setResults([]))
+			void Promise.all([
+				searchPlayers(key, SEARCH_TAKE).catch(() => null),
+				searchRooms(key, SEARCH_TAKE).catch(() => null),
+			]).then(([p, r]) => {
+				const found: [PublicAccount[], PublicRoom[]] = [p ?? [], r ?? []]
+				// A failed half isn't cached, so the next time this is typed it asks again.
+				if (p !== null && r !== null) cache.current.set(key, found)
+				if (!stale) show(found)
+			})
 		}, 250)
-		return () => clearTimeout(timeout)
+		return () => {
+			stale = true
+			clearTimeout(timeout)
+		}
 	}, [query])
 
 	useEffect(() => {
-		const onClickOutside = (e: MouseEvent) => {
+		if (!open) return
+		inputRef.current?.focus()
+		const onPointerDown = (e: PointerEvent) => {
 			if (containerRef.current && !containerRef.current.contains(e.target as Node)) {
 				setOpen(false)
 			}
 		}
-		document.addEventListener('mousedown', onClickOutside)
-		return () => document.removeEventListener('mousedown', onClickOutside)
-	}, [])
+		document.addEventListener('pointerdown', onPointerDown)
+		return () => document.removeEventListener('pointerdown', onPointerDown)
+	}, [open])
 
-	const go = (username: string) => {
+	const go = (to: string) => {
 		setOpen(false)
 		setQuery('')
-		navigate(`/u/${encodeURIComponent(username)}`)
+		navigate(to)
 	}
+	const playerPath = (r: PublicAccount) => `/user/${encodeURIComponent(r.username)}`
+	const roomPath = (r: PublicRoom) => `/rooms/${r.RoomId}`
+	const nothing = query.trim() !== '' && answered === query && players.length + rooms.length === 0
 
 	return (
-		<div className="player-search" ref={containerRef}>
-			<input
-				type="text"
-				placeholder="Search players…"
-				value={query}
-				onChange={(e) => {
-					setQuery(e.target.value)
-					setOpen(true)
-				}}
-				onFocus={() => setOpen(true)}
-				onKeyDown={(e) => {
-					if (e.key === 'Escape') setOpen(false)
-					if (e.key === 'Enter' && results[0]) go(results[0].username)
-				}}
-			/>
-			{open && results.length > 0 && (
-				<div className="player-search-bubble">
-					{results.map((r) => (
-						<button
-							key={r.accountId}
-							className="player-search-result"
-							onClick={() => go(r.username)}
-						>
-							<img
-								className="player-search-avatar"
-								src={`${where().img}/${r.profileImage}?width=64`}
-								alt=""
-							/>
-							<span>
-								<span className="player-search-name">{r.displayName || r.username}</span>
-								<span className="player-search-handle">@{r.username}</span>
-							</span>
-						</button>
-					))}
+		<div className="site-search" ref={containerRef}>
+			<button
+				type="button"
+				className={`site-search-toggle${open ? ' active' : ''}`}
+				aria-label="Search players and rooms"
+				aria-expanded={open}
+				onClick={() => setOpen((o) => !o)}
+			>
+				<SearchIcon />
+			</button>
+			{open && (
+				<div className="site-search-panel">
+					<input
+						ref={inputRef}
+						type="search"
+						placeholder="Search players and rooms…"
+						aria-label="Search players and rooms"
+						value={query}
+						onChange={(e) => setQuery(e.target.value)}
+						onKeyDown={(e) => {
+							if (e.key === 'Escape') setOpen(false)
+							if (e.key === 'Enter') {
+								if (players[0]) go(playerPath(players[0]))
+								else if (rooms[0]) go(roomPath(rooms[0]))
+							}
+						}}
+					/>
+					{players.length > 0 && (
+						<div className="site-search-group">
+							<p className="site-search-heading">Players</p>
+							{players.map((r) => (
+								<button
+									key={r.accountId}
+									type="button"
+									className="site-search-result"
+									onClick={() => go(playerPath(r))}
+								>
+									<img
+										className="site-search-avatar"
+										src={`${where().img}/${r.profileImage}?width=64`}
+										alt=""
+									/>
+									<span>
+										<span className="site-search-name">{r.displayName || r.username}</span>
+										<span className="site-search-sub">@{r.username}</span>
+									</span>
+								</button>
+							))}
+						</div>
+					)}
+					{rooms.length > 0 && (
+						<div className="site-search-group">
+							<p className="site-search-heading">Rooms</p>
+							{rooms.map((r) => (
+								<button
+									key={r.RoomId}
+									type="button"
+									className="site-search-result"
+									onClick={() => go(roomPath(r))}
+								>
+									<img
+										className="site-search-thumb"
+										src={`${where().img}/${r.ImageName}?width=128`}
+										alt=""
+									/>
+									<span>
+										<span className="site-search-name">^{r.Name}</span>
+										<span className="site-search-sub">
+											{r.Stats.VisitCount.toLocaleString()} visits
+										</span>
+									</span>
+								</button>
+							))}
+						</div>
+					)}
+					{nothing && <p className="site-search-empty">No players or rooms match.</p>}
 				</div>
 			)}
 		</div>
@@ -1429,7 +1537,7 @@ function ImagePage({ imageId, config }: { imageId: number; config: SiteConfig | 
 }
 
 /**
- * A player's public profile page (`/u/<username>`) — banner, avatar, bio-adjacent
+ * A player's public profile page (`/user/<username>`) — banner, avatar, bio-adjacent
  * info, their public rooms, and their public photos. Read-only: this is the
  * "rec.net-style profile" other players browse to, not the owner's own dashboard
  * (that stays on `/account`).
@@ -1451,7 +1559,7 @@ function PlayerPage({
 	useEffect(() => {
 		// Waits for the config, not the session: this page is public, but every fetch on it
 		// goes through `where()`, which has no hostnames until `/api/config` lands. On a cold
-		// load of `/u/<name>` the effect would otherwise fire first and the page would be
+		// load of `/user/<name>` the effect would otherwise fire first and the page would be
 		// stuck on "Still starting up".
 		if (config === undefined) return
 		setAccount(undefined)
@@ -2460,7 +2568,6 @@ function NavBar({
 				RecFlare
 			</Link>
 			<nav className="nav-links">
-				{SHOW_PLAYER_SEARCH && <PlayerSearch navigate={navigate} />}
 				<a href={DISCORD_INVITE} target="_blank" rel="noreferrer">
 					Discord
 				</a>
@@ -2505,6 +2612,7 @@ function NavBar({
 						Sign in
 					</Link>
 				)}
+				{SHOW_SEARCH && <SiteSearch navigate={navigate} />}
 			</nav>
 		</header>
 	)
@@ -3199,7 +3307,7 @@ function PublicRoomView({
 					{creator && (
 						<p className="room-hero-by">
 							by{' '}
-							<Link to={`/u/${encodeURIComponent(creator.username)}`} navigate={navigate}>
+							<Link to={`/user/${encodeURIComponent(creator.username)}`} navigate={navigate}>
 								{creator.displayName || creator.username}
 							</Link>
 						</p>
