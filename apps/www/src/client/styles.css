@@ -447,6 +447,33 @@ body {
 	border-color: #4752c4;
 }
 
+/* The way back out of the Discord link, at the foot of the benefits card: set apart by a
+   rule so it doesn't read as part of the claim, and the button in the error colour so it
+   reads as the undo it is. The hint beside it says what has to be set first. */
+.unlink {
+	margin-top: 22px;
+	padding-top: 16px;
+	border-top: 1px solid var(--line);
+}
+
+.unlink h3 {
+	margin: 0 0 8px;
+	font-size: 1rem;
+}
+
+.linkish.danger {
+	color: var(--error);
+}
+
+.linkish.danger:hover {
+	color: var(--text);
+}
+
+.linkish.danger:disabled {
+	opacity: 0.6;
+	cursor: default;
+}
+
 /* Secondary action: same shape, outlined instead of filled. */
 .cta.ghost {
 	background: transparent;

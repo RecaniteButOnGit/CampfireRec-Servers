@@ -490,6 +490,40 @@ export async function isPlatformIdentityLinked(
 }
 
 /**
+ * Remove EVERY link an account holds on one platform, and return the links that were
+ * removed (empty when it held none). The website's Discord unlink is the one caller:
+ * a player taking their Discord off their account, which gives the identity back —
+ * "Sign in with Discord" with it afterwards makes a NEW account, and the benefits claim's
+ * once-only guard lets it claim elsewhere again.
+ *
+ * The removed rows are returned rather than a count because the caller needs to know what
+ * they carried: a link whose `role` was recorded is a CLAIM, and the account must remember
+ * having made one after the row is gone (see `account.hasClaimedDiscord`), or the
+ * first-link gift would pay again on every link/unlink cycle. Read-then-delete, not
+ * `DELETE … RETURNING`, so it runs on every D1 the tests do.
+ *
+ * Not for Steam or Meta: those links are what a cached login redeems, and nothing on the
+ * website removes one. The helper doesn't refuse them — the table has no idea what a
+ * platform is for — so a caller must only ever name a platform nobody logs in with.
+ */
+export async function unlinkPlatform(
+	db: D1Database,
+	accountId: number,
+	platform: number
+): Promise<PlatformLink[]> {
+	const { results } = await db
+		.prepare(`${SELECT_LINK} WHERE account_id = ?1 AND platform = ?2 ORDER BY linked_at`)
+		.bind(accountId, platform)
+		.all<LinkRow>()
+	if (results.length === 0) return []
+	await db
+		.prepare(`DELETE FROM platform_account WHERE account_id = ?1 AND platform = ?2`)
+		.bind(accountId, platform)
+		.run()
+	return results.map(toLink)
+}
+
+/**
  * How many accounts one platform identity already opens — the count both signup caps
  * and link caps are enforced against, so an identity can't accumulate accounts by
  * creating them under the cap and then linking more in.

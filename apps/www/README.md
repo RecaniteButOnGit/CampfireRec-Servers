@@ -154,6 +154,23 @@ box. The grant runs after Plus is granted and the link written, and a failure in
 logged rather than failing the claim. Unset, the var awards nothing and the claim is as
 before.
 
+**Unlinking.** The same panel offers **Unlink Discord** whenever any Discord is on the
+account — a claim's link or the bare one "Sign in with Discord" leaves — and
+`POST /api/benefits/unlink` removes every `PlatformType.Discord` link the account holds.
+It is refused (403) until the account has an **email address**: an account made from
+Discord has none until the player sets one, the link may be its only way in, and an address
+is what the account can be recovered through (a password is not required — a passwordless
+account sets one in game). The row decides, not the page; `/api/benefits/status` serves the
+same flag (`hasEmail`, beside `discordLinked`) so the panel can say so first. Afterwards that
+Discord opens no account — signing in with it makes a new one — and the once-only guard lets
+it claim elsewhere. **The grants go with the link**: `hasPlus` and `hasStudio` are both
+cleared, whoever set them (an operator's grant too — nothing on the row says which wrote
+it), and the panel warns before the confirm; both reach the game on the next token. What the
+account does keep is that it claimed: removing a link with roles recorded stamps
+`hasClaimedDiscord` on the account, and the claim's "first link" check consults it, or
+link → unlink → link would pay the one-time supporter gift on every cycle. The route is not gated on the Discord
+configuration — the link is in the table whether or not the claim is still open.
+
 The link also records the member's **roles** (`platform_account.role`, a JSON array of
 role ids). The claim writes them from the member record it read; on their own they'd be
 a snapshot from claim time, because the claim revokes the player's token the moment it's

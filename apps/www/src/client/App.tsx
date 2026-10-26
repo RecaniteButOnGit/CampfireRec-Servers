@@ -560,6 +560,16 @@ interface BenefitsStatus {
 	hasPlus: boolean
 	/** Whether a Discord identity is already tied to it. Which one is deliberately not served. */
 	linked: boolean
+	/**
+	 * Whether ANY Discord is on the account — a claim's link or the bare one "Sign in with
+	 * Discord" leaves. What the unlink button keys on; `linked` is only the claimed case.
+	 */
+	discordLinked: boolean
+	/**
+	 * The unlink's one precondition: the account must have an email address, or taking the
+	 * Discord off could leave nothing to recover it by. Served so the panel can say so first.
+	 */
+	hasEmail: boolean
 }
 
 /**
@@ -589,6 +599,14 @@ interface ClaimResult {
 /** Redeem the code Discord sent us back with. The access token never reaches this page. */
 const claimBenefits = (code: string): Promise<ClaimResult> =>
 	call<ClaimResult>('/api/benefits/claim', { json: { code }, authed: true })
+
+/**
+ * Take the Discord off the account. `www` refuses (403, with a sentence) unless the account
+ * has a password and an email — the panel checks the same two flags first so the button
+ * only shows when it can work. Answers the status as it now stands.
+ */
+const unlinkDiscord = (): Promise<BenefitsStatus> =>
+	call<BenefitsStatus>('/api/benefits/unlink', { json: {}, authed: true })
 
 /**
  * The per-attempt CSRF nonce for the Discord round-trip, in sessionStorage.
@@ -778,6 +796,7 @@ function BenefitsPanel({ account, config }: { account: SelfAccount; config: Site
 	// and tokens last a day and are never refreshed. Without this line the claim looks like
 	// it silently did nothing, which is the single most likely support question here.
 	const [relogin, setRelogin] = useState(false)
+	const [unlinking, setUnlinking] = useState(false)
 	// StrictMode runs effects twice in dev, and a Discord code is single-use: the second
 	// run would redeem a spent code and report a failure over a claim that just worked.
 	const redeemed = useRef(false)
@@ -818,7 +837,14 @@ function BenefitsPanel({ account, config }: { account: SelfAccount; config: Site
 		setPending(true)
 		claimBenefits(code)
 			.then((result) => {
-				setStatus({ hasPlus: result.hasPlus, linked: true })
+				setStatus((prev) => ({
+					hasPlus: result.hasPlus,
+					linked: true,
+					discordLinked: true,
+					// The claim says nothing about this; keep what the status read said, and assume
+					// none until it answers.
+					hasEmail: prev?.hasEmail ?? false,
+				}))
 				const who = result.discordUsername ? ` as ${result.discordUsername}` : ''
 				// Linked either way; whether Plus came with it depends on the roles. Without a
 				// qualifying role the roles are still saved for the game, and that is said
@@ -919,6 +945,60 @@ function BenefitsPanel({ account, config }: { account: SelfAccount; config: Site
 				>
 					Verify with Discord
 				</button>
+			)}
+
+			{status?.discordLinked && !pending && (
+				// Taking the Discord off again. Offered for ANY link — a claim's, or the bare one a
+				// Discord sign-in made — but only once the account can be recovered without it: an
+				// account made from Discord has no email until the player sets one, and `www`
+				// refuses the unlink until there is one. The panel says so rather than showing a
+				// button that would fail.
+				<div className="unlink">
+					<h3>Unlink Discord</h3>
+					{status.hasEmail ? (
+						<>
+							<p className="muted">
+								Removes your Discord from this account. Rec Room Plus and Rec Room Studio access
+								granted to this account are removed with it, your roles stop being read, and signing
+								in with that Discord afterwards will make a new account rather than open this one.
+								You can link again at any time.
+							</p>
+							<button
+								type="button"
+								className="linkish danger"
+								disabled={unlinking}
+								onClick={() => {
+									if (
+										!confirm(
+											'Unlink your Discord from this account? Rec Room Plus and Studio access on this account will be removed.'
+										)
+									)
+										return
+									setUnlinking(true)
+									setError('')
+									setDone('')
+									unlinkDiscord()
+										.then((next) => {
+											setStatus(next)
+											setRelogin(false)
+											setDone('Your Discord has been unlinked from this account.')
+										})
+										.catch((err: unknown) =>
+											setError(err instanceof Error ? err.message : String(err))
+										)
+										.finally(() => setUnlinking(false))
+								}}
+							>
+								{unlinking ? 'Unlinking…' : 'Unlink Discord'}
+							</button>
+						</>
+					) : (
+						<p className="hint">
+							Before you can unlink, add an email address to this account (the{' '}
+							<strong>Email</strong> tab), so the account can be recovered without Discord.
+						</p>
+					)}
+				</div>
 			)}
 		</section>
 	)

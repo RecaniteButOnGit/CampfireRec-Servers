@@ -49,6 +49,7 @@ import {
 	linkPlatformIdentity,
 	PLATFORM_SCHEMA_DDL,
 	recordFirstRoles,
+	unlinkPlatform,
 } from '../../../../auth/src/platform-db'
 import {
 	BALANCE_SCHEMA_DDL,
@@ -679,25 +680,168 @@ it('reports where an account stands on benefits', async () => {
 		headers: { authorization: `Bearer ${token}` },
 	})
 	expect(res.status).toBe(200)
-	expect(await res.json()).toEqual({ hasPlus: false, linked: false })
+	// No email either: the unlink's one precondition, served alongside so the page can say
+	// so first. Nothing linked, so there is nothing to unlink yet.
+	expect(await res.json()).toEqual({
+		hasPlus: false,
+		linked: false,
+		discordLinked: false,
+		hasEmail: false,
+	})
 
 	// A bare link — what "Sign in with Discord" leaves on an account it just made — is NOT a
-	// claim: no roles were ever recorded, so the page must still offer the claim.
+	// claim: no roles were ever recorded, so the page must still offer the claim. It IS a
+	// Discord on the account, though, so `discordLinked` says so: the unlink is offered for
+	// it as much as for a claim's link.
 	await updateAccount(env.DB, 4003, { hasPlus: true })
 	await linkPlatformIdentity(env.DB, 4003, PlatformType.Discord, '99001')
 	res = await SELF.fetch('https://example.com/api/benefits/status', {
 		headers: { authorization: `Bearer ${token}` },
 	})
-	expect(await res.json()).toEqual({ hasPlus: true, linked: false })
+	expect(await res.json()).toEqual({
+		hasPlus: true,
+		linked: false,
+		discordLinked: true,
+		hasEmail: false,
+	})
 
 	// Claimed (roles recorded, even none). `linked` says THAT a Discord identity has claimed,
 	// never which one — the id is of no use to the page, and an account's linked identities
 	// have no business on the wire.
+	await updateAccount(env.DB, 4003, { email: 'p@example.com' })
 	await linkPlatformIdentity(env.DB, 4003, PlatformType.Discord, '99001', [])
 	res = await SELF.fetch('https://example.com/api/benefits/status', {
 		headers: { authorization: `Bearer ${token}` },
 	})
-	expect(await res.json()).toEqual({ hasPlus: true, linked: true })
+	expect(await res.json()).toEqual({
+		hasPlus: true,
+		linked: true,
+		discordLinked: true,
+		hasEmail: true,
+	})
+})
+
+// ---- Discord unlink --------------------------------------------------------
+// Taking the Discord off an account. The link may be the only way in — an account made by
+// "Sign in with Discord" has no email until the player sets one — so the unlink is refused
+// until the account has an address to be recovered through, decided from the row and never
+// from the page. A password is NOT required: a passwordless account sets one in game.
+
+const unlink = (token: string) =>
+	SELF.fetch('https://example.com/api/benefits/unlink', {
+		method: 'POST',
+		headers: { authorization: `Bearer ${token}`, 'content-type': 'application/json' },
+		body: '{}',
+	})
+
+it('requires a valid session to unlink a discord', async () => {
+	expect((await unlink('')).status).toBe(401)
+	const forged = await generateToken('4020', '', 4, 'not-the-real-secret')
+	expect((await unlink(forged)).status).toBe(401)
+})
+
+it('refuses to unlink a discord until the account has an email address', async () => {
+	const token = await tokenFor(4021)
+	await linkPlatformIdentity(env.DB, 4021, PlatformType.Discord, '99021')
+
+	// No email — and a password doesn't stand in for one.
+	await updateAccount(env.DB, 4021, { passwordHash: 'salt:hash' })
+	const res = await unlink(token)
+	expect(res.status).toBe(403)
+	expect(await res.json()).toEqual({
+		error:
+			'Add an email address to your account before unlinking Discord, so the account can be recovered without it.',
+	})
+
+	// Refused means untouched: the link is still there.
+	await expect(isPlatformIdentityLinked(env.DB, 4021, PlatformType.Discord, '99021')).resolves.toBe(
+		true
+	)
+
+	// An email alone, no password, is enough.
+	await updateAccount(env.DB, 4021, { passwordHash: undefined, email: 'p@example.com' })
+	expect((await unlink(token)).status).toBe(200)
+	await expect(isPlatformIdentityLinked(env.DB, 4021, PlatformType.Discord, '99021')).resolves.toBe(
+		false
+	)
+})
+
+it('unlinks every discord on the account, and takes plus and studio with it', async () => {
+	const token = await tokenFor(4022)
+	await updateAccount(env.DB, 4022, {
+		username: 'Leaver',
+		email: 'p@example.com',
+		hasPlus: true,
+		hasStudio: true,
+	})
+	// A claimed link and (the once-only guard aside) a second identity, both Discord — and a
+	// Steam login that must survive: only the Discord goes.
+	await linkPlatformIdentity(env.DB, 4022, PlatformType.Discord, '99022', ['r1'])
+	await linkPlatformIdentity(env.DB, 4022, PlatformType.Discord, '99023')
+	await linkPlatformIdentity(env.DB, 4022, PlatformType.Steam, '76561000000000022')
+
+	const res = await unlink(token)
+	expect(res.status).toBe(200)
+	// The status as it now stands, in `/api/benefits/status`'s shape: the grants went with
+	// the link.
+	expect(await res.json()).toEqual({
+		hasPlus: false,
+		linked: false,
+		discordLinked: false,
+		hasEmail: true,
+	})
+	expect((await getLinksForAccount(env.DB, 4022)).map((l) => [l.platform, l.platformId])).toEqual([
+		[PlatformType.Steam, '76561000000000022'],
+	])
+	// The identity is free again: the once-only guard counts nobody holding it now.
+	await expect(
+		countAccountsForPlatformIdentity(env.DB, PlatformType.Discord, '99022')
+	).resolves.toBe(0)
+	// The account remembers it CLAIMED (a link with roles recorded was removed), so a re-link
+	// won't be a "first" one to the gift — see the test below. Plus and Studio are CLEARED —
+	// dropped from the blob, not written false — and the rest of the row is untouched.
+	const after = await getAccount(env.DB, 4022)
+	expect(after?.hasClaimedDiscord).toBe(true)
+	expect(after?.hasPlus).toBeUndefined()
+	expect(after?.hasStudio).toBeUndefined()
+	expect(after?.username).toBe('Leaver')
+	expect(after?.email).toBe('p@example.com')
+
+	// Nothing left to unlink.
+	const again = await unlink(token)
+	expect(again.status).toBe(404)
+	expect(await again.json()).toEqual({ error: 'No Discord account is linked to this account.' })
+})
+
+// Removing a BARE link (a Discord sign-in's, no roles recorded) is not a claim to remember:
+// that player's first claim, on whatever account they next link, is still their first.
+it('does not remember a claim when the unlinked discord never claimed', async () => {
+	const token = await tokenFor(4023)
+	await updateAccount(env.DB, 4023, { email: 'p@example.com' })
+	await linkPlatformIdentity(env.DB, 4023, PlatformType.Discord, '99024')
+	expect((await unlink(token)).status).toBe(200)
+	expect((await getAccount(env.DB, 4023))?.hasClaimedDiscord).toBeUndefined()
+
+	// But a claim that found NO roles is still a claim — `[]` is recorded, NULL is not — and
+	// `unlinkPlatform`'s parsed rows can't tell the two apart, which is why the route asks
+	// the raw column before it deletes.
+	await linkPlatformIdentity(env.DB, 4023, PlatformType.Discord, '99024', [])
+	expect((await unlink(token)).status).toBe(200)
+	expect((await getAccount(env.DB, 4023))?.hasClaimedDiscord).toBe(true)
+})
+
+// The helper itself: returns what it removed (so the caller knows what the rows carried),
+// and an account with nothing on that platform yields an empty list and no write.
+it('removes every link on one platform and returns them', async () => {
+	await linkPlatformIdentity(env.DB, 4024, PlatformType.Discord, '99025', ['r1', 'r2'])
+	await linkPlatformIdentity(env.DB, 4024, PlatformType.Steam, '76561000000000024')
+	await expect(unlinkPlatform(env.DB, 4024, PlatformType.Oculus)).resolves.toEqual([])
+	const removed = await unlinkPlatform(env.DB, 4024, PlatformType.Discord)
+	expect(removed.map((l) => [l.platformId, l.roles])).toEqual([['99025', ['r1', 'r2']]])
+	await expect(unlinkPlatform(env.DB, 4024, PlatformType.Discord)).resolves.toEqual([])
+	expect((await getLinksForAccount(env.DB, 4024)).map((l) => l.platform)).toEqual([
+		PlatformType.Steam,
+	])
 })
 
 // How the claim decides "first claim" now that a Discord link can predate it: a link made by

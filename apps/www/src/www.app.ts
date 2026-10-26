@@ -16,10 +16,12 @@ import { generateIdentityAssertion, validateAndGetAccountId } from '@repo/jwt'
 // verify, and its picker lists only the platforms that can be (CACHED_LOGIN_PLATFORMS).
 import {
 	countAccountsForPlatformIdentity,
+	getLinksForAccount,
 	hasRecordedRoles,
 	isPlatformIdentityLinked,
 	linkPlatformIdentity,
 	recordFirstRoles,
+	unlinkPlatform,
 } from '../../auth/src/platform-db'
 // The signup grant's default and the Discord supporter gift, both `econ`'s. The gift is
 // econ's cron paid on demand: the first time an account links its Discord, the claim hands
@@ -463,9 +465,10 @@ const app = new Hono<App>()
 	.get('/api/benefits/status', async (c) => {
 		const accountId = await claimant(c)
 		if (accountId === null) return c.body(null, 401)
-		const [account, claimed] = await Promise.all([
+		const [account, claimed, links] = await Promise.all([
 			getAccount(c.env.DB, accountId),
 			hasRecordedRoles(c.env.DB, accountId, PlatformType.Discord),
+			getLinksForAccount(c.env.DB, accountId),
 		])
 		return c.json({
 			hasPlus: account?.hasPlus ?? false,
@@ -475,6 +478,93 @@ const app = new Hono<App>()
 			// bare link, which "Sign in with Discord" leaves on a new account, reads as not yet
 			// claimed: the page then offers the claim, which is what that player still has to do.
 			linked: claimed,
+			// Whether ANY Discord identity is on the account, claimed or bare — what the unlink
+			// button keys on, since a sign-in's bare link is as much a link to take off as a
+			// claim's. Still never WHICH one.
+			discordLinked: links.some((link) => link.platform === PlatformType.Discord),
+			// The unlink's one precondition (see `/api/benefits/unlink`), served beside the link
+			// so the page can say so before the button fails. The self DTO carries the address
+			// too; this is the server's own reading of the same row the unlink will decide from.
+			hasEmail: !!account?.email,
+		})
+	})
+
+	/**
+	 * Take the account's Discord off it: every `PlatformType.Discord` link goes, whether a
+	 * claim wrote it or "Sign in with Discord" did. Afterwards that Discord opens no account —
+	 * signing in with it makes a NEW one — and the benefits claim's once-only guard lets it
+	 * claim on another account.
+	 *
+	 * Refused unless the account has an EMAIL ADDRESS. The link may be the only way into the
+	 * account: an account made by "Sign in with Discord" has no password and no email until
+	 * the player sets them, and removing its link would leave nothing to recover the account
+	 * by. An address is enough — it is what the account can be recovered through — so a
+	 * password is NOT required: a player with an email and no password sets one in game, as
+	 * any passwordless account does. Checked here, on the row, and not trusted from the page
+	 * (which shows the same flag from `/api/benefits/status` so it can say so before anyone
+	 * presses anything).
+	 *
+	 * The grants the link carried go with it. `hasPlus` and `hasStudio` are both cleared:
+	 * the Discord roles are what the claim granted Plus for and what the Studio rollout reads,
+	 * and a player taking the link off is giving that proof back — unlike a role that merely
+	 * lapses, which the claim deliberately never revokes for. This clears an operator's
+	 * grant too (`runx admin grant-plus`/`grant-studio` write the same flags, and nothing on
+	 * the row says which wrote them); the page warns, and staff can re-grant. Both reach the
+	 * game on the NEXT token, like every account flag.
+	 *
+	 * What it does NOT do is forget that the account has claimed. A link with roles recorded
+	 * was a claim, and the first-link supporter gift keys on "never claimed before", read from
+	 * the link table — which would read as never-linked once the row is gone. So a claimed
+	 * link's removal stamps `hasClaimedDiscord` on the account, and the claim consults both;
+	 * otherwise link → unlink → link would pay the one-time box on every cycle.
+	 *
+	 * Not gated on the Discord configuration: the link is in the table whether or not the
+	 * operator still runs the claim, and a player can always take it off. Answers the same
+	 * shape `/api/benefits/status` does, as the account now stands.
+	 */
+	.post('/api/benefits/unlink', async (c) => {
+		const accountId = await claimant(c)
+		if (accountId === null) return c.body(null, 401)
+
+		const account = await getAccount(c.env.DB, accountId)
+		if (!account?.email) {
+			return c.json(
+				{
+					error:
+						'Add an email address to your account before unlinking Discord, so the account can be recovered without it.',
+				},
+				403
+			)
+		}
+
+		// Whether what's being removed includes a CLAIM — a link with `role` recorded, even as
+		// `[]`. Asked of the raw column BEFORE the delete: the parsed `PlatformLink` reads a
+		// NULL role and an empty list both as `[]`, and only the column tells a sign-in's bare
+		// link from a claim that found no roles.
+		const claimed = await hasRecordedRoles(c.env.DB, accountId, PlatformType.Discord)
+		const removed = await unlinkPlatform(c.env.DB, accountId, PlatformType.Discord)
+		if (removed.length === 0) {
+			return c.json({ error: 'No Discord account is linked to this account.' }, 404)
+		}
+		// One write: remember the claim (when there was one), and take back what the link
+		// carried. `undefined` drops the key from the blob, which is how "no Plus" is spelled.
+		await updateAccount(c.env.DB, accountId, {
+			hasClaimedDiscord: claimed || account.hasClaimedDiscord === true ? true : undefined,
+			hasPlus: undefined,
+			hasStudio: undefined,
+		})
+		logger.info('unlinked a discord from an account', {
+			accountId,
+			links: removed.length,
+			claimed,
+			hadPlus: account.hasPlus === true,
+			hadStudio: account.hasStudio === true,
+		})
+		return c.json({
+			hasPlus: false,
+			linked: false,
+			discordLinked: false,
+			hasEmail: true,
 		})
 	})
 
@@ -506,7 +596,8 @@ const app = new Hono<App>()
 	 * Nothing here ever REVOKES Plus: losing the Discord role later leaves the flag set.
 	 * That's deliberate for now — a sweep would need a bot token to enumerate the guild,
 	 * which this design specifically avoids — but it does mean the flag records "held the
-	 * role once", not "holds it today".
+	 * role once", not "holds it today". The player's own unlink (`/api/benefits/unlink`) is
+	 * the one thing that takes it back.
 	 *
 	 * The FIRST time an account links a Discord, the claim also pays the supporter gift
 	 * econ's cron would (`DISCORD_ROLE_TOKENS`, the amount for the best of the roles just
@@ -585,7 +676,13 @@ const app = new Hono<App>()
 		// DIFFERENT one the once-only guard doesn't stop) has claimed before. A link with NO
 		// roles has not: that is what "Sign in with Discord" leaves on an account it just made,
 		// and that player's first claim is still their first.
-		const firstClaim = !(await hasRecordedRoles(c.env.DB, accountId, PlatformType.Discord))
+		//
+		// AND from the account: an unlink removes a claimed link's row, and stamps
+		// `hasClaimedDiscord` on the account so the table reading as never-linked afterwards
+		// doesn't make the next link a "first" one. Both are asked; either says not-first.
+		const firstClaim =
+			(await getAccount(c.env.DB, accountId))?.hasClaimedDiscord !== true &&
+			!(await hasRecordedRoles(c.env.DB, accountId, PlatformType.Discord))
 		// On a link that already exists without roles, writing them is the claim's one-shot
 		// write — the single-winner guard a fresh link gets from its INSERT below. Asked only
 		// when the link is the caller's: on anyone else's it would be refused above.

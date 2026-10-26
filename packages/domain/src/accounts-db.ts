@@ -168,7 +168,10 @@ export interface Account {
 	 *
 	 * So never read a Discord link as a precondition for Plus, and never revoke one because
 	 * the other is missing: a manually granted account has `hasPlus` and no link at all, and
-	 * that is a normal, supported state.
+	 * that is a normal, supported state. The one thing that clears it besides an operator is
+	 * the player UNLINKING their Discord (`www` `POST /api/benefits/unlink`), which clears
+	 * this and `hasStudio` together — the player is handing back the proof — and does so
+	 * whoever set them, since nothing on the row says which.
 	 *
 	 * Nothing reads this per request. `auth` stamps it into every token it mints as the
 	 * `rn.plus` claim, and `econ` decides the CampusCard and the subscriber discount from
@@ -177,6 +180,21 @@ export interface Account {
 	 * real: the website's claim page warns about it, and so does `grant-plus`.
 	 */
 	hasPlus?: boolean
+	/**
+	 * Whether this account has EVER claimed its Discord benefits — had roles recorded on a
+	 * `PlatformType.Discord` link by `www`'s `POST /api/benefits/claim` — even if that link is
+	 * gone. Set only by the website's Discord UNLINK, when the link it removes carries roles:
+	 * while the link exists the link table itself says so (`hasRecordedRoles`), and a link
+	 * that never claimed has nothing to remember.
+	 *
+	 * What it protects is the first-link supporter gift. The claim pays that box the FIRST
+	 * time an account links a Discord, deciding "first" from the link table — which, after an
+	 * unlink, reads as if the account had never linked. Without this flag, link → unlink →
+	 * link would pay the one-time gift on every cycle. Nothing else reads it: `hasPlus` stands
+	 * on its own (above), and the once-only-per-Discord-user guard is the link table's.
+	 * Absent/false means no claim remembered.
+	 */
+	hasClaimedDiscord?: boolean
 	/**
 	 * Whether this account may upload from Rec Room Studio. The editor decides Full access
 	 * by reading the token for a `role` claim of exactly `betastudio`, which `auth` stamps
