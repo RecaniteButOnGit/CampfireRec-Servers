@@ -14,7 +14,6 @@ import {
 	canManageRoomById,
 	cloneRoom,
 	cloneSubRoom,
-	confirmedRoomRoles,
 	countRoomsByCreator,
 	createNotification,
 	createStudioRoom,
@@ -2659,15 +2658,14 @@ const app = new Hono<App>()
 			summary: 'A room’s roles',
 			description: [
 				'Everyone with a role in the room — its creator plus whoever has been granted Host,',
-				'Moderator or CoOwner — as whole `RoomRole` records. This is the same array the',
-				'room DTO serves under `Roles`, on its own endpoint, so it is public exactly like the',
-				'room is: a role list says who runs a room, which the room page already shows.',
+				'Moderator or CoOwner — as whole `RoomRole` records, PLUS every pending invite. It is',
+				'public exactly like the room is: a role list says who runs a room, which the room',
+				'page already shows.',
 				'',
-				'Held roles only. A player with a standing co-owner invite they have not answered',
-				'(`Role` 0, the offer on `InvitedRole`) is not listed here or on the room DTO: they',
-				'have no standing in the room until they accept, and the offer reaches them as a',
-				'`RoomCoOwnerInvited` message. A member who holds a role AND has a higher one pending',
-				'is listed at the role they hold, `InvitedRole` included.',
+				'Unlike the room DTO’s `Roles`, this list INCLUDES unanswered co-owner invites (`Role`',
+				'0, the offer on `InvitedRole`): the client reads it to show the players with an',
+				'invite pending. The room DTO leaves those entries out, because there an invited',
+				'player read as a member before they had accepted anything.',
 				'',
 				'A bare array, NOT the `{ success, error, value }` envelope the role WRITE answers. An',
 				'unknown room is an empty list rather than an error — it reads the same as a room',
@@ -2681,7 +2679,7 @@ const app = new Hono<App>()
 		async (c) => {
 			const roomId = Number.parseInt(c.req.param('roomId'), 10)
 			const room = await getRoomById(c.env.DB, roomId)
-			return c.json(room ? confirmedRoomRoles(room) : [])
+			return c.json(room ? roomRoles(room) : [])
 		}
 	)
 

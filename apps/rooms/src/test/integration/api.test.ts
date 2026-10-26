@@ -576,8 +576,9 @@ describe('rooms endpoints', () => {
 		expect(ownedIds).toContain(30401)
 		expect(ownedIds).not.toContain(30408)
 
-		// Nor is the invited player part of the room anyone is shown: the room DTO and the
-		// role list carry only HELD roles. The stored room keeps the entry for the accept.
+		// Nor is the invited player part of the room as served: the room DTO carries only HELD
+		// roles. `GET /rooms/:id/roles` DOES list the invite — the client shows pending invites
+		// from it — and the stored room keeps the entry for the accept.
 		type Served = { Roles: Array<{ AccountId: number; Role: number; InvitedRole: number }> }
 		const servedRoles = async () =>
 			((await (await SELF.fetch(`${ORIGIN}/rooms/30408`)).json()) as Served).Roles
@@ -586,6 +587,7 @@ describe('rooms endpoints', () => {
 		])
 		expect(await (await SELF.fetch(`${ORIGIN}/rooms/30408/roles`)).json()).toEqual([
 			{ AccountId: 821, Role: 255, LastChangedByAccountId: null, InvitedRole: 0 },
+			{ AccountId: 820, Role: 0, LastChangedByAccountId: 821, InvitedRole: 30 },
 		])
 		expect(
 			await env.DB.prepare(
@@ -1729,8 +1731,7 @@ describe('rooms endpoints', () => {
 	const envOf = async (res: Response) => (await res.json()) as RoomEnv
 
 	// A role entry as STORED, read off the `room_role` index — pending invites included.
-	// The served room and `GET /rooms/:id/roles` carry only held roles, so an entry that is
-	// nothing but an unanswered invite (`Role` 0) can only be observed here.
+	// The served room carries only held roles; `GET /rooms/:id/roles` lists invites too.
 	type StoredRole = { Role: number; InvitedRole: number; LastChangedByAccountId: number | null }
 	const storedRoleOf = async (roomId: number, accountId: number) =>
 		(await env.DB.prepare(
@@ -2158,8 +2159,8 @@ describe('rooms endpoints', () => {
 			error: 'You must provide a valid role!',
 		})
 		expect(await storedRoleOf(2, 885)).toMatchObject({ Role: 0, InvitedRole: 30 })
-		// An entry that is only an invite is not a role the room serves.
-		expect(await roleOf(885)).toBeUndefined()
+		// The role list still shows the invite as pending.
+		expect(await roleOf(885)).toMatchObject({ Role: 0, InvitedRole: 30 })
 	})
 
 	it('a revoke pushes a RoomUpdate to the room and to the player who lost the role', async () => {
@@ -2218,11 +2219,11 @@ describe('rooms endpoints', () => {
 			)
 
 		// RecCenter (room 2) is owned by account 1. The owner invites 850 to co-ownership,
-		// leaving a pending offer and no role yet. The offer is stored on their entry but
-		// the room as SERVED does not list them: they are not a member until they accept.
+		// leaving a pending offer and no role yet. The role list shows the pending invite, but
+		// the room DTO does not list them: they are not a member until they accept.
 		expect((await putForm('/rooms/2/roles/850/invite', { role: '30' }, '1')).status).toBe(200)
 		expect(await storedRoleOf(2, 850)).toMatchObject({ Role: 0, InvitedRole: 30 })
-		expect(await roleOf(850)).toBeUndefined()
+		expect(await roleOf(850)).toMatchObject({ Role: 0, InvitedRole: 30 })
 		const room2 = (await (await SELF.fetch(`${ORIGIN}/rooms/2`)).json()) as { Roles: Role[] }
 		expect(room2.Roles.some((r) => r.AccountId === 850)).toBe(false)
 
@@ -2302,7 +2303,7 @@ describe('rooms endpoints', () => {
 		// offer rather than an entry with nothing pending on it.
 		expect((await putForm('/rooms/2/roles/851/invite', { role: '30' }, '1')).status).toBe(200)
 		expect(await storedRoleOf(2, 851)).toMatchObject({ Role: 0, InvitedRole: 30 })
-		expect(await roleOf(851)).toBeUndefined()
+		expect(await roleOf(851)).toMatchObject({ Role: 0, InvitedRole: 30 })
 
 		const declined = await putForm('/rooms/2/roles/851', { role: '0' }, '851')
 		expect(declined.status).toBe(200)
@@ -2570,14 +2571,23 @@ describe('rooms endpoints', () => {
 		expect(await res.json()).toEqual({ success: true })
 
 		// A new entry, holding no role yet — only the pending offer, stamped with the inviter.
-		// STORED, not served: the room's role list carries held roles only, so the invited
-		// player does not appear on it until they accept.
+		// The role list shows it as a pending invite (the client lists pending invites from
+		// it); the room DTO's `Roles` does not, until they accept.
 		expect(await storedRoleOf(2, 187)).toEqual({
 			Role: 0,
 			InvitedRole: 30,
 			LastChangedByAccountId: 1,
 		})
-		expect((await rolesOf(2)).find((r) => r.AccountId === 187)).toBeUndefined()
+		expect(await rolesOf(2)).toContainEqual({
+			AccountId: 187,
+			Role: 0,
+			InvitedRole: 30,
+			LastChangedByAccountId: 1,
+		})
+		const room2 = (await (await SELF.fetch(`${ORIGIN}/rooms/2`)).json()) as {
+			Roles: Array<{ AccountId: number }>
+		}
+		expect(room2.Roles.some((r) => r.AccountId === 187)).toBe(false)
 
 		// One MessageReceived to the INVITED player carrying a type 62 RoomCoOwnerInvited —
 		// the entry alone is silent, this is what raises the invite on their client.

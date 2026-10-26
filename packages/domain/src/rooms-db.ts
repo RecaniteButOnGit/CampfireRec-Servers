@@ -305,18 +305,6 @@ function holdsRole(entry: unknown): boolean {
 }
 
 /**
- * A room's HELD roles — {@link roomRoles} without the pending invites. What the client is
- * shown as the room's role list: an invited player has no standing in the room until they
- * accept, and listing them as a member with `Role` 0 showed them on the room's member list
- * before they had agreed to anything. The offer reaches them as a `RoomCoOwnerInvited`
- * message instead, and the entry itself stays in the stored room for
- * {@link answerRoomRoleInvite} to promote.
- */
-export function confirmedRoomRoles(room: Room): RoomRole[] {
-	return roomRoles(room).filter((r) => r.Role !== Role.None)
-}
-
-/**
  * The room as SERVED, with pending invites dropped from its `Roles` — a shallow copy; the
  * room passed in is untouched, so a caller can keep writing from it. Entries are kept in the
  * blob's own shape (not normalised through {@link roomRoles}), so a room that had no
