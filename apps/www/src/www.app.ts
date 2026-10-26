@@ -51,6 +51,7 @@ import {
 	bansInForceHandler,
 	clearDormHandler,
 	clearPasswordHandler,
+	clearRoomInstancesHandler,
 	createReportHandler,
 	getReportHandler,
 	giftItemHandler,
@@ -813,6 +814,8 @@ const app = new Hono<App>()
 	.post('/api/staff/players/:id/gift-xp', requireDeveloper, giftXpHandler)
 	// Everyone standing in a room, across all of its instances.
 	.post('/api/staff/rooms/:roomId/gift-tokens', requireDeveloper, giftRoomTokensHandler)
+	// Delete every live instance of a room — for one whose sessions are stuck. All staff.
+	.post('/api/staff/rooms/:roomId/clear-instances', clearRoomInstancesHandler)
 	// The account page's token drop: the same gift to everyone online at once.
 	.post('/api/staff/online/gift-tokens', requireDeveloper, giftOnlineTokensHandler)
 	// Its sibling: the same gift to every account whose Discord link holds a role, offline

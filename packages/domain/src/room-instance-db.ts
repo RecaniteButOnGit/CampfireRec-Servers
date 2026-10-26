@@ -477,6 +477,25 @@ export async function deleteEmptyRoomInstances(
 }
 
 /**
+ * Delete EVERY instance of a room, occupied or not — the staff "Clear instances" button
+ * for a room whose sessions are stuck. Presence is left alone: a player still in a
+ * deleted instance keeps their row until it expires or they move, and their next
+ * matchmake lands them in a fresh instance.
+ *
+ * Returns the ids deleted.
+ */
+export async function deleteRoomInstancesByRoom(db: D1Database, roomId: number): Promise<number[]> {
+	const { results } = await db
+		.prepare(
+			`DELETE FROM room_instance WHERE room_id = ?1
+			 RETURNING json_extract(data, '$.roomInstanceId') AS id`
+		)
+		.bind(roomId)
+		.all<{ id: number }>()
+	return results.map((r) => r.id)
+}
+
+/**
  * The oldest joinable public instance of a room (not private, not full, joins
  * enabled, not already in progress, not set to `Ignore`) that is running `gameVersion`,
  * or null when there's none to join. Used by matchmaking to reuse an existing instance

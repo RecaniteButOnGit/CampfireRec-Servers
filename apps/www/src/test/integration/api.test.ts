@@ -22,7 +22,11 @@ import {
 	setPresence,
 } from '@repo/domain/src/presence-db'
 import { getProgression, PROGRESSION_SCHEMA_DDL } from '@repo/domain/src/progression-db'
-import { ROOM_INSTANCE_SCHEMA_DDL } from '@repo/domain/src/room-instance-db'
+import {
+	createRoomInstance,
+	getRoomInstancesByRoom,
+	ROOM_INSTANCE_SCHEMA_DDL,
+} from '@repo/domain/src/room-instance-db'
 // Banning a player moves them into their own dorm, which is a room (created on demand) with
 // a subroom — so those tables have to be here, as they are on the shared database.
 import { getOrCreateDormRoom, ROOM_SCHEMA_DDL, SUBROOM_SCHEMA_DDL } from '@repo/domain/src/rooms-db'
@@ -1087,6 +1091,7 @@ it('refuses every staff endpoint without a token, and without a staff role', asy
 		'/api/staff/players/1/username-changes',
 		'/api/staff/players/1/clear-password',
 		'/api/staff/players/1/clear-dorm',
+		'/api/staff/rooms/1/clear-instances',
 		'/api/staff/studio-access',
 		'/api/staff/players/1/grant-plus',
 	]
@@ -2470,6 +2475,31 @@ it('clears a player’s dorm by publishing an empty save over the newest one', a
 		{ playerId: 8340, roomId, previousSaveId: newer, saveId },
 		{ playerId: 8340, roomId, previousSaveId: saveId, saveId: null },
 	])
+})
+
+it('clears every instance of a room, for any staff member', async () => {
+	const make = (roomId: number, photonRoomId: string) =>
+		createRoomInstance(env.DB, { ownerAccountId: 8110, roomId, photonRoomId })
+	const a = await make(7740, 'clear-a')
+	const b = await make(7740, 'clear-b')
+	const other = await make(7741, 'clear-other')
+
+	// A moderator, not only a developer, may clear a room.
+	const res = await staffPost('/api/staff/rooms/7740/clear-instances', 8101, {})
+	expect(res.status).toBe(200)
+	const body = (await res.json()) as { roomId: number; deleted: number[] }
+	expect(body.roomId).toBe(7740)
+	expect(body.deleted.toSorted()).toEqual([a.roomInstanceId, b.roomInstanceId].toSorted())
+	expect(await getRoomInstancesByRoom(env.DB, 7740)).toEqual([])
+	// Another room's instances are untouched.
+	expect((await getRoomInstancesByRoom(env.DB, 7741)).map((i) => i.roomInstanceId)).toEqual([
+		other.roomInstanceId,
+	])
+
+	// Clearing an empty room succeeds and deletes nothing.
+	const again = await staffPost('/api/staff/rooms/7740/clear-instances', 8101, {})
+	expect(await again.json()).toEqual({ roomId: 7740, deleted: [] })
+	expect((await staffPost('/api/staff/rooms/abc/clear-instances', 8101, {})).status).toBe(400)
 })
 
 it('grants a player Plus, developers only', async () => {

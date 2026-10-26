@@ -4,6 +4,7 @@ import {
 	clearDormSaveBlob,
 	clearPasswordHash,
 	createGift,
+	deleteRoomInstancesByRoom,
 	getAccount,
 	getImageById,
 	getOnlinePlayerIds,
@@ -1014,6 +1015,28 @@ export async function giftRoomTokensHandler(c: Context<App>) {
 		skippedCount: skipped.length,
 	})
 	return c.json({ roomId, amount, paid, skipped })
+}
+
+/**
+ * Delete every instance of a room from `room_instance`, from the room's own page. For a
+ * room whose sessions have gone bad: the next player to matchmake in gets a fresh one.
+ * Clearing a room with no instances succeeds and deletes nothing.
+ */
+export async function clearRoomInstancesHandler(c: Context<App>) {
+	const roomId = Number(c.req.param('roomId'))
+	if (!Number.isInteger(roomId) || roomId <= 0) {
+		return c.json({ error: 'A numeric room id is required' }, 400)
+	}
+
+	const deleted = await deleteRoomInstancesByRoom(c.env.DB, roomId)
+
+	await recordPlayerAudit(c, 'clear_room_instances', { roomId, deleted })
+	logger.info('staff cleared room instances', {
+		moderatorId: staffId(c),
+		roomId,
+		deletedCount: deleted.length,
+	})
+	return c.json({ roomId, deleted })
 }
 
 /**

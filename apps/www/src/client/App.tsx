@@ -3213,6 +3213,7 @@ function PublicRoomView({
 				<>
 					{isDeveloper() && <StaffRoomTokens room={room} />}
 					<StaffListing room={room} onRoomChange={onRoomChange} />
+					<StaffClearInstances room={room} />
 					{isDeveloper() && <StaffTakedown room={room} onTakenDown={onTakenDown} />}
 				</>
 			)}
@@ -3345,6 +3346,64 @@ function StaffListing({
 				and by invite, and its creator keeps everything. Sets both the lists and search exclusions
 				at once.
 			</p>
+			{error && <p className="error">{error}</p>}
+			{done && <p className="ok">{done}</p>}
+		</section>
+	)
+}
+
+/**
+ * Delete every instance of the room, for one whose sessions are stuck. Two steps, like the
+ * dorm clear: nothing is lost for good, but anyone inside is cut off from their session.
+ */
+function StaffClearInstances({ room }: { room: OwnedRoom }) {
+	const [confirming, setConfirming] = useState(false)
+	const { pending, error, done, run } = useAction()
+
+	return (
+		<section className="card">
+			<h2>Instances</h2>
+			<p className="hint">
+				Deletes every instance of this room, including ones with players in them. The next player to
+				join gets a fresh instance.
+			</p>
+			<div className="mod-filter-actions">
+				{confirming ? (
+					<>
+						<button
+							type="submit"
+							disabled={pending}
+							onClick={() =>
+								void run(async () => {
+									const res = await call<{ deleted: number[] }>(
+										`/api/staff/rooms/${room.RoomId}/clear-instances`,
+										{ authed: true, method: 'POST' }
+									)
+									setConfirming(false)
+									const n = res.deleted.length
+									return n === 0
+										? `^${room.Name} had no instances.`
+										: `Cleared ${n} instance${n === 1 ? '' : 's'} of ^${room.Name}.`
+								})
+							}
+						>
+							{pending ? 'Clearing…' : 'Confirm clear instances'}
+						</button>
+						<button
+							type="button"
+							className="linkish"
+							disabled={pending}
+							onClick={() => setConfirming(false)}
+						>
+							Cancel
+						</button>
+					</>
+				) : (
+					<button type="submit" onClick={() => setConfirming(true)}>
+						Clear instances
+					</button>
+				)}
+			</div>
 			{error && <p className="error">{error}</p>}
 			{done && <p className="ok">{done}</p>}
 		</section>
