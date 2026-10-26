@@ -2720,7 +2720,7 @@ function About({ slides, error }: { slides: Slide[] | null; error: string }) {
 	return (
 		<section className="about">
 			<div>
-				<h2 className="about-title">A cloud architected server for the 2023/2025 game clients</h2>
+				<h2 className="about-title">A cloud architected server for the 2023-2026 game clients</h2>
 				<p className="about-lede">
 					A free fan project, made by players who missed it. Aiming to be{' '}
 					<strong>feature-complete</strong> and infinitely scalable —{' '}
