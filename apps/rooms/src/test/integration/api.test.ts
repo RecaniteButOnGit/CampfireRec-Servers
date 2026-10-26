@@ -9,6 +9,7 @@ import {
 import { beforeAll, describe, expect, it } from 'vitest'
 
 import {
+	answerRoomRoleInvite,
 	AUDIT_LOG_SCHEMA_DDL,
 	countRoomsUsingInvention,
 	createRoomInstance,
@@ -540,6 +541,20 @@ describe('rooms endpoints', () => {
 			Roles: [{ AccountId: 822, Role: 30 }],
 		})
 		await seed({ RoomId: 30405, Name: 'ContribNoRoles', CreatorAccountId: 821, SubRooms: [] })
+		// ...and one where 820 has only been INVITED to co-own — `Role` 0 with the offer on
+		// `InvitedRole`. They have no job in the room until they accept, so it stays out of
+		// both of their lists, and the pending entry is not served as part of the room.
+		await seed({
+			RoomId: 30408,
+			Name: 'ContribInvited',
+			CreatorAccountId: 821,
+			Accessibility: 1,
+			SubRooms: [],
+			Roles: [
+				{ AccountId: 821, Role: 255, LastChangedByAccountId: null, InvitedRole: 0 },
+				{ AccountId: 820, Role: 0, LastChangedByAccountId: 821, InvitedRole: 30 },
+			],
+		})
 
 		const res = await SELF.fetch(`${ORIGIN}/rooms/contributedby/me`, {
 			headers: await bearer('820'),
@@ -553,6 +568,44 @@ describe('rooms endpoints', () => {
 		// empty for someone who only ever built their own — but the dorm is not.
 		expect(rooms.some((r) => r.RoomId === 30407)).toBe(false)
 		expect(rooms[0]).toMatchObject({ Name: expect.any(String), Accessibility: expect.any(Number) })
+
+		// The unanswered invite lists the room for NOBODY: not under "contributed" (above),
+		// not under "owned".
+		const owned = await SELF.fetch(`${ORIGIN}/rooms/ownedby/me`, { headers: await bearer('820') })
+		const ownedIds = ((await owned.json()) as Array<{ RoomId: number }>).map((r) => r.RoomId)
+		expect(ownedIds).toContain(30401)
+		expect(ownedIds).not.toContain(30408)
+
+		// Nor is the invited player part of the room anyone is shown: the room DTO and the
+		// role list carry only HELD roles. The stored room keeps the entry for the accept.
+		type Served = { Roles: Array<{ AccountId: number; Role: number; InvitedRole: number }> }
+		const servedRoles = async () =>
+			((await (await SELF.fetch(`${ORIGIN}/rooms/30408`)).json()) as Served).Roles
+		expect(await servedRoles()).toEqual([
+			{ AccountId: 821, Role: 255, LastChangedByAccountId: null, InvitedRole: 0 },
+		])
+		expect(await (await SELF.fetch(`${ORIGIN}/rooms/30408/roles`)).json()).toEqual([
+			{ AccountId: 821, Role: 255, LastChangedByAccountId: null, InvitedRole: 0 },
+		])
+		expect(
+			await env.DB.prepare(
+				'SELECT role, invited_role FROM room_role WHERE room_id = 30408 AND account_id = 820'
+			).first()
+		).toEqual({ role: 0, invited_role: 30 })
+
+		// Accepting is what puts them in: the room appears in both lists and the entry is served.
+		const invitedRoom = (await getRoomById(env.DB, 30408))!
+		expect(await answerRoomRoleInvite(env.DB, 30408, 820, 30, invitedRoom)).not.toBeNull()
+		expect(await contributed('820')).toContain(30408)
+		const ownedAfter = await SELF.fetch(`${ORIGIN}/rooms/ownedby/me`, {
+			headers: await bearer('820'),
+		})
+		expect(((await ownedAfter.json()) as Array<{ RoomId: number }>).map((r) => r.RoomId)).toContain(
+			30408
+		)
+		expect(await servedRoles()).toContainEqual(
+			expect.objectContaining({ AccountId: 820, Role: 30, InvitedRole: 0 })
+		)
 
 		// A player who contributes to nothing gets an empty array, not a 404.
 		const none = await SELF.fetch(`${ORIGIN}/rooms/contributedby/me`, {
@@ -579,8 +632,8 @@ describe('rooms endpoints', () => {
 
 		// The DB is shared across this file, and these are the only player-made public rooms
 		// in it — leaving them behind changes what the `new`/`community` room feeds serve.
-		await env.DB.prepare('DELETE FROM room WHERE room_id BETWEEN 30401 AND 30407').run()
-		await env.DB.prepare('DELETE FROM room_role WHERE room_id BETWEEN 30401 AND 30407').run()
+		await env.DB.prepare('DELETE FROM room WHERE room_id BETWEEN 30401 AND 30408').run()
+		await env.DB.prepare('DELETE FROM room_role WHERE room_id BETWEEN 30401 AND 30408').run()
 	})
 
 	it('GET /rooms/:roomId/experience serves the room’s stored XP settings, no auth', async () => {
@@ -1675,6 +1728,19 @@ describe('rooms endpoints', () => {
 	type RoomEnv = { success: boolean; error: string; value: Record<string, unknown> | null }
 	const envOf = async (res: Response) => (await res.json()) as RoomEnv
 
+	// A role entry as STORED, read off the `room_role` index — pending invites included.
+	// The served room and `GET /rooms/:id/roles` carry only held roles, so an entry that is
+	// nothing but an unanswered invite (`Role` 0) can only be observed here.
+	type StoredRole = { Role: number; InvitedRole: number; LastChangedByAccountId: number | null }
+	const storedRoleOf = async (roomId: number, accountId: number) =>
+		(await env.DB.prepare(
+			`SELECT role AS Role, invited_role AS InvitedRole,
+			        last_changed_by_account_id AS LastChangedByAccountId
+			 FROM room_role WHERE room_id = ?1 AND account_id = ?2`
+		)
+			.bind(roomId, accountId)
+			.first<StoredRole>()) ?? undefined
+
 	// A subroom as the client sees it. There is no GET for a single subroom — the client
 	// reads them off the room — so tests do the same.
 	const subRoomOf = async (
@@ -2091,7 +2157,9 @@ describe('rooms endpoints', () => {
 			success: false,
 			error: 'You must provide a valid role!',
 		})
-		expect(await roleOf(885)).toMatchObject({ InvitedRole: 30 })
+		expect(await storedRoleOf(2, 885)).toMatchObject({ Role: 0, InvitedRole: 30 })
+		// An entry that is only an invite is not a role the room serves.
+		expect(await roleOf(885)).toBeUndefined()
 	})
 
 	it('a revoke pushes a RoomUpdate to the room and to the player who lost the role', async () => {
@@ -2150,9 +2218,13 @@ describe('rooms endpoints', () => {
 			)
 
 		// RecCenter (room 2) is owned by account 1. The owner invites 850 to co-ownership,
-		// leaving a pending offer and no role yet.
+		// leaving a pending offer and no role yet. The offer is stored on their entry but
+		// the room as SERVED does not list them: they are not a member until they accept.
 		expect((await putForm('/rooms/2/roles/850/invite', { role: '30' }, '1')).status).toBe(200)
-		expect(await roleOf(850)).toMatchObject({ Role: 0, InvitedRole: 30 })
+		expect(await storedRoleOf(2, 850)).toMatchObject({ Role: 0, InvitedRole: 30 })
+		expect(await roleOf(850)).toBeUndefined()
+		const room2 = (await (await SELF.fetch(`${ORIGIN}/rooms/2`)).json()) as { Roles: Role[] }
+		expect(room2.Roles.some((r) => r.AccountId === 850)).toBe(false)
 
 		// No token → 401 (auth gate).
 		expect((await putForm('/rooms/2/roles/850', { role: '30' })).status).toBe(401)
@@ -2165,7 +2237,7 @@ describe('rooms endpoints', () => {
 				await envOf(await putForm('/rooms/2/roles/850', { role: '30' }, caller))
 			).toMatchObject({ success: false, error: 'Co-ownership must be invited, not granted!' })
 		}
-		expect(await roleOf(850)).toMatchObject({ Role: 0, InvitedRole: 30 })
+		expect(await storedRoleOf(2, 850)).toMatchObject({ Role: 0, InvitedRole: 30 })
 		// Unknown room → failure envelope.
 		expect(
 			await envOf(await putForm('/rooms/99999/roles/850', { role: '30' }, '850'))
@@ -2182,7 +2254,7 @@ describe('rooms endpoints', () => {
 		expect(await envOf(await putForm('/rooms/2/roles/850', { role: '255' }, '850'))).toMatchObject({
 			success: false,
 		})
-		expect(await roleOf(850)).toMatchObject({ Role: 0, InvitedRole: 30 })
+		expect(await storedRoleOf(2, 850)).toMatchObject({ Role: 0, InvitedRole: 30 })
 
 		// A player with no entry in the room at all is the same rejection — probing tells
 		// them nothing.
@@ -2229,11 +2301,13 @@ describe('rooms endpoints', () => {
 		// Invited, then declined: the whole entry goes, leaving `Roles` as it was before the
 		// offer rather than an entry with nothing pending on it.
 		expect((await putForm('/rooms/2/roles/851/invite', { role: '30' }, '1')).status).toBe(200)
-		expect(await roleOf(851)).toMatchObject({ Role: 0, InvitedRole: 30 })
+		expect(await storedRoleOf(2, 851)).toMatchObject({ Role: 0, InvitedRole: 30 })
+		expect(await roleOf(851)).toBeUndefined()
 
 		const declined = await putForm('/rooms/2/roles/851', { role: '0' }, '851')
 		expect(declined.status).toBe(200)
 		expect(await envOf(declined)).toMatchObject({ success: true, error: '' })
+		expect(await storedRoleOf(2, 851)).toBeUndefined()
 		expect(await roleOf(851)).toBeUndefined()
 
 		// And the decline can't be replayed either — there is no entry left to answer.
@@ -2248,6 +2322,7 @@ describe('rooms endpoints', () => {
 		expect(await roleOf(852)).toMatchObject({ Role: 10, InvitedRole: 0 })
 		expect((await putForm('/rooms/2/roles/852/invite', { role: '30' }, '1')).status).toBe(200)
 		expect((await putForm('/rooms/2/roles/852', { role: '0' }, '852')).status).toBe(200)
+		expect(await storedRoleOf(2, 852)).toBeUndefined()
 		expect(await roleOf(852)).toBeUndefined()
 	})
 
@@ -2495,12 +2570,14 @@ describe('rooms endpoints', () => {
 		expect(await res.json()).toEqual({ success: true })
 
 		// A new entry, holding no role yet — only the pending offer, stamped with the inviter.
-		expect(await rolesOf(2)).toContainEqual({
-			AccountId: 187,
+		// STORED, not served: the room's role list carries held roles only, so the invited
+		// player does not appear on it until they accept.
+		expect(await storedRoleOf(2, 187)).toEqual({
 			Role: 0,
 			InvitedRole: 30,
 			LastChangedByAccountId: 1,
 		})
+		expect((await rolesOf(2)).find((r) => r.AccountId === 187)).toBeUndefined()
 
 		// One MessageReceived to the INVITED player carrying a type 62 RoomCoOwnerInvited —
 		// the entry alone is silent, this is what raises the invite on their client.
@@ -7320,7 +7397,7 @@ it('omits hydrated Badges when persisting a room settings edit', async () => {
 // The badge lookup runs on every room page, served by a partial index over the badge rows
 // (api migrations/0035, mirrored in SCHEMA_DDL above). Only a PUBLISHED badge with a built save
 // hydrates; a draft stays on its creator's Studio shelf.
-it('GET /rooms/:id hydrates the room\'s published badges', async () => {
+it("GET /rooms/:id hydrates the room's published badges", async () => {
 	await seedRoomWithSubRooms(env.DB, {
 		RoomId: 987671,
 		Name: 'BadgeHydration',

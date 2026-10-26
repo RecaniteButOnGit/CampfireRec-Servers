@@ -14,6 +14,7 @@ import {
 	canManageRoomById,
 	cloneRoom,
 	cloneSubRoom,
+	confirmedRoomRoles,
 	countRoomsByCreator,
 	createNotification,
 	createStudioRoom,
@@ -83,6 +84,7 @@ import {
 	transferRoomOwnership,
 	unbanPlayerFromRoom,
 	updateRoomFields,
+	withConfirmedRoles,
 	writeAuditLog,
 } from '@repo/domain'
 import {
@@ -665,16 +667,14 @@ function parseMaxPlayerCalculationMode(value: unknown): number | undefined {
 	return Object.values(MAX_PLAYER_CALCULATION_MODES).includes(ordinal) ? ordinal : undefined
 }
 
-async function pushRoomUpdate(
-	c: Context<App>,
-	playerId: number,
-	room: Record<string, unknown>
-): Promise<void> {
+async function pushRoomUpdate(c: Context<App>, playerId: number, room: Room): Promise<void> {
 	try {
+		// The pushed room is the client's room, like any served one: pending invites are not
+		// part of its `Roles` (see `serveRoom`).
 		await c.env.RECFLARE_NOTIFICATIONS_HUB.getByName(HUB_INSTANCE).notifyPlayer(
 			playerId,
 			NotificationType.SubscriptionUpdateRoom,
-			room
+			withConfirmedRoles(room)
 		)
 	} catch (err) {
 		logger.error('failed to push RoomUpdate notification', {
@@ -702,7 +702,7 @@ async function pushRoomUpdate(
 async function pushRoomUpdateToRoom(
 	c: Context<App>,
 	roomId: number,
-	room: Record<string, unknown>,
+	room: Room,
 	alsoNotify: number[] = []
 ): Promise<void> {
 	const playerIds = new Set(await getPlayerIdsInRoom(c.env.DB, roomId))
@@ -1114,16 +1114,44 @@ function toSaveDetail(save: Record<string, unknown>, target: number | null) {
 	}
 }
 
-/** Client envelope for room mutations: `{ success, error, value }` (lowercase). */
-function roomEnvelope(c: Context<App>, value: unknown, error = '') {
-	return c.json({ success: error === '', error, value })
+/**
+ * A room as the client is shown it. The stored room is served whole EXCEPT for its pending
+ * role invites: a `Roles` entry with `Role` 0 and an `InvitedRole` is an offer the player
+ * has not answered, and served as-is it put the invited player on the room's member list
+ * (and, on the 2025 client, in its co-owner list) before they had accepted anything. The
+ * offer reaches them as a `RoomCoOwnerInvited` message; the entry stays in the STORED room
+ * for the accept to promote, which is why this is applied where the room leaves the worker
+ * and never to a room about to be written back.
+ *
+ * Every room this worker answers — alone, in a list, in the mutation envelope or pushed as
+ * a `RoomUpdate` — goes through this (or {@link serveRooms}).
+ */
+const serveRoom = withConfirmedRoles
+
+/** {@link serveRoom} over a list. */
+const serveRooms = (rooms: Room[]): Room[] => rooms.map(serveRoom)
+
+/** {@link serveRoom} over a `{ Results, TotalResults }` page. */
+const serveRoomPage = <T extends { Results: Room[] }>(page: T): T => ({
+	...page,
+	Results: serveRooms(page.Results),
+})
+
+/**
+ * Client envelope for room mutations: `{ success, error, value }` (lowercase). `value` is
+ * the updated room (served through {@link serveRoom}) or null on a refusal.
+ */
+function roomEnvelope(c: Context<App>, value: Room | null, error = '') {
+	return c.json({ success: error === '', error, value: value && serveRoom(value) })
 }
 
 /**
  * The same envelope for the ban write, whose `value` is the BAN rather than the room —
  * a ban isn't part of the room the client renders, so there is no updated room to send.
  */
-const banEnvelope = roomEnvelope
+function banEnvelope(c: Context<App>, value: unknown, error = '') {
+	return c.json({ success: error === '', error, value })
+}
 
 /**
  * The envelope both leaderboard routes answer: `{ Success, Error, error_id }`, carrying
@@ -1162,7 +1190,7 @@ const experienceEnvelope = leaderboardEnvelope
 async function ownedRooms(c: Context<App>) {
 	const accountId = await authedAccountId(c)
 	if (accountId === null) return unauthorized(c)
-	return c.json(await getRoomsByCreator(c.env.DB, accountId))
+	return c.json(serveRooms(await getRoomsByCreator(c.env.DB, accountId)))
 }
 
 /**
@@ -1175,7 +1203,7 @@ async function ownedRoomsExcludingDorm(c: Context<App>) {
 	const rooms = (await getContributedRooms(c.env.DB, accountId)).filter((room) =>
 		canManageRoom(room, accountId)
 	)
-	return c.json(rooms.filter((r) => r.IsDorm !== true))
+	return c.json(serveRooms(rooms.filter((r) => r.IsDorm !== true)))
 }
 
 /** Suggestions `/rooms/autocomplete_search` returns when the client names no `take`. */
@@ -1331,10 +1359,10 @@ const app = new Hono<App>()
 			if (idParam) {
 				const id = firstId(idParam)
 				const room = id === undefined ? null : await getRoomById(c.env.DB, id)
-				return c.json(room ?? (c.req.query('include') === '525581' ? null : {}))
+				return c.json(room ? serveRoom(room) : c.req.query('include') === '525581' ? null : {})
 			}
 			const room = await getRoomByName(c.env.DB, nameParam ?? '')
-			return c.json(room ?? (c.req.query('include') === '525581' ? null : {}))
+			return c.json(room ? serveRoom(room) : c.req.query('include') === '525581' ? null : {})
 		}
 	)
 
@@ -1366,7 +1394,7 @@ const app = new Hono<App>()
 				return c.json({ error: `You can only have ${maxRooms} rooms.` }, 403)
 			const room = await createStudioRoom(c.env.DB, name, accountId, version)
 			if (!room) return c.json({ error: 'A room with that name already exists.' }, 409)
-			return c.json(room)
+			return c.json(serveRoom(room))
 		}
 	)
 
@@ -1404,7 +1432,7 @@ const app = new Hono<App>()
 			const query = c.req.query('query') ?? ''
 			const skip = Number.parseInt(c.req.query('skip') ?? '0', 10) || 0
 			const take = Number.parseInt(c.req.query('take') ?? '30', 10) || 30
-			return c.json(await searchRooms(c.env.DB, query, skip, take))
+			return c.json(serveRoomPage(await searchRooms(c.env.DB, query, skip, take)))
 		}
 	)
 
@@ -1489,7 +1517,7 @@ const app = new Hono<App>()
 			const tag = c.req.query('tag') ?? ''
 			const skip = Number.parseInt(c.req.query('skip') ?? '0', 10) || 0
 			const take = Number.parseInt(c.req.query('take') ?? '100', 10) || 100
-			return c.json(await getHotRooms(c.env.DB, tag, skip, take))
+			return c.json(serveRoomPage(await getHotRooms(c.env.DB, tag, skip, take)))
 		}
 	)
 
@@ -1541,7 +1569,7 @@ const app = new Hono<App>()
 		async (c) => {
 			const skip = Number.parseInt(c.req.query('skip') ?? '0', 10) || 0
 			const take = Number.parseInt(c.req.query('take') ?? '100', 10) || 100
-			return c.json(await getTrendingRooms(c.env.DB, skip, take))
+			return c.json(serveRoomPage(await getTrendingRooms(c.env.DB, skip, take)))
 		}
 	)
 
@@ -1563,7 +1591,7 @@ const app = new Hono<App>()
 		async (c) => {
 			const skip = Number.parseInt(c.req.query('skip') ?? '0', 10) || 0
 			const take = Number.parseInt(c.req.query('take') ?? '100', 10) || 100
-			return c.json(await getBaseRooms(c.env.DB, skip, take))
+			return c.json(serveRooms(await getBaseRooms(c.env.DB, skip, take)))
 		}
 	)
 
@@ -1591,7 +1619,7 @@ const app = new Hono<App>()
 		async (c) => {
 			const skip = Number.parseInt(c.req.query('skip') ?? '0', 10) || 0
 			const take = Number.parseInt(c.req.query('take') ?? '100', 10) || 100
-			return c.json(await getRecommendedRooms(c.env.DB, skip, take))
+			return c.json(serveRooms(await getRecommendedRooms(c.env.DB, skip, take)))
 		}
 	)
 
@@ -1686,13 +1714,15 @@ const app = new Hono<App>()
 				if (ids.length > MAX_BULK_ROOM_IDS) return tooManyIds(c)
 				const rooms = await getRoomsByIds(c.env.DB, ids)
 				return c.json(
-					excludePrivateRooms(c.req.query('excludePrivateRooms'))
-						? rooms.filter((r) => r.Accessibility === 1)
-						: rooms
+					serveRooms(
+						excludePrivateRooms(c.req.query('excludePrivateRooms'))
+							? rooms.filter((r) => r.Accessibility === 1)
+							: rooms
+					)
 				)
 			}
 			const room = await getRoomByName(c.env.DB, nameParam ?? '')
-			return c.json(room ? [room] : [])
+			return c.json(room ? [serveRoom(room)] : [])
 		}
 	)
 
@@ -1744,7 +1774,7 @@ const app = new Hono<App>()
 			const rooms = await getRoomsByIds(c.env.DB, ids)
 
 			const excludePrivate = excludePrivateRooms(field('excludePrivateRooms')[0])
-			return c.json(excludePrivate ? rooms.filter((r) => r.Accessibility === 1) : rooms)
+			return c.json(serveRooms(excludePrivate ? rooms.filter((r) => r.Accessibility === 1) : rooms))
 		}
 	)
 
@@ -1835,7 +1865,7 @@ const app = new Hono<App>()
 		async (c) => {
 			const accountId = await authedAccountId(c)
 			if (accountId === null) return unauthorized(c)
-			return c.json(await getContributedRooms(c.env.DB, accountId))
+			return c.json(serveRooms(await getContributedRooms(c.env.DB, accountId)))
 		}
 	)
 
@@ -1892,7 +1922,11 @@ const app = new Hono<App>()
 			responses: { 200: json(RoomDto.array(), 'That account’s public rooms') },
 		}),
 		async (c) =>
-			c.json(await getPublicRoomsByCreator(c.env.DB, Number.parseInt(c.req.param('accountId'), 10)))
+			c.json(
+				serveRooms(
+					await getPublicRoomsByCreator(c.env.DB, Number.parseInt(c.req.param('accountId'), 10))
+				)
+			)
 	)
 
 	// A player's showcased rooms — the hand-picked rail the client draws on a profile,
@@ -1940,7 +1974,7 @@ const app = new Hono<App>()
 			if (accountId === null) return unauthorized(c)
 			const skip = Number.parseInt(c.req.query('skip') ?? '0', 10) || 0
 			const take = Number.parseInt(c.req.query('take') ?? '100', 10) || 100
-			return c.json(await getFavoritedRooms(c.env.DB, accountId, skip, take))
+			return c.json(serveRooms(await getFavoritedRooms(c.env.DB, accountId, skip, take)))
 		}
 	)
 
@@ -1964,7 +1998,7 @@ const app = new Hono<App>()
 			if (accountId === null) return unauthorized(c)
 			const skip = Number.parseInt(c.req.query('skip') ?? '0', 10) || 0
 			const take = Number.parseInt(c.req.query('take') ?? '100', 10) || 100
-			return c.json(await getVisitedRooms(c.env.DB, accountId, skip, take))
+			return c.json(serveRooms(await getVisitedRooms(c.env.DB, accountId, skip, take)))
 		}
 	)
 
@@ -2010,9 +2044,11 @@ const app = new Hono<App>()
 			const skip = Number.parseInt(c.req.query('skip') ?? '0', 10) || 0
 			const take = Number.parseInt(c.req.query('take') ?? '100', 10) || 100
 			return c.json(
-				own
-					? await getVisitedRooms(c.env.DB, playerId, skip, take)
-					: await getPublicVisitedRooms(c.env.DB, playerId, skip, take)
+				serveRooms(
+					own
+						? await getVisitedRooms(c.env.DB, playerId, skip, take)
+						: await getPublicVisitedRooms(c.env.DB, playerId, skip, take)
+				)
 			)
 		}
 	)
@@ -2627,6 +2663,12 @@ const app = new Hono<App>()
 				'room DTO serves under `Roles`, on its own endpoint, so it is public exactly like the',
 				'room is: a role list says who runs a room, which the room page already shows.',
 				'',
+				'Held roles only. A player with a standing co-owner invite they have not answered',
+				'(`Role` 0, the offer on `InvitedRole`) is not listed here or on the room DTO: they',
+				'have no standing in the room until they accept, and the offer reaches them as a',
+				'`RoomCoOwnerInvited` message. A member who holds a role AND has a higher one pending',
+				'is listed at the role they hold, `InvitedRole` included.',
+				'',
 				'A bare array, NOT the `{ success, error, value }` envelope the role WRITE answers. An',
 				'unknown room is an empty list rather than an error — it reads the same as a room',
 				'nobody holds a role in.',
@@ -2639,7 +2681,7 @@ const app = new Hono<App>()
 		async (c) => {
 			const roomId = Number.parseInt(c.req.param('roomId'), 10)
 			const room = await getRoomById(c.env.DB, roomId)
-			return c.json(room ? roomRoles(room) : [])
+			return c.json(room ? confirmedRoomRoles(room) : [])
 		}
 	)
 
@@ -4311,7 +4353,7 @@ const app = new Hono<App>()
 			return c.json({
 				success: true,
 				error: null,
-				value: { room: result.room, subRoomDataSave: toSaveResponse(result.save) },
+				value: { room: serveRoom(result.room), subRoomDataSave: toSaveResponse(result.save) },
 			})
 		}
 	)
@@ -4862,7 +4904,9 @@ const app = new Hono<App>()
 			const skip = Number.parseInt(c.req.query('skip') ?? '0', 10) || 0
 			const take = Number.parseInt(c.req.query('take') ?? '100', 10) || 100
 			return c.json(
-				await getSimilarRooms(c.env.DB, Number.parseInt(c.req.param('roomId'), 10), skip, take)
+				serveRoomPage(
+					await getSimilarRooms(c.env.DB, Number.parseInt(c.req.param('roomId'), 10), skip, take)
+				)
 			)
 		}
 	)
@@ -5130,7 +5174,9 @@ const app = new Hono<App>()
 			tags: ['Rooms'],
 			summary: 'A room by id',
 			description: [
-				'The room as stored, with its `SubRooms` re-attached. Unlike `GET /rooms?id=`, an',
+				'The room as stored, with its `SubRooms` re-attached and pending role invites left',
+				'out of `Roles` (an unanswered invite is `Role` 0 with the offer on `InvitedRole`; the',
+				'invited player is not a member until they accept). Unlike `GET /rooms?id=`, an',
 				'unknown room here is a 404, not `{}`. A save that has a Rec Room Studio build',
 				'lists its main bundles on `CurrentSave.UnitySubAssets` (`Target` 0 Windows, 2',
 				'Android/Quest, `Filename` downloaded from the CDN at `/unityasset/{filename}`).',
@@ -5153,7 +5199,7 @@ const app = new Hono<App>()
 			const room = await getRoomById(c.env.DB, Number.parseInt(c.req.param('roomId'), 10))
 			if (!room) return c.notFound()
 			filterRoomUnityAssets(room, unityAssetTargetQuery(c))
-			return c.json(room)
+			return c.json(serveRoom(room))
 		}
 	)
 

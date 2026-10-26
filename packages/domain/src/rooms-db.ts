@@ -293,6 +293,47 @@ export function roomRoles(room: Room): RoomRole[] {
 }
 
 /**
+ * Whether a `Roles` entry records a role the account actually HOLDS, as opposed to one it has
+ * only been offered. An invite is an entry with `Role` {@link Role.None} and the offer on
+ * `InvitedRole`; it stays that way until the player accepts ({@link answerRoomRoleInvite})
+ * or declines (which drops the entry). Tolerates the raw blob shape — older rooms carry
+ * entries without a `Role` key, which read as None, and a malformed entry is not a role.
+ */
+function holdsRole(entry: unknown): boolean {
+	if (entry === null || typeof entry !== 'object') return false
+	return Number((entry as Partial<RoomRole>).Role ?? Role.None) !== Role.None
+}
+
+/**
+ * A room's HELD roles — {@link roomRoles} without the pending invites. What the client is
+ * shown as the room's role list: an invited player has no standing in the room until they
+ * accept, and listing them as a member with `Role` 0 showed them on the room's member list
+ * before they had agreed to anything. The offer reaches them as a `RoomCoOwnerInvited`
+ * message instead, and the entry itself stays in the stored room for
+ * {@link answerRoomRoleInvite} to promote.
+ */
+export function confirmedRoomRoles(room: Room): RoomRole[] {
+	return roomRoles(room).filter((r) => r.Role !== Role.None)
+}
+
+/**
+ * The room as SERVED, with pending invites dropped from its `Roles` — a shallow copy; the
+ * room passed in is untouched, so a caller can keep writing from it. Entries are kept in the
+ * blob's own shape (not normalised through {@link roomRoles}), so a room that had no
+ * pending invite serializes exactly as before. A room with no `Roles` array is returned as
+ * is.
+ *
+ * Apply this at the response boundary ONLY, never to a room that is about to be written
+ * back. Rooms are stored as whole blobs and every writer rewrites the blob from the loaded
+ * room, so dropping the pending entries any earlier would silently erase every open invite
+ * on the room's next unrelated edit (a renamed room, a new load screen).
+ */
+export function withConfirmedRoles<T extends Room>(room: T): T {
+	if (!Array.isArray(room.Roles)) return room
+	return { ...room, Roles: room.Roles.filter(holdsRole) }
+}
+
+/**
  * The statements that bring `room_role` in line with a room's `Roles`: drop the room's rows,
  * then insert each entry whole, as {@link roomRoles} reads it. Every entry is stored,
  * pending invites (`Role` 0 with an `InvitedRole`) included. An account named twice keeps
@@ -3317,6 +3358,13 @@ export async function countRoomsByCreator(db: D1Database, accountId: number): Pr
  * room the player made. A room matching BOTH halves appears once — the roles half is an
  * EXISTS, not a join.
  *
+ * A PENDING invite is not a job. An invited account holds a `Roles` entry with `Role` 0 and
+ * the offer on `InvitedRole` until it answers, and that entry is indexed like any other —
+ * so without the `role <> 0` guard a room showed up in the player's "rooms you contribute
+ * to" (and, through `ownedby/me`, was considered for "rooms you own") the moment someone
+ * invited them, before they had accepted anything. Only a held role counts here; the offer
+ * reaches them as a `RoomCoOwnerInvited` message, not through this list.
+ *
  * Roles live inside the room blob, so the roles half reads `room_role`, the trigger-kept
  * index of them, rather than a `json_each` over every room's `$.Roles` (which scanned and
  * parsed the whole table on every call). Both halves are index lookups, and SQLite runs
@@ -3328,9 +3376,9 @@ export async function getContributedRooms(db: D1Database, accountId: number): Pr
 		.prepare(
 			`SELECT ${ROOM_COLUMNS} FROM room
 			 WHERE creator_account_id = ?1
-			    OR room_id IN (SELECT room_id FROM room_role WHERE account_id = ?1)`
+			    OR room_id IN (SELECT room_id FROM room_role WHERE account_id = ?1 AND role <> ?2)`
 		)
-		.bind(accountId)
+		.bind(accountId, Role.None)
 		.all<RoomRow>()
 	return (await hydrateRooms(db, parseAll(results))).filter((r) => r.IsDorm !== true)
 }
