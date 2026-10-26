@@ -1894,6 +1894,34 @@ button[type='submit']:disabled {
 	flex-wrap: wrap;
 }
 
+/* The account page's banner upload, in the profile banner's shape so what's uploaded
+   looks as it will across the top of the profile. */
+.banner-upload {
+	display: block;
+	margin: 12px 0 0;
+	border-radius: 9px;
+	border: 1px solid var(--line);
+}
+
+.banner-preview {
+	width: 100%;
+	height: 220px;
+	object-fit: cover;
+	background:
+		radial-gradient(
+			circle at 80% 20%,
+			color-mix(in srgb, var(--accent) 24%, transparent),
+			transparent 45%
+		),
+		linear-gradient(135deg, var(--surface-hi), var(--surface));
+}
+
+@media (max-width: 640px) {
+	.banner-preview {
+		height: 140px;
+	}
+}
+
 /* ---- Public player profiles -------------------------------------------- */
 
 .player-hero {

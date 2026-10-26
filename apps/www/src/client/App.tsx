@@ -74,6 +74,8 @@ interface SelfAccount {
 	email: string | null
 	/** A key on the `img` worker — `DefaultProfileImage.jpg` until the player sets one. */
 	profileImage: string
+	/** The profile banner's key on `img` — `""` until the player sets one. */
+	bannerImage: string
 	/**
 	 * Username changes left on the account — each change spends one, and an account
 	 * starts with one. Absent on an older self DTO, which reads as "unknown": the form
@@ -362,6 +364,41 @@ async function setProfileImage(imageName: string): Promise<void> {
 		refusal: 'The accounts worker refused the image.',
 	})
 	if (res.success !== true) throw new Error('The accounts worker refused the image.')
+}
+
+/**
+ * Upload a banner picture through the same `api` route as the avatar, but typed
+ * `SavedImageType.None` (0): the game has no banner type (its banner is one of the
+ * player's camera photos), and anything but ShareCamera stays out of the photo feed and
+ * the player's photo list, while ProfileThumbnail would also overwrite the avatar. Filed
+ * under `none/` in the bucket. Returns the key `img` serves it by.
+ */
+async function uploadBannerImage(file: File): Promise<string> {
+	const form = new FormData()
+	form.set('imgMeta', JSON.stringify({ savedImageType: 0 }))
+	form.set('image', file)
+	const { ImageName } = await call<{ ImageName?: string }>(
+		`${where().api}/api/images/v4/uploadsaved`,
+		{ method: 'POST', multipart: form, authed: true }
+	)
+	if (!ImageName) throw new Error('The api worker accepted the picture but returned no name.')
+	return ImageName
+}
+
+/**
+ * Point the account's banner at an uploaded picture — `PUT /account/me/bannerimage` on
+ * `accounts`, the call the game makes when a player picks a banner. Same `{ success }`
+ * envelope as the avatar's PUT, and it pushes the same `AccountUpdate` frame, so a
+ * running client redraws the banner too.
+ */
+async function setBannerImage(imageName: string): Promise<void> {
+	const res = await call<{ success?: boolean }>(`${where().accounts}/account/me/bannerimage`, {
+		method: 'PUT',
+		authed: true,
+		form: { imageName },
+		refusal: 'The accounts worker refused the banner.',
+	})
+	if (res.success !== true) throw new Error('The accounts worker refused the banner.')
 }
 
 /**
@@ -4318,6 +4355,11 @@ function Dashboard({
 		{ id: 'rooms', label: 'My rooms', render: () => <MyRooms navigate={navigate} /> },
 		{ id: 'photos', label: 'My photos', render: () => <MyPhotos accountId={account.accountId} /> },
 		{
+			id: 'banner',
+			label: 'Profile banner',
+			render: () => <BannerUpload account={account} onChange={onChange} />,
+		},
+		{
 			id: 'username',
 			label: 'Username',
 			render: () => <UsernameForm account={account} onChange={onChange} />,
@@ -4491,6 +4533,55 @@ function MyPhotos({ accountId }: { accountId: number }) {
 			) : (
 				<PhotoGrid photos={photos} />
 			)}
+		</section>
+	)
+}
+
+/**
+ * The profile banner, as an {@link ImageUpload} in the profile banner's own shape: upload
+ * the picture (`uploadBannerImage`), then set it on the account (`setBannerImage`). The
+ * game only lets a player pick one of their camera photos; this takes any JPEG or PNG.
+ * The held account is patched with the new key, so the preview redraws without a refetch.
+ */
+function BannerUpload({
+	account,
+	onChange,
+}: {
+	account: SelfAccount
+	onChange: (a: SelfAccount) => void
+}) {
+	const { pending, error, done, run } = useAction()
+
+	return (
+		<section className="card">
+			<h2>Profile banner</h2>
+			<p className="muted">
+				The wide picture across the top of your profile. Click it to upload a JPEG or PNG.
+			</p>
+			<ImageUpload
+				// No banner yet: a transparent pixel, so the frame shows its gradient backdrop
+				// (the profile's empty-banner look) rather than a stretched default avatar.
+				src={
+					account.bannerImage
+						? `${where().img}/${account.bannerImage}?width=1024`
+						: 'data:image/gif;base64,R0lGODlhAQABAAAAACH5BAEKAAEALAAAAAABAAEAAAICTAEAOw=='
+				}
+				className="banner-upload"
+				imgClassName="banner-preview"
+				hint={account.bannerImage ? 'Change banner' : 'Upload a banner'}
+				pending={pending}
+				onFile={(file) =>
+					void run(async () => {
+						requireImage(file)
+						const imageName = await uploadBannerImage(file)
+						await setBannerImage(imageName)
+						onChange({ ...account, bannerImage: imageName })
+						return 'Banner updated.'
+					})
+				}
+			/>
+			{error && <p className="error">{error}</p>}
+			{done && <p className="ok">{done}</p>}
 		</section>
 	)
 }
