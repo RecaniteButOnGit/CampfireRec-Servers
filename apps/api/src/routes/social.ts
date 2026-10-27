@@ -57,6 +57,22 @@ import type { App } from '../context'
 const HUB_INSTANCE = 'global'
 
 /**
+ * The only message types a PLAYER may send through `/api/messages/v2/send` (and its bulk
+ * form) — the six the client's `RecNet.Messages.SendMessage` wrappers post. Every other
+ * {@link MessageType} (cheers, friend requests, co-owner/club invites, the Coach, game
+ * invites themselves) is minted by this server from its own route; accepting them here
+ * would let any player forge one, from their own id, with a payload of their choosing.
+ */
+const PLAYER_SENDABLE_MESSAGE_TYPES: ReadonlySet<number> = new Set([
+	MessageType.GameInviteDeclined,
+	MessageType.GameJoinFailed,
+	MessageType.RequestGameInvite,
+	MessageType.RequestGameInviteDeclined,
+	MessageType.TextMessage,
+	MessageType.FriendCodeUsed,
+])
+
+/**
  * Push the `MessageReceived` frame for an ALREADY-STORED message, resolving false when the
  * hub could not be reached.
  *
@@ -343,8 +359,11 @@ export const socialRoutes = new Hono<App>({ strict: false })
 				'stored id and the recipient reads the same message back from ' +
 				'`GET /api/messages/v2/get` whether or not the push reached them. The sender is ' +
 				'the caller (from the bearer token), NOT a body field. `Type` is a Message-model ' +
-				'type (a different enum from `NotificationType`) passed through unmapped, ' +
-				'defaulting to 0; `Data` is the payload and is commonly empty.\n\n' +
+				'type (a different enum from `NotificationType`) and is required: only the ' +
+				'types the client itself posts are accepted — 1 GameInviteDeclined, 2 ' +
+				'GameJoinFailed, 10 RequestGameInvite, 11 RequestGameInviteDeclined, 30 ' +
+				'TextMessage, 41 FriendCodeUsed. Every other type is server-originated and ' +
+				'refused with a 400. `Data` is the payload and is commonly empty.\n\n' +
 				'Answers the same `{ success, error }` envelope as the report / warning writes, ' +
 				'`error` an empty string on success. A hub failure is still reported honestly as ' +
 				'a 500 with `success: false` — the message is in their inbox, but the caller ' +
@@ -353,7 +372,7 @@ export const socialRoutes = new Hono<App>({ strict: false })
 			requestBody: form(SendMessageRequest, 'The message'),
 			responses: {
 				200: json(SuccessErrorEnvelope, '`{ success: true, error: "" }`'),
-				400: json(SuccessErrorEnvelope, 'No `ToPlayerId` in the request'),
+				400: json(SuccessErrorEnvelope, 'No `ToPlayerId`, or a missing or server-only `Type`'),
 				401: UNAUTHORIZED_RESPONSE,
 				500: json(SuccessErrorEnvelope, 'The notifications hub could not be reached'),
 			},
@@ -373,10 +392,16 @@ export const socialRoutes = new Hono<App>({ strict: false })
 			// and its id is what goes on the frame. A hub failure after this point leaves
 			// the message in the recipient's inbox, which is the point of the store — they
 			// read it on next login instead of losing it.
+			// The client always names the type; a missing or server-only one is refused.
+			const type = Number(str(body.Type) ?? Number.NaN)
+			if (!PLAYER_SENDABLE_MESSAGE_TYPES.has(type)) {
+				return c.json({ success: false, error: 'Invalid message type' }, 400)
+			}
+
 			const message = await createNotification(c.env.DB, {
 				FromPlayerId: fromPlayerId,
 				ToPlayerId: toPlayerId,
-				Type: Number.parseInt(str(body.Type) ?? '', 10) || 0,
+				Type: type,
 				// `Data` stays a string, empty included — distinct from the null the types
 				// carrying no payload of their own send.
 				Data: str(body.Data) ?? '',
@@ -406,7 +431,7 @@ export const socialRoutes = new Hono<App>({ strict: false })
 				'sender rule: the caller’s bearer token, never a body field. Stored the same way ' +
 				'too — one notification per recipient, each with its own id.\n\n' +
 				'The body is JSON rather than the single send’s form encoding, so `Type` is a ' +
-				'number (still an unmapped Message-model type, defaulting to 0) and `Data` a ' +
+				'number (limited to the same player-sendable types, 400 otherwise) and `Data` a ' +
 				'string, commonly empty. Repeated ids are delivered once.\n\n' +
 				'Answers the same `{ success, error }` envelope. Delivery is attempted for every ' +
 				'recipient even after one fails, but a hub failure for ANY of them is reported ' +
@@ -417,7 +442,10 @@ export const socialRoutes = new Hono<App>({ strict: false })
 			requestBody: jsonBody(SendMultipleMessagesRequest, 'The message and its recipients'),
 			responses: {
 				200: json(SuccessErrorEnvelope, '`{ success: true, error: "" }`'),
-				400: json(SuccessErrorEnvelope, 'No usable id in `ToPlayerIds`'),
+				400: json(
+					SuccessErrorEnvelope,
+					'No usable id in `ToPlayerIds`, or a missing or server-only `Type`'
+				),
 				401: UNAUTHORIZED_RESPONSE,
 				500: json(SuccessErrorEnvelope, 'The notifications hub could not be reached'),
 			},
@@ -443,7 +471,10 @@ export const socialRoutes = new Hono<App>({ strict: false })
 				return c.json({ success: false, error: 'ToPlayerIds is required' }, 400)
 			}
 
-			const type = typeof body.Type === 'number' ? body.Type : Number(body.Type) || 0
+			const type = typeof body.Type === 'number' ? body.Type : Number(body.Type ?? Number.NaN)
+			if (!PLAYER_SENDABLE_MESSAGE_TYPES.has(type)) {
+				return c.json({ success: false, error: 'Invalid message type' }, 400)
+			}
 			const data = typeof body.Data === 'string' ? body.Data : ''
 
 			// Every recipient is attempted even if an earlier one fails — the reachable

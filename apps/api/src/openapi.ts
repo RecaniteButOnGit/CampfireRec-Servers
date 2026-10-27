@@ -205,8 +205,7 @@ export const SendMessageRequest = z.object({
 	ToPlayerId: z.string().describe('Account id of the recipient'),
 	Type: z
 		.string()
-		.optional()
-		.describe('The Message-model type, e.g. `10`. Passed through unmapped; defaults to 0'),
+		.describe('The Message-model type, e.g. `10`. Only 1, 2, 10, 11, 30 and 41 are accepted'),
 	Data: z.string().optional().describe('The message payload; often empty'),
 })
 
@@ -220,8 +219,7 @@ export const SendMultipleMessagesRequest = z.object({
 	ToPlayerIds: z.array(z.int()).describe('Account ids of the recipients'),
 	Type: z
 		.int()
-		.optional()
-		.describe('The Message-model type, e.g. `20`. Passed through unmapped; defaults to 0'),
+		.describe('The Message-model type, e.g. `10`. Only 1, 2, 10, 11, 30 and 41 are accepted'),
 	Data: z.string().optional().describe('The message payload; often empty'),
 })
 
