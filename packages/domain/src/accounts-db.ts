@@ -16,7 +16,8 @@ import { bindPlaceholders, chunkForBinds } from './d1-binds'
 
 /**
  * Schema DDL — the head schema, i.e. what the table looks like after every migration
- * (0001_accounts + 0002_avatar + 0009_account_has_plus + 0012_account_is_influencer, sans
+ * (0001_accounts + 0002_avatar + 0009_account_has_plus + 0012_account_is_influencer +
+ * 0013_account_signup_ip_device_id, sans
  * seed INSERTs; 0004 added a `platform_id` generated column and 0008 dropped it again, so it
  * appears here in neither form).
  *
@@ -24,6 +25,7 @@ import { bindPlaceholders, chunkForBinds } from './d1-binds'
  * subscriber through its partial index instead of scanning every account's JSON. It is 1 for
  * JSON true, 0 for false and NULL when the key is absent; the index holds only the 1s.
  * `is_influencer` does the same for `isInfluencer`, for econ's influencer list.
+ * `signup_ip` and `device_id` (full indexes) back the signup caps' counts.
  */
 export const SCHEMA_DDL: string[] = [
 	`CREATE TABLE IF NOT EXISTS account (
@@ -32,12 +34,16 @@ export const SCHEMA_DDL: string[] = [
 		account_id INTEGER GENERATED ALWAYS AS (json_extract(data, '$.accountId')) VIRTUAL,
 		username_lower TEXT GENERATED ALWAYS AS (lower(json_extract(data, '$.username'))) VIRTUAL,
 		has_plus INTEGER GENERATED ALWAYS AS (json_extract(data, '$.hasPlus')) VIRTUAL,
-		is_influencer INTEGER GENERATED ALWAYS AS (json_extract(data, '$.isInfluencer')) VIRTUAL
+		is_influencer INTEGER GENERATED ALWAYS AS (json_extract(data, '$.isInfluencer')) VIRTUAL,
+		signup_ip TEXT GENERATED ALWAYS AS (json_extract(data, '$.signupIp')) VIRTUAL,
+		device_id TEXT GENERATED ALWAYS AS (json_extract(data, '$.deviceId')) VIRTUAL
 	)`,
 	`CREATE UNIQUE INDEX IF NOT EXISTS idx_accounts_account_id ON account (account_id)`,
 	`CREATE INDEX IF NOT EXISTS idx_accounts_username_lower ON account (username_lower)`,
 	`CREATE INDEX IF NOT EXISTS idx_account_has_plus ON account (has_plus) WHERE has_plus = 1`,
 	`CREATE INDEX IF NOT EXISTS idx_account_is_influencer ON account (is_influencer) WHERE is_influencer = 1`,
+	`CREATE INDEX IF NOT EXISTS idx_account_signup_ip ON account (signup_ip)`,
+	`CREATE INDEX IF NOT EXISTS idx_account_device_id ON account (device_id)`,
 ]
 
 /** Client-facing account shape (camelCase, exactly as the client's AccountDTO). */
@@ -358,11 +364,8 @@ export async function searchAccounts(
  * at login). An empty id yields no matches (avoids matching every account with no
  * device recorded).
  *
- * Reads `deviceId` straight out of the JSON blob, so this is a table scan — no
- * generated column, no migration. Fine at our account count and for the occasional
- * linkup lookup this exists for; if it ever gets hot, promote `deviceId` to an indexed
- * generated column (migration 0004 did that for `platformId`, and 0008 undid it once
- * nothing queried it — that pair is the recipe both ways).
+ * Reads the indexed `device_id` generated column (migration 0013, added for the
+ * per-device signup cap), not the JSON blob, so it is an index lookup.
  *
  * The device id is unverified client input, so treat a match as a *hint* (these
  * accounts share a device) and never as proof of identity.
@@ -370,7 +373,7 @@ export async function searchAccounts(
 export async function getAccountsByDeviceId(db: D1Database, deviceId: string): Promise<Account[]> {
 	if (deviceId === '') return []
 	const { results } = await db
-		.prepare("SELECT data FROM account WHERE json_extract(data, '$.deviceId') = ?1")
+		.prepare('SELECT data FROM account WHERE device_id = ?1')
 		.bind(deviceId)
 		.all<AccountRow>()
 	return parseAll(results)
@@ -393,7 +396,7 @@ export async function getAccountsByDeviceId(db: D1Database, deviceId: string): P
 export async function countAccountsByDeviceId(db: D1Database, deviceId: string): Promise<number> {
 	if (deviceId === '') return 0
 	const row = await db
-		.prepare("SELECT COUNT(*) AS n FROM account WHERE json_extract(data, '$.deviceId') = ?1")
+		.prepare('SELECT COUNT(*) AS n FROM account WHERE device_id = ?1')
 		.bind(deviceId)
 		.first<{ n: number }>()
 	return row?.n ?? 0
@@ -462,7 +465,7 @@ export async function setLoginContext(
 export async function countAccountsBySignupIp(db: D1Database, ip: string): Promise<number> {
 	if (ip === '') return 0
 	const row = await db
-		.prepare("SELECT COUNT(*) AS n FROM account WHERE json_extract(data, '$.signupIp') = ?1")
+		.prepare('SELECT COUNT(*) AS n FROM account WHERE signup_ip = ?1')
 		.bind(ip)
 		.first<{ n: number }>()
 	return row?.n ?? 0

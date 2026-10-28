@@ -17,11 +17,15 @@ export const SCHEMA_DDL: string[] = [
 		account_id INTEGER GENERATED ALWAYS AS (json_extract(data, '$.accountId')) VIRTUAL,
 		username_lower TEXT GENERATED ALWAYS AS (lower(json_extract(data, '$.username'))) VIRTUAL,
 		has_plus INTEGER GENERATED ALWAYS AS (json_extract(data, '$.hasPlus')) VIRTUAL,
-		is_influencer INTEGER GENERATED ALWAYS AS (json_extract(data, '$.isInfluencer')) VIRTUAL
+		is_influencer INTEGER GENERATED ALWAYS AS (json_extract(data, '$.isInfluencer')) VIRTUAL,
+		signup_ip TEXT GENERATED ALWAYS AS (json_extract(data, '$.signupIp')) VIRTUAL,
+		device_id TEXT GENERATED ALWAYS AS (json_extract(data, '$.deviceId')) VIRTUAL
 	)`,
 	`CREATE UNIQUE INDEX IF NOT EXISTS idx_accounts_account_id ON account (account_id)`,
 	`CREATE INDEX IF NOT EXISTS idx_account_has_plus ON account (has_plus) WHERE has_plus = 1`,
 	`CREATE INDEX IF NOT EXISTS idx_account_is_influencer ON account (is_influencer) WHERE is_influencer = 1`,
+	`CREATE INDEX IF NOT EXISTS idx_account_signup_ip ON account (signup_ip)`,
+	`CREATE INDEX IF NOT EXISTS idx_account_device_id ON account (device_id)`,
 ]
 
 /** The stored avatar payload — opaque JSON the client sets and reads back. */
