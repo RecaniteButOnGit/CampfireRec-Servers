@@ -8,6 +8,7 @@ import {
 	UNITY_ASSET_SCHEMA_DDL,
 } from '@repo/domain'
 
+import { SCHEMA_DDL as CUSTOM_AVATAR_ITEM_SCHEMA_DDL } from '../../../../api/src/custom-avatar-items-db'
 import cloudBuilds, { CLOUD_JOB_SCHEMA } from '../../cloud-builds'
 
 import type { Env } from '../../context'
@@ -56,6 +57,9 @@ beforeAll(async () => {
 		...SUBROOM_SCHEMA_DDL,
 		...STUDIO_CLOUD_BUILD_SCHEMA_DDL,
 		...UNITY_ASSET_SCHEMA_DDL,
+		// Custom avatar items (owned by the api worker) — every room read joins the published
+		// room badges from this table.
+		...CUSTOM_AVATAR_ITEM_SCHEMA_DDL,
 		CLOUD_JOB_SCHEMA,
 	])
 		await env.DB.prepare(sql).run()

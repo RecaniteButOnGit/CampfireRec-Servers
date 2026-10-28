@@ -4291,6 +4291,7 @@ describe('auth-gated endpoints', () => {
 			'POST /player/login',
 			'POST /player/logout',
 			'POST /player/notifydisconnect',
+			'POST /player/verifylock',
 			'POST /roominstance/{id}/markprivate',
 			'POST /roominstance/{id}/reportjoinresult',
 			'PUT /player/avoidjuniors',
