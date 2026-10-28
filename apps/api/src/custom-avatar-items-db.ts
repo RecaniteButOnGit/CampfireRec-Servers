@@ -147,6 +147,13 @@ export const OUTFIT_TYPE_CUSTOM_SHIRT = 105
  */
 export const MAX_PLAYER_ITEM_PRICE = 1000
 
+/**
+ * The fewest tokens a player-made item may sell for: a price is 0 (free, open to anyone) or
+ * at least this. Served as `minPriceForPublicItem`, which the client's creation UI enforces,
+ * and checked on the create and the edit as well so the API can't price an item at 1.
+ */
+export const MIN_PLAYER_ITEM_PRICE = 100
+
 /** What `POST /api/customAvatarItems/v1` needs to create an item. */
 export interface CreateCustomAvatarItemInput {
 	/** The item's id. Chosen by the caller because the upload keys are derived from it. */

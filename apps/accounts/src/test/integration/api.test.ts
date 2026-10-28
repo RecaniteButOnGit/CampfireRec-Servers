@@ -50,10 +50,13 @@ function b64url(input: ArrayBuffer | string): string {
 	return btoa(binary).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '')
 }
 
-async function bearer(sub = '42'): Promise<Record<string, string>> {
+async function bearer(
+	sub = '42',
+	claims: Record<string, unknown> = {}
+): Promise<Record<string, string>> {
 	const now = Math.floor(Date.now() / 1000)
 	const signingInput = `${b64url(JSON.stringify({ alg: 'HS256', typ: 'JWT' }))}.${b64url(
-		JSON.stringify({ sub, exp: now + 3600 })
+		JSON.stringify({ sub, exp: now + 3600, ...claims })
 	)}`
 	const key = await crypto.subtle.importKey(
 		'raw',
@@ -65,6 +68,9 @@ async function bearer(sub = '42'): Promise<Record<string, string>> {
 	const sig = await crypto.subtle.sign('HMAC', key, new TextEncoder().encode(signingInput))
 	return { Authorization: `Bearer ${signingInput}.${b64url(sig)}` }
 }
+
+/** The `rn.plus` claim `auth` stamps for a Rec Room Plus account. */
+const PLUS = { 'rn.plus': true }
 
 const form = (fields: Record<string, string>): RequestInit => ({
 	method: 'PUT',
@@ -482,7 +488,10 @@ describe('auth-gated endpoints', () => {
 		// Exactly the body the client sends: one urlencoded field (`%F0%9F%A4%AA`).
 		const res = await exports.default.fetch(`${ORIGIN}/account/me/emoji`, {
 			method: 'PUT',
-			headers: { ...(await bearer('779')), 'Content-Type': 'application/x-www-form-urlencoded' },
+			headers: {
+				...(await bearer('779', PLUS)),
+				'Content-Type': 'application/x-www-form-urlencoded',
+			},
 			body: 'displayEmoji=%F0%9F%A4%AA',
 		})
 		expect(res.status).toBe(200)
@@ -509,7 +518,10 @@ describe('auth-gated endpoints', () => {
 	test('PUT /account/me/emoji canonicalizes a pick sent without its variation selector', async () => {
 		const res = await exports.default.fetch(`${ORIGIN}/account/me/emoji`, {
 			...form({ displayEmoji: '\u{2764}' }),
-			headers: { ...(await bearer('780')), 'Content-Type': 'application/x-www-form-urlencoded' },
+			headers: {
+				...(await bearer('780', PLUS)),
+				'Content-Type': 'application/x-www-form-urlencoded',
+			},
 		})
 		expect(res.status).toBe(200)
 
@@ -524,13 +536,19 @@ describe('auth-gated endpoints', () => {
 	test('PUT /account/me/emoji clears the pick on an empty value', async () => {
 		const set = await exports.default.fetch(`${ORIGIN}/account/me/emoji`, {
 			...form({ displayEmoji: '\u{1F389}' }),
-			headers: { ...(await bearer('781')), 'Content-Type': 'application/x-www-form-urlencoded' },
+			headers: {
+				...(await bearer('781', PLUS)),
+				'Content-Type': 'application/x-www-form-urlencoded',
+			},
 		})
 		expect(set.status).toBe(200)
 
 		const cleared = await exports.default.fetch(`${ORIGIN}/account/me/emoji`, {
 			...form({ displayEmoji: '' }),
-			headers: { ...(await bearer('781')), 'Content-Type': 'application/x-www-form-urlencoded' },
+			headers: {
+				...(await bearer('781', PLUS)),
+				'Content-Type': 'application/x-www-form-urlencoded',
+			},
 		})
 		expect(cleared.status).toBe(200)
 
@@ -549,7 +567,10 @@ describe('auth-gated endpoints', () => {
 		for (const displayEmoji of ['not an emoji', '\u{1F92A}\u{1F92A}', '\u{1F595}\u{1F3FB}']) {
 			const res = await exports.default.fetch(`${ORIGIN}/account/me/emoji`, {
 				...form({ displayEmoji }),
-				headers: { ...(await bearer('782')), 'Content-Type': 'application/x-www-form-urlencoded' },
+				headers: {
+					...(await bearer('782', PLUS)),
+					'Content-Type': 'application/x-www-form-urlencoded',
+				},
 			})
 			expect(res.status).toBe(400)
 		}
@@ -557,6 +578,38 @@ describe('auth-gated endpoints', () => {
 		// Nothing was stored by the refusals.
 		const me = await exports.default.fetch(`${ORIGIN}/account/me`, { headers: await bearer('782') })
 		expect(((await me.json()) as { displayEmoji: string }).displayEmoji).toBe('')
+	})
+
+	// Setting an emoji is a Rec Room Plus perk; clearing one is not, so a player whose Plus
+	// lapsed can still take an old pick down.
+	test('PUT /account/me/emoji 403s a set without Rec Room Plus but allows a clear', async () => {
+		const headers = {
+			...(await bearer('783')),
+			'Content-Type': 'application/x-www-form-urlencoded',
+		}
+		const set = await exports.default.fetch(`${ORIGIN}/account/me/emoji`, {
+			...form({ displayEmoji: '\u{1F92A}' }),
+			headers,
+		})
+		expect(set.status).toBe(403)
+
+		const notPlus = await exports.default.fetch(`${ORIGIN}/account/me/emoji`, {
+			...form({ displayEmoji: '\u{1F92A}' }),
+			headers: {
+				...(await bearer('783', { 'rn.plus': 'true' })),
+				'Content-Type': 'application/x-www-form-urlencoded',
+			},
+		})
+		expect(notPlus.status).toBe(403)
+
+		const me = await exports.default.fetch(`${ORIGIN}/account/me`, { headers: await bearer('783') })
+		expect(((await me.json()) as { displayEmoji: string }).displayEmoji).toBe('')
+
+		const clear = await exports.default.fetch(`${ORIGIN}/account/me/emoji`, {
+			...form({ displayEmoji: '' }),
+			headers,
+		})
+		expect(clear.status).toBe(200)
 	})
 
 	test('PUT /account/me/bannerimage 401s without a token, 400s without an imageName', async () => {

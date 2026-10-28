@@ -27,7 +27,7 @@ import {
 	withNotFound,
 	withOnError,
 } from '@repo/hono-helpers'
-import { validateAndGetAccountId } from '@repo/jwt'
+import { validateAndGetAccountId, validateAndGetPlus } from '@repo/jwt'
 
 // The notification-type ids the hub carries (owned by the `notify` worker). Imported as a
 // value — the enum has no runtime dependencies.
@@ -1071,6 +1071,11 @@ const app = new Hono<App>()
 	//
 	// Broadcast like every other public-DTO mutation here — the emoji rides along in the
 	// AccountUpdate payload, so it redraws beside the name without a refetch.
+	//
+	// SETTING an emoji is a Rec Room Plus perk: the token's `rn.plus` claim, the same one
+	// econ's `isSubscriber` reads (Plus has one source — see `validateAndGetPlus`). Anyone
+	// may CLEAR theirs, so a player who loses Plus can still take an old pick down. An emoji
+	// already stored is left alone when Plus lapses; this only gates the write.
 	.put(
 		'/account/me/emoji',
 		describeRoute({
@@ -1079,7 +1084,8 @@ const app = new Hono<App>()
 			description: [
 				'Persists the emoji shown beside the display name and broadcasts it in the',
 				'AccountUpdate payload. The value must be one the whitelist serves; an empty value',
-				'clears the pick.',
+				'clears the pick. Setting one requires Rec Room Plus (the token’s `rn.plus` claim);',
+				'clearing does not.',
 			].join(' '),
 			security: AUTHED,
 			requestBody: form(EmojiRequest, 'A whitelisted emoji, or "" to clear'),
@@ -1087,6 +1093,7 @@ const app = new Hono<App>()
 				200: json(SuccessResponse, 'Updated'),
 				400: { description: 'Not a whitelisted emoji (empty body)' },
 				401: UNAUTHORIZED_RESPONSE,
+				403: { description: 'Setting an emoji without Rec Room Plus (empty body)' },
 			},
 		}),
 		async (c) => {
@@ -1096,6 +1103,11 @@ const app = new Hono<App>()
 			// An empty value clears the pick; anything else has to be on the list.
 			const displayEmoji = submitted === '' ? '' : resolveWhitelistedEmoji(submitted)
 			if (displayEmoji === null) return c.body(null, 400)
+			if (
+				displayEmoji !== '' &&
+				!(await validateAndGetPlus(c.req.raw, await c.env.JWT_SECRET.get()))
+			)
+				return c.body(null, 403)
 			const account = await updateAccount(c.env.DB, id, { displayEmoji })
 			await pushAccountUpdate(c, account)
 			return c.json({ success: true })

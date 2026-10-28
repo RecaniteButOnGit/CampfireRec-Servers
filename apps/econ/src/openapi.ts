@@ -822,7 +822,13 @@ export const CreateRoomKeyRequest = z.object({
 	Price: z
 		.string()
 		.optional()
-		.describe('What the key costs, in tokens; defaults to 0. At most 1000'),
+		.describe(
+			'What the key costs, in tokens or `PurchaseCurrencyId`; defaults to 0. At most 1000 in tokens, 1000000000 in a room currency'
+		),
+	PurchaseCurrencyId: z
+		.string()
+		.optional()
+		.describe('A `room_currency` id of the key’s own room; absent or blank prices it in tokens'),
 })
 
 /**

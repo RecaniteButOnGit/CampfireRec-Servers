@@ -25,11 +25,12 @@ import {
 	listFeaturedCustomAvatarItems,
 	listHotCustomAvatarItems,
 	MAX_PLAYER_ITEM_PRICE,
+	MIN_PLAYER_ITEM_PRICE,
 	searchCustomAvatarItems,
 	toQuestCustomAvatarItem,
 	updateCustomAvatarItem,
 } from '../custom-avatar-items-db'
-import { authedId, unauthorized } from '../http'
+import { authedId, authedPlus, unauthorized } from '../http'
 import {
 	createInvention,
 	deleteInvention,
@@ -134,6 +135,59 @@ import type { InventionTag, SavedInvention } from '../inventions-db'
  * client doing something other than filling a screen.
  */
 const BULK_CUSTOM_AVATAR_ITEM_CAP = 100
+
+/** The all-zero Guid — what a C# client sends for an unset Guid field. */
+const EMPTY_GUID = '00000000-0000-0000-0000-000000000000'
+
+/**
+ * The refusal for putting a price above 0 on an invention without Rec Room Plus (the token's
+ * `rn.plus` claim). Selling for tokens is a Plus perk; making an invention free is not, so a
+ * player whose Plus lapsed can still take theirs off sale.
+ */
+const INVENTION_PRICE_NEEDS_PLUS = 'Rec Room Plus is required to sell an invention'
+
+/** The same refusal for a custom avatar item — selling one for tokens is a Plus perk too. */
+const CUSTOM_ITEM_PRICE_NEEDS_PLUS = 'Rec Room Plus is required to sell a custom avatar item'
+
+/**
+ * The Rec Room Plus perks an outfit body wears, by name — empty when it wears none. Both
+ * live in `CustomizationSettings`, the client's JSON document encoded as a string (an
+ * object is accepted too, for a hand-written request):
+ *
+ * - an aura, `AuraData.Id`;
+ * - body paint, `BodyPaint` (a Guid string).
+ *
+ * The client's "none" spelling for either hasn't been observed, so every plausible one
+ * reads as none — a missing/null `AuraData` or an `Id` of 0, and a missing, null, empty or
+ * all-zero `BodyPaint`. Erring the other way would refuse every non-Plus save if that is
+ * how the client says "none". A settings string that isn't JSON names no perks either: it's
+ * stored verbatim and nothing here can read one out of it.
+ */
+function plusPerksWorn(body: Record<string, unknown>): string[] {
+	let settings: unknown = body.CustomizationSettings
+	if (typeof settings === 'string') {
+		try {
+			settings = JSON.parse(settings)
+		} catch {
+			return []
+		}
+	}
+	if (typeof settings !== 'object' || settings === null) return []
+	const { AuraData, BodyPaint } = settings as Record<string, unknown>
+
+	const perks: string[] = []
+	const auraId =
+		typeof AuraData === 'object' && AuraData !== null
+			? (AuraData as Record<string, unknown>).Id
+			: undefined
+	if (auraId !== undefined && auraId !== null && auraId !== 0 && auraId !== '' && auraId !== '0') {
+		perks.push('an aura')
+	}
+	if (typeof BodyPaint === 'string' && BodyPaint !== '' && BodyPaint !== EMPTY_GUID) {
+		perks.push('body paint')
+	}
+	return perks
+}
 
 /**
  * The ids `POST /api/customAvatarItems/v1/bulk` was asked to resolve. They ride as repeated
@@ -462,10 +516,11 @@ export const avatarRoutes = new Hono<App>({ strict: false })
 			tags: ['Avatar'],
 			summary: 'Minimum token price for a public custom item',
 			description:
-				'The floor the creation UI enforces when listing a custom item publicly. A fixed `100`.',
+				'The floor the creation UI enforces when listing a custom item publicly. A fixed `100`' +
+				' (`MIN_PLAYER_ITEM_PRICE`), which the create and edit enforce too: a price is 0 or at least this.',
 			responses: { 200: json(BareInteger, 'A bare `100`') },
 		}),
-		(c) => c.json(100)
+		(c) => c.json(MIN_PLAYER_ITEM_PRICE)
 	)
 	.post(
 		'/api/customAvatarItems/v1',
@@ -486,16 +541,21 @@ export const avatarRoutes = new Hono<App>({ strict: false })
 				'from that signature, and anything else is refused with a 400 before either file is ' +
 				'written.\n\n' +
 				'`Price` is capped at 1000 tokens (`MAX_PLAYER_ITEM_PRICE`); one above it, or below ' +
-				'0, is refused with a 400 rather than clamped.',
+				'0, is refused with a 400 rather than clamped, and so is one between 1 and 99 — a ' +
+				'price is 0 (free) or at least 100 (`MIN_PLAYER_ITEM_PRICE`, the ' +
+				'`minPriceForPublicItem` floor). A `Price` above 0 needs Rec Room ' +
+				'Plus (the token’s `rn.plus` claim); without it the create is refused with a 403 ' +
+				'and nothing is written.',
 			security: AUTHED,
 			requestBody: form(CreateCustomAvatarItemRequest, 'The metadata and the two files'),
 			responses: {
 				200: json(CustomAvatarItemResponse, 'The created item'),
 				400: json(
 					CustomAvatarItemResponse,
-					'Missing or malformed metadata / files, a file that is not an image, or a `Price` outside 0–1000'
+					'Missing or malformed metadata / files, a file that is not an image, or a `Price` that is not 0 or 100–1000'
 				),
 				401: UNAUTHORIZED_RESPONSE,
+				403: json(CustomAvatarItemResponse, 'A `Price` above 0 without Rec Room Plus'),
 				413: json(CustomAvatarItemResponse, 'Either file exceeds the configured per-file limit'),
 			},
 		}),
@@ -526,6 +586,16 @@ export const avatarRoutes = new Hono<App>({ strict: false })
 				if (meta.Price < 0) return fail('Price must be >= 0')
 				if (meta.Price > MAX_PLAYER_ITEM_PRICE)
 					return fail(`Price must be <= ${MAX_PLAYER_ITEM_PRICE}`)
+				if (meta.Price > 0 && meta.Price < MIN_PLAYER_ITEM_PRICE)
+					return fail(`Price must be 0 or >= ${MIN_PLAYER_ITEM_PRICE}`)
+				// Selling for tokens is a Rec Room Plus perk; a free item needs none. Checked
+				// before the files are read, so a refusal writes nothing to R2.
+				if (meta.Price > 0 && !(await authedPlus(c))) {
+					return c.json(
+						{ Value: null, Success: false, Error: CUSTOM_ITEM_PRICE_NEEDS_PLUS, error_id: null },
+						403
+					)
+				}
 			}
 			if (!(body.thumbnailImage instanceof File)) return fail('thumbnailImage is required')
 			if (!(body.design instanceof File)) return fail('design is required')
@@ -607,15 +677,22 @@ export const avatarRoutes = new Hono<App>({ strict: false })
 				'sends every field and nulls the ones it is not changing, so null means "leave ' +
 				'alone". Only the creator may edit. `ModifiedAt` is bumped. Answers the updated ' +
 				'item in the same `{ Value, Success, Error, error_id }` envelope as the create. ' +
-				'`Price` is bound the same way as on the create: 0 to 1000 tokens, or a 400.',
+				'`Price` is bound the same way as on the create: 0, or 100 to 1000 tokens, or a 400; and ' +
+				'setting one above 0 needs Rec Room Plus (the token’s `rn.plus` claim), or a 403.',
 			security: AUTHED,
 			parameters: [stringParam('id', 'The `CustomAvatarItemId`')],
 			requestBody: jsonBody(UpdateCustomAvatarItemRequest, 'The fields to change'),
 			responses: {
 				200: json(CustomAvatarItemResponse, 'The updated item'),
-				400: json(CustomAvatarItemResponse, 'Malformed body, or a `Price` outside 0–1000'),
+				400: json(
+					CustomAvatarItemResponse,
+					'Malformed body, or a `Price` that is not 0 or 100–1000'
+				),
 				401: UNAUTHORIZED_RESPONSE,
-				403: json(CustomAvatarItemResponse, 'Not the creator'),
+				403: json(
+					CustomAvatarItemResponse,
+					'Not the creator, or a `Price` above 0 without Rec Room Plus'
+				),
 				404: json(CustomAvatarItemResponse, 'No such item'),
 			},
 		}),
@@ -659,6 +736,12 @@ export const avatarRoutes = new Hono<App>({ strict: false })
 			if (patch.price !== null && patch.price < 0) return fail(400, 'Price must be >= 0')
 			if (patch.price !== null && patch.price > MAX_PLAYER_ITEM_PRICE)
 				return fail(400, `Price must be <= ${MAX_PLAYER_ITEM_PRICE}`)
+			if (patch.price !== null && patch.price > 0 && patch.price < MIN_PLAYER_ITEM_PRICE)
+				return fail(400, `Price must be 0 or >= ${MIN_PLAYER_ITEM_PRICE}`)
+			// Setting a price above 0 is a Rec Room Plus perk. Null (leave it) and 0 (make it
+			// free) need none, so a creator whose Plus lapsed can still take an item off sale.
+			if (patch.price !== null && patch.price > 0 && !(await authedPlus(c)))
+				return fail(403, CUSTOM_ITEM_PRICE_NEEDS_PLUS)
 
 			const item = await updateCustomAvatarItem(c.env.DB, itemId, patch)
 			if (!item) return fail(404, 'No such item')
@@ -1075,13 +1158,23 @@ export const avatarRoutes = new Hono<App>({ strict: false })
 				'client’s own serializer, so nothing here parses or re-encodes them.\n\n' +
 				'The response is the base envelope with no `Value` key — three keys, and the outfit ' +
 				'is not echoed back. The mixed casing (`Success`/`Error` but `error_id`) is the ' +
-				'reference’s, not a typo.',
+				'reference’s, not a typo.\n\n' +
+				'An aura (`CustomizationSettings.AuraData.Id`) and body paint ' +
+				'(`CustomizationSettings.BodyPaint`) are Rec Room Plus perks: an outfit wearing ' +
+				'either, without the token’s `rn.plus` claim the save is refused with a 403 and ' +
+				'`Success: false`, and nothing is stored.',
 			security: AUTHED,
 			requestBody: jsonBody(OutfitsMeRequest, 'The outfit to save'),
 			responses: {
 				200: json(OutfitSaveResponse, 'Saved — `{ Success: true, Error: null, error_id: null }`'),
 				400: json(ErrorResponse, 'Unparseable body'),
 				401: UNAUTHORIZED_RESPONSE,
+				403: json(
+					OutfitSaveResponse,
+					'The outfit wears an aura (`CustomizationSettings.AuraData.Id`) or body paint ' +
+						'(`CustomizationSettings.BodyPaint`) and the caller’s ' +
+						'token has no Rec Room Plus (`rn.plus`) claim — `Success: false`, nothing saved'
+				),
 			},
 		}),
 		async (c) => {
@@ -1090,6 +1183,22 @@ export const avatarRoutes = new Hono<App>({ strict: false })
 
 			const body = (await c.req.json().catch(() => null)) as Record<string, unknown> | null
 			if (body === null) return c.json({ error: 'Invalid request body' }, 400)
+
+			// Auras and body paint are Plus perks: an outfit wearing either is refused outright
+			// for a caller without the token's `rn.plus` claim, rather than saved with the perk
+			// stripped — the client keeps what it sent, so a silent strip would show the player
+			// something nobody else sees.
+			const perks = plusPerksWorn(body)
+			if (perks.length > 0 && !(await authedPlus(c))) {
+				return c.json(
+					{
+						Success: false,
+						Error: `Rec Room Plus is required to wear ${perks.join(' or ')}`,
+						error_id: null,
+					},
+					403
+				)
+			}
 
 			// The client sends `Slot`; a body without one saves the worn outfit.
 			const outfit = {
@@ -1498,7 +1607,8 @@ export const avatarRoutes = new Hono<App>({ strict: false })
 				'What puts an invention into search and the feeds. Sets the permission other ' +
 				'players get (defaulting to UseOnly) and its price. Another GET that writes. A ' +
 				'price over 1000 tokens (`MAX_INVENTION_PRICE`) refuses the whole publish with a ' +
-				'400 rather than being clamped or dropped.',
+				'400 rather than being clamped or dropped. A price above 0 needs Rec Room Plus ' +
+				'(the token’s `rn.plus` claim); without it the publish is refused with a 403.',
 			security: AUTHED,
 			parameters: [
 				intQuery('inventionId', 'Invention id; required'),
@@ -1509,7 +1619,7 @@ export const avatarRoutes = new Hono<App>({ strict: false })
 				200: json(InventionSaveResult, 'The published invention, in the save envelope'),
 				400: json(ErrorResponse, 'A price over 1000'),
 				401: UNAUTHORIZED_RESPONSE,
-				403: json(ErrorResponse, 'Not the caller’s invention'),
+				403: json(ErrorResponse, 'Not the caller’s invention, or a price without Rec Room Plus'),
 				404: { description: 'No such invention' },
 			},
 		}),
@@ -1521,6 +1631,8 @@ export const avatarRoutes = new Hono<App>({ strict: false })
 			const price = Number.parseInt(c.req.query('price') ?? '', 10)
 			if (price > MAX_INVENTION_PRICE)
 				return c.json({ error: `Price must be <= ${MAX_INVENTION_PRICE}` }, 400)
+			if (price > 0 && !(await authedPlus(c)))
+				return c.json({ error: INVENTION_PRICE_NEEDS_PLUS }, 403)
 
 			const published = await publishInvention(c.env.DB, gate.invention.InventionId, {
 				permissionLevel:
@@ -1540,14 +1652,15 @@ export const avatarRoutes = new Hono<App>({ strict: false })
 			summary: 'Set an invention’s price',
 			description:
 				'Unlike update/publish, this one POSTs a JSON body. Creator only; a negative price ' +
-				'is rejected, as is one over 1000 tokens (`MAX_INVENTION_PRICE`).',
+				'is rejected, as is one over 1000 tokens (`MAX_INVENTION_PRICE`). A price above 0 ' +
+				'needs Rec Room Plus (the token’s `rn.plus` claim); without it, 403. Setting 0 does not.',
 			security: AUTHED,
 			requestBody: jsonBody(UpdatePriceRequest, 'The invention and its new price'),
 			responses: {
 				200: json(InventionSaveResult, 'The repriced invention, in the save envelope'),
 				400: json(ErrorResponse, 'Unparseable body, or a price below 0 or over 1000'),
 				401: UNAUTHORIZED_RESPONSE,
-				403: json(ErrorResponse, 'Not the caller’s invention'),
+				403: json(ErrorResponse, 'Not the caller’s invention, or a price without Rec Room Plus'),
 				404: { description: 'No such invention' },
 			},
 		}),
@@ -1563,6 +1676,8 @@ export const avatarRoutes = new Hono<App>({ strict: false })
 			if (Number.isNaN(price) || price < 0) return c.json({ error: 'Price must be >= 0' }, 400)
 			if (price > MAX_INVENTION_PRICE)
 				return c.json({ error: `Price must be <= ${MAX_INVENTION_PRICE}` }, 400)
+			if (price > 0 && !(await authedPlus(c)))
+				return c.json({ error: INVENTION_PRICE_NEEDS_PLUS }, 403)
 
 			const updated = await setInventionPrice(c.env.DB, gate.invention.InventionId, price)
 			return updated === null ? c.notFound() : c.json(toSaveResult(updated))
@@ -2348,7 +2463,8 @@ export const avatarRoutes = new Hono<App>({ strict: false })
 				'than zeroing it, so re-publishing something that was for sale doesn’t give it ' +
 				'away; every field but `InventionId` is nullable and an omitted one keeps what ' +
 				'the invention has. A price over 1000 tokens (`MAX_INVENTION_PRICE`) refuses the ' +
-				'publish in-band.\n\n' +
+				'publish in-band, and so does a `Price` above 0 without Rec Room Plus (the ' +
+				'token’s `rn.plus` claim).\n\n' +
 				'Publishing is undone by `v2/unpublish`, and re-publishing doesn’t re-date the first ' +
 				'publish. Refusals answer `Success: false` with a null `Value`, the way ' +
 				'`v9/save` does.',
@@ -2388,6 +2504,10 @@ export const avatarRoutes = new Hono<App>({ strict: false })
 			const price = int('Price')
 			if (price !== undefined && price > MAX_INVENTION_PRICE)
 				return c.json(inventionSaveV9Failure(`Price must be <= ${MAX_INVENTION_PRICE}`))
+			// Selling an invention is a Rec Room Plus perk. Refused in-band like the cap, so the
+			// client reads it out of the envelope. Null (leave it) and 0 (free) need no Plus.
+			if (price !== undefined && price > 0 && !(await authedPlus(c)))
+				return c.json(inventionSaveV9Failure(INVENTION_PRICE_NEEDS_PLUS))
 
 			const published = await publishInvention(c.env.DB, gate.invention.InventionId, {
 				permissionLevel: int('Permission'),

@@ -4222,6 +4222,8 @@ const app = new Hono<App>({ strict: false })
 				'the thing actually lives.',
 				'',
 				'Gated to the room’s creator or a co-owner; a valid token from anyone else is a 403.',
+				'A listing priced in TOKENS (`CurrencyId` null) at a non-zero price also needs Rec',
+				'Room Plus (the token’s `rn.plus` claim), on a create or a replace; without it, 403.',
 				'`PriceAndCurrency` is collapsed into the flat `Price`/`PurchaseCurrencyId` the read',
 				'serves. Answers the `{ Value, Success, Error, error_id }` envelope the room-currency',
 				'writes use, or a 200 carrying `Success: false` when the body is unusable or the',
@@ -4235,7 +4237,10 @@ const app = new Hono<App>({ strict: false })
 					'The listing as stored, or a rejection with `Success: false`'
 				),
 				401: UNAUTHORIZED_RESPONSE,
-				403: { description: 'Not the room’s creator or a co-owner (empty body)' },
+				403: {
+					description:
+						'Not the room’s creator or a co-owner, or a token price without Rec Room Plus (empty body)',
+				},
 			},
 		}),
 		async (c) => {
@@ -4282,6 +4287,15 @@ const app = new Hono<App>({ strict: false })
 					: {}
 			) as Record<string, unknown>
 
+			const price = int(priceAndCurrency.Price, 0)
+			const purchaseCurrencyId = str(priceAndCurrency.CurrencyId)
+			// Selling for TOKENS is a Rec Room Plus perk (see `isSubscriber`); a listing in the
+			// room's own currency, or a free one, is open to every room manager. Checked on a
+			// replace too, so an edit can't turn a currency listing into a token one.
+			if (purchaseCurrencyId === null && price !== 0 && !(await isSubscriber(c))) {
+				return c.body(null, 403)
+			}
+
 			const consumable = await upsertRoomConsumable(c.env.DB, roomConsumableId, {
 				RoomId: roomId,
 				// Masked like every other player-typed string: a shop's contents are shown to
@@ -4289,8 +4303,8 @@ const app = new Hono<App>({ strict: false })
 				Name: censorSwears(name),
 				Description: censorSwears(str(body.Description) ?? ''),
 				ImageName: str(body.ImageName),
-				Price: int(priceAndCurrency.Price, 0),
-				PurchaseCurrencyId: str(priceAndCurrency.CurrencyId),
+				Price: price,
+				PurchaseCurrencyId: purchaseCurrencyId,
 				// The client has not been seen sending this, so it falls back to the CLR default
 				// for an int rather than to a guess at what the shop should allow.
 				MaximumCountPerPurchase: int(body.MaximumCountPerPurchase, 0),
@@ -4691,7 +4705,8 @@ const app = new Hono<App>({ strict: false })
 				'offers are served sorted by it, so several at 0 keep the order they were added in.',
 				'',
 				'Gated to the creator or a co-owner of the room that minted the currency. A valid',
-				'token from anyone else is a 403. Answers the same',
+				'token from anyone else is a 403, and so is a non-zero `Price` without Rec Room Plus',
+				'(the token’s `rn.plus` claim) — the offer is paid in tokens. Answers the same',
 				'`{ Value, Success, Error, error_id }` envelope the currency writes use, with the',
 				'offer in `Value`, or a 200 carrying `Success: false` when the currency is unknown',
 				'or the body unusable.',
@@ -4704,7 +4719,10 @@ const app = new Hono<App>({ strict: false })
 					'The offer as created, or a rejection with `Success: false`'
 				),
 				401: UNAUTHORIZED_RESPONSE,
-				403: { description: 'Not the creator or a co-owner of the minting room (empty body)' },
+				403: {
+					description:
+						'Not the creator or a co-owner of the minting room, or a priced offer without Rec Room Plus (empty body)',
+				},
 			},
 		}),
 		async (c) => {
@@ -4735,6 +4753,9 @@ const app = new Hono<App>({ strict: false })
 			const canManage = await canManageRoomById(c.env.DB, currency.RoomId, accountId)
 			if (canManage === null) return purchaseOfferEnvelope(c, null, CREATE_OFFER_FAILED)
 			if (!canManage) return c.body(null, 403)
+			// An offer sells the currency for TOKENS, which is a Rec Room Plus perk (see
+			// `isSubscriber`). A free offer moves no tokens, so any room manager may make one.
+			if (price !== 0 && !(await isSubscriber(c))) return c.body(null, 403)
 
 			const offer = await createPurchaseOffer(c.env.DB, currencyId, {
 				// The body's `Amount` is the model's `CurrencyAmount`.
@@ -5015,7 +5036,8 @@ const app = new Hono<App>({ strict: false })
 				'offers are served sorted by it, so several at 0 keep the order they were added in.',
 				'',
 				'Gated to the creator or a co-owner of the room that minted the currency. A valid',
-				'token from anyone else is a 403. Answers the same',
+				'token from anyone else is a 403, and so is a non-zero `Price` without Rec Room Plus',
+				'(the token’s `rn.plus` claim) — the offer is paid in tokens. Answers the same',
 				'`{ Value, Success, Error, error_id }` envelope the currency writes use, with the',
 				'offer in `Value`, or a 200 carrying `Success: false` when the currency is unknown',
 				'or the body unusable.',
@@ -5028,7 +5050,10 @@ const app = new Hono<App>({ strict: false })
 					'The offer as created, or a rejection with `Success: false`'
 				),
 				401: UNAUTHORIZED_RESPONSE,
-				403: { description: 'Not the creator or a co-owner of the minting room (empty body)' },
+				403: {
+					description:
+						'Not the creator or a co-owner of the minting room, or a priced offer without Rec Room Plus (empty body)',
+				},
 			},
 		}),
 		async (c) => {
@@ -5059,6 +5084,9 @@ const app = new Hono<App>({ strict: false })
 			const canManage = await canManageRoomById(c.env.DB, currency.RoomId, accountId)
 			if (canManage === null) return purchaseOfferEnvelope(c, null, CREATE_OFFER_FAILED)
 			if (!canManage) return c.body(null, 403)
+			// An offer sells the currency for TOKENS, which is a Rec Room Plus perk (see
+			// `isSubscriber`). A free offer moves no tokens, so any room manager may make one.
+			if (price !== 0 && !(await isSubscriber(c))) return c.body(null, 403)
 
 			const offer = await createPurchaseOffer(c.env.DB, currencyId, {
 				// The body's `Amount` is the model's `CurrencyAmount`.
@@ -6887,20 +6915,25 @@ const app = new Hono<App>({ strict: false })
 			summary: 'Create a room key',
 			description: [
 				'Lists a key for one room — its name, its description and its price. Form-encoded',
-				'(`Type=Key&RoomId=1162&Name=my%20key&Description=…&Price=50`).',
+				'(`Type=Key&RoomId=1162&Name=my%20key&Description=…&Price=50`), optionally with a',
+				'`PurchaseCurrencyId` naming one of the room’s own currencies to price it in.',
 				'',
 				'Gated to the room’s CREATOR or a CO-OWNER, like minting a currency. A valid token',
-				'from anyone else is a 403.',
+				'from anyone else is a 403. A key priced in tokens (no `PurchaseCurrencyId`) at a',
+				'non-zero `Price` also needs Rec Room Plus (the token’s `rn.plus` claim); without it,',
+				'403. A room-currency price does not.',
 				'',
 				'`Name` and `Description` are masked by the same word list as every other string a',
 				'player types. A room may list at most 10 keys — the `RoomKeyConfig.MaxKeysPerRoom`',
-				'the `api` config tells the client — and the eleventh is refused. A new key is priced',
-				'in tokens (the body names no currency), so a `Price` over 1000 is refused too.',
+				'the `api` config tells the client — and the eleventh is refused. `Price` is capped by',
+				'what the key is priced in: 1000 in tokens, 1000000000 in a room currency.',
+				'`PurchaseCurrencyId` absent or blank is tokens; otherwise it must be a currency of',
+				'the key’s own room, as on `updateAll`.',
 				'',
 				'Answers `{ Status, RoomKey }` — `Status` 0 and the created key, as the live client',
 				'reads it — not the `{ Value, Success, Error, error_id }` envelope the room-currency',
 				'writes use. A recoverable refusal (an unusable `RoomId`, an empty `Name`, an unknown',
-				'room, a full room, a `Price` over the limit) is a 200 carrying a non-zero `Status` and a null `RoomKey`; only',
+				'room, a full room, a `Price` over the limit, an unknown or foreign currency) is a 200 carrying a non-zero `Status` and a null `RoomKey`; only',
 				'the auth gates answer with an HTTP status of their own.',
 				'',
 				'Pushes `LocalRoomKeyCreated` (120), carrying the same object, to everyone in the',
@@ -6911,7 +6944,10 @@ const app = new Hono<App>({ strict: false })
 			responses: {
 				200: json(RoomKeyEnvelope, 'The key as created, or a refusal with a non-zero `Status`'),
 				401: UNAUTHORIZED_RESPONSE,
-				403: { description: 'Not the room’s creator or a co-owner (empty body)' },
+				403: {
+					description:
+						'Not the room’s creator or a co-owner, or a token price without Rec Room Plus (empty body)',
+				},
 			},
 		}),
 		async (c) => {
@@ -6929,14 +6965,31 @@ const app = new Hono<App>({ strict: false })
 			if (!Number.isInteger(roomId)) return roomKeyEnvelope(c, null)
 			const name = str(body.Name).trim()
 			if (name === '') return roomKeyEnvelope(c, null)
-			// A key cannot cost less than nothing — nor, being priced in tokens until an edit
-			// says otherwise, more than the token cap.
+			// A key cannot cost less than nothing.
 			const price = Math.max(0, int(body.Price, 0))
-			if (price > MAX_KEY_PRICE_TOKENS) return roomKeyEnvelope(c, null)
 
 			const canManage = await canManageRoomById(c.env.DB, roomId, accountId)
 			if (canManage === null) return roomKeyEnvelope(c, null)
 			if (!canManage) return c.body(null, 403)
+
+			// Absent or blank is TOKENS; otherwise the key is sold in its own room's money, not
+			// another's — the same rule `updateAll` applies.
+			const postedCurrencyId = str(body.PurchaseCurrencyId).trim()
+			let purchaseCurrencyId: string | null = null
+			if (postedCurrencyId !== '') {
+				const currency = await getRoomCurrency(c.env.DB, postedCurrencyId)
+				if (!currency || currency.RoomId !== roomId) return roomKeyEnvelope(c, null)
+				purchaseCurrencyId = currency.CurrencyId
+			}
+
+			const maxPrice =
+				purchaseCurrencyId === null ? MAX_KEY_PRICE_TOKENS : MAX_KEY_PRICE_ROOM_CURRENCY
+			if (price > maxPrice) return roomKeyEnvelope(c, null)
+			// Selling for TOKENS is a Rec Room Plus perk (see `isSubscriber`). A room-currency
+			// price, or a free key, is open to any room manager.
+			if (purchaseCurrencyId === null && price !== 0 && !(await isSubscriber(c))) {
+				return c.body(null, 403)
+			}
 
 			if ((await getRoomKeys(c.env.DB, roomId)).length >= MAX_KEYS_PER_ROOM) {
 				return roomKeyEnvelope(c, null)
@@ -6948,6 +7001,7 @@ const app = new Hono<App>({ strict: false })
 				Name: censorSwears(name),
 				Description: censorSwears(str(body.Description)),
 				Price: price,
+				PurchaseCurrencyId: purchaseCurrencyId,
 			})
 
 			await pushRoomKeyCreated(c, key, accountId)
@@ -7202,7 +7256,9 @@ const app = new Hono<App>({ strict: false })
 				'(`RoomKeyId=43&Name=key1&Description=…&Price=1000&PurchaseCurrencyId=`).',
 				'',
 				'Gated to the CREATOR or a CO-OWNER of the room that lists the key; a valid token',
-				'from anyone else is a 403.',
+				'from anyone else is a 403. A key that ends up priced in tokens at a non-zero `Price`',
+				'also needs Rec Room Plus (the token’s `rn.plus` claim); without it, 403. A room',
+				'currency price does not.',
 				'',
 				'`PurchaseCurrencyId` sent EMPTY prices the key in tokens (stored and served as',
 				'null) — that is how a key on a room currency is taken back off it; otherwise it',
@@ -7227,7 +7283,10 @@ const app = new Hono<App>({ strict: false })
 			responses: {
 				200: json(RoomKeyEnvelope, 'The key as it now stands, or a refusal'),
 				401: UNAUTHORIZED_RESPONSE,
-				403: { description: 'Not the room’s creator or a co-owner (empty body)' },
+				403: {
+					description:
+						'Not the room’s creator or a co-owner, or a token price without Rec Room Plus (empty body)',
+				},
 			},
 		}),
 		async (c) => {
@@ -7273,6 +7332,12 @@ const app = new Hono<App>({ strict: false })
 			const maxPrice =
 				purchaseCurrencyId === null ? MAX_KEY_PRICE_TOKENS : MAX_KEY_PRICE_ROOM_CURRENCY
 			if (price > maxPrice) return roomKeyEnvelope(c, null)
+			// Judged on the RESULTING pair, like the cap: a token price is a Rec Room Plus perk
+			// (see `isSubscriber`), so an edit that leaves or puts a key on tokens at a non-zero
+			// price needs Plus. A room-currency price, or a free key, does not.
+			if (purchaseCurrencyId === null && price !== 0 && !(await isSubscriber(c))) {
+				return c.body(null, 403)
+			}
 
 			// Blank is a value here too: no art. Only absence leaves the stored name alone.
 			const postedImageName = str(body.ImageName)?.trim()

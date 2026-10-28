@@ -97,6 +97,8 @@ export interface NewRoomKey {
 	Name: string
 	Description: string
 	Price: number
+	/** A `room_currency` id of the key's own room, or null for tokens. */
+	PurchaseCurrencyId: string | null
 }
 
 interface RoomKeyRow {
@@ -133,7 +135,7 @@ export async function createRoomKey(db: D1Database, key: NewRoomKey): Promise<Ro
 		.prepare(
 			`INSERT INTO room_key
 			   (replication_id, room_id, key_type, name, description, price, purchase_currency_id, image_name, created_at)
-			 VALUES (?1, ?2, ?3, ?4, ?5, ?6, NULL, '', ?7)
+			 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, '', ?8)
 			 RETURNING ${SELECT_COLUMNS}`
 		)
 		.bind(
@@ -143,6 +145,7 @@ export async function createRoomKey(db: D1Database, key: NewRoomKey): Promise<Ro
 			key.Name,
 			key.Description,
 			key.Price,
+			key.PurchaseCurrencyId,
 			new Date().toISOString()
 		)
 		.first<RoomKeyRow>()

@@ -229,11 +229,12 @@ function b64url(input: ArrayBuffer | string): string {
 // off, the token carries none, which is what a plain player's looks like to the
 // role-gated routes. `version` mints the `rn.ver` claim auth stamps from the build the
 // client posted at login; left off, the token carries none, like one issued before the
-// claim existed.
+// claim existed. `plus` mints the `rn.plus` claim auth stamps from `account.hasPlus`.
 async function bearer(
 	sub = '42',
 	roles?: string[],
-	version?: string
+	version?: string,
+	plus?: boolean
 ): Promise<Record<string, string>> {
 	const now = Math.floor(Date.now() / 1000)
 	const signingInput = `${b64url(JSON.stringify({ alg: 'HS256', typ: 'JWT' }))}.${b64url(
@@ -242,6 +243,7 @@ async function bearer(
 			exp: now + 3600,
 			...(roles && { role: roles }),
 			...(version && { 'rn.ver': version }),
+			...(plus && { 'rn.plus': true }),
 		})
 	)}`
 	const key = await crypto.subtle.importKey(
@@ -1986,6 +1988,60 @@ describe('public endpoints', () => {
 		expect(((await worn.json()) as { Name: string | null }).Name).toBe(null)
 	})
 
+	test('PUT /outfits/me refuses an aura or body paint without Plus', async () => {
+		const outfit = (auraId: number | null, bodyPaint: string | null, Slot: number) => ({
+			DataVersion: 10,
+			CustomizationSettings: JSON.stringify({
+				AvatarVersion: 10,
+				...(auraId !== null && { AuraData: { Id: auraId } }),
+				...(bodyPaint !== null && { BodyPaint: bodyPaint }),
+			}),
+			Selections: [],
+			Slot,
+		})
+		const put = async (body: unknown, headers: Record<string, string>) =>
+			exports.default.fetch(`${ORIGIN}/outfits/me`, {
+				method: 'PUT',
+				headers: { ...headers, 'content-type': 'application/json' },
+				body: JSON.stringify(body),
+			})
+		const paint = '44d7e2a4-ae8d-4b95-8686-63e0f7d1ef8b'
+
+		// No Plus: an aura, body paint, or both are refused and nothing lands in the slot.
+		const refused = await put(outfit(14, null, 5), await bearer('4444'))
+		expect(refused.status).toBe(403)
+		expect(await refused.json()).toEqual({
+			Success: false,
+			Error: 'Rec Room Plus is required to wear an aura',
+			error_id: null,
+		})
+		const painted = await put(outfit(null, paint, 5), await bearer('4444'))
+		expect(painted.status).toBe(403)
+		expect(((await painted.json()) as { Error: string }).Error).toBe(
+			'Rec Room Plus is required to wear body paint'
+		)
+		const both = await put(outfit(14, paint, 5), await bearer('4444'))
+		expect(((await both.json()) as { Error: string }).Error).toBe(
+			'Rec Room Plus is required to wear an aura or body paint'
+		)
+		const saved = await exports.default.fetch(`${ORIGIN}/outfits/me/saved`, {
+			headers: await bearer('4444'),
+		})
+		expect(((await saved.json()) as { Slot: number }[]).some((o) => o.Slot === 5)).toBe(false)
+
+		// No Plus, neither perk (absent, aura Id 0, empty or all-zero paint): saves as before.
+		expect((await put(outfit(null, null, 0), await bearer('4444'))).status).toBe(200)
+		expect((await put(outfit(0, '', 0), await bearer('4444'))).status).toBe(200)
+		expect(
+			(await put(outfit(0, '00000000-0000-0000-0000-000000000000', 0), await bearer('4444'))).status
+		).toBe(200)
+
+		// Plus: both save.
+		const plus = await put(outfit(14, paint, 5), await bearer('4444', undefined, undefined, true))
+		expect(plus.status).toBe(200)
+		expect(await plus.json()).toEqual({ Success: true, Error: null, error_id: null })
+	})
+
 	test('GET /outfits/me/saved lists every saved slot, ordered by slot', async () => {
 		const anon = await exports.default.fetch(`${ORIGIN}/outfits/me/saved`)
 		expect(anon.status).toBe(401)
@@ -3047,13 +3103,35 @@ describe('public endpoints', () => {
 		const publish = async (body: Record<string, unknown>) => {
 			const res = await exports.default.fetch(`${ORIGIN}/api/inventions/v4/publish`, {
 				method: 'POST',
-				headers: { ...(await bearer('5172')), 'Content-Type': 'application/json' },
+				headers: {
+					...(await bearer('5172', undefined, undefined, true)),
+					'Content-Type': 'application/json',
+				},
 				body: JSON.stringify({ InventionId: inventionId, ...body }),
 			})
 			const value = ((await res.json()) as InventionSaveV9Result).Value
 			if (value === null) throw new Error('Value must not be null on a successful publish')
 			return value.Invention
 		}
+
+		// A price is a Rec Room Plus perk: without `rn.plus` the publish is refused in-band and
+		// nothing is published.
+		const unpaid = await exports.default.fetch(`${ORIGIN}/api/inventions/v4/publish`, {
+			method: 'POST',
+			headers: { ...(await bearer('5172')), 'Content-Type': 'application/json' },
+			body: JSON.stringify({
+				InventionId: inventionId,
+				Permission: 80,
+				Accessibility: 1,
+				Price: 250,
+			}),
+		})
+		expect(unpaid.status).toBe(200)
+		expect(await unpaid.json()).toMatchObject({
+			Success: false,
+			Value: null,
+			Error: 'Rec Room Plus is required to sell an invention',
+		})
 
 		const first = await publish({ Permission: 80, Accessibility: 1, Price: 250 })
 		expect(first.Price).toBe(250)
@@ -3071,7 +3149,10 @@ describe('public endpoints', () => {
 		// One over the cap refuses the publish in-band, and the price stands.
 		const over = await exports.default.fetch(`${ORIGIN}/api/inventions/v4/publish`, {
 			method: 'POST',
-			headers: { ...(await bearer('5172')), 'Content-Type': 'application/json' },
+			headers: {
+				...(await bearer('5172', undefined, undefined, true)),
+				'Content-Type': 'application/json',
+			},
 			body: JSON.stringify({ InventionId: inventionId, Price: 1001 }),
 		})
 		expect(over.status).toBe(200)
@@ -3081,6 +3162,14 @@ describe('public endpoints', () => {
 			Error: 'Price must be <= 1000',
 		})
 		expect((await publish({ Price: 1000 })).Price).toBe(1000)
+
+		// A republish without Plus that leaves the price alone (null) is not a sale being set.
+		const keep = await exports.default.fetch(`${ORIGIN}/api/inventions/v4/publish`, {
+			method: 'POST',
+			headers: { ...(await bearer('5172')), 'Content-Type': 'application/json' },
+			body: JSON.stringify({ InventionId: inventionId, Permission: 20, Price: null }),
+		})
+		expect(((await keep.json()) as InventionSaveV9Result).Success).toBe(true)
 
 		// Out of the published catalogue again — see the note in the publish test above.
 		await env.DB.prepare('DELETE FROM invention WHERE id = ?1').bind(inventionId).run()
@@ -4436,9 +4525,18 @@ describe('public endpoints', () => {
 		// A saved draft is invisible until it's published.
 		expect(await search()).toEqual([])
 
-		const res = await exports.default.fetch(
+		// Pricing is a Rec Room Plus perk: without `rn.plus` the publish is refused, unpublished.
+		const unpaid = await exports.default.fetch(
 			`${ORIGIN}/api/inventions/v3/publish?inventionId=${Invention.InventionId}&permissionLevel=charge&price=250`,
 			{ headers: await bearer('2121') }
+		)
+		expect(unpaid.status).toBe(403)
+		expect(await unpaid.json()).toEqual({ error: 'Rec Room Plus is required to sell an invention' })
+		expect(await search()).toEqual([])
+
+		const res = await exports.default.fetch(
+			`${ORIGIN}/api/inventions/v3/publish?inventionId=${Invention.InventionId}&permissionLevel=charge&price=250`,
+			{ headers: await bearer('2121', undefined, undefined, true) }
 		)
 		expect(res.status).toBe(200)
 		const published = (await res.json()) as InventionSaveResult
@@ -4455,7 +4553,7 @@ describe('public endpoints', () => {
 		// A price over the cap refuses the whole publish, leaving the invention as it was.
 		const over = await exports.default.fetch(
 			`${ORIGIN}/api/inventions/v3/publish?inventionId=${Invention.InventionId}&price=1001`,
-			{ headers: await bearer('2121') }
+			{ headers: await bearer('2121', undefined, undefined, true) }
 		)
 		expect(over.status).toBe(400)
 		expect(await over.json()).toEqual({ error: 'Price must be <= 1000' })
@@ -4501,12 +4599,27 @@ describe('public endpoints', () => {
 			body: JSON.stringify({ name: 'Priced Lamp', inventionDataFilename: 'a.inv' }),
 		})
 		const { Invention } = (await save.json()) as InventionSaveResult
-		const updateprice = async (body: unknown, sub = '1212'): Promise<Response> =>
+		const updateprice = async (body: unknown, sub = '1212', plus = true): Promise<Response> =>
 			exports.default.fetch(`${ORIGIN}/api/inventions/v1/updateprice`, {
 				method: 'POST',
-				headers: { ...(await bearer(sub)), 'Content-Type': 'application/json' },
+				headers: {
+					...(await bearer(sub, undefined, undefined, plus)),
+					'Content-Type': 'application/json',
+				},
 				body: JSON.stringify(body),
 			})
+
+		// A price above 0 is a Rec Room Plus perk; making it free is not.
+		const unpaid = await updateprice(
+			{ InventionId: Invention.InventionId, Price: 500 },
+			'1212',
+			false
+		)
+		expect(unpaid.status).toBe(403)
+		expect(await unpaid.json()).toEqual({ error: 'Rec Room Plus is required to sell an invention' })
+		expect(
+			(await updateprice({ InventionId: Invention.InventionId, Price: 0 }, '1212', false)).status
+		).toBe(200)
 
 		const res = await updateprice({ InventionId: Invention.InventionId, Price: 500 })
 		expect(res.status).toBe(200)
@@ -5050,9 +5163,26 @@ describe('custom avatar items', () => {
 			new Date('2026-08-01T00:00:00Z')
 		)
 		const url = `${ORIGIN}/api/customAvatarItems/v1/${item.CustomAvatarItemId}`
-		const res = await exports.default.fetch(url, {
+		// Pricing is a Rec Room Plus perk: without `rn.plus` the edit is refused, unchanged.
+		const unpaid = await exports.default.fetch(url, {
 			method: 'PUT',
 			headers: { ...(await bearer('205')), 'content-type': 'application/json' },
+			body: JSON.stringify({ Name: null, Description: null, Price: 100, Accessibility: 1 }),
+		})
+		expect(unpaid.status).toBe(403)
+		expect(await unpaid.json()).toMatchObject({
+			Success: false,
+			Value: null,
+			Error: 'Rec Room Plus is required to sell a custom avatar item',
+		})
+		expect((await getCustomAvatarItem(env.DB, item.CustomAvatarItemId))!.Price).toBe(0)
+
+		const res = await exports.default.fetch(url, {
+			method: 'PUT',
+			headers: {
+				...(await bearer('205', undefined, undefined, true)),
+				'content-type': 'application/json',
+			},
 			body: JSON.stringify({ Name: null, Description: null, Price: 100, Accessibility: 1 }),
 		})
 		expect(res.status).toBe(200)
@@ -5103,7 +5233,7 @@ describe('custom avatar items', () => {
 	// player has enforce it — refusing, not clamping, so the creator sees what was set.
 	test('the price is capped at 1000 tokens on create and edit', async () => {
 		expect(MAX_PLAYER_ITEM_PRICE).toBe(1000)
-		const create = async (Price: unknown) => {
+		const create = async (Price: unknown, plus = true) => {
 			const form = new FormData()
 			form.set(
 				'metadata',
@@ -5113,10 +5243,18 @@ describe('custom avatar items', () => {
 			form.set('design', new File([PNG_BYTES], 'd.png', { type: 'image/png' }))
 			return exports.default.fetch(`${ORIGIN}/api/customAvatarItems/v1`, {
 				method: 'POST',
-				headers: await bearer('205'),
+				headers: await bearer('205', undefined, undefined, plus),
 				body: form,
 			})
 		}
+		// A price above 0 is a Rec Room Plus perk; without `rn.plus` the create is refused.
+		const unpaid = await create(100, false)
+		expect(unpaid.status).toBe(403)
+		expect(await unpaid.json()).toMatchObject({
+			Success: false,
+			Value: null,
+			Error: 'Rec Room Plus is required to sell a custom avatar item',
+		})
 		const over = await create(1001)
 		expect(over.status).toBe(400)
 		expect(await over.json()).toMatchObject({
@@ -5126,6 +5264,11 @@ describe('custom avatar items', () => {
 		})
 		expect((await create(-1)).status).toBe(400)
 		expect((await create(10.5)).status).toBe(400)
+		// Below the `minPriceForPublicItem` floor: a price is 0 or at least 100, Plus or not.
+		const cheap = await create(1)
+		expect(cheap.status).toBe(400)
+		expect(await cheap.json()).toMatchObject({ Error: 'Price must be 0 or >= 100' })
+		expect((await create(99)).status).toBe(400)
 		// Nothing was written for the refused ones.
 		expect(
 			await env.DB.prepare(
@@ -5148,20 +5291,35 @@ describe('custom avatar items', () => {
 
 		// The edit is bound the same way, and a refused edit leaves the row as it was.
 		const url = `${ORIGIN}/api/customAvatarItems/v1/${Value.CustomAvatarItemId}`
-		const edit = async (Price: number) =>
+		const edit = async (Price: number, plus = true) =>
 			exports.default.fetch(url, {
 				method: 'PUT',
-				headers: { ...(await bearer('205')), 'content-type': 'application/json' },
+				headers: {
+					...(await bearer('205', undefined, undefined, plus)),
+					'content-type': 'application/json',
+				},
 				body: JSON.stringify({ Name: null, Description: null, Price, Accessibility: null }),
 			})
 		const tooMuch = await edit(1001)
 		expect(tooMuch.status).toBe(400)
 		expect(await tooMuch.json()).toMatchObject({ Success: false, Error: 'Price must be <= 1000' })
 		expect((await edit(-1)).status).toBe(400)
+		expect((await edit(1)).status).toBe(400)
+		expect((await edit(99)).status).toBe(400)
 		expect((await getCustomAvatarItem(env.DB, Value.CustomAvatarItemId))!.Price).toBe(1000)
 		const lowered = await edit(999)
 		expect(lowered.status).toBe(200)
 		expect(((await lowered.json()) as { Value: { Price: number } }).Value.Price).toBe(999)
+
+		// Without Plus a price can't be set, but the item can still be made free.
+		expect((await edit(500, false)).status).toBe(403)
+		const freed = await edit(0, false)
+		expect(freed.status).toBe(200)
+		expect(((await freed.json()) as { Value: { Price: number } }).Value.Price).toBe(0)
+		// And a free item can be created without Plus.
+		expect((await create(0, false)).status).toBe(200)
+		// The floor itself is allowed.
+		expect((await create(100)).status).toBe(200)
 	})
 
 	// The cap arrived after players had already priced shirts. Migration 0032 lowers every
