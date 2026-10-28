@@ -4836,11 +4836,6 @@ function Dashboard({
 			render: () => <EmailForm account={account} onChange={onChange} />,
 		},
 		{ id: 'password', label: 'Password', render: () => <PasswordForm /> },
-		{
-			id: 'delete',
-			label: 'Delete account',
-			render: () => <DeleteAccountForm account={account} onChange={onChange} />,
-		},
 		// Only when the operator has Discord configured — otherwise the panel has nothing to
 		// offer and the tab is a promise the server can't keep. The claim also still lives at
 		// /claim, because that URL is Discord's registered redirect and has to keep working.
@@ -4879,6 +4874,13 @@ function Dashboard({
 					},
 				]
 			: []),
+		// Last, below even the staff tabs: the way out sits at the bottom of the rail, where
+		// nobody reaches it by accident while looking for a setting.
+		{
+			id: 'delete',
+			label: 'Delete account',
+			render: () => <DeleteAccountForm account={account} onChange={onChange} />,
+		},
 	]
 	const [active, setActive] = useState(sections[0].id)
 	const current = sections.find((s) => s.id === active) ?? sections[0]
