@@ -98,6 +98,12 @@ export const SelfAccountDto = AccountDto.extend({
 		),
 	birthday: z.iso.datetime().describe('A fixed placeholder — birthdays are not stored'),
 	availableUsernameChanges: z.int().describe('Remaining username changes'),
+	isDeleted: z
+		.boolean()
+		.describe(
+			'Whether the player asked the website to delete this account (a mark, not a deletion)'
+		),
+	deletedAt: z.iso.datetime().optional().describe('When they asked; present only when isDeleted'),
 })
 
 /** Player bio, from `GET /account/:id/bio`. */

@@ -1208,6 +1208,17 @@ button[type='submit']:disabled {
 	cursor: default;
 }
 
+/* The one submit that takes something away (delete account): the error colour, so it
+   can't be mistaken for a save. */
+button[type='submit'].danger {
+	background: var(--error);
+	color: #fff;
+}
+
+button[type='submit'].danger:not(:disabled):hover {
+	background: var(--text);
+}
+
 /* The cross-link under an auth form ("Don't have an account? Create one"). Sits under
    the submit button, which hugs its label, so it needs its own separation from it. */
 .swap {

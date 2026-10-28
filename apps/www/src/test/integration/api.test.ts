@@ -741,6 +741,47 @@ const unlink = (token: string) =>
 		body: '{}',
 	})
 
+const requestDeletion = (token: string) =>
+	SELF.fetch('https://example.com/api/account/delete', {
+		method: 'POST',
+		headers: { authorization: `Bearer ${token}`, 'content-type': 'application/json' },
+		body: '{}',
+	})
+
+it('requires a valid session to mark an account for deletion', async () => {
+	expect((await requestDeletion('')).status).toBe(401)
+	const forged = await generateToken('4030', '', 4, 'not-the-real-secret')
+	expect((await requestDeletion(forged)).status).toBe(401)
+	// A token for an account that doesn't exist marks nothing.
+	expect((await requestDeletion(await tokenFor(4031))).status).toBe(404)
+})
+
+it('marks the account for deletion without deleting it, once', async () => {
+	const token = await tokenFor(4032)
+	await updateAccount(env.DB, 4032, { username: 'Leaving', email: 'p4032@example.com' })
+
+	const res = await requestDeletion(token)
+	expect(res.status).toBe(200)
+	const body = (await res.json()) as { isDeleted: boolean; deletedAt: string }
+	expect(body.isDeleted).toBe(true)
+	expect(Date.parse(body.deletedAt)).not.toBeNaN()
+
+	// A mark, not a deletion: the row is still there, untouched but for the flag.
+	const marked = await getAccount(env.DB, 4032)
+	expect(marked).toMatchObject({
+		username: 'Leaving',
+		email: 'p4032@example.com',
+		isDeleted: true,
+		deletedAt: body.deletedAt,
+	})
+
+	// Idempotent, keeping the ORIGINAL request time: a second click can't push the mark
+	// past a sign-in that already reversed it.
+	const again = (await (await requestDeletion(token)).json()) as { deletedAt: string }
+	expect(again.deletedAt).toBe(body.deletedAt)
+	expect((await getAccount(env.DB, 4032))?.deletedAt).toBe(body.deletedAt)
+})
+
 it('requires a valid session to unlink a discord', async () => {
 	expect((await unlink('')).status).toBe(401)
 	const forged = await generateToken('4020', '', 4, 'not-the-real-secret')

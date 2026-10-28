@@ -82,6 +82,14 @@ interface SelfAccount {
 	 * stays usable and lets the server be the one to refuse.
 	 */
 	availableUsernameChanges?: number
+	/**
+	 * Whether the player asked for the account to be deleted (`/api/account/delete`). A
+	 * mark, not a deletion: the account still works, and signing in again is meant to
+	 * reverse it. Absent on an older self DTO, which reads as "not marked".
+	 */
+	isDeleted?: boolean
+	/** When they asked, present only while `isDeleted`. */
+	deletedAt?: string
 }
 
 /**
@@ -686,6 +694,14 @@ const claimBenefits = (code: string): Promise<ClaimResult> =>
  */
 const unlinkDiscord = (): Promise<BenefitsStatus> =>
 	call<BenefitsStatus>('/api/benefits/unlink', { json: {}, authed: true })
+
+/**
+ * Mark the signed-in account for deletion — www's own route, which only sets a flag on
+ * the account. Nothing is removed and the session stays valid; the account page just
+ * shows the mark from here on. Answers the mark as it now stands.
+ */
+const deleteAccount = (): Promise<{ isDeleted: true; deletedAt: string }> =>
+	call<{ isDeleted: true; deletedAt: string }>('/api/account/delete', { json: {}, authed: true })
 
 /**
  * The per-attempt CSRF nonce for the Discord round-trip, in sessionStorage.
@@ -4820,6 +4836,11 @@ function Dashboard({
 			render: () => <EmailForm account={account} onChange={onChange} />,
 		},
 		{ id: 'password', label: 'Password', render: () => <PasswordForm /> },
+		{
+			id: 'delete',
+			label: 'Delete account',
+			render: () => <DeleteAccountForm account={account} onChange={onChange} />,
+		},
 		// Only when the operator has Discord configured — otherwise the panel has nothing to
 		// offer and the tab is a promise the server can't keep. The claim also still lives at
 		// /claim, because that URL is Discord's registered redirect and has to keep working.
@@ -5873,6 +5894,77 @@ function PasswordForm() {
 				{done && <p className="ok">{done}</p>}
 				<button type="submit" disabled={pending}>
 					{pending ? 'Updating…' : 'Change password'}
+				</button>
+			</form>
+		</section>
+	)
+}
+
+/**
+ * The way out. The button MARKS the account (`/api/account/delete`) rather than deleting
+ * it, and the panel says so plainly: the account keeps working, and signing in again is
+ * what reverses the request. The player types their username to confirm — a password
+ * would lock out the accounts that sign in through Discord and have none.
+ */
+function DeleteAccountForm({
+	account,
+	onChange,
+}: {
+	account: SelfAccount
+	onChange: (a: SelfAccount) => void
+}) {
+	const [confirmation, setConfirmation] = useState('')
+	const { pending, error, run } = useAction()
+	const confirmed = confirmation.trim().toLowerCase() === account.username.toLowerCase()
+
+	if (account.isDeleted) {
+		return (
+			<section className="card">
+				<h2>Delete account</h2>
+				<p className="error">
+					This account is marked for deletion
+					{account.deletedAt ? ` as of ${new Date(account.deletedAt).toLocaleString()}` : ''}.
+				</p>
+				<p className="muted">
+					Nothing has been removed yet, and the account still works. Signing in again before it is
+					deleted keeps it.
+				</p>
+			</section>
+		)
+	}
+
+	return (
+		<section className="card">
+			<h2>Delete account</h2>
+			<p className="muted">
+				This marks your account for deletion. Your rooms, photos and inventory are not removed right
+				away, and you can change your mind by signing in again before they are.
+			</p>
+			<form
+				onSubmit={(e) => {
+					e.preventDefault()
+					if (!confirmed) return
+					void run(async () => {
+						const marked = await deleteAccount()
+						onChange({ ...account, isDeleted: true, deletedAt: marked.deletedAt })
+						setConfirmation('')
+						return 'Your account is marked for deletion.'
+					})
+				}}
+			>
+				<label>
+					Type your username (@{account.username}) to confirm
+					<input
+						type="text"
+						value={confirmation}
+						autoComplete="off"
+						onChange={(e) => setConfirmation(e.target.value)}
+						required
+					/>
+				</label>
+				{error && <p className="error">{error}</p>}
+				<button type="submit" className="danger" disabled={pending || !confirmed}>
+					{pending ? 'Marking…' : 'Delete account'}
 				</button>
 			</form>
 		</section>

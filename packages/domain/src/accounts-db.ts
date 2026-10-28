@@ -225,6 +225,16 @@ export interface Account {
 	hasStudio?: boolean
 	/** Staff override for screen sharing. Absent means screen sharing is disabled. */
 	hasScreenshare?: boolean
+	/**
+	 * Whether the player has asked for this account to be deleted (`www`
+	 * `POST /api/account/delete`). A MARK, not a deletion: nothing is removed, nothing reads
+	 * it yet, and the account logs in and plays exactly as before. The intent is that a later
+	 * sweep compares `deletedAt` with `lastLoginTime` — a login AFTER the request is the
+	 * player changing their mind, and reverses it. Absent/false means not marked.
+	 */
+	isDeleted?: boolean
+	/** ISO-8601 time of the deletion request; set with `isDeleted`, absent otherwise. */
+	deletedAt?: string
 }
 
 interface AccountRow {

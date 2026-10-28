@@ -781,6 +781,31 @@ const app = new Hono<App>()
 	// Whether the signed-in account has studio upload access (`hasStudio`). The page
 	// Studio opens (`/settings/recroomstudio`) asks this; it does not list anyone
 	// else. Staff manage the flag on the routes below.
+	/**
+	 * Mark the caller's account for deletion. A MARK only: `isDeleted` and `deletedAt` go on
+	 * the account blob and nothing else changes — no row is removed, the session stays
+	 * valid, and the game keeps serving the account. Reversal is meant to be the player
+	 * signing in again (a `lastLoginTime` later than `deletedAt`), which is why there is no
+	 * "undo" here and why this never touches `auth`. Idempotent: re-posting keeps the
+	 * ORIGINAL `deletedAt`, so a second click can't push the mark past a login that already
+	 * reversed it.
+	 */
+	.post('/api/account/delete', async (c) => {
+		const accountId = await claimant(c)
+		if (accountId === null) return c.body(null, 401)
+
+		const account = await getAccount(c.env.DB, accountId)
+		if (!account) return c.json({ error: 'No such account.' }, 404)
+
+		const deletedAt =
+			account.isDeleted === true && account.deletedAt ? account.deletedAt : new Date().toISOString()
+		if (!(account.isDeleted === true && account.deletedAt)) {
+			await updateAccount(c.env.DB, accountId, { isDeleted: true, deletedAt })
+			logger.info('a player marked their account for deletion', { accountId })
+		}
+		return c.json({ isDeleted: true, deletedAt })
+	})
+
 	.get('/api/studio-access', studioAccessStatusHandler)
 
 	// ---- Staff moderation panel ---------------------------------------------

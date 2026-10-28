@@ -219,6 +219,10 @@ function toSelfAccountDto(account: Account) {
 		// everyone can be old.
 		birthday: '1904-01-01T00:00:00.000Z',
 		availableUsernameChanges: account.availableUsernameChanges ?? DEFAULT_USERNAME_CHANGES,
+		// The website's "delete account" mark, so its account page can show it. Always a
+		// boolean (the game client drops unknown members and reads nothing here).
+		isDeleted: account.isDeleted === true,
+		...(account.isDeleted === true && account.deletedAt ? { deletedAt: account.deletedAt } : {}),
 	}
 }
 
