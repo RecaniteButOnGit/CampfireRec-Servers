@@ -77,7 +77,7 @@ const TEST_ROOMS = [
 		Name: 'RecCenter',
 		IsDorm: false,
 		Accessibility: 1,
-		SubRooms: [{ SubRoomId: 2, UnitySceneId: RECCENTER_SCENE, MaxPlayers: 12 }],
+		SubRooms: [{ SubRoomId: 2, UnitySceneId: RECCENTER_SCENE, MaxPlayers: 12, DataBlob: '2026-10-07/63b1dcf7-4d50-41f0-838f-4d2b548cb041' }],
 	},
 	{
 		RoomId: 3,
@@ -701,13 +701,14 @@ describe('public endpoints', () => {
 		expect(res.status).toBe(200)
 		const body = (await res.json()) as {
 			errorCode: number
-			roomInstance: { roomId: number; location: string; isPrivate: boolean; name: string }
+			roomInstance: { roomId: number; location: string; isPrivate: boolean; name: string; dataBlob: string }
 		}
 		expect(body.errorCode).toBe(0)
 		expect(body.roomInstance).toMatchObject({
 			roomId: 2,
 			name: '^RecCenter',
 			location: RECCENTER_SCENE,
+			dataBlob: '',
 			isPrivate: true,
 		})
 	})

@@ -989,7 +989,12 @@ function instanceFieldsFromRoom(room: Room, subRoomId?: number) {
 		// the choice client-side from the `/subrooms/{id}/saves` list — matchmaking is not
 		// involved, and serving a staged blob here would put two people in one instance on
 		// different versions.
-		dataBlob: subRoomDataBlob(sub),
+		// Temporary compatibility probe: keep the published save in storage, but load
+		// the built-in Rec Center scene without this known 2025-era save for the 2024 client.
+		dataBlob:
+			room.RoomId === 2 && subRoomDataBlob(sub) === '2026-10-07/63b1dcf7-4d50-41f0-838f-4d2b548cb041'
+				? ''
+				: subRoomDataBlob(sub),
 		name,
 		maxCapacity: num(sub?.MaxPlayers, 4),
 		roomInstanceType: room.IsDorm === true ? RoomInstanceType.Dormroom : RoomInstanceType.Public,
