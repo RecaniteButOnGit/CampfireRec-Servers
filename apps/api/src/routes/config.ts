@@ -2,10 +2,8 @@ import { Hono } from 'hono'
 import { describeRoute } from 'hono-openapi'
 
 import { isSupportedGameVersion } from '@repo/domain'
-import { validateAndGetVersion } from '@repo/jwt'
 
 import apiConfigV2 from '../../static/api-config-v2.json'
-import gameConfigsV1All2025 from '../../static/gameconfigs-v1-all-2025.json'
 import gameConfigsV1All from '../../static/gameconfigs-v1-all.json'
 import {
 	AmplitudeConfig,
@@ -133,40 +131,24 @@ export const configRoutes = new Hono<App>({ strict: false })
 		}),
 		(c) => c.json([])
 	)
-	// Two catalogs, one per client generation: the 2023 build and the 2025 build read
-	// different keys out of this, and the 2025 one carries entries (`Screens.*`, the
-	// creative-door queries) the older catalog never had.
-	//
-	// Which one a caller gets is decided by the token's `rn.ver` claim — the build the
-	// client posted at login — since the request itself carries no version. Anything NEWER
-	// than `20230414` gets the 2025 catalog; that build and anything older
-	// get the 2023 one. Builds are date-stamped (`20230414`, `20250718.01`), so they order
-	// as strings, the same comparison `match` makes for cross-build joins.
-	//
-	// A request with no readable token version gets the 2023 catalog, the same body this
-	// route has always served: unauthenticated is not evidence of a newer client, and this
-	// does not establish a client's build. Like the version gate on `featuredrooms`, the claim is
-	// unverified — a client that lies about its build only misconfigures itself.
+	// The only supported client is the June 2024 build (`20240621`). The 2025 catalog
+	// contains keys that build does not know how to consume. Until we have an observed,
+	// build-matched 2024 catalog, serve the known pre-2025 catalog to every caller; the
+	// version gate rejects every other build separately. Keeping this route independent of
+	// auth also lets the client fetch bootstrap config before it has a token.
 	.get(
 		'/api/gameconfigs/v1/all',
 		describeRoute({
 			tags: ['Config'],
 			summary: 'Per-game configuration',
 			description:
-				'An opaque static catalog of per-game settings, served verbatim. There are two: a ' +
-				'build NEWER than `20230414` gets the 2025 catalog, which carries keys the older one ' +
-				'never had; that build and anything older get the 2023 catalog. Builds are ' +
-				'date-stamped, so they compare as strings. The build is read from the token’s ' +
-				'`rn.ver` claim — the request carries no version of its own — so auth is optional ' +
-				'here and only selects the catalog; a request without a readable token version gets ' +
-				'the 2023 one.',
+				'An opaque static catalog of per-game settings. This server supports the June 2024 ' +
+				'build and serves it the known pre-2025 catalog because the 2025 catalog includes ' +
+				'keys the 2024 client cannot consume. The endpoint is available before login; all ' +
+				'other builds are rejected by the version gate.',
 			responses: { 200: json(JsonObject, 'The game config catalog for the caller’s build') },
 		}),
-		async (c) => {
-			const version = await validateAndGetVersion(c.req.raw, await c.env.JWT_SECRET.get())
-			const newerThanTarget = version !== null && version > '20230414'
-			return c.json(newerThanTarget ? gameConfigsV1All2025 : gameConfigsV1All)
-		}
+		(c) => c.json(gameConfigsV1All)
 	)
 
 	// The property bag the client would attach to its Statsig user. The reference server

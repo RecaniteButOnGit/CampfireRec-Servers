@@ -320,9 +320,9 @@ describe('public endpoints', () => {
 		expect(await res.json()).toMatchObject({ VersionStatus: 1 })
 	})
 
-	// Two catalogs, picked off the token's `rn.ver`: a build newer than 20230414 gets
-	// the 2025 one. `Avatars.AdvancedFaceCustomizationEnabled` is a key only that catalog
-	// has, so its presence identifies which body was served.
+	// The server only supports the June 2024 build. The 2025 catalog contains keys that
+	// the client cannot consume, so every caller receives the known pre-2025 compatibility
+	// catalog while versioncheck rejects unsupported builds.
 	const gameConfigKeys = async (version?: string) => {
 		const res = await exports.default.fetch(`${ORIGIN}/api/gameconfigs/v1/all`, {
 			headers: version === undefined ? {} : await bearer('42', undefined, version),
@@ -332,18 +332,14 @@ describe('public endpoints', () => {
 	}
 	const KEY_2025_ONLY = 'Avatars.AdvancedFaceCustomizationEnabled'
 
-	test('GET /api/gameconfigs/v1/all serves the 2025 catalog to a newer build', async () => {
-		for (const version of ['20250718.01', '20250424.01', '20240621', '20231207']) {
-			expect(await gameConfigKeys(version), version).toContain(KEY_2025_ONLY)
+	test('GET /api/gameconfigs/v1/all serves the pre-2025 catalog to the supported 2024 build', async () => {
+		expect(await gameConfigKeys('20240621')).not.toContain(KEY_2025_ONLY)
+	})
+
+	test('GET /api/gameconfigs/v1/all never sends the 2025 catalog to unsupported builds', async () => {
+		for (const version of ['20250718.01', '20250424.01', '20231207', '20220101']) {
+			expect(await gameConfigKeys(version), version).not.toContain(KEY_2025_ONLY)
 		}
-	})
-
-	test('GET /api/gameconfigs/v1/all serves the 2023 catalog to the 2023 build', async () => {
-		expect(await gameConfigKeys('20230414')).not.toContain(KEY_2025_ONLY)
-	})
-
-	test('GET /api/gameconfigs/v1/all serves the 2023 catalog to an older build', async () => {
-		expect(await gameConfigKeys('20220101')).not.toContain(KEY_2025_ONLY)
 	})
 
 	test('GET /api/gameconfigs/v1/all falls back to the 2023 catalog without a token', async () => {
