@@ -61,12 +61,14 @@ import {
 	toSaveResultV9,
 	unpublishInvention,
 	updateInvention,
+	withClientInvention,
 } from '../inventions-db'
 import {
 	AUTHED,
 	BareBoolean,
 	BareInteger,
 	BulkCustomAvatarItemsRequest,
+	InventionBatchRequest,
 	CreateCustomAvatarItemRequest,
 	CustomAvatarItemList,
 	CustomAvatarItemReportRequest,
@@ -122,7 +124,7 @@ import { exceedsApiUploadLimit, maxApiUploadBytes } from '../upload-limit'
 
 import type { Context } from 'hono'
 import type { App } from '../context'
-import type { InventionTag, SavedInvention } from '../inventions-db'
+import type { InventionTag, ListedInvention, SavedInvention } from '../inventions-db'
 
 /**
  * The most ids `POST /api/customAvatarItems/v1/bulk` will resolve. A batch over this answers
@@ -382,13 +384,45 @@ async function createInventionFromBody(
  * value may itself be a comma-separated list; anything non-numeric is dropped.
  */
 function inventionIdQuery(c: Context<App>): number[] {
-	return (
-		c.req
-			.queries('id')
-			?.flatMap((raw) => raw.split(','))
-			.map((raw) => Number.parseInt(raw.trim(), 10))
-			.filter((id) => !Number.isNaN(id)) ?? []
-	)
+	return parseInventionIds(c.req.queries('id') ?? [])
+}
+
+/**
+ * {@link inventionIdQuery} for `POST /api/inventions/v2/batch`, which carries the same
+ * repeated `id` in a form body instead (the query string is read too, so either works).
+ */
+async function inventionIdForm(c: Context<App>): Promise<number[]> {
+	const raw = [...(c.req.queries('id') ?? [])]
+	const body = await c.req.parseBody({ all: true }).catch(() => ({}) as Record<string, unknown>)
+	const posted = body.id
+	for (const value of Array.isArray(posted) ? posted : [posted]) {
+		if (typeof value === 'string') raw.push(value)
+	}
+	return parseInventionIds(raw)
+}
+
+/**
+ * The client asks for official-game inventions by their 64-bit ids, which a JS number
+ * can't hold exactly; those never match a local (sequential) id and are simply dropped.
+ */
+function parseInventionIds(raw: string[]): number[] {
+	return raw
+		.flatMap((value) => value.split(','))
+		.map((value) => Number.parseInt(value.trim(), 10))
+		.filter((id) => !Number.isNaN(id))
+}
+
+/**
+ * The inventions `ids` names that the caller may see — the body of both batch routes —
+ * with the 2025 client's flat `RRInvention` laid over the stored record, as `v2/mine` serves.
+ */
+async function visibleInventions(c: Context<App>, ids: number[]): Promise<ListedInvention[]> {
+	if (ids.length === 0) return []
+	const playerId = await authedId(c)
+	const inventions = await getInventionsByIds(c.env.DB, ids)
+	return inventions
+		.filter((i) => i.IsPublished || (playerId !== null && i.CreatorPlayerId === playerId))
+		.map(withClientInvention)
 }
 
 // ---- Avatar gifts ----------------------------------------------------------
@@ -1369,20 +1403,36 @@ export const avatarRoutes = new Hono<App>({ strict: false })
 				'and an empty request is an empty list. Auth is optional and only widens what you ' +
 				'see: an unpublished invention comes back only to its creator.',
 			parameters: [intQuery('id', 'Repeatable; each value may be a comma-separated list of ids')],
-			responses: { 200: json(InventionDto.array(), 'The inventions the caller may see') },
+			responses: {
+				200: json(
+					InventionDto.extend(InventionV9Dto.shape).array(),
+					'The inventions the caller may see'
+				),
+			},
 		}),
-		async (c) => {
-			const ids = inventionIdQuery(c)
-			if (ids.length === 0) return c.json([])
+		async (c) => c.json(await visibleInventions(c, inventionIdQuery(c)))
+	)
 
-			const playerId = await authedId(c)
-			const inventions = await getInventionsByIds(c.env.DB, ids)
-			return c.json(
-				inventions.filter(
-					(i) => i.IsPublished || (playerId !== null && i.CreatorPlayerId === playerId)
-				)
-			)
-		}
+	// The same batch with the ids in a form body (`id=1&id=2`) — what the 2025+ client
+	// sends, since a room's worth of ids overflows a URL.
+	.post(
+		'/api/inventions/v2/batch',
+		describeRoute({
+			tags: ['Inventions'],
+			summary: 'Inventions by id, in bulk (form body)',
+			description:
+				'`GET /api/inventions/v2/batch` with the repeated `id` posted as a form instead of ' +
+				'the query string. Unknown ids are dropped, including official-game ids that have ' +
+				'no local invention; auth is optional and only adds the caller’s unpublished ones.',
+			requestBody: form(InventionBatchRequest, 'The invention ids to resolve'),
+			responses: {
+				200: json(
+					InventionDto.extend(InventionV9Dto.shape).array(),
+					'The inventions the caller may see'
+				),
+			},
+		}),
+		async (c) => c.json(await visibleInventions(c, await inventionIdForm(c)))
 	)
 
 	// Whether the caller owns every invention in a lineage (`?id=101&id=102&id=103`) —

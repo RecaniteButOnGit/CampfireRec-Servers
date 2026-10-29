@@ -4097,6 +4097,52 @@ describe('public endpoints', () => {
 		expect(await batch('')).toEqual([])
 	})
 
+	test('POST /api/inventions/v2/batch reads the ids from a form body', async () => {
+		const save = await exports.default.fetch(`${ORIGIN}/api/inventions/v6/save`, {
+			method: 'POST',
+			headers: { ...(await bearer('5567')), 'Content-Type': 'application/json' },
+			body: JSON.stringify({ name: 'Batch Form', inventionDataFilename: 'a.inv' }),
+		})
+		const { Invention } = (await save.json()) as InventionSaveResult
+		await exports.default.fetch(
+			`${ORIGIN}/api/inventions/v3/publish?inventionId=${Invention.InventionId}`,
+			{ headers: await bearer('5567') }
+		)
+
+		// Official-game 64-bit ids have no local invention and are dropped.
+		const res = await exports.default.fetch(`${ORIGIN}/api/inventions/v2/batch`, {
+			method: 'POST',
+			headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+			body: `id=4984136863891873049&id=${Invention.InventionId}&id=9181913027670897186`,
+		})
+		expect(res.status).toBe(200)
+		// The 2025 client's flat `RRInvention` keys, laid over the stored record.
+		expect(await res.json()).toMatchObject([
+			{
+				InventionId: Invention.InventionId,
+				UgcVersion: 1,
+				LatestVersionNumber: Invention.CurrentVersionNumber,
+				Accessibility: 1,
+				ForceCannotPublish: false,
+				IsRecRoomApproved: false,
+				DisplayMetadataJson: null,
+			},
+		])
+
+		const empty = await exports.default.fetch(`${ORIGIN}/api/inventions/v2/batch`, {
+			method: 'POST',
+			headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+			body: '',
+		})
+		expect(await empty.json()).toEqual([])
+
+		await exports.default.fetch(`${ORIGIN}/api/inventions/v2/delete`, {
+			method: 'POST',
+			headers: { ...(await bearer('5567')), 'Content-Type': 'application/json' },
+			body: JSON.stringify({ InventionId: Invention.InventionId }),
+		})
+	})
+
 	test('GET /api/inventions/v1/fulllineageowner answers for the whole set of ids', async () => {
 		const save = async (sub: string, name: string): Promise<SavedInvention> => {
 			const res = await exports.default.fetch(`${ORIGIN}/api/inventions/v6/save`, {
@@ -10689,6 +10735,7 @@ describe('openapi', () => {
 			'POST /api/inventions/v1/settags',
 			'POST /api/inventions/v1/update',
 			'POST /api/inventions/v1/updateprice',
+			'POST /api/inventions/v2/batch',
 			'POST /api/inventions/v2/cheer',
 			'POST /api/inventions/v2/delete',
 			'POST /api/inventions/v2/unpublish',

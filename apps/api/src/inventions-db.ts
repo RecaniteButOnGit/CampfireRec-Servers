@@ -623,9 +623,9 @@ export async function getMyInventions(
 }
 
 /** A stored record with the client's flat `RRInvention` laid over it — see {@link getMyInventions}. */
-type ListedInvention = Omit<SavedInvention, keyof InventionV9Dto> & InventionV9Dto
+export type ListedInvention = Omit<SavedInvention, keyof InventionV9Dto> & InventionV9Dto
 
-function withClientInvention(invention: SavedInvention): ListedInvention {
+export function withClientInvention(invention: SavedInvention): ListedInvention {
 	return { ...invention, ...toInventionV9(invention) }
 }
 

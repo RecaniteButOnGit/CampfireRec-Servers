@@ -923,6 +923,11 @@ export const GenerateGiftRequest = z.object({
  * array: the reference binds `[FromForm] List<string>`, so the client posts
  * `customAvatarItemIds=a&customAvatarItemIds=b`.
  */
+/** `POST /api/inventions/v2/batch` form body — the GET's repeated `id`, posted. */
+export const InventionBatchRequest = z.object({
+	id: z.array(z.string()).describe('The invention ids to resolve; repeat the field once per id'),
+})
+
 export const BulkCustomAvatarItemsRequest = z.object({
 	customAvatarItemIds: z
 		.array(z.string())
