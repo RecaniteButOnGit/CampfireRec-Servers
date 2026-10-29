@@ -1003,7 +1003,7 @@ export const avatarRoutes = new Hono<App>({ strict: false })
 	// The newer outfit read, on a bare (un-prefixed) path. Auth-gated. The outfit the
 	// player is wearing is slot 0 of the shared `outfit` table (the same table the `econ`
 	// worker's saved-outfit slots live in); a player who has never saved gets the
-	// brand-new-account envelope instead.
+	// empty outfit with the legacy-data envelope expected by the June 2024 client.
 	.get(
 		'/outfits/me',
 		describeRoute({
@@ -1014,9 +1014,8 @@ export const avatarRoutes = new Hono<App>({ strict: false })
 				'`outfit` table — the newer client treats slot 0 as the outfit currently worn — and ' +
 				'handed back exactly as it was saved, since the payload’s heavy fields are the ' +
 				'client’s own JSON-in-a-string documents.\n\n' +
-				'A player who has never saved gets the brand-new-account envelope, which is a ' +
-				'different, flatter shape than a stored outfit: the four empty-string fields ' +
-				'`FaceFeatures`, `HairColor`, `OutfitSelections` and `SkinColor`, and nothing else.',
+				'A player who has never saved gets an empty outfit with `LegacyData`, which the ' +
+				'June 2024 client requires when parsing the response.',
 			security: AUTHED,
 			responses: {
 				200: json(OutfitsMeResponse, 'The stored outfit, or the empty envelope'),
@@ -1030,12 +1029,7 @@ export const avatarRoutes = new Hono<App>({ strict: false })
 			const outfit = await getOutfit(c.env.DB, id, CURRENT_OUTFIT_SLOT)
 			if (outfit !== null) return c.json(toNewClientOutfit(outfit))
 
-			return c.json({
-				FaceFeatures: '',
-				HairColor: '',
-				OutfitSelections: '',
-				SkinColor: '',
-			})
+			return c.json(toNewClientOutfit({ Slot: CURRENT_OUTFIT_SLOT }))
 		}
 	)
 

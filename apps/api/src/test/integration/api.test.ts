@@ -1852,11 +1852,17 @@ describe('public endpoints', () => {
 		// Account 77 never saves an outfit, so it keeps getting the new-account envelope.
 		const res = await exports.default.fetch(`${ORIGIN}/outfits/me`, { headers: await bearer('77') })
 		expect(res.status).toBe(200)
-		expect(await res.json()).toEqual({
-			FaceFeatures: '',
-			HairColor: '',
-			OutfitSelections: '',
-			SkinColor: '',
+		expect(await res.json()).toMatchObject({
+			DataVersion: 2,
+			LegacyData: {
+				SelectionsV1: '',
+				SelectionsV2: null,
+				FaceFeatures: null,
+				SkinColor: null,
+				HairColor: null,
+			},
+			Selections: [],
+			Slot: 0,
 		})
 	})
 
