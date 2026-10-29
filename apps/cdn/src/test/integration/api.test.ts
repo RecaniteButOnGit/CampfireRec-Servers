@@ -102,6 +102,21 @@ describe('cdn endpoints', () => {
 		expect(res.status).toBe(404)
 	})
 
+	test('the June 2024 signature fallback serves the original bytes and honors ranges', async () => {
+		const url = `${ORIGIN}/sigs/af3a046f-193a-45f0-bf20-4998d788a972`
+		const res = await exports.default.fetch(url)
+		expect(res.status).toBe(200)
+		const bytes = await res.arrayBuffer()
+		expect(bytes.byteLength).toBe(4082136)
+		const digest = new Uint8Array(await crypto.subtle.digest('SHA-256', bytes))
+		expect(Array.from(digest, (v) => v.toString(16).padStart(2, '0')).join('')).toBe(
+			'dcd37a3c4becc32caf29e3ea97f80e13cc52e0a3eb63e54b9cb74b9f97808474'
+		)
+		const partial = await exports.default.fetch(url, { headers: { Range: 'bytes=0-15' } })
+		expect(partial.status).toBe(206)
+		expect(new Uint8Array(await partial.arrayBuffer())).toEqual(new Uint8Array(bytes).subarray(0, 16))
+	})
+
 	test('GET /sigs/:sigName streams the blob from R2 as octet-stream', async () => {
 		await env.CDN_ASSETS.put('sigs/682c1283', new Uint8Array([1, 2, 3, 4]))
 		const res = await exports.default.fetch(`${ORIGIN}/sigs/682c1283`)

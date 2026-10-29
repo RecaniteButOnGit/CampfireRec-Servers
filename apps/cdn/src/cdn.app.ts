@@ -113,6 +113,9 @@ const CACHE_CONTROL = `public, max-age=${86400 * 30}`
 // either key, its object takes precedence. Keep the old ObbyTemplate save for clones made
 // before MakerRoom2 switched to the MyLittleMonsters source.
 const BUNDLED_ROOMS2_TEMPLATE_ASSETS: Record<string, string> = {
+	// Candidate signature list shipped with the June 2024 PC build. A bucket object
+	// at this key takes precedence if the original CDN object is recovered later.
+	'sigs/af3a046f-193a-45f0-bf20-4998d788a972': '/legacy-signatures/20240621-pc.sig',
 	'room/templates/rooms2/empty-obbytemplate/7xd0rcm7jwv1l2heirlvhi1zh.room':
 		'/room-templates/rooms2-obby-empty.room',
 	'room/templates/rooms2/mylittlemonsters/b095j1ikk9vu9j8wl3jwq5eht.room':
