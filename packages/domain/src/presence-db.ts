@@ -28,33 +28,16 @@ export const PRESENCE_TTL_SECONDS = 900
 
 /**
  * Game build version reported in presence (and echoed in the auth token's `rn.ver`
- * claim). This is a server-side constant — the client doesn't supply it, and an
- * empty value breaks the client's presence/version handling. Matches our target
- * 2023 client build.
+ * claim) when a client does not provide a build. An empty value breaks the client's
+ * presence/version handling. Campfire targets the June 2024 client.
  */
-export const GAME_VERSION = '20230414'
+export const GAME_VERSION = '20240621'
 
 /**
- * Client builds `/api/versioncheck/v4` answers "current" for, in the support tiers the
- * README publishes. They talk close enough to the same protocol to get past the update
- * prompt; how much beyond that is tested differs by tier:
- *
- * - `GAME_VERSION` (`20230414`, manifest `7859140924515540835`) is the DEFAULT — the
- *   build the rest of the stack targets and the one it reports for itself.
- * - `20250718.01` (manifest `1151455856673601091`, reached through the `patch-2025`
- *   patch) is BETA — supported, and the build the "newer than `20230414`" gates in
- *   `econ`/`api`/`rooms` are written and tested against.
- * - The rest are ALPHA: waved past the version check, but nothing else in the stack
- *   targets them, so they can still hit protocol differences this check would otherwise
- *   have caught. Expect breakage rather than treating a bug there as a regression.
+ * Only the target build passes `/api/versioncheck/v4`. This gate does not itself
+ * guarantee that every endpoint or saved room is compatible with that build.
  */
-export const SUPPORTED_GAME_VERSIONS: string[] = [
-	GAME_VERSION, // default
-	'20250718.01', // beta
-	'20230616', // alpha
-	'20231207', // alpha
-	'20250424.01', // alpha
-]
+export const SUPPORTED_GAME_VERSIONS: string[] = [GAME_VERSION]
 
 /** Whether a client-supplied build (the version check's `?v=`) is one we serve. */
 export function isSupportedGameVersion(version: string | null | undefined): boolean {

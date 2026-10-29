@@ -63,12 +63,12 @@ try {
 		!(JSON.parse(config.body) as { ShareBaseUrl: string }).ShareBaseUrl.includes('www.example.test')
 	)
 		throw new Error('API config failed')
-	const version = await route('api.example.test', '/api/versioncheck/v4?v=20250718.01')
+	const version = await route('api.example.test', '/api/versioncheck/v4?v=20240621')
 	if (
 		version.status !== 200 ||
 		(JSON.parse(version.body) as { VersionStatus: number }).VersionStatus !== 0
 	)
-		throw new Error('20250718.01 version check failed')
+		throw new Error('20240621 version check failed')
 	for (const service of ['auth', 'rooms', 'match', 'studio']) {
 		const response = await route(
 			`${service}.example.test`,

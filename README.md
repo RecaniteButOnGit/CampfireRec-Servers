@@ -36,24 +36,10 @@ resulting in bugs getting fixed faster. I hope.
 
 ## Game client
 
-See [RecFlare Client](https://github.com/djdevin/recflare-client) for the official RecFlare build.
-
-These game builds are supported:
-
-| Build         | Manifest              | Support                                                                                 |
-| ------------- | --------------------- | --------------------------------------------------------------------------------------- |
-| `20230414`    | `7859140924515540835` | **Default**, official — the 2023 build the rest of the stack targets                    |
-| `20250718.01` | `1151455856673601091` | **Beta**, official — use the [patch-2025](https://github.com/recflare/patch-2025) patch |
-| `20250424.01` |                       | Alpha                                                                                   |
-| `20231207`    |                       | Alpha                                                                                   |
-| `20230616`    |                       | Alpha                                                                                   |
-
-Alpha builds get past the version check and largely work, but nothing else in the
-stack targets them, so expect protocol differences. Other client or game versions
-may expect different endpoints and response shapes and are not supported.
-
-Generally speaking any client that effectively rewrites the nameserver with the
-right mods (see [RecNet Plugin](https://github.com/djdevin/recnet-plugin), [2025 patch](https://github.com/recflare/patch-2025)) can be used with this server.
+Campfire targets the June 2024 PC build `20240621` (Steam depot manifest
+`5652464073904128818`). It is the only build accepted by the version check.
+Full protocol and room compatibility are still being verified; passing the version
+check alone does not mean a saved room can be loaded by this client.
 
 ## Services
 
@@ -67,9 +53,8 @@ Want to run it yourself? See [DEPLOYING.md](DEPLOYING.md)
 
 ### What year is this for?
 
-Most 2023 and 2025 clients. A few older builds work at
-alpha quality — see the table in the "Game client" section above. Other clients may not
-work.
+The target is the June 2024 client (`20240621`). Other builds are rejected by the
+version check.
 
 See the "Game client" section above for instructions on how to modify a client to connect to this server.
 

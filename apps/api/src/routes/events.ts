@@ -1,7 +1,7 @@
 import { Hono } from 'hono'
 import { describeRoute } from 'hono-openapi'
 
-import { Accessibility, createNotification, GAME_VERSION, MessageType } from '@repo/domain'
+import { Accessibility, createNotification, MessageType } from '@repo/domain'
 import { logger } from '@repo/hono-helpers'
 import { validateAndGetVersion } from '@repo/jwt'
 
@@ -304,7 +304,7 @@ async function pushEventInvitation(
  * owes the 2023 build `["celebration"]` and anything newer `[{ Tag, Type }]`. The build
  * comes off the token's `rn.ver` claim — the request carries no version of its own — and
  * the split is the one `/api/gameconfigs/v1/all` already makes: anything NEWER than
- * `GAME_VERSION` (20230414) gets the pairs; that build, anything older, and a request
+ * `20230414` gets the pairs; that build, anything older, and a request
  * with no readable token version all get the 2023 names. Builds are date-stamped, so they
  * order as strings. `TagModifyResult.Tags` is a name list to every build — only the
  * inline field moves.
@@ -314,7 +314,7 @@ async function pushEventInvitation(
  */
 async function eventResult(c: Context<App>, event: PlayerEvent, tags: EventTag[]) {
 	const version = await validateAndGetVersion(c.req.raw, await c.env.JWT_SECRET.get())
-	const isModernBuild = version !== null && version > GAME_VERSION
+	const isModernBuild = version !== null && version > '20230414'
 	return toEventResult(event, tags, isModernBuild)
 }
 

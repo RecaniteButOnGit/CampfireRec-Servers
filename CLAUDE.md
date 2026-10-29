@@ -47,11 +47,8 @@
 <game-clients>
 Supported client builds live in `SUPPORTED_GAME_VERSIONS`
 (`packages/domain/src/presence-db.ts`); `GAME_VERSION` is the default the stack targets.
-
-- `20230414` — default, official. Manifest `7859140924515540835` (2023).
-- `20250718.01` — beta, official. Manifest `1151455856673601091`; reaches this server via
-  the [patch-2025](https://github.com/recflare/patch-2025) patch.
-- `20250424.01`, `20231207`, `20230616` — alpha.
+Campfire accepts only `20240621`, Steam depot manifest `5652464073904128818`.
+Full protocol and room compatibility remain under investigation.
 
 Builds are date-stamped (`YYYYMMDD[.NN]`) so they order as plain strings; several
 surfaces gate on "newer than `20230414`" (econ storefront catalog, `api` event tags,

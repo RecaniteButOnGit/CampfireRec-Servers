@@ -301,6 +301,15 @@ describe('public endpoints', () => {
 		}
 	})
 
+	test('GET /api/versioncheck/v4 accepts only the June 2024 build', async () => {
+		const res = await exports.default.fetch(`${ORIGIN}/api/versioncheck/v4?v=20240621`)
+		expect(await res.json()).toMatchObject({ VersionStatus: 0 })
+		for (const version of ['20230414', '20230616', '20231207', '20250424.01', '20250718.01']) {
+			const other = await exports.default.fetch(`${ORIGIN}/api/versioncheck/v4?v=${version}`)
+			expect(await other.json(), version).toMatchObject({ VersionStatus: 1 })
+		}
+	})
+
 	test('GET /api/versioncheck/v4 flags a mismatched build', async () => {
 		const res = await exports.default.fetch(`${ORIGIN}/api/versioncheck/v4?v=19990101`)
 		expect(await res.json()).toMatchObject({ VersionStatus: 1 })
@@ -311,7 +320,7 @@ describe('public endpoints', () => {
 		expect(await res.json()).toMatchObject({ VersionStatus: 1 })
 	})
 
-	// Two catalogs, picked off the token's `rn.ver`: a build newer than GAME_VERSION gets
+	// Two catalogs, picked off the token's `rn.ver`: a build newer than 20230414 gets
 	// the 2025 one. `Avatars.AdvancedFaceCustomizationEnabled` is a key only that catalog
 	// has, so its presence identifies which body was served.
 	const gameConfigKeys = async (version?: string) => {
@@ -324,13 +333,13 @@ describe('public endpoints', () => {
 	const KEY_2025_ONLY = 'Avatars.AdvancedFaceCustomizationEnabled'
 
 	test('GET /api/gameconfigs/v1/all serves the 2025 catalog to a newer build', async () => {
-		for (const version of ['20250718.01', '20250424.01', '20231207']) {
+		for (const version of ['20250718.01', '20250424.01', '20240621', '20231207']) {
 			expect(await gameConfigKeys(version), version).toContain(KEY_2025_ONLY)
 		}
 	})
 
-	test('GET /api/gameconfigs/v1/all serves the 2023 catalog to the target build', async () => {
-		expect(await gameConfigKeys(GAME_VERSION)).not.toContain(KEY_2025_ONLY)
+	test('GET /api/gameconfigs/v1/all serves the 2023 catalog to the 2023 build', async () => {
+		expect(await gameConfigKeys('20230414')).not.toContain(KEY_2025_ONLY)
 	})
 
 	test('GET /api/gameconfigs/v1/all serves the 2023 catalog to an older build', async () => {
@@ -8790,6 +8799,7 @@ describe('player events', () => {
 		// no build at all are all the 2023 client and get names. Builds are date-stamped, so
 		// they compare as strings.
 		expect((await created('20250718.01')).PlayerEvent.Tags).toEqual(PAIRS)
+		expect((await created('20240621')).PlayerEvent.Tags).toEqual(PAIRS)
 		expect((await created('20230414')).PlayerEvent.Tags).toEqual(NAMES)
 		expect((await created('20220101')).PlayerEvent.Tags).toEqual(NAMES)
 		const legacy = await created()

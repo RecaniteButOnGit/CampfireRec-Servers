@@ -1,7 +1,7 @@
 import { Hono } from 'hono'
 import { describeRoute } from 'hono-openapi'
 
-import { GAME_VERSION, isSupportedGameVersion } from '@repo/domain'
+import { isSupportedGameVersion } from '@repo/domain'
 import { validateAndGetVersion } from '@repo/jwt'
 
 import apiConfigV2 from '../../static/api-config-v2.json'
@@ -139,13 +139,13 @@ export const configRoutes = new Hono<App>({ strict: false })
 	//
 	// Which one a caller gets is decided by the token's `rn.ver` claim — the build the
 	// client posted at login — since the request itself carries no version. Anything NEWER
-	// than `GAME_VERSION` (20230414) gets the 2025 catalog; that build and anything older
+	// than `20230414` gets the 2025 catalog; that build and anything older
 	// get the 2023 one. Builds are date-stamped (`20230414`, `20250718.01`), so they order
 	// as strings, the same comparison `match` makes for cross-build joins.
 	//
 	// A request with no readable token version gets the 2023 catalog, the same body this
 	// route has always served: unauthenticated is not evidence of a newer client, and this
-	// stack targets `GAME_VERSION`. Like the version gate on `featuredrooms`, the claim is
+	// does not establish a client's build. Like the version gate on `featuredrooms`, the claim is
 	// unverified — a client that lies about its build only misconfigures itself.
 	.get(
 		'/api/gameconfigs/v1/all',
@@ -164,7 +164,7 @@ export const configRoutes = new Hono<App>({ strict: false })
 		}),
 		async (c) => {
 			const version = await validateAndGetVersion(c.req.raw, await c.env.JWT_SECRET.get())
-			const newerThanTarget = version !== null && version > GAME_VERSION
+			const newerThanTarget = version !== null && version > '20230414'
 			return c.json(newerThanTarget ? gameConfigsV1All2025 : gameConfigsV1All)
 		}
 	)
