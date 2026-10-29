@@ -77,7 +77,14 @@ const TEST_ROOMS = [
 		Name: 'RecCenter',
 		IsDorm: false,
 		Accessibility: 1,
-		SubRooms: [{ SubRoomId: 2, UnitySceneId: RECCENTER_SCENE, MaxPlayers: 12, DataBlob: '2026-10-07/63b1dcf7-4d50-41f0-838f-4d2b548cb041' }],
+		SubRooms: [
+			{
+				SubRoomId: 2,
+				UnitySceneId: RECCENTER_SCENE,
+				MaxPlayers: 12,
+				DataBlob: 'a-later-save.room',
+			},
+		],
 	},
 	{
 		RoomId: 3,
@@ -701,7 +708,13 @@ describe('public endpoints', () => {
 		expect(res.status).toBe(200)
 		const body = (await res.json()) as {
 			errorCode: number
-			roomInstance: { roomId: number; location: string; isPrivate: boolean; name: string; dataBlob: string }
+			roomInstance: {
+				roomId: number
+				location: string
+				isPrivate: boolean
+				name: string
+				dataBlob: string
+			}
 		}
 		expect(body.errorCode).toBe(0)
 		expect(body.roomInstance).toMatchObject({
@@ -711,6 +724,20 @@ describe('public endpoints', () => {
 			dataBlob: '',
 			isPrivate: true,
 		})
+	})
+
+	test('other client builds retain the published Rec Center save', async () => {
+		const res = await exports.default.fetch(`${ORIGIN}/matchmake/room/2`, {
+			method: 'POST',
+			headers: {
+				...(await bearer('8908', '20250718.01')),
+				'Content-Type': 'application/x-www-form-urlencoded',
+			},
+			body: new URLSearchParams({ JoinMode: '2' }).toString(),
+		})
+		expect(res.status).toBe(200)
+		const body = (await res.json()) as { roomInstance: { dataBlob: string } }
+		expect(body.roomInstance.dataBlob).toBe('a-later-save.room')
 	})
 
 	test('a matchmake counts a visit against the room', async () => {

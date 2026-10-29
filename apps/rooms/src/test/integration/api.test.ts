@@ -318,22 +318,51 @@ describe('rooms endpoints', () => {
 		expect(await res.json()).toEqual({ service: 'rooms', status: 'ok' })
 	})
 
-	 it('temporarily omits only the identified Rec Center save without changing storage', async () => {
-		const existing = await env.DB.prepare('SELECT current_save_id, data FROM subroom WHERE sub_room_id = 2').first<{ current_save_id: number | null; data: string }>()
+	it('serves the 2024 Rec Center base scene without changing its stored save', async () => {
+		const existing = await env.DB.prepare(
+			'SELECT current_save_id, data FROM subroom WHERE sub_room_id = 2'
+		).first<{ current_save_id: number | null; data: string }>()
 		expect(existing).not.toBeNull()
-		const inserted = await env.DB.prepare('INSERT INTO subroom_save (sub_room_id, data) VALUES (2, ?1) RETURNING sub_room_data_save_id')
-			.bind(JSON.stringify({ DataBlob: '2026-10-07/63b1dcf7-4d50-41f0-838f-4d2b548cb041', PersistenceVersion: 227 }))
+		const inserted = await env.DB.prepare(
+			'INSERT INTO subroom_save (sub_room_id, data) VALUES (2, ?1) RETURNING sub_room_data_save_id'
+		)
+			.bind(JSON.stringify({ DataBlob: 'a-later-save.room', PersistenceVersion: 227 }))
 			.first<{ sub_room_data_save_id: number }>()
 		try {
-			await env.DB.prepare('UPDATE subroom SET current_save_id = ?1 WHERE sub_room_id = 2').bind(inserted!.sub_room_data_save_id).run()
+			await env.DB.prepare('UPDATE subroom SET current_save_id = ?1 WHERE sub_room_id = 2')
+				.bind(inserted!.sub_room_data_save_id)
+				.run()
 			const res = await SELF.fetch(`${ORIGIN}/rooms/2`)
-			const room = (await res.json()) as { SubRooms: Array<{ SubRoomId: number; CurrentSave: unknown; PersistenceVersion: number }> }
-			expect(room.SubRooms.find((s) => s.SubRoomId === 2)).toMatchObject({ CurrentSave: null, PersistenceVersion: 0 })
-			const stored = await env.DB.prepare('SELECT current_save_id, data FROM subroom WHERE sub_room_id = 2').first()
-			expect(stored).toEqual({ current_save_id: inserted!.sub_room_data_save_id, data: existing!.data })
+			const room = (await res.json()) as {
+				SubRooms: Array<{ SubRoomId: number; CurrentSave: unknown; PersistenceVersion: number }>
+			}
+			expect(room.SubRooms.find((s) => s.SubRoomId === 2)).toMatchObject({
+				CurrentSave: null,
+				PersistenceVersion: 0,
+			})
+			const newer = await SELF.fetch(`${ORIGIN}/rooms/2`, {
+				headers: await bearer('42', undefined, '20250718.01'),
+			})
+			const newerRoom = (await newer.json()) as {
+				SubRooms: Array<{ SubRoomId: number; CurrentSave: unknown }>
+			}
+			expect(newerRoom.SubRooms.find((s) => s.SubRoomId === 2)?.CurrentSave).toMatchObject({
+				DataBlob: 'a-later-save.room',
+			})
+			const stored = await env.DB.prepare(
+				'SELECT current_save_id, data FROM subroom WHERE sub_room_id = 2'
+			).first()
+			expect(stored).toEqual({
+				current_save_id: inserted!.sub_room_data_save_id,
+				data: existing!.data,
+			})
 		} finally {
-			await env.DB.prepare('UPDATE subroom SET current_save_id = ?1 WHERE sub_room_id = 2').bind(existing!.current_save_id).run()
-			await env.DB.prepare('DELETE FROM subroom_save WHERE sub_room_data_save_id = ?1').bind(inserted!.sub_room_data_save_id).run()
+			await env.DB.prepare('UPDATE subroom SET current_save_id = ?1 WHERE sub_room_id = 2')
+				.bind(existing!.current_save_id)
+				.run()
+			await env.DB.prepare('DELETE FROM subroom_save WHERE sub_room_data_save_id = ?1')
+				.bind(inserted!.sub_room_data_save_id)
+				.run()
 		}
 	})
 

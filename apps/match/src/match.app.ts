@@ -47,6 +47,7 @@ import {
 	recordStat,
 	refreshInstanceFullness,
 	Role,
+	roomForClientBuild,
 	RoomInstanceType,
 	roomRoles,
 	setPresence,
@@ -967,7 +968,8 @@ const NO_INSTANCE = 0
  * into one with `/matchmake/room/{roomId}/{subRoomId}`); an unknown or unspecified
  * subroom falls back to the room's first, which is its default entrance.
  */
-function instanceFieldsFromRoom(room: Room, subRoomId?: number) {
+function instanceFieldsFromRoom(room: Room, subRoomId?: number, build = GAME_VERSION) {
+	room = roomForClientBuild(room, build)
 	const subRooms = (Array.isArray(room.SubRooms) ? room.SubRooms : []) as Array<
 		Record<string, unknown>
 	>
@@ -989,12 +991,7 @@ function instanceFieldsFromRoom(room: Room, subRoomId?: number) {
 		// the choice client-side from the `/subrooms/{id}/saves` list — matchmaking is not
 		// involved, and serving a staged blob here would put two people in one instance on
 		// different versions.
-		// Temporary compatibility probe: keep the published save in storage, but load
-		// the built-in Rec Center scene without this known 2025-era save for the 2024 client.
-		dataBlob:
-			room.RoomId === 2 && subRoomDataBlob(sub) === '2026-10-07/63b1dcf7-4d50-41f0-838f-4d2b548cb041'
-				? ''
-				: subRoomDataBlob(sub),
+		dataBlob: subRoomDataBlob(sub),
 		name,
 		maxCapacity: num(sub?.MaxPlayers, 4),
 		roomInstanceType: room.IsDorm === true ? RoomInstanceType.Dormroom : RoomInstanceType.Public,
@@ -1013,9 +1010,10 @@ function roomInstanceFromRoom(
 	isPrivate: boolean,
 	instanceId: number,
 	photonRoomId: string,
-	subRoomId?: number
+	subRoomId?: number,
+	build = GAME_VERSION
 ) {
-	const f = instanceFieldsFromRoom(room, subRoomId)
+	const f = instanceFieldsFromRoom(room, subRoomId, build)
 	// The same region the connection info names its Photon apps for — see photonApps.
 	const region = instancePhotonRegion(env)
 	return {
@@ -1471,7 +1469,9 @@ async function resolveRoomInstance(
 
 	const { room, subRoomId } = await substituteRoom(c, requested, requestedSubRoomId)
 
-	const f = instanceFieldsFromRoom(room, subRoomId)
+	const tokenVersion = await callerVersion(c)
+	const gameVersion = tokenVersion ?? GAME_VERSION
+	const f = instanceFieldsFromRoom(room, subRoomId, gameVersion)
 
 	// A banned player never gets an instance. This is the whole enforcement of a room
 	// ban: the Photon room id only ever reaches a player through a matchmake, so
@@ -1515,7 +1515,6 @@ async function resolveRoomInstance(
 	// The build this player is on, from their token. A 2023 client can't load a scene
 	// saved at a newer persistence version, so it is refused the room outright (see
 	// persistenceVersionRefusal) before any instance is created or reused.
-	const tokenVersion = await callerVersion(c)
 	const tooNew = persistenceVersionRefusal(room, tokenVersion)
 	if (tooNew !== null) {
 		logger.info('matchmake refused: room persistence version too new for client build', {
@@ -1541,7 +1540,6 @@ async function resolveRoomInstance(
 	// The same build, with GAME_VERSION standing in for a token that names none. It scopes
 	// the search below and is stamped on the instance when one is created, which is what
 	// keeps a session to a single client version.
-	const gameVersion = tokenVersion ?? GAME_VERSION
 	// Reuse an existing joinable instance *of the same subroom and the same build* —
 	// subrooms are separate places, so joining one must never land you in another, and
 	// neither must a session running a different version of the room. A published room
@@ -1581,7 +1579,8 @@ async function resolveRoomInstance(
 			privateInstance,
 			instance.roomInstanceId,
 			instance.photonRoomId,
-			f.subRoomId
+			f.subRoomId,
+			gameVersion
 		),
 		errorCode: MatchmakingErrorCode.Success,
 	}
@@ -2829,7 +2828,8 @@ const app = new Hono<App>()
 				stored.isPrivate,
 				stored.roomInstanceId,
 				stored.photonRoomId,
-				stored.subRoomId
+				stored.subRoomId,
+				stored.gameVersion
 			)
 			await enterRoom(c, id, instance)
 			return matchmakeResult(c, 0, instance)

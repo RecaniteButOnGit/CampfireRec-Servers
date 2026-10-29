@@ -22,6 +22,7 @@ import {
 	deleteRoomLeaderboard,
 	deleteSubRoom,
 	findSubRoom,
+	GAME_VERSION,
 	getAccount,
 	getBakedUnityAssets,
 	getBaseRooms,
@@ -66,6 +67,7 @@ import {
 	removeFavorite,
 	removeRoomRole,
 	Role,
+	roomForClientBuild,
 	roomNameRejection,
 	roomProgression,
 	roomRoles,
@@ -4863,16 +4865,7 @@ const app = new Hono<App>()
 			const room = await getRoomById(c.env.DB, Number.parseInt(c.req.param('roomId'), 10))
 			if (!room) return c.notFound()
 			filterRoomUnityAssets(room, unityAssetTargetQuery(c))
-			// Temporary 2024 Rec Center probe: omit only the identified newer save from
-			// this response. The database and its published save stay untouched.
-			if (room.RoomId === 2 && Array.isArray(room.SubRooms)) {
-				room.SubRooms = room.SubRooms.map((sub: Record<string, unknown>) => {
-					const save = sub.CurrentSave as Record<string, unknown> | null
-					if (sub.SubRoomId !== 2 || save?.DataBlob !== '2026-10-07/63b1dcf7-4d50-41f0-838f-4d2b548cb041') return sub
-					return { ...sub, CurrentSave: null, RoomDataBlob: null, PersistenceVersion: 0 }
-				})
-			}
-			return c.json(room)
+			return c.json(roomForClientBuild(room, (await authedGameVersion(c)) ?? GAME_VERSION))
 		}
 	)
 
