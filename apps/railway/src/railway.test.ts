@@ -249,6 +249,35 @@ function fakeBucket() {
 }
 
 describe('S3 R2 adapter and CDN', () => {
+	it('streams operator MP4s from the CDN bucket with ranges', async () => {
+		const { bucket } = fakeBucket()
+		await bucket.put('video/trailer.mp4', Buffer.from('abcdefghij'))
+		const env = {
+			CDN_ASSETS: bucket,
+			NAME: 'cdn',
+			ENVIRONMENT: 'test',
+			SENTRY_RELEASE: 'test',
+		} as never
+		const url = 'https://cdn.example.test/video/trailer.mp4'
+		const head = await cdnApp.fetch(
+			new Request(url, { method: 'HEAD' }),
+			env,
+			new NodeExecutionContext() as never
+		)
+		expect(head.status).toBe(200)
+		expect(head.headers.get('content-length')).toBe('10')
+		expect(head.headers.get('content-type')).toBe('video/mp4')
+		const response = await cdnApp.fetch(
+			new Request(url, { headers: { range: 'bytes=2-5' } }),
+			env,
+			new NodeExecutionContext() as never
+		)
+		expect(response.status).toBe(206)
+		expect(response.headers.get('content-type')).toBe('video/mp4')
+		expect(response.headers.get('content-range')).toBe('bytes 2-5/10')
+		expect(await response.text()).toBe('cdef')
+	})
+
 	it('puts, streams, heads and deletes an object', async () => {
 		const { bucket } = fakeBucket()
 		await bucket.put('room/x', new Uint8Array([1, 2, 3]))

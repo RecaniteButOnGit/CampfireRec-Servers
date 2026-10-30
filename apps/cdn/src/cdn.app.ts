@@ -33,7 +33,7 @@ import type { App, Env } from './context'
  */
 
 /**
- * Stream a binary asset from the CDN R2 bucket as application/octet-stream,
+ * Stream a binary asset from the CDN R2 bucket, as application/octet-stream by default,
  * honoring Range requests. 404s when the file is missing.
  * Supports conditional GET and byte-range requests (206) — large-file
  * downloaders fetch in ranges, and a 200 where a 206 is expected corrupts the
@@ -44,7 +44,7 @@ import type { App, Env } from './context'
  * degrades to a whole-object 200 whenever the response is not cacheable. The range
  * answer has to be ours to guarantee.
  */
-async function serveAsset(c: Context<App>, key: string) {
+async function serveAsset(c: Context<App>, key: string, contentType = 'application/octet-stream') {
 	if (key.includes('..')) return c.body(null, 400)
 
 	const ifNoneMatch = c.req.header('if-none-match')?.replace(/"/g, '')
@@ -79,7 +79,7 @@ async function serveAsset(c: Context<App>, key: string) {
 	const headers = new Headers()
 	object.writeHttpMetadata(headers)
 	headers.set('etag', object.httpEtag)
-	headers.set('content-type', 'application/octet-stream')
+	headers.set('content-type', contentType)
 	headers.set('accept-ranges', 'bytes')
 	headers.set('cache-control', CACHE_CONTROL)
 
@@ -95,7 +95,34 @@ async function serveAsset(c: Context<App>, key: string) {
 		return new Response(object.body, { status: 206, headers })
 	}
 
+	headers.set('content-length', String(object.size))
 	return new Response(object.body, { headers })
+}
+
+// This is an operator-managed namespace, not a general-purpose file proxy. Restrict
+// names to MP4 files so arbitrary uploaded documents cannot be served as video.
+function videoKey(name: string): string | null {
+	if (!/^[a-zA-Z0-9_-][a-zA-Z0-9_./-]*\.mp4$/i.test(name)) return null
+	if (name.includes('..') || name.includes('//')) return null
+	if (name === 'RR2020.mp4') return 'ytmp4-Rec-Room-2020-Trailer-1080p.mp4'
+	return `video/${name}`
+}
+
+async function videoHead(env: Pick<Env, 'CDN_ASSETS'>, name: string): Promise<Response> {
+	const key = videoKey(name)
+	if (!key) return new Response(null, { status: 404 })
+	const object = await env.CDN_ASSETS?.head(key)
+	if (!object) return new Response(null, { status: 404 })
+	const headers = new Headers({
+		'content-type': 'video/mp4',
+		'content-length': String(object.size),
+		'accept-ranges': 'bytes',
+		'cache-control': CACHE_CONTROL,
+		etag: object.httpEtag,
+		'access-control-allow-origin': '*',
+	})
+	applyNoExecuteHeaders(headers)
+	return new Response(null, { status: 200, headers })
 }
 
 /**
@@ -256,11 +283,11 @@ const app = new Hono<App>()
 	// unchanged by who may read a response they already had to name exactly.
 	.use('*', withDefaultCors())
 
-	// The blob routes force `application/octet-stream` over whatever type an upload was
+	// The ordinary blob routes force `application/octet-stream` over whatever type an upload was
 	// stored with, which is what keeps a stored HTML body from rendering; `nosniff` makes
 	// that type binding on the browser, and the sandboxing CSP covers the config files,
 	// which go out under their own types. The hand-rolled HEAD below is outside this chain
-	// and stamps the same headers itself.
+	// and stamps the same headers itself. The operator-managed MP4 route serves video/mp4.
 	.use('*', withNoExecute())
 
 	.onError(withOnError())
@@ -353,6 +380,43 @@ const app = new Hono<App>()
 			responses: assetResponses('The signature blob'),
 		}),
 		(c) => serveAsset(c, `sigs/${c.req.param('sigName')}`)
+	)
+
+	.on(
+		'HEAD',
+		'/video/:name{.+}',
+		describeRoute({
+			tags: ['Assets'],
+			summary: 'Check an operator-hosted MP4',
+			parameters: [keyParam('name', 'The MP4 filename.', true)],
+			responses: { 200: { description: 'The MP4 exists' }, 404: { description: 'No such MP4' } },
+		}),
+		(c) => videoHead(c.env, c.req.param('name'))
+	)
+	.get(
+		'/video/:name{.+}',
+		describeRoute({
+			tags: ['Assets'],
+			summary: 'Stream an operator-hosted MP4',
+			description:
+				'Streams an MP4 from the video/ prefix in the CDN bucket. This direct URL can be used by clients that support remote MP4 playback.',
+			parameters: [keyParam('name', 'The MP4 filename.', true), ...CONDITIONAL_HEADERS],
+			responses: {
+				...assetResponses('The MP4'),
+				200: {
+					description: 'The MP4',
+					content: { 'video/mp4': { schema: { type: 'string', format: 'binary' } } },
+				},
+				206: {
+					description: 'A byte range of the MP4',
+					content: { 'video/mp4': { schema: { type: 'string', format: 'binary' } } },
+				},
+			},
+		}),
+		(c) => {
+			const key = videoKey(c.req.param('name'))
+			return key ? serveAsset(c, key, 'video/mp4') : c.notFound()
+		}
 	)
 
 	// Room build data by name. The client fetches this for a SubRoom's DataBlob to
@@ -655,6 +719,13 @@ export default {
 		if (request.method === 'HEAD' && url.pathname.startsWith('/unityasset/')) {
 			const filename = decodeURIComponent(url.pathname.slice('/unityasset/'.length))
 			return studioUnityAssetHead(env, filename)
+		}
+		if (request.method === 'HEAD' && url.pathname.startsWith('/video/')) {
+			try {
+				return videoHead(env, decodeURIComponent(url.pathname.slice('/video/'.length)))
+			} catch {
+				return new Response(null, { status: 400 })
+			}
 		}
 		return app.fetch(request, env, executionCtx)
 	},

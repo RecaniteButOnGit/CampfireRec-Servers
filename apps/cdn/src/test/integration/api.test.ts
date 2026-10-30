@@ -39,6 +39,47 @@ test('serves opaque avatar source manifests and SDK avatar bundle GET/HEAD/range
 })
 
 describe('cdn endpoints', () => {
+	test('serves RR2020 from the uploaded trailer object', async () => {
+		await env.CDN_ASSETS.put('ytmp4-Rec-Room-2020-Trailer-1080p.mp4', 'trailer')
+		const url = `${ORIGIN}/video/RR2020.mp4`
+		const head = await exports.default.fetch(url, { method: 'HEAD' })
+		expect(head.status).toBe(200)
+		expect(head.headers.get('content-length')).toBe('7')
+		const partial = await exports.default.fetch(url, { headers: { Range: 'bytes=0-2' } })
+		expect(partial.status).toBe(206)
+		expect(new TextDecoder().decode(await partial.arrayBuffer())).toBe('tra')
+	})
+
+	test('serves operator MP4s with video headers, byte ranges, and HEAD', async () => {
+		await env.CDN_ASSETS.put('video/room/demo.mp4', 'abcdefghij', {
+			httpMetadata: { contentType: 'text/html' },
+		})
+		const url = `${ORIGIN}/video/room/demo.mp4`
+		const full = await exports.default.fetch(url)
+		expect(full.status).toBe(200)
+		expect(full.headers.get('content-type')).toBe('video/mp4')
+		expect(full.headers.get('content-length')).toBe('10')
+		expect(await full.text()).toBe('abcdefghij')
+		const range = await exports.default.fetch(url, { headers: { Range: 'bytes=2-5' } })
+		expect(range.status).toBe(206)
+		expect(range.headers.get('content-type')).toBe('video/mp4')
+		expect(range.headers.get('content-range')).toBe('bytes 2-5/10')
+		expect(await range.text()).toBe('cdef')
+		const head = await exports.default.fetch(url, { method: 'HEAD' })
+		expect(head.status).toBe(200)
+		expect(head.headers.get('content-length')).toBe('10')
+		expect(head.headers.get('content-type')).toBe('video/mp4')
+		expect(head.headers.get('accept-ranges')).toBe('bytes')
+		expect(await head.text()).toBe('')
+		const cached = await exports.default.fetch(url, {
+			headers: { 'If-None-Match': full.headers.get('etag')! },
+		})
+		expect(cached.status).toBe(304)
+		expect((await exports.default.fetch(`${ORIGIN}/video/missing.mp4`)).status).toBe(404)
+		expect((await exports.default.fetch(`${ORIGIN}/video/room/demo.html`)).status).toBe(404)
+		expect((await exports.default.fetch(`${ORIGIN}/video/room%2f..%2fdemo.mp4`)).status).toBe(404)
+	})
+
 	test('GET / reports service status', async () => {
 		const res = await exports.default.fetch(`${ORIGIN}/`)
 		expect(res.status).toBe(200)
@@ -172,7 +213,9 @@ describe('cdn endpoints', () => {
 		)
 		const partial = await exports.default.fetch(url, { headers: { Range: 'bytes=0-15' } })
 		expect(partial.status).toBe(206)
-		expect(new Uint8Array(await partial.arrayBuffer())).toEqual(new Uint8Array(bytes).subarray(0, 16))
+		expect(new Uint8Array(await partial.arrayBuffer())).toEqual(
+			new Uint8Array(bytes).subarray(0, 16)
+		)
 	})
 
 	test('GET /sigs/:sigName streams the blob from R2 as octet-stream', async () => {
@@ -469,7 +512,9 @@ describe('cdn endpoints', () => {
 			'GET /roomunityasset/{filename}',
 			'GET /sigs/{sigName}',
 			'GET /unityasset/{filename}',
+			'GET /video/{name}',
 			'HEAD /unityasset/{filename}',
+			'HEAD /video/{name}',
 		])
 
 		// Every operation carries a summary — a path present but undescribed is not

@@ -30,6 +30,25 @@ images are served by `img`. Studio room bundles are uploaded by the `studio` wor
 the same bucket. The worker binds the shared D1 database to resolve those filenames and
 does not migrate it.
 
+## Operator-hosted MP4s
+
+Put an MP4 in the CDN bucket under `video/<name>.mp4`, then use the direct URL
+`https://cdn.<your-domain>/video/<name>.mp4` in a remote video player. Foldered names
+such as `video/events/trailer.mp4` work too. These URLs are public, so only upload media
+you intend to make public. The route serves `video/mp4`, supports HEAD and byte-range
+requests for seeking, and does not fetch or convert videos from other sites. For widest
+client compatibility, use an H.264 video with AAC audio in an MP4 container; actual codec
+and remote-player support depend on the client and platform.
+
+On Cloudflare, for example, from `apps/cdn` upload an existing local file with
+`pnpm exec wrangler r2 object put recflare-cdn/video/trailer.mp4 --file /path/to/trailer.mp4 --remote`.
+Railway deployments use the configured CDN S3-compatible bucket instead. Use a new
+filename when replacing a video: responses are cached for 30 days.
+
+This provides a direct media URL; it does not establish which URL the community board
+client constructs from its `BlobName`, or change the board's current entries. Verify that
+client behavior before expecting its video tiles to use this endpoint.
+
 ## API documentation
 
 `GET /openapi.json` serves a spec generated from `describeRoute` blocks that sit
