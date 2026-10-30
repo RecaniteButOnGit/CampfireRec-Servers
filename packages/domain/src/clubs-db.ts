@@ -452,6 +452,25 @@ export async function createClubAnnouncement(
 	return row?.announcement_id ?? 0
 }
 
+/**
+ * Delete one of a club's announcements. Scoped to the club, so an id belonging to
+ * another club is left alone. Returns whether anything was deleted.
+ */
+export async function deleteClubAnnouncement(
+	db: D1Database,
+	clubId: number,
+	announcementId: number
+): Promise<boolean> {
+	const row = await db
+		.prepare(
+			`DELETE FROM club_announcement WHERE club_id = ?1 AND announcement_id = ?2
+			 RETURNING announcement_id`
+		)
+		.bind(clubId, announcementId)
+		.first<{ announcement_id: number }>()
+	return row !== null
+}
+
 // ---- Subscriptions ---------------------------------------------------------
 //
 // Rec Room had no per-player "follow": a creator's subscribers are the members of a

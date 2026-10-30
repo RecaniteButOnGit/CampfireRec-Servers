@@ -4,7 +4,12 @@ import { beforeAll, describe, expect, test } from 'vitest'
 
 import '../../accounts.app'
 
-import { SCHEMA_DDL } from '@repo/domain'
+import {
+	EMAIL_CODE_SCHEMA_DDL,
+	hashPassword,
+	RATE_LIMIT_SCHEMA_DDL,
+	SCHEMA_DDL,
+} from '@repo/domain'
 
 import { WHITELISTED_EMOJIS } from '../../whitelisted-emojis'
 
@@ -22,6 +27,10 @@ beforeAll(async () => {
 	// Seed the shared JWT signing key into the local Secrets Store so .get() resolves.
 	await adminSecretsStore(env.JWT_SECRET).create('test-signing-key')
 	for (const stmt of SCHEMA_DDL) await env.DB.prepare(stmt).run()
+	// The codes an email change is confirmed with (owned by `auth`'s migrations).
+	for (const stmt of EMAIL_CODE_SCHEMA_DDL) await env.DB.prepare(stmt).run()
+	// The counters that cap how many of those go out per account and day.
+	for (const stmt of RATE_LIMIT_SCHEMA_DDL) await env.DB.prepare(stmt).run()
 	const insert = env.DB.prepare('INSERT OR IGNORE INTO account (data) VALUES (?1)')
 	await env.DB.batch([
 		insert.bind(JSON.stringify({ accountId: 0, username: 'RecRoom', displayName: 'Rec Room' })),
@@ -41,10 +50,13 @@ function b64url(input: ArrayBuffer | string): string {
 	return btoa(binary).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '')
 }
 
-async function bearer(sub = '42'): Promise<Record<string, string>> {
+async function bearer(
+	sub = '42',
+	claims: Record<string, unknown> = {}
+): Promise<Record<string, string>> {
 	const now = Math.floor(Date.now() / 1000)
 	const signingInput = `${b64url(JSON.stringify({ alg: 'HS256', typ: 'JWT' }))}.${b64url(
-		JSON.stringify({ sub, exp: now + 3600 })
+		JSON.stringify({ sub, exp: now + 3600, ...claims })
 	)}`
 	const key = await crypto.subtle.importKey(
 		'raw',
@@ -56,6 +68,9 @@ async function bearer(sub = '42'): Promise<Record<string, string>> {
 	const sig = await crypto.subtle.sign('HMAC', key, new TextEncoder().encode(signingInput))
 	return { Authorization: `Bearer ${signingInput}.${b64url(sig)}` }
 }
+
+/** The `rn.plus` claim `auth` stamps for a Rec Room Plus account. */
+const PLUS = { 'rn.plus': true }
 
 const form = (fields: Record<string, string>): RequestInit => ({
 	method: 'PUT',
@@ -151,6 +166,24 @@ describe('public endpoints', () => {
 		// An empty query yields nothing (no full-table dump).
 		const empty = await exports.default.fetch(`${ORIGIN}/account/search?name=`)
 		expect(await empty.json()).toEqual([])
+	})
+
+	test('GET /account/username/:name is an exact, case-insensitive lookup', async () => {
+		const res = await exports.default.fetch(`${ORIGIN}/account/username/coach`)
+		expect(res.status).toBe(200)
+		const account = (await res.json()) as { accountId: number; username: string }
+		expect(account).toMatchObject({ accountId: 1, username: 'Coach' })
+		// A leading `@` is tolerated — staff fields take names in that form.
+		const at = await exports.default.fetch(
+			`${ORIGIN}/account/username/${encodeURIComponent('@Coach')}`
+		)
+		expect(((await at.json()) as { accountId: number }).accountId).toBe(1)
+		// A prefix is NOT a match: that's what `/account/search` is for.
+		const prefix = await exports.default.fetch(`${ORIGIN}/account/username/coa`)
+		expect(prefix.status).toBe(404)
+		const missing = await exports.default.fetch(`${ORIGIN}/account/username/zzzznope`)
+		expect(missing.status).toBe(404)
+		expect(await missing.json()).toEqual({ error: "There's no player called @zzzznope." })
 	})
 
 	test('GET /account/:id/bio returns an empty bio', async () => {
@@ -272,7 +305,7 @@ describe('auth-gated endpoints', () => {
 			...(await bearer('895')),
 			'Content-Type': 'application/x-www-form-urlencoded',
 		}
-		// A name carries no spaces, so the filter has to find the swear at the seam the
+		// These names carry no spaces, so the filter has to find the swear at the seam the
 		// player typed instead of one.
 		for (const displayName of ['fuck', 'ShitLord', 'Fucker123']) {
 			const res = await exports.default.fetch(`${ORIGIN}/account/me/displayname`, {
@@ -455,7 +488,10 @@ describe('auth-gated endpoints', () => {
 		// Exactly the body the client sends: one urlencoded field (`%F0%9F%A4%AA`).
 		const res = await exports.default.fetch(`${ORIGIN}/account/me/emoji`, {
 			method: 'PUT',
-			headers: { ...(await bearer('779')), 'Content-Type': 'application/x-www-form-urlencoded' },
+			headers: {
+				...(await bearer('779', PLUS)),
+				'Content-Type': 'application/x-www-form-urlencoded',
+			},
 			body: 'displayEmoji=%F0%9F%A4%AA',
 		})
 		expect(res.status).toBe(200)
@@ -482,7 +518,10 @@ describe('auth-gated endpoints', () => {
 	test('PUT /account/me/emoji canonicalizes a pick sent without its variation selector', async () => {
 		const res = await exports.default.fetch(`${ORIGIN}/account/me/emoji`, {
 			...form({ displayEmoji: '\u{2764}' }),
-			headers: { ...(await bearer('780')), 'Content-Type': 'application/x-www-form-urlencoded' },
+			headers: {
+				...(await bearer('780', PLUS)),
+				'Content-Type': 'application/x-www-form-urlencoded',
+			},
 		})
 		expect(res.status).toBe(200)
 
@@ -497,13 +536,19 @@ describe('auth-gated endpoints', () => {
 	test('PUT /account/me/emoji clears the pick on an empty value', async () => {
 		const set = await exports.default.fetch(`${ORIGIN}/account/me/emoji`, {
 			...form({ displayEmoji: '\u{1F389}' }),
-			headers: { ...(await bearer('781')), 'Content-Type': 'application/x-www-form-urlencoded' },
+			headers: {
+				...(await bearer('781', PLUS)),
+				'Content-Type': 'application/x-www-form-urlencoded',
+			},
 		})
 		expect(set.status).toBe(200)
 
 		const cleared = await exports.default.fetch(`${ORIGIN}/account/me/emoji`, {
 			...form({ displayEmoji: '' }),
-			headers: { ...(await bearer('781')), 'Content-Type': 'application/x-www-form-urlencoded' },
+			headers: {
+				...(await bearer('781', PLUS)),
+				'Content-Type': 'application/x-www-form-urlencoded',
+			},
 		})
 		expect(cleared.status).toBe(200)
 
@@ -522,7 +567,10 @@ describe('auth-gated endpoints', () => {
 		for (const displayEmoji of ['not an emoji', '\u{1F92A}\u{1F92A}', '\u{1F595}\u{1F3FB}']) {
 			const res = await exports.default.fetch(`${ORIGIN}/account/me/emoji`, {
 				...form({ displayEmoji }),
-				headers: { ...(await bearer('782')), 'Content-Type': 'application/x-www-form-urlencoded' },
+				headers: {
+					...(await bearer('782', PLUS)),
+					'Content-Type': 'application/x-www-form-urlencoded',
+				},
 			})
 			expect(res.status).toBe(400)
 		}
@@ -530,6 +578,38 @@ describe('auth-gated endpoints', () => {
 		// Nothing was stored by the refusals.
 		const me = await exports.default.fetch(`${ORIGIN}/account/me`, { headers: await bearer('782') })
 		expect(((await me.json()) as { displayEmoji: string }).displayEmoji).toBe('')
+	})
+
+	// Setting an emoji is a Rec Room Plus perk; clearing one is not, so a player whose Plus
+	// lapsed can still take an old pick down.
+	test('PUT /account/me/emoji 403s a set without Rec Room Plus but allows a clear', async () => {
+		const headers = {
+			...(await bearer('783')),
+			'Content-Type': 'application/x-www-form-urlencoded',
+		}
+		const set = await exports.default.fetch(`${ORIGIN}/account/me/emoji`, {
+			...form({ displayEmoji: '\u{1F92A}' }),
+			headers,
+		})
+		expect(set.status).toBe(403)
+
+		const notPlus = await exports.default.fetch(`${ORIGIN}/account/me/emoji`, {
+			...form({ displayEmoji: '\u{1F92A}' }),
+			headers: {
+				...(await bearer('783', { 'rn.plus': 'true' })),
+				'Content-Type': 'application/x-www-form-urlencoded',
+			},
+		})
+		expect(notPlus.status).toBe(403)
+
+		const me = await exports.default.fetch(`${ORIGIN}/account/me`, { headers: await bearer('783') })
+		expect(((await me.json()) as { displayEmoji: string }).displayEmoji).toBe('')
+
+		const clear = await exports.default.fetch(`${ORIGIN}/account/me/emoji`, {
+			...form({ displayEmoji: '' }),
+			headers,
+		})
+		expect(clear.status).toBe(200)
 	})
 
 	test('PUT /account/me/bannerimage 401s without a token, 400s without an imageName', async () => {
@@ -650,18 +730,265 @@ describe('auth-gated endpoints', () => {
 		expect(res.status).toBe(400)
 	})
 
-	test('POST /account/me/email persists the email, surfaced by /account/me', async () => {
-		const res = await exports.default.fetch(`${ORIGIN}/account/me/email`, {
-			...form({ email: 'ners@recroom.com' }),
+	/** POST an address for an account, as the website and the game do. */
+	const postEmail = async (id: string, email: string) =>
+		exports.default.fetch(`${ORIGIN}/account/me/email`, {
+			...form({ email }),
 			method: 'POST',
-			headers: { ...(await bearer('888')), 'Content-Type': 'application/x-www-form-urlencoded' },
+			headers: { ...(await bearer(id)), 'Content-Type': 'application/x-www-form-urlencoded' },
 		})
+	/** POST a code to confirm the account's staged change. */
+	const confirmEmail = async (id: string, code: string) =>
+		exports.default.fetch(`${ORIGIN}/account/me/email/confirm`, {
+			...form({ code }),
+			method: 'POST',
+			headers: { ...(await bearer(id)), 'Content-Type': 'application/x-www-form-urlencoded' },
+		})
+	const pendingEmail = async (id: string) =>
+		(await (
+			await exports.default.fetch(`${ORIGIN}/account/me/email/pending`, {
+				headers: await bearer(id),
+			})
+		).json()) as { pending: string | null; sentTo: string | null }
+	const emailOf = async (id: string) =>
+		(
+			(await (
+				await exports.default.fetch(`${ORIGIN}/account/me`, { headers: await bearer(id) })
+			).json()) as { email: string }
+		).email
+	type Purpose = 'email_change' | 'email_verify'
+	/** The staged step's row. Only the code's hash is stored; `plantCode` puts a known one in. */
+	const stagedRow = (id: string, purpose: Purpose) =>
+		env.DB.prepare(
+			'SELECT code_hash AS codeHash, payload, created_at AS createdAt FROM email_code WHERE account_id = ?1 AND purpose = ?2'
+		)
+			.bind(Number(id), purpose)
+			.first<{ codeHash: string | null; payload: string; createdAt: number }>()
+	const plantCode = async (id: string, purpose: Purpose, code: string) => {
+		await env.DB.prepare(
+			'UPDATE email_code SET code_hash = ?2 WHERE account_id = ?1 AND purpose = ?3'
+		)
+			.bind(Number(id), await hashPassword(code), purpose)
+			.run()
+	}
+	/** Set an address the way a player does, through every step the account needs. */
+	const setEmail = async (id: string, email: string) => {
+		const staged = await postEmail(id, email)
+		if (staged.status !== 200) return staged
+		if ((await pendingEmail(id)).sentTo !== email) {
+			await plantCode(id, 'email_change', '100000')
+			const approved = await confirmEmail(id, '100000')
+			if (approved.status !== 200) return approved
+		}
+		await plantCode(id, 'email_verify', '100001')
+		return confirmEmail(id, '100001')
+	}
+
+	test('POST /account/me/email on an account with no address: one code, to the new address', async () => {
+		const res = await postEmail('888', 'ners@recroom.com')
 		expect(res.status).toBe(200)
 		expect(await res.json()).toEqual({ success: true })
 
-		// The stored email is now returned by the self account (was a null stub).
-		const me = await exports.default.fetch(`${ORIGIN}/account/me`, { headers: await bearer('888') })
-		expect(((await me.json()) as { email: string }).email).toBe('ners@recroom.com')
+		// Staged, not applied: the self account still has no email, and the pending read says
+		// where the code went — the NEW address, since there is nobody else to ask.
+		expect(await emailOf('888')).toBe('')
+		expect(await pendingEmail('888')).toEqual({
+			pending: 'ners@recroom.com',
+			sentTo: 'ners@recroom.com',
+		})
+		const row = await stagedRow('888', 'email_verify')
+		expect(row?.payload).toBe('ners@recroom.com')
+		expect(row?.codeHash).toMatch(/^[^:]+:[^:]+$/)
+		expect(await stagedRow('888', 'email_change')).toBeNull()
+
+		await plantCode('888', 'email_verify', '123456')
+		const ok = await confirmEmail('888', '123456')
+		expect(ok.status).toBe(200)
+		expect(await ok.json()).toEqual({ success: true, applied: true, pending: null, sentTo: null })
+		expect(await emailOf('888')).toBe('ners@recroom.com')
+		expect(await pendingEmail('888')).toEqual({ pending: null, sentTo: null })
+
+		// Spent: the same code again is refused.
+		expect((await confirmEmail('888', '123456')).status).toBe(400)
+	})
+
+	test('with no address on file, a mistyped address can be replaced at once; the same one waits', async () => {
+		await postEmail('892', 'typo@exmaple.com')
+		const first = await stagedRow('892', 'email_verify')
+
+		// A DIFFERENT address right away: a fresh code, to it.
+		expect((await postEmail('892', 'right@example.com')).status).toBe(200)
+		const second = await stagedRow('892', 'email_verify')
+		expect(second?.payload).toBe('right@example.com')
+		expect(second?.codeHash).not.toBe(first?.codeHash)
+		expect((await pendingEmail('892')).sentTo).toBe('right@example.com')
+
+		// The SAME address again within the cooldown is a repeat, and refused.
+		const repeat = await postEmail('892', 'right@example.com')
+		expect(repeat.status).toBe(400)
+		expect(((await repeat.json()) as { error: string }).error).toMatch(/less than two minutes/)
+		expect(await stagedRow('892', 'email_verify')).toEqual(second)
+	})
+
+	test('with an address on file, the current address approves and then the new one confirms', async () => {
+		expect((await setEmail('889', 'first@example.com')).status).toBe(200)
+		expect(await emailOf('889')).toBe('first@example.com')
+
+		// Step 1: the code goes to the address being given up, not the new one.
+		expect((await postEmail('889', 'second@example.com')).status).toBe(200)
+		expect(await pendingEmail('889')).toEqual({
+			pending: 'second@example.com',
+			sentTo: 'first@example.com',
+		})
+		expect(await stagedRow('889', 'email_verify')).toBeNull()
+		expect(await emailOf('889')).toBe('first@example.com')
+
+		// Approving it applies nothing yet: step 2's code goes to the new address.
+		await plantCode('889', 'email_change', '111111')
+		const approved = await confirmEmail('889', '111111')
+		expect(approved.status).toBe(200)
+		expect(await approved.json()).toEqual({
+			success: true,
+			applied: false,
+			pending: 'second@example.com',
+			sentTo: 'second@example.com',
+		})
+		expect(await stagedRow('889', 'email_change')).toBeNull()
+		expect(await pendingEmail('889')).toEqual({
+			pending: 'second@example.com',
+			sentTo: 'second@example.com',
+		})
+		expect(await emailOf('889')).toBe('first@example.com')
+
+		// Step 2 lands it.
+		await plantCode('889', 'email_verify', '222222')
+		const done = await confirmEmail('889', '222222')
+		expect(await done.json()).toEqual({ success: true, applied: true, pending: null, sentTo: null })
+		expect(await emailOf('889')).toBe('second@example.com')
+	})
+
+	test('a wrong code at either step voids the change; a new attempt starts again at step 1', async () => {
+		expect((await setEmail('893', 'keep@example.com')).status).toBe(200)
+
+		// Wrong at step 1: burned, and the right code no longer works.
+		await postEmail('893', 'next@example.com')
+		await plantCode('893', 'email_change', '333333')
+		const wrong = await confirmEmail('893', '999999')
+		expect(wrong.status).toBe(400)
+		expect(await wrong.json()).toEqual({
+			success: false,
+			error: 'That code is wrong or has expired. Save the address again to be sent a new one.',
+		})
+		expect((await stagedRow('893', 'email_change'))?.codeHash).toBeNull()
+		expect(await pendingEmail('893')).toEqual({ pending: null, sentTo: null })
+		expect((await confirmEmail('893', '333333')).status).toBe(400)
+
+		// Past the cooldown, try again: step 1 again, then wrong at step 2.
+		await env.DB.prepare(
+			"UPDATE email_code SET created_at = created_at - 600 WHERE account_id = 893 AND purpose = 'email_change'"
+		).run()
+		expect((await postEmail('893', 'next@example.com')).status).toBe(200)
+		await plantCode('893', 'email_change', '444444')
+		expect((await confirmEmail('893', '444444')).status).toBe(200)
+		await plantCode('893', 'email_verify', '555555')
+		expect((await confirmEmail('893', '000000')).status).toBe(400)
+		expect((await stagedRow('893', 'email_verify'))?.codeHash).toBeNull()
+		expect((await confirmEmail('893', '555555')).status).toBe(400)
+		expect(await emailOf('893')).toBe('keep@example.com')
+
+		// A fresh attempt (cooldown passed) starts at step 1 again, whatever the address: the
+		// current address has approved nothing yet.
+		await env.DB.prepare(
+			"UPDATE email_code SET created_at = created_at - 600 WHERE account_id = 893 AND purpose = 'email_change'"
+		).run()
+		expect((await postEmail('893', 'other@example.com')).status).toBe(200)
+		expect((await pendingEmail('893')).sentTo).toBe('keep@example.com')
+		expect(await stagedRow('893', 'email_verify')).toBeNull()
+	})
+
+	test('with an address on file, a second attempt within the cooldown is refused whatever the address, and re-saving the same address applies at once', async () => {
+		expect((await setEmail('890', 'cool@example.com')).status).toBe(200)
+		await postEmail('890', 'cooler@example.com')
+		const first = await stagedRow('890', 'email_change')
+		// A different new address is still the current inbox being written to: refused.
+		const again = await postEmail('890', 'coolest@example.com')
+		expect(again.status).toBe(400)
+		expect(((await again.json()) as { error: string }).error).toMatch(/less than two minutes/)
+		expect(await stagedRow('890', 'email_change')).toEqual(first)
+
+		// Re-saving the current address in another case: no code, applied directly.
+		expect((await postEmail('890', 'COOL@example.com')).status).toBe(200)
+		expect(await emailOf('890')).toBe('COOL@example.com')
+	})
+
+	test('POST /account/me/email sends an account at most five codes a day, typos included', async () => {
+		// With no address on file every different address gets a code at once — until the
+		// day's five are spent, when the sixth is refused with a reason, not silently.
+		for (let i = 0; i < 5; i++) {
+			expect((await postEmail('894', `try${i}@example.com`)).status).toBe(200)
+		}
+		const sixth = await postEmail('894', 'try5@example.com')
+		expect(sixth.status).toBe(400)
+		expect(((await sixth.json()) as { error: string }).error).toMatch(/today/)
+		// The fifth is still the one staged, and still works.
+		expect((await pendingEmail('894')).pending).toBe('try4@example.com')
+		await plantCode('894', 'email_verify', '123456')
+		expect((await confirmEmail('894', '123456')).status).toBe(200)
+		expect(await emailOf('894')).toBe('try4@example.com')
+	})
+
+	test('POST /account/me/email/confirm refuses an empty code and a code with nothing staged', async () => {
+		const empty = await confirmEmail('891', '')
+		expect(empty.status).toBe(400)
+		const none = await confirmEmail('891', '123456')
+		expect(none.status).toBe(400)
+		expect(await none.json()).toEqual({
+			success: false,
+			error: 'That code is wrong or has expired. Save the address again to be sent a new one.',
+		})
+	})
+
+	test('the email routes 401 without a token', async () => {
+		const pending = await exports.default.fetch(`${ORIGIN}/account/me/email/pending`)
+		expect(pending.status).toBe(401)
+		// A well-formed body, so the refusal is for the missing token and not the form.
+		const confirm = await exports.default.fetch(`${ORIGIN}/account/me/email/confirm`, {
+			...form({ code: '123456' }),
+			method: 'POST',
+		})
+		expect(confirm.status).toBe(401)
+	})
+
+	test('POST /account/me/email refuses an address another account holds, case-insensitively', async () => {
+		expect((await setEmail('886', 'shared@example.com')).status).toBe(200)
+
+		// Another account, same address in different case: refused with a sentence the
+		// website shows — a 400 like the malformed-address refusal, but with a body.
+		const taken = await postEmail('887', 'Shared@Example.com')
+		expect(taken.status).toBe(400)
+		expect(await taken.json()).toEqual({
+			success: false,
+			error: 'That email address is already on another account.',
+		})
+		expect(await emailOf('887')).toBe('')
+
+		// The holder may save it again (a no-op), and may change case — no code either way.
+		expect((await postEmail('886', 'shared@example.com')).status).toBe(200)
+		expect((await postEmail('886', 'SHARED@example.com')).status).toBe(200)
+		expect(await emailOf('886')).toBe('SHARED@example.com')
+
+		// A change that was staged while the address was free is refused as it lands, if
+		// another account took the address meanwhile.
+		expect((await postEmail('887', 'contested@example.com')).status).toBe(200)
+		expect((await setEmail('886', 'contested@example.com')).status).toBe(200)
+		await plantCode('887', 'email_verify', '100002')
+		const late = await confirmEmail('887', '100002')
+		expect(late.status).toBe(400)
+		expect(((await late.json()) as { error: string }).error).toMatch(/already on another account/)
+
+		// Once the holder moves on, the address is free.
+		expect((await setEmail('886', 'moved@example.com')).status).toBe(200)
+		expect((await setEmail('887', 'shared@example.com')).status).toBe(200)
 	})
 
 	test('GET /openapi.json documents every route', async () => {
@@ -688,7 +1015,9 @@ describe('auth-gated endpoints', () => {
 			'GET /',
 			'GET /account/bulk',
 			'GET /account/me',
+			'GET /account/me/email/pending',
 			'GET /account/search',
+			'GET /account/username/{name}',
 			'GET /account/{id}',
 			'GET /account/{id}/bio',
 			'GET /accountprivacysettings/{id}',
@@ -697,6 +1026,7 @@ describe('auth-gated endpoints', () => {
 			'POST /account/bulk',
 			'POST /account/create',
 			'POST /account/me/email',
+			'POST /account/me/email/confirm',
 			'POST /account/me/phone',
 			'PUT /account/me/bannerimage',
 			'PUT /account/me/bio',
@@ -741,8 +1071,9 @@ describe('auth-gated endpoints', () => {
 	})
 })
 
-// The names a player chooses are alphanumeric and length-capped, by the same rule the
-// `rooms` worker applies (see `nameRejection` in @repo/domain). The three limits come
+// The names a player chooses are charset- and length-capped by the rules in @repo/domain:
+// a username is alphanumeric (`nameRejection`), a display name takes the wider charset
+// the client's own box does (`displayNameRejection`). The limits come
 // from the client's own input boxes rather than a round number, so anything stored is
 // something the game can render and re-edit.
 //
@@ -787,25 +1118,44 @@ describe('name, email and bio validation', () => {
 		expect(((await ok.json()) as { success: boolean }).success).toBe(true)
 	})
 
-	test('PUT /account/me/displayname refuses anything but letters and digits, max 15', async () => {
+	test('PUT /account/me/displayname holds a name to the client charset, max 15', async () => {
 		const headers = await authed('8802')
-		for (const displayName of ['has space', 'punct!', 'a'.repeat(16)]) {
-			const res = await exports.default.fetch(`${ORIGIN}/account/me/displayname`, {
+		const put = (displayName: string) =>
+			exports.default.fetch(`${ORIGIN}/account/me/displayname`, {
 				...form({ displayName }),
 				headers,
 			})
+
+		// The Rec Room build's own rule: ^[\p{Latin}0-9 .,'!?_&()#@:+-]+$
+		for (const displayName of ['has space', 'punct!', 'café', "O'Neil_Jr.", '(a)&b#1@c:+-,?']) {
+			expect((await put(displayName)).status, displayName).toBe(200)
+		}
+
+		for (const displayName of [
+			'semi;colon',
+			'star*',
+			'sla/sh',
+			'Привет',
+			'名前',
+			'smile😀',
+			'a'.repeat(16),
+		]) {
 			// An empty 400, matching what this route already answers for an empty name —
 			// it acks with a bare `{ success: true }` and has never sent the client a body
 			// on failure.
-			expect(res.status, displayName).toBe(400)
+			expect((await put(displayName)).status, displayName).toBe(400)
+		}
+
+		// Trimmed before it is checked, so a name of nothing but spaces is an empty one.
+		expect((await put('   ')).status).toBe(400)
+
+		// A swear set off by the punctuation the charset now allows is still a swear.
+		for (const displayName of ['shit lord', 'Shit_Lord', 'fuck.you', 'fuck!']) {
+			expect((await put(displayName)).status, displayName).toBe(400)
 		}
 
 		// 15 is the client's box, so it must fit.
-		const ok = await exports.default.fetch(`${ORIGIN}/account/me/displayname`, {
-			...form({ displayName: 'a'.repeat(15) }),
-			headers,
-		})
-		expect(ok.status).toBe(200)
+		expect((await put('a'.repeat(15))).status).toBe(200)
 	})
 
 	// Syntax comes from the `isemail` package rather than a pattern written here — this is
@@ -832,16 +1182,17 @@ describe('name, email and bio validation', () => {
 		}
 
 		// `someone@localhost` is in the ACCEPTED list on purpose: it's valid per the RFC,
-		// and an undeliverable address costs nothing here.
-		for (const email of [
+		// and an undeliverable address costs nothing here. One account per address: a second
+		// save on the same account within two minutes is refused for the cooldown, not the syntax.
+		for (const [i, email] of [
 			'someone@example.com',
 			'first.last+tag@mail.example.co.uk',
 			'someone@localhost',
-		]) {
+		].entries()) {
 			const res = await exports.default.fetch(`${ORIGIN}/account/me/email`, {
 				...form({ email }),
 				method: 'POST',
-				headers,
+				headers: await authed(`881${i}`),
 			})
 			expect(res.status, email).toBe(200)
 		}

@@ -125,8 +125,8 @@ admin *args:
 reload-plus *args:
   bun runx admin reload-plus "$@"
 
-# Load the first-party custom avatar items (apps/econ/static/db/2025-1-cai.json by default)
-# into the custom_avatar_item table. Merges: existing ids are replaced, nothing is deleted.
+# Load the first-party custom avatar items (apps/econ/static/db/2025-1-cai.json, then
+# studio87-extras.json, by default) into the custom_avatar_item table. Merges: existing ids are replaced, nothing is deleted.
 # Defaults to --local; pass --remote for production, --dry-run to only validate. Prices come
 # from the storefront dump via apps/api/scripts/price-custom-avatar-items.ts. See CLI.md.
 [group('4. utility')]
@@ -134,3 +134,12 @@ reload-plus *args:
 [no-cd]
 cai-load *args:
   bun runx admin cai-load "$@"
+
+# Merges by default; --replace drops rows the file no longer lists. Defaults to --local; pass
+# --remote for production, --dry-run to only validate. Run it whenever sf3-2025.json changes.
+# Reload the item catalog (econ `catalog` table) from apps/econ/static/storefronts/sf3-2025.json
+[group('4. utility')]
+[positional-arguments]
+[no-cd]
+catalog-load *args:
+  bun runx catalog load "$@"

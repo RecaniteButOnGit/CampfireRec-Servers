@@ -95,6 +95,22 @@ async function runD1(worker: string, extraArgs: string[], remote: boolean): Prom
 		// dependency of @repo/tools, so it's not on this process's PATH).
 		const out = await $`pnpm exec wrangler ${args}`.quiet()
 		return out.stdout
+	} catch (e) {
+		// `.quiet()` hides wrangler's output, and runx exits on a failed process WITHOUT
+		// printing it — so a D1 error (a constraint, a missing column, an unapplied migration)
+		// surfaced as a bare "exited with code 1". Rethrow with what wrangler actually said.
+		if (e instanceof ProcessOutput) {
+			const said = [e.stderr, e.stdout]
+				.join('\n')
+				.split('\n')
+				.filter((line) => /ERROR|✘|error/i.test(line))
+				.join('\n')
+				.trim()
+			throw new Error(
+				`wrangler d1 execute failed (exit ${e.exitCode}):\n${said || `${e.stderr}\n${e.stdout}`.trim()}`
+			)
+		}
+		throw e
 	} finally {
 		if (cleanup) await cleanup()
 	}

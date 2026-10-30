@@ -1,336 +1,465 @@
 {
-    "NewUntil": null,
-    "NextUpdate": "2222-02-22T22:22:00Z",
-    "StoreItems": [
-        {
-            "GiftDrop": {
-                "GiftDropId": 377,
-                "FriendlyName": "Paintball Goggles",
-                "Tooltip": "",
-                "ConsumableItemDesc": "",
-                "AvatarItemDesc": "34144f4c-f6ef-49e5-a286-1781e82e6782,,,",
-                "AvatarItemType": 0,
-                "EquipmentPrefabName": "",
-                "EquipmentModificationGuid": "",
-                "IsQuery": false,
-                "QueryRedirectContext": null,
-                "QueryRedirectRarity": null,
-                "Unique": false,
-                "SubscribersOnly": false,
-                "Rarity": 20,
-                "Context": 0,
-                "Currency": 0,
-                "CurrencyType": 0,
-                "ItemSetId": null,
-                "ItemSetFriendlyName": ""
-            },
-            "IsFeatured": false,
-            "NewUntil": null,
-            "Prices": [
-                {
-                    "CurrencyType": 2,
-                    "Price": 550,
-                    "StorefrontSaleData": null
-                }
-            ],
-            "PurchasableItemId": 2328,
-            "SubscriberPrices": [
-                {
-                    "CurrencyType": 2,
-                    "Price": 495,
-                    "StorefrontSaleData": null
-                }
-            ],
-            "Type": 0
-        },
-        {
-            "GiftDrop": {
-                "GiftDropId": 3076,
-                "FriendlyName": "Soda Clerk Hat (Blue)",
-                "Tooltip": null,
-                "ConsumableItemDesc": "",
-                "AvatarItemDesc": "Wua43ED71UqL71ATtyS0iQ,XFCpIdeDXUqeYCIgh4fGtg,sV_ByCug30G1Gw-77KUe1Q,",
-                "AvatarItemType": 0,
-                "EquipmentPrefabName": "",
-                "EquipmentModificationGuid": "",
-                "IsQuery": false,
-                "QueryRedirectContext": null,
-                "QueryRedirectRarity": null,
-                "Unique": false,
-                "SubscribersOnly": false,
-                "Rarity": 30,
-                "Context": 0,
-                "Currency": 0,
-                "CurrencyType": 0,
-                "ItemSetId": null,
-                "ItemSetFriendlyName": ""
-            },
-            "IsFeatured": false,
-            "NewUntil": null,
-            "Prices": [
-                {
-                    "CurrencyType": 2,
-                    "Price": 900,
-                    "StorefrontSaleData": null
-                }
-            ],
-            "PurchasableItemId": 2329,
-            "SubscriberPrices": [
-                {
-                    "CurrencyType": 2,
-                    "Price": 810,
-                    "StorefrontSaleData": null
-                }
-            ],
-            "Type": 0
-        },
-        {
-            "GiftDrop": {
-                "GiftDropId": 2754,
-                "FriendlyName": "Soda Clerk Hat (Red)",
-                "Tooltip": null,
-                "ConsumableItemDesc": "",
-                "AvatarItemDesc": "Wua43ED71UqL71ATtyS0iQ,,,",
-                "AvatarItemType": 0,
-                "EquipmentPrefabName": "",
-                "EquipmentModificationGuid": "",
-                "IsQuery": false,
-                "QueryRedirectContext": null,
-                "QueryRedirectRarity": null,
-                "Unique": false,
-                "SubscribersOnly": false,
-                "Rarity": 30,
-                "Context": 0,
-                "Currency": 0,
-                "CurrencyType": 0,
-                "ItemSetId": null,
-                "ItemSetFriendlyName": ""
-            },
-            "IsFeatured": false,
-            "NewUntil": null,
-            "Prices": [
-                {
-                    "CurrencyType": 2,
-                    "Price": 900,
-                    "StorefrontSaleData": null
-                }
-            ],
-            "PurchasableItemId": 2330,
-            "SubscriberPrices": [
-                {
-                    "CurrencyType": 2,
-                    "Price": 810,
-                    "StorefrontSaleData": null
-                }
-            ],
-            "Type": 0
-        },
-        {
-            "GiftDrop": {
-                "GiftDropId": 3082,
-                "FriendlyName": "KO Icon - Tire Track",
-                "Tooltip": "When you KO someone this will appear over their head.",
-                "ConsumableItemDesc": "J1WqFNUWo0OBi4LGKPDHWw",
-                "AvatarItemDesc": "",
-                "AvatarItemType": null,
-                "EquipmentPrefabName": "",
-                "EquipmentModificationGuid": "",
-                "IsQuery": false,
-                "QueryRedirectContext": null,
-                "QueryRedirectRarity": null,
-                "Unique": false,
-                "SubscribersOnly": false,
-                "Rarity": 20,
-                "Context": 110000,
-                "Currency": 0,
-                "CurrencyType": 0,
-                "ItemSetId": null,
-                "ItemSetFriendlyName": ""
-            },
-            "IsFeatured": false,
-            "NewUntil": null,
-            "Prices": [
-                {
-                    "CurrencyType": 2,
-                    "Price": 200,
-                    "StorefrontSaleData": null
-                }
-            ],
-            "PurchasableItemId": 2331,
-            "SubscriberPrices": [
-                {
-                    "CurrencyType": 2,
-                    "Price": 180,
-                    "StorefrontSaleData": null
-                }
-            ],
-            "Type": 0
-        },
-        {
-            "GiftDrop": {
-                "GiftDropId": 458,
-                "FriendlyName": "Paintball Vest (Black)",
-                "Tooltip": "",
-                "ConsumableItemDesc": "",
-                "AvatarItemDesc": "d8f408f0-78f5-4e8a-b42a-e7b09632d1fd,,,",
-                "AvatarItemType": 0,
-                "EquipmentPrefabName": "",
-                "EquipmentModificationGuid": "",
-                "IsQuery": false,
-                "QueryRedirectContext": null,
-                "QueryRedirectRarity": null,
-                "Unique": false,
-                "SubscribersOnly": false,
-                "Rarity": 20,
-                "Context": 0,
-                "Currency": 0,
-                "CurrencyType": 0,
-                "ItemSetId": null,
-                "ItemSetFriendlyName": ""
-            },
-            "IsFeatured": false,
-            "NewUntil": null,
-            "Prices": [
-                {
-                    "CurrencyType": 2,
-                    "Price": 550,
-                    "StorefrontSaleData": null
-                }
-            ],
-            "PurchasableItemId": 2332,
-            "SubscriberPrices": [
-                {
-                    "CurrencyType": 2,
-                    "Price": 495,
-                    "StorefrontSaleData": null
-                }
-            ],
-            "Type": 0
-        },
-        {
-            "GiftDrop": {
-                "GiftDropId": 3079,
-                "FriendlyName": "Soda Clerk Uniform (Blue)",
-                "Tooltip": null,
-                "ConsumableItemDesc": "",
-                "AvatarItemDesc": "iai6P7dDTUq8S4hqQmY1YA,XFCpIdeDXUqeYCIgh4fGtg,MBuxBAIkpkWI26d-arAKQg,",
-                "AvatarItemType": 0,
-                "EquipmentPrefabName": "",
-                "EquipmentModificationGuid": "",
-                "IsQuery": false,
-                "QueryRedirectContext": null,
-                "QueryRedirectRarity": null,
-                "Unique": false,
-                "SubscribersOnly": false,
-                "Rarity": 30,
-                "Context": 0,
-                "Currency": 0,
-                "CurrencyType": 0,
-                "ItemSetId": null,
-                "ItemSetFriendlyName": ""
-            },
-            "IsFeatured": false,
-            "NewUntil": null,
-            "Prices": [
-                {
-                    "CurrencyType": 2,
-                    "Price": 700,
-                    "StorefrontSaleData": null
-                }
-            ],
-            "PurchasableItemId": 2333,
-            "SubscriberPrices": [
-                {
-                    "CurrencyType": 2,
-                    "Price": 630,
-                    "StorefrontSaleData": null
-                }
-            ],
-            "Type": 0
-        },
-        {
-            "GiftDrop": {
-                "GiftDropId": 2764,
-                "FriendlyName": "Soda Clerk Uniform (Red)",
-                "Tooltip": null,
-                "ConsumableItemDesc": "",
-                "AvatarItemDesc": "iai6P7dDTUq8S4hqQmY1YA,,,",
-                "AvatarItemType": 0,
-                "EquipmentPrefabName": "",
-                "EquipmentModificationGuid": "",
-                "IsQuery": false,
-                "QueryRedirectContext": null,
-                "QueryRedirectRarity": null,
-                "Unique": false,
-                "SubscribersOnly": false,
-                "Rarity": 30,
-                "Context": 0,
-                "Currency": 0,
-                "CurrencyType": 0,
-                "ItemSetId": null,
-                "ItemSetFriendlyName": ""
-            },
-            "IsFeatured": false,
-            "NewUntil": null,
-            "Prices": [
-                {
-                    "CurrencyType": 2,
-                    "Price": 700,
-                    "StorefrontSaleData": null
-                }
-            ],
-            "PurchasableItemId": 2334,
-            "SubscriberPrices": [
-                {
-                    "CurrencyType": 2,
-                    "Price": 630,
-                    "StorefrontSaleData": null
-                }
-            ],
-            "Type": 0
-        },
-        {
-            "GiftDrop": {
-                "GiftDropId": 3026,
-                "FriendlyName": "Popcorn",
-                "Tooltip": "",
-                "ConsumableItemDesc": "QRx0aSTT9keMFdAJMQHdTg",
-                "AvatarItemDesc": "",
-                "AvatarItemType": null,
-                "EquipmentPrefabName": "",
-                "EquipmentModificationGuid": "",
-                "IsQuery": false,
-                "QueryRedirectContext": null,
-                "QueryRedirectRarity": null,
-                "Unique": false,
-                "SubscribersOnly": false,
-                "Rarity": 30,
-                "Context": 110000,
-                "Currency": 0,
-                "CurrencyType": 0,
-                "ItemSetId": 52,
-                "ItemSetFriendlyName": "Snickety Snacks"
-            },
-            "IsFeatured": false,
-            "NewUntil": null,
-            "Prices": [
-                {
-                    "CurrencyType": 2,
-                    "Price": 100,
-                    "StorefrontSaleData": null
-                }
-            ],
-            "PurchasableItemId": 2335,
-            "SubscriberPrices": [
-                {
-                    "CurrencyType": 2,
-                    "Price": 90,
-                    "StorefrontSaleData": null
-                }
-            ],
-            "Type": 0
-        }
-    ],
-    "StorefrontType": 406,
-    "SubscriberDiscountPercent": 10
+	"StoreItems": [
+		{
+			"GiftDrop": {
+				"GiftDropId": 1666,
+				"FriendlyName": "Wood Paintball Shotgun Skin",
+				"Tooltip": "",
+				"TagList": "",
+				"ConsumableItemDesc": "",
+				"AvatarItemDesc": "",
+				"CustomAvatarItemId": null,
+				"AvatarItemType": null,
+				"EquipmentPrefabName": "[PaintballShotgun]",
+				"EquipmentModificationGuid": "61e49c13-b414-425f-8e8b-bdcf3d12a5bf",
+				"IsQuery": false,
+				"QueryRedirectContext": null,
+				"QueryRedirectTag": null,
+				"QueryRedirectRarity": null,
+				"Unique": true,
+				"SubscribersOnly": false,
+				"Rarity": 50,
+				"Context": 1003,
+				"Currency": 0,
+				"CurrencyType": 0,
+				"ItemCount": 1,
+				"ItemSetId": null,
+				"ItemSetFriendlyName": "",
+				"AvatarItemId": 0,
+				"EquipmentItemId": 17,
+				"ThumbnailImageName": "0u00ag3f9pqicz18snoqj3e01.png",
+				"AvatarItemInfo": null
+			},
+			"PurchasableItemId": 269,
+			"Type": 0,
+			"Prices": [
+				{
+					"CurrencyType": 2,
+					"Price": 2800,
+					"StorefrontSaleData": {
+						"SalePercent": 80,
+						"SaleStartDate": "2026-03-30T23:00:00Z",
+						"SaleEndDate": null
+					}
+				}
+			],
+			"SubscriberPrices": [
+				{
+					"CurrencyType": 2,
+					"Price": 2520,
+					"StorefrontSaleData": null
+				}
+			],
+			"IsFeatured": false,
+			"NewUntil": null,
+			"AvailableAt": "2025-08-14T19:00:00Z",
+			"AvailableUntil": null,
+			"CanBeGifted": true,
+			"OnlyAvailableThroughCv2": false
+		},
+		{
+			"GiftDrop": {
+				"GiftDropId": 5449,
+				"FriendlyName": "Bucket Skin (Tennis Rocks)",
+				"Tooltip": "Play at own risk!",
+				"TagList": "",
+				"ConsumableItemDesc": "",
+				"AvatarItemDesc": "",
+				"CustomAvatarItemId": null,
+				"AvatarItemType": null,
+				"EquipmentPrefabName": "[Bucket]",
+				"EquipmentModificationGuid": "U_3PE9Qc10OsVPTXyXsI_w",
+				"IsQuery": false,
+				"QueryRedirectContext": null,
+				"QueryRedirectTag": null,
+				"QueryRedirectRarity": null,
+				"Unique": false,
+				"SubscribersOnly": false,
+				"Rarity": 50,
+				"Context": 1000,
+				"Currency": 0,
+				"CurrencyType": 0,
+				"ItemCount": 1,
+				"ItemSetId": null,
+				"ItemSetFriendlyName": "",
+				"AvatarItemId": 0,
+				"EquipmentItemId": 319,
+				"ThumbnailImageName": "dg1rjaxzq98eajxvpb2oxgwaa.png",
+				"AvatarItemInfo": null
+			},
+			"PurchasableItemId": 23255,
+			"Type": 0,
+			"Prices": [
+				{
+					"CurrencyType": 2,
+					"Price": 1750,
+					"StorefrontSaleData": {
+						"SalePercent": 80,
+						"SaleStartDate": "2026-03-30T23:00:00Z",
+						"SaleEndDate": null
+					}
+				}
+			],
+			"SubscriberPrices": [
+				{
+					"CurrencyType": 2,
+					"Price": 1575,
+					"StorefrontSaleData": null
+				}
+			],
+			"IsFeatured": false,
+			"NewUntil": null,
+			"AvailableAt": "2025-08-14T19:00:00Z",
+			"AvailableUntil": null,
+			"CanBeGifted": true,
+			"OnlyAvailableThroughCv2": false
+		},
+		{
+			"GiftDrop": {
+				"GiftDropId": 17011,
+				"FriendlyName": "Caution Paintball Shield Skin",
+				"Tooltip": "",
+				"TagList": "",
+				"ConsumableItemDesc": "",
+				"AvatarItemDesc": "",
+				"CustomAvatarItemId": null,
+				"AvatarItemType": null,
+				"EquipmentPrefabName": "[PaintballShield]",
+				"EquipmentModificationGuid": "ClJApV0LC0mxh0UiYhaXGQ",
+				"IsQuery": false,
+				"QueryRedirectContext": null,
+				"QueryRedirectTag": null,
+				"QueryRedirectRarity": null,
+				"Unique": false,
+				"SubscribersOnly": false,
+				"Rarity": 50,
+				"Context": 1003,
+				"Currency": 0,
+				"CurrencyType": 0,
+				"ItemCount": 1,
+				"ItemSetId": null,
+				"ItemSetFriendlyName": "",
+				"AvatarItemId": 0,
+				"EquipmentItemId": 388,
+				"ThumbnailImageName": "4eczgwca3gxgn6r946dwwq1sc.png",
+				"AvatarItemInfo": null
+			},
+			"PurchasableItemId": 32021,
+			"Type": 0,
+			"Prices": [
+				{
+					"CurrencyType": 2,
+					"Price": 1800,
+					"StorefrontSaleData": {
+						"SalePercent": 80,
+						"SaleStartDate": "2026-03-30T23:00:00Z",
+						"SaleEndDate": null
+					}
+				}
+			],
+			"SubscriberPrices": [
+				{
+					"CurrencyType": 2,
+					"Price": 1620,
+					"StorefrontSaleData": null
+				}
+			],
+			"IsFeatured": false,
+			"NewUntil": null,
+			"AvailableAt": "2025-08-14T19:00:00Z",
+			"AvailableUntil": null,
+			"CanBeGifted": true,
+			"OnlyAvailableThroughCv2": false
+		},
+		{
+			"GiftDrop": {
+				"GiftDropId": 1860,
+				"FriendlyName": "Pirate Paintball Burst Rifle Skin",
+				"Tooltip": "",
+				"TagList": "",
+				"ConsumableItemDesc": "",
+				"AvatarItemDesc": "",
+				"CustomAvatarItemId": null,
+				"AvatarItemType": null,
+				"EquipmentPrefabName": "[PaintballAssaultRifle]",
+				"EquipmentModificationGuid": "996662ad-631d-4a81-8a8b-74ace4833279",
+				"IsQuery": false,
+				"QueryRedirectContext": null,
+				"QueryRedirectTag": null,
+				"QueryRedirectRarity": null,
+				"Unique": false,
+				"SubscribersOnly": false,
+				"Rarity": 50,
+				"Context": 1003,
+				"Currency": 0,
+				"CurrencyType": 0,
+				"ItemCount": 1,
+				"ItemSetId": null,
+				"ItemSetFriendlyName": "",
+				"AvatarItemId": 0,
+				"EquipmentItemId": 46,
+				"ThumbnailImageName": "285a0x1eblrae2o8gwlayqhxt.png",
+				"AvatarItemInfo": null
+			},
+			"PurchasableItemId": 443,
+			"Type": 0,
+			"Prices": [
+				{
+					"CurrencyType": 2,
+					"Price": 1750,
+					"StorefrontSaleData": {
+						"SalePercent": 80,
+						"SaleStartDate": "2026-03-30T23:00:00Z",
+						"SaleEndDate": null
+					}
+				}
+			],
+			"SubscriberPrices": [
+				{
+					"CurrencyType": 2,
+					"Price": 1575,
+					"StorefrontSaleData": null
+				}
+			],
+			"IsFeatured": false,
+			"NewUntil": null,
+			"AvailableAt": "2025-08-14T19:00:00Z",
+			"AvailableUntil": null,
+			"CanBeGifted": true,
+			"OnlyAvailableThroughCv2": false
+		},
+		{
+			"GiftDrop": {
+				"GiftDropId": 2621,
+				"FriendlyName": "Comic Paintball Sniper Rifle Skin",
+				"Tooltip": "",
+				"TagList": "",
+				"ConsumableItemDesc": "",
+				"AvatarItemDesc": "",
+				"CustomAvatarItemId": null,
+				"AvatarItemType": null,
+				"EquipmentPrefabName": "[PaintballRifleScoped]",
+				"EquipmentModificationGuid": "0dM2SfqGR0SmtO5ufTWfUQ",
+				"IsQuery": false,
+				"QueryRedirectContext": null,
+				"QueryRedirectTag": null,
+				"QueryRedirectRarity": null,
+				"Unique": false,
+				"SubscribersOnly": false,
+				"Rarity": 50,
+				"Context": 1003,
+				"Currency": 0,
+				"CurrencyType": 0,
+				"ItemCount": 1,
+				"ItemSetId": null,
+				"ItemSetFriendlyName": "",
+				"AvatarItemId": 0,
+				"EquipmentItemId": 168,
+				"ThumbnailImageName": "ep34wzljj174idlwxob06hc22.png",
+				"AvatarItemInfo": null
+			},
+			"PurchasableItemId": 1124,
+			"Type": 0,
+			"Prices": [
+				{
+					"CurrencyType": 2,
+					"Price": 4500,
+					"StorefrontSaleData": {
+						"SalePercent": 80,
+						"SaleStartDate": "2026-03-30T23:00:00Z",
+						"SaleEndDate": null
+					}
+				}
+			],
+			"SubscriberPrices": [
+				{
+					"CurrencyType": 2,
+					"Price": 4050,
+					"StorefrontSaleData": null
+				}
+			],
+			"IsFeatured": false,
+			"NewUntil": null,
+			"AvailableAt": "2025-08-14T19:00:00Z",
+			"AvailableUntil": null,
+			"CanBeGifted": true,
+			"OnlyAvailableThroughCv2": false
+		},
+		{
+			"GiftDrop": {
+				"GiftDropId": 2926,
+				"FriendlyName": "Bee-utiful Paintball Launcher Skin",
+				"Tooltip": "",
+				"TagList": "",
+				"ConsumableItemDesc": "",
+				"AvatarItemDesc": "",
+				"CustomAvatarItemId": null,
+				"AvatarItemType": null,
+				"EquipmentPrefabName": "[PaintballGrenadeLauncher]",
+				"EquipmentModificationGuid": "3UmIhvqmkU-aWxFDFd4QDg",
+				"IsQuery": false,
+				"QueryRedirectContext": null,
+				"QueryRedirectTag": null,
+				"QueryRedirectRarity": null,
+				"Unique": false,
+				"SubscribersOnly": false,
+				"Rarity": 50,
+				"Context": 1003,
+				"Currency": 0,
+				"CurrencyType": 0,
+				"ItemCount": 1,
+				"ItemSetId": null,
+				"ItemSetFriendlyName": "",
+				"AvatarItemId": 0,
+				"EquipmentItemId": 186,
+				"ThumbnailImageName": "dz4kr58hwf2k3sh3gp2ewfh2x.png",
+				"AvatarItemInfo": null
+			},
+			"PurchasableItemId": 1465,
+			"Type": 0,
+			"Prices": [
+				{
+					"CurrencyType": 2,
+					"Price": 5000,
+					"StorefrontSaleData": {
+						"SalePercent": 80,
+						"SaleStartDate": "2026-03-30T23:00:00Z",
+						"SaleEndDate": null
+					}
+				}
+			],
+			"SubscriberPrices": [
+				{
+					"CurrencyType": 2,
+					"Price": 4500,
+					"StorefrontSaleData": null
+				}
+			],
+			"IsFeatured": false,
+			"NewUntil": null,
+			"AvailableAt": "2025-08-14T19:00:00Z",
+			"AvailableUntil": null,
+			"CanBeGifted": true,
+			"OnlyAvailableThroughCv2": false
+		},
+		{
+			"GiftDrop": {
+				"GiftDropId": 4314,
+				"FriendlyName": "Watermelon Paintball Pistol Skin",
+				"Tooltip": "",
+				"TagList": "",
+				"ConsumableItemDesc": "",
+				"AvatarItemDesc": "",
+				"CustomAvatarItemId": null,
+				"AvatarItemType": null,
+				"EquipmentPrefabName": "[PaintballGun]",
+				"EquipmentModificationGuid": "p70jO7t0OEyaCWGrpUQa0Q",
+				"IsQuery": false,
+				"QueryRedirectContext": null,
+				"QueryRedirectTag": null,
+				"QueryRedirectRarity": null,
+				"Unique": false,
+				"SubscribersOnly": false,
+				"Rarity": 50,
+				"Context": 1003,
+				"Currency": 0,
+				"CurrencyType": 0,
+				"ItemCount": 1,
+				"ItemSetId": null,
+				"ItemSetFriendlyName": "",
+				"AvatarItemId": 0,
+				"EquipmentItemId": 298,
+				"ThumbnailImageName": "96d54u1ezx4ldh9mjgpp1jqpl.png",
+				"AvatarItemInfo": null
+			},
+			"PurchasableItemId": 23144,
+			"Type": 0,
+			"Prices": [
+				{
+					"CurrencyType": 2,
+					"Price": 2800,
+					"StorefrontSaleData": {
+						"SalePercent": 80,
+						"SaleStartDate": "2026-03-30T23:00:00Z",
+						"SaleEndDate": null
+					}
+				}
+			],
+			"SubscriberPrices": [
+				{
+					"CurrencyType": 2,
+					"Price": 2520,
+					"StorefrontSaleData": null
+				}
+			],
+			"IsFeatured": false,
+			"NewUntil": null,
+			"AvailableAt": "2025-08-14T19:00:00Z",
+			"AvailableUntil": null,
+			"CanBeGifted": true,
+			"OnlyAvailableThroughCv2": false
+		},
+		{
+			"GiftDrop": {
+				"GiftDropId": 5477,
+				"FriendlyName": "Spring Egg Paintball Grenade Skin",
+				"Tooltip": "",
+				"TagList": "",
+				"ConsumableItemDesc": "",
+				"AvatarItemDesc": "",
+				"CustomAvatarItemId": null,
+				"AvatarItemType": null,
+				"EquipmentPrefabName": "[Grenade]",
+				"EquipmentModificationGuid": "8Ex4aO2GpEqwvow6bEu_ag",
+				"IsQuery": false,
+				"QueryRedirectContext": null,
+				"QueryRedirectTag": null,
+				"QueryRedirectRarity": null,
+				"Unique": false,
+				"SubscribersOnly": false,
+				"Rarity": 50,
+				"Context": 1000,
+				"Currency": 0,
+				"CurrencyType": 0,
+				"ItemCount": 1,
+				"ItemSetId": null,
+				"ItemSetFriendlyName": "",
+				"AvatarItemId": 0,
+				"EquipmentItemId": 321,
+				"ThumbnailImageName": "799wq002rrsfj1uzr8ma3xyjn.png",
+				"AvatarItemInfo": null
+			},
+			"PurchasableItemId": 2964,
+			"Type": 0,
+			"Prices": [
+				{
+					"CurrencyType": 2,
+					"Price": 2000,
+					"StorefrontSaleData": {
+						"SalePercent": 80,
+						"SaleStartDate": "2026-03-30T23:00:00Z",
+						"SaleEndDate": null
+					}
+				}
+			],
+			"SubscriberPrices": [
+				{
+					"CurrencyType": 2,
+					"Price": 1800,
+					"StorefrontSaleData": null
+				}
+			],
+			"IsFeatured": false,
+			"NewUntil": null,
+			"AvailableAt": "2025-08-14T19:00:00Z",
+			"AvailableUntil": null,
+			"CanBeGifted": true,
+			"OnlyAvailableThroughCv2": false
+		}
+	],
+	"SubscriberDiscountPercent": 10,
+	"StorefrontName": null,
+	"StorefrontType": 406,
+	"NextUpdate": "2222-02-22T22:00:00Z",
+	"NewUntil": null
 }

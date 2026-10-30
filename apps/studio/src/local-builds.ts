@@ -19,6 +19,7 @@ export interface CloudBuildRow {
 	error: string | null
 	unityAssetId: string
 	createdByAccountId: number
+	serverDataFileName?: string | null
 }
 
 export type BundlePlatform = StudioBundlePlatform
@@ -35,6 +36,16 @@ export interface StoredLocalBuild extends CloudBuildRow {
 	subRoomDataSaveId: number
 }
 
+export interface UserBuildCount {
+	accountId: number
+	startTime: string
+	endTime: string
+	subRoomTotalBuildCount: number
+	subRoomFailedBuildCount: number
+	avatarItemTotalBuildCount: number
+	avatarItemFailedBuildCount: number
+}
+
 interface BuildListRow {
 	cloud_build_id: string
 	started_at: string
@@ -48,10 +59,14 @@ function toCloudBuild(row: BuildListRow): CloudBuildRow {
 	return {
 		cloudBuildId: row.cloud_build_id,
 		startedAt: row.started_at,
-		completedAt: row.completed_at,
+		completedAt: row.completed_at || null,
 		error: row.error,
 		unityAssetId: row.unity_asset_id,
 		createdByAccountId: row.created_by_account_id,
+		serverDataFileName:
+			row.completed_at && !row.error && /^\d+$/.test(row.cloud_build_id)
+				? `studio-builds/${row.cloud_build_id}/server-data.json`
+				: null,
 	}
 }
 
@@ -81,6 +96,43 @@ export async function listCloudBuilds(
 		.bind(roomId, subRoomId, take, skip)
 		.all<BuildListRow>()
 	return { results: results.map(toCloudBuild), totalResults: Number(total?.n ?? 0) }
+}
+
+/** Build totals for the current UTC hour, matching Studio's rate-limit window DTO. */
+export async function getUserBuildCount(
+	db: D1Database,
+	accountId: number,
+	now = new Date()
+): Promise<UserBuildCount> {
+	const start = new Date(now)
+	start.setUTCMinutes(0, 0, 0)
+	const end = new Date(start.getTime() + 60 * 60 * 1000)
+	const row = await db
+		.prepare(
+			`SELECT SUM(CASE WHEN room_id!=0 THEN 1 ELSE 0 END) AS total,
+			        SUM(CASE WHEN room_id!=0 AND error IS NOT NULL THEN 1 ELSE 0 END) AS failed,
+			        SUM(CASE WHEN room_id=0 THEN 1 ELSE 0 END) AS avatar_total,
+			        SUM(CASE WHEN room_id=0 AND error IS NOT NULL THEN 1 ELSE 0 END) AS avatar_failed
+			 FROM studio_cloud_build
+			 WHERE created_by_account_id = ?1
+			   AND started_at >= ?2 AND started_at < ?3`
+		)
+		.bind(accountId, start.toISOString(), end.toISOString())
+		.first<{
+			total: number | string
+			failed: number | string | null
+			avatar_total: number | null
+			avatar_failed: number | null
+		}>()
+	return {
+		accountId,
+		startTime: start.toISOString(),
+		endTime: end.toISOString(),
+		subRoomTotalBuildCount: Number(row?.total ?? 0),
+		subRoomFailedBuildCount: Number(row?.failed ?? 0),
+		avatarItemTotalBuildCount: Number(row?.avatar_total ?? 0),
+		avatarItemFailedBuildCount: Number(row?.avatar_failed ?? 0),
+	}
 }
 
 /** Base64 SHA-256 — the encoding `unity_asset.hash` (and every other bundle hash) uses. */

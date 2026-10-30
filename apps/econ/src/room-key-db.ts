@@ -97,6 +97,8 @@ export interface NewRoomKey {
 	Name: string
 	Description: string
 	Price: number
+	/** A `room_currency` id of the key's own room, or null for tokens. */
+	PurchaseCurrencyId: string | null
 }
 
 interface RoomKeyRow {
@@ -133,7 +135,7 @@ export async function createRoomKey(db: D1Database, key: NewRoomKey): Promise<Ro
 		.prepare(
 			`INSERT INTO room_key
 			   (replication_id, room_id, key_type, name, description, price, purchase_currency_id, image_name, created_at)
-			 VALUES (?1, ?2, ?3, ?4, ?5, ?6, NULL, '', ?7)
+			 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, '', ?8)
 			 RETURNING ${SELECT_COLUMNS}`
 		)
 		.bind(
@@ -143,6 +145,7 @@ export async function createRoomKey(db: D1Database, key: NewRoomKey): Promise<Ro
 			key.Name,
 			key.Description,
 			key.Price,
+			key.PurchaseCurrencyId,
 			new Date().toISOString()
 		)
 		.first<RoomKeyRow>()
@@ -211,6 +214,38 @@ export async function getRoomKeys(db: D1Database, roomId: number): Promise<RoomK
 		.all<RoomKeyRow>()
 
 	return results.map(toRoomKey)
+}
+
+/**
+ * A key as `GET /api/roomkeys/v1/mine` serves it — observed from the live client: the
+ * {@link RoomKey} plus `IsGiftable` and `Visibility`, and `ImageName` as '' (not null) on a
+ * key without art. Neither extra field is modelled here, so both are served as their 0/false.
+ */
+export interface HeldRoomKey extends Omit<RoomKey, 'ImageName'> {
+	ImageName: string
+	IsGiftable: boolean
+	Visibility: number
+}
+
+/** Every key `accountId` holds, across all rooms, in creation order. */
+export async function getHeldRoomKeys(db: D1Database, accountId: number): Promise<HeldRoomKey[]> {
+	const { results } = await db
+		.prepare(
+			`SELECT ${SELECT_COLUMNS.split(', ')
+				.map((col) => `k.${col}`)
+				.join(', ')}
+			 FROM room_key_player p JOIN room_key k ON k.room_key_id = p.room_key_id
+			 WHERE p.account_id = ?1 ORDER BY k.room_key_id`
+		)
+		.bind(accountId)
+		.all<RoomKeyRow>()
+
+	return results.map((row) => ({
+		...toRoomKey(row),
+		ImageName: row.image_name,
+		IsGiftable: false,
+		Visibility: 0,
+	}))
 }
 
 /**

@@ -1,6 +1,7 @@
 import { Hono } from 'hono'
 import { describeRoute, openAPIRouteHandler } from 'hono-openapi'
 import { useWorkersLogger } from 'workers-tagged-logger'
+import { z } from 'zod'
 
 import {
 	addXp,
@@ -12,6 +13,7 @@ import {
 	getOutfits,
 	getPendingGifts,
 	getPlayerIdsInRoom,
+	getPresence,
 	grantInvention,
 	levelReward,
 	levelsReached,
@@ -21,7 +23,7 @@ import {
 	updateAccount,
 } from '@repo/domain'
 import { intVar, logger, withCleanSpec, withNotFound, withOnError } from '@repo/hono-helpers'
-import { validateAndGetAccountId, validateAndGetPlus, validateAndGetVersion } from '@repo/jwt'
+import { validateAndGetAccountId, validateAndGetBuild, validateAndGetPlus } from '@repo/jwt'
 
 import {
 	getCustomAvatarItems,
@@ -41,6 +43,7 @@ import { censorSwears } from '../../api/src/sanitize'
 import { BalanceAddType } from '../../notify/src/notification-payloads'
 import { NotificationType } from '../../notify/src/notification-types'
 import adCarouselItems from '../static/ad-carousel-items.json'
+import consumableDefinitions from '../static/consumables.json'
 import defaultAvatarItems from '../static/default-avatar-items.json'
 import defaultAvatar from '../static/default-avatar.json'
 import defaultBaseAvatarItems from '../static/default-base-avatar-items.json'
@@ -57,7 +60,7 @@ import {
 	isSpendable,
 	spendCurrency,
 } from './balance-db'
-import { getCatalogItem, toCatalogAvatarItem } from './catalog-db'
+import { getCatalogItem, getStoreListings, toCatalogAvatarItem } from './catalog-db'
 // `LEGACY_CLIENT_BUILD` is shared with the storefront generator rather than restated: it picks
 // which store FILE a caller is served here, and is what the generator's help names.
 import { CatalogKind, LEGACY_CLIENT_BUILD } from './catalog-load'
@@ -104,6 +107,8 @@ import {
 	ConsumeConsumableRequest,
 	ConsumeEnvelope,
 	ConsumeGiftRequest,
+	ConsumeRoomConsumableRequest,
+	ConsumeRoomConsumableResponse,
 	CreatePurchaseOfferRequest,
 	CreateRoomCurrencyRequest,
 	CreateRoomKeyRequest,
@@ -113,6 +118,9 @@ import {
 	ErrorResponse,
 	form,
 	GameRewardRequest,
+	GrantRoomBadgeRequest,
+	GrantRoomBadgeResponse,
+	HeldRoomKeyDto,
 	InfluencerIdsResponse,
 	IsOnWishlistBulkRequest,
 	IsOnWishlistBulkResponse,
@@ -128,14 +136,20 @@ import {
 	OPTIONAL_AUTHED,
 	OwnsRoomKeysRequest,
 	OwnsRoomKeysResponse,
+	PurchasableItemsRequest,
+	PurchaseRoomConsumableRequest,
+	PurchaseRoomConsumableResponse,
 	PurchaseRoomCurrencyEnvelope,
 	PurchaseRoomCurrencyRequest,
 	PurchaseRoomKeyWithCurrencyRequest,
 	PurchaseRoomKeyWithCurrencyResponse,
+	QueryConsumablesRequest,
 	ReferralProgressResponse,
 	RemoveInfluencerBody,
 	RoomConsumableDto,
 	RoomConsumableEnvelope,
+	RoomConsumableInventoryItemDto,
+	RoomCurrencyBalance,
 	RoomCurrencyDto,
 	RoomCurrencyEnvelope,
 	RoomCurrencyPurchaseOfferDto,
@@ -165,11 +179,14 @@ import {
 	WishlistItemList,
 	WishlistItemRequest,
 } from './openapi'
-import { claimReward, isNewActivity } from './reward-db'
+import { claimAllowance, claimReward, DAILY_REWARD_COOLDOWN_MS } from './reward-db'
 import {
 	awardRoomConsumable,
+	consumeRoomConsumable,
 	getRoomConsumable,
 	getRoomConsumables,
+	getRoomInventory,
+	toInventoryItem,
 	upsertRoomConsumable,
 } from './room-consumable-db'
 import {
@@ -189,6 +206,7 @@ import {
 	awardRoomKey,
 	claimRoomKey,
 	createRoomKey,
+	getHeldRoomKeys,
 	getRoomKey,
 	getRoomKeys,
 	getRoomOwnerId,
@@ -211,6 +229,7 @@ import type { CustomAvatarItem } from '../../api/src/custom-avatar-items-db'
 import type { SavedInvention } from '../../api/src/inventions-db'
 import type {
 	BalanceResponsePayload,
+	ConsumableMappingPayload,
 	LocalRoomKeyPayload,
 	PurchaseBalanceModificationPayload,
 	RoomCurrencyPayload,
@@ -226,7 +245,7 @@ import type { ConsumeResult } from './consumables-db'
 import type { App, Env } from './context'
 import type { Equipment } from './equipment-db'
 import type { AvatarItem } from './inventory-db'
-import type { RoomConsumable } from './room-consumable-db'
+import type { RoomConsumable, RoomConsumableInventoryItem } from './room-consumable-db'
 import type { RoomCurrency, RoomCurrencyPurchaseOffer } from './room-currency-db'
 import type { RoomKey, RoomKeyHolding } from './room-key-db'
 import type { WishlistItem } from './wishlist-db'
@@ -259,22 +278,45 @@ async function authedId(c: Context<App>): Promise<number | null> {
 /**
  * The client build this request's token was minted for (`rn.ver`), as a comparable NUMBER —
  * the leading `YYYYMMDD` of e.g. `20250718.01`, whose `.01` is a same-day rebuild and not a
- * version to order by. `null` when there is no valid token, when it carries no `rn.ver` (an
- * older token, issued before the claim did), or when the claim isn't a build at all.
+ * version to order by (`validateAndGetBuild` drops it). `null` when there is no valid
+ * token, when it carries no `rn.ver` (an older token, issued before the claim did), or
+ * when the claim isn't a build at all.
  *
  * Unverified — a client can claim any build — which is fine for what it gates here: a build
  * lying about itself only changes which storefront its own player is shown.
  */
 async function authedBuild(c: Context<App>): Promise<number | null> {
-	const version = await validateAndGetVersion(c.req.raw, await c.env.JWT_SECRET.get())
+	const version = await validateAndGetBuild(c.req.raw, await c.env.JWT_SECRET.get())
 	if (version === null) return null
-	const build = Number.parseInt(version.split('.')[0] ?? '', 10)
+	const build = Number.parseInt(version, 10)
 	return Number.isInteger(build) ? build : null
 }
 
 /** Results.Unauthorized() equivalent — 401 with empty body. */
 function unauthorized(c: Context<App>) {
 	return c.body(null, 401)
+}
+
+/** The badge tab reads another account's inventory, filtered before paging. */
+async function customAvatarItemsPage(c: Context<App>, accountId: number, callerId: number) {
+	const owned = await getOwnedCustomAvatarItems(c.env.DB, accountId)
+	const outfitType = c.req.query('outfitType')
+	const visible = owned.filter(
+		(item) =>
+			(accountId === callerId || item.Accessibility !== 0) &&
+			(outfitType === undefined || item.OutfitType === Number(outfitType))
+	)
+	const pageNumber = (value: string | undefined, fallback: number) => {
+		const parsed = Number(value ?? fallback)
+		return Number.isSafeInteger(parsed) && parsed >= 0 ? parsed : fallback
+	}
+	const skip = pageNumber(c.req.query('skip'), 0)
+	const take = Math.min(pageNumber(c.req.query('take'), 1000), 1000)
+	const page = visible.slice(skip, skip + take)
+	const Results = isQuestAssetTarget(c.req.query('unityAssetTarget'))
+		? page.map(toQuestCustomAvatarItem)
+		: page
+	return c.json({ Results, TotalResults: visible.length })
 }
 
 /**
@@ -559,6 +601,24 @@ async function pushRoomKeyCreated(
 }
 
 /**
+ * Whether a consumable is a first-party (Rec Room Original) item, as its definition in
+ * `static/consumables.json` says — the value every consumable instance we serve must carry.
+ *
+ * The 2026 client keys an instance on this flag and checks it against the definition it holds:
+ * a mismatch throws (`Key IsRRO=False does not match Definition IsRRO=True!`) and the frame is
+ * lost, so the purchase never shows. Every definition in the file says true; a desc with none
+ * is still a built-in store item, so it defaults to true too.
+ */
+const RRO_BY_DESC = new Map(
+	(consumableDefinitions as Array<{ ConsumableItemDesc: string; IsRRO?: boolean }>).map((d) => [
+		d.ConsumableItemDesc,
+		d.IsRRO !== false,
+	])
+)
+const isRroConsumable = (consumableItemDesc: string): boolean =>
+	RRO_BY_DESC.get(consumableItemDesc) ?? true
+
+/**
  * Push a ConsumableMappingRemoved notification to a player after they consume a
  * consumable, mirroring the reference's
  * `HubSendToPlayer(accountID, NotifFrame(ConsumableMappingRemoved, {...}))` — the
@@ -583,7 +643,9 @@ async function pushConsumableRemoved(
 				IsActive: false,
 				ActiveDurationMinutes: 0,
 				IsTransferable: false,
-			}
+				ActivatedByRoomie: false,
+				IsRRO: isRroConsumable(consumed.consumableItemDesc),
+			} satisfies ConsumableMappingPayload
 		)
 	} catch (err) {
 		logger.error('failed to push ConsumableMappingRemoved notification', {
@@ -606,20 +668,48 @@ async function pushConsumableAdded(
 	accountId: number,
 	gift: StoredGift
 ): Promise<void> {
+	await pushConsumableMappingAdded(c, accountId, {
+		mappingId: gift.ConsumableMappingId ?? 0,
+		consumableItemDesc: gift.ConsumableItemDesc,
+		count: gift.ConsumableCount,
+		preExistingCount: gift.ConsumablePreExistingCount ?? 0,
+	})
+}
+
+/**
+ * The `ConsumableMappingAdded` frame itself — one granted consumable instance (its row id,
+ * how many it holds, and the player's count before it). Sent when a box carrying it is
+ * opened ({@link pushConsumableAdded}) or, when there IS no box, at grant time: a purchase
+ * under `BypassGiftPackages` is never opened, and without this the consumable didn't show
+ * until the client refetched its inventory. Never both for one grant — a second frame for
+ * the same row id could be counted twice. Best-effort like the removed push.
+ */
+async function pushConsumableMappingAdded(
+	c: Context<App>,
+	accountId: number,
+	granted: {
+		mappingId: number
+		consumableItemDesc: string
+		count: number
+		preExistingCount: number
+	}
+): Promise<void> {
 	try {
 		await c.env.RECFLARE_NOTIFICATIONS_HUB.getByName(HUB_INSTANCE).notifyPlayer(
 			accountId,
 			NotificationType.ConsumableMappingAdded,
 			{
-				Id: gift.ConsumableMappingId ?? 0,
-				ConsumableItemDesc: gift.ConsumableItemDesc,
+				Id: granted.mappingId,
+				ConsumableItemDesc: granted.consumableItemDesc,
 				CreatedAt: new Date().toISOString(),
-				Count: gift.ConsumableCount,
-				InitialCount: gift.ConsumablePreExistingCount ?? 0,
+				Count: granted.count,
+				InitialCount: granted.preExistingCount,
 				IsActive: false,
 				ActiveDurationMinutes: 0,
 				IsTransferable: false,
-			}
+				ActivatedByRoomie: false,
+				IsRRO: isRroConsumable(granted.consumableItemDesc),
+			} satisfies ConsumableMappingPayload
 		)
 	} catch (err) {
 		logger.error('failed to push ConsumableMappingAdded notification', {
@@ -1828,7 +1918,19 @@ async function grantGiftDrop(
 			consumableCount
 		)
 	}
-	if (options.skipGiftBox === true) return { id: 0, drop: giftDrop }
+	if (options.skipGiftBox === true) {
+		// No box means nothing will ever be opened to announce the consumable, so announce it
+		// now — otherwise a bag bought with `BypassGiftPackages` doesn't show it until a refetch.
+		if (isConsumable) {
+			await pushConsumableMappingAdded(c, accountId, {
+				mappingId: consumableMappingId,
+				consumableItemDesc: giftDrop.ConsumableItemDesc,
+				count: consumableCount,
+				preExistingCount: consumablePreExisting,
+			})
+		}
+		return { id: 0, drop: giftDrop }
+	}
 	const { id } = await createGift(
 		db,
 		accountId,
@@ -2260,15 +2362,24 @@ function isBulkLine(resolved: BulkPurchaseLine | BulkLineFailure): resolved is B
 }
 
 /**
- * XP paid for a claimed game reward. One flat amount for every reward type, matching the
- * one flat cooldown they share — "First Game of the Day" and "Activity completed!" are the
- * same size of pat on the back until there's reason to price them apart.
+ * XP paid for a claimed game reward. One flat amount for every reward type — "First Game of
+ * the Day" and "Activity completed!" are the same size of pat on the back until there's
+ * reason to price them apart.
  *
- * Deliberately smaller than the 10 XP the first level costs: a single action shouldn't be a
- * level-up, let alone two of them. At 5 it takes two rewards to reach level 2, and the early
- * levels are paced by the hourly cooldown rather than cleared in one match.
+ * Exactly what each of the first three levels costs, so a fresh player's first rewards each
+ * level them up; from level 4 (20 XP a level) it takes two or more. The daily
+ * {@link GAME_REWARD_DAILY_XP_CAP} paces it from there.
  */
-const GAME_REWARD_XP = 5
+const GAME_REWARD_XP = 10
+
+/**
+ * The most game-reward XP a player earns in one rolling 24h window: fifteen claims' worth,
+ * whatever the type or activity — `FirstActivityOfDay` aside, whose XP is a bonus on top, like
+ * its tokens. The running total is the player's `$xp` row in `reward_status`
+ * (`claimAllowance`). A multiple of {@link GAME_REWARD_XP} — a claim that would cross it pays
+ * no XP.
+ */
+const GAME_REWARD_DAILY_XP_CAP = 150
 
 /**
  * `GiftContext.GameRewards` — what the box says it came from, so the client files it under
@@ -2281,29 +2392,46 @@ const GIFT_CONTEXT_GAME_REWARDS = 50
 const DEFAULT_GAME_REWARD_MESSAGE = 'Reward earned!'
 
 /**
- * Tokens paid the FIRST time a player completes an activity — a `giftContext` no row of
- * theirs in `reward_status` has seen before, whatever the reward type. A one-off per
- * activity on top of the hourly XP: the reward for trying something new, sized as a
- * visible nudge (a cheap catalog item) rather than an income, since the catalog of
- * activities is finite and each pays it exactly once.
+ * Tokens paid with each claimed {@link TOKEN_REWARD_TYPES} reward, until the player has had
+ * {@link GAME_REWARD_DAILY_TOKEN_CAP} in the current 24h window — whatever the activity.
+ * The running total is the player's `$tokens` row in `reward_status` (`claimAllowance`).
  */
-const NEW_ACTIVITY_BONUS_TOKENS = 250
+const GAME_REWARD_TOKENS = 250
+
+/**
+ * The most game-reward tokens a player earns in one rolling 24h window: five claims' worth.
+ * A multiple of {@link GAME_REWARD_TOKENS} — a claim that would cross it pays nothing.
+ */
+const GAME_REWARD_DAILY_TOKEN_CAP = 1250
+
+/**
+ * The reward types whose tokens draw on the daily allowance: the client's ask after a match
+ * and after a quest. {@link FIRST_ACTIVITY_OF_DAY} pays its own on top, outside the cap.
+ */
+const TOKEN_REWARD_TYPES = new Set(['PostGameActivity', 'PostQuestActivity'])
+
+/**
+ * The once-a-day bonus. Its claim is per PLAYER — keyed on the empty context whatever
+ * activity asked — on a 24h cooldown, and it pays {@link GAME_REWARD_TOKENS} outside the
+ * daily cap: the claim itself is what limits it, so it needs no allowance row.
+ */
+const FIRST_ACTIVITY_OF_DAY = 'FirstActivityOfDay'
 
 /**
  * `GiftContext.GameRewardsTokens` — the tokens variant of {@link GIFT_CONTEXT_GAME_REWARDS},
- * on the box the new-activity bonus arrives in.
+ * on the box the token payout arrives in.
  */
 const GIFT_CONTEXT_GAME_REWARDS_TOKENS = 51
 
-/** The message on the new-activity bonus box. */
-const NEW_ACTIVITY_BONUS_MESSAGE = 'New activity bonus!'
+/** The message on the token payout's box. */
+const GAME_REWARD_TOKENS_MESSAGE = 'Activity bonus!'
 
 /**
- * The gift-drop the new-activity bonus hands over: tokens in a box, no item, no XP. Like
+ * The gift-drop a claimed game reward's token payout hands over: tokens in a box, no item, no XP. Like
  * {@link toGameRewardDrop}, `grantGiftDrop` creates only the box from it — the tokens are
  * credited to the balance separately, and the copy here is what the box displays.
  */
-function toNewActivityBonusDrop(): StoreGiftDrop {
+function toGameRewardTokensDrop(): StoreGiftDrop {
 	return {
 		FriendlyName: '',
 		Tooltip: '',
@@ -2314,7 +2442,7 @@ function toNewActivityBonusDrop(): StoreGiftDrop {
 		EquipmentModificationGuid: '',
 		Rarity: 0,
 		Context: GIFT_CONTEXT_GAME_REWARDS_TOKENS,
-		Currency: NEW_ACTIVITY_BONUS_TOKENS,
+		Currency: GAME_REWARD_TOKENS,
 		CurrencyType: CurrencyType.RecCenterTokens,
 		Xp: 0,
 	}
@@ -2326,7 +2454,7 @@ function toNewActivityBonusDrop(): StoreGiftDrop {
  * nothing into the inventory and only creates the box. The XP is banked in `progression`;
  * the copy here is what the box and its notification display.
  */
-function toGameRewardDrop(): StoreGiftDrop {
+function toGameRewardDrop(xp: number): StoreGiftDrop {
 	return {
 		FriendlyName: '',
 		Tooltip: '',
@@ -2339,7 +2467,7 @@ function toGameRewardDrop(): StoreGiftDrop {
 		Context: GIFT_CONTEXT_GAME_REWARDS,
 		Currency: 0,
 		CurrencyType: 0,
-		Xp: GAME_REWARD_XP,
+		Xp: xp,
 	}
 }
 
@@ -2404,10 +2532,14 @@ async function pickQuestReward(
  * row, so the item IS granted — unlike {@link toGameRewardDrop}'s empty box. The catalog
  * row for the item, when it resolves, supplies what the table doesn't carry (name, tooltip,
  * `AvatarItemType`), so the inventory entry reads like a bought one rather than blank.
- * The XP is the flat game-reward amount, not the row's (always 0): the reward is the item,
- * and the XP is the same pat on the back every claim gets.
+ * The XP is the game reward's (`xp`), not the row's (always 0): the reward is the item, and
+ * the XP is the same pat on the back every claim gets while the daily cap has room.
  */
-function toQuestRewardDrop(reward: QuestReward, catalog: CatalogRow | null): StoreGiftDrop {
+function toQuestRewardDrop(
+	reward: QuestReward,
+	catalog: CatalogRow | null,
+	xp: number
+): StoreGiftDrop {
 	return {
 		FriendlyName: catalog?.friendly_name ?? '',
 		Tooltip: catalog?.tooltip ?? '',
@@ -2420,7 +2552,7 @@ function toQuestRewardDrop(reward: QuestReward, catalog: CatalogRow | null): Sto
 		Context: reward.Context,
 		Currency: reward.Currency,
 		CurrencyType: reward.CurrencyType,
-		Xp: GAME_REWARD_XP,
+		Xp: xp,
 	}
 }
 
@@ -2951,6 +3083,99 @@ const app = new Hono<App>({ strict: false })
 			if (id === null) return unauthorized(c)
 			const owned = await getInventory(c.env.DB, id)
 			return c.json([...owned, ...defaultAvatarItems].map(toAvatarItemV4))
+		}
+	)
+
+	.get(
+		'/econ/customAvatarItems/v1/ownedby/:accountId{[0-9]+}',
+		describeRoute({
+			tags: ['Avatar'],
+			summary: 'Custom avatar items owned by an account',
+			description:
+				'Lists owned and created items, filtered by outfitType and paged by skip/take. ' +
+				'TotalResults is the filtered count before paging. Other accounts see published items only. ' +
+				'Honors unityAssetTarget as the caller-owned inventory does.',
+			security: AUTHED,
+			responses: {
+				200: json(CustomAvatarItemsResponse, 'The owned items'),
+				401: UNAUTHORIZED_RESPONSE,
+			},
+		}),
+		async (c) => {
+			const id = await authedId(c)
+			if (id === null) return unauthorized(c)
+			return customAvatarItemsPage(c, Number(c.req.param('accountId')), id)
+		}
+	)
+	.post(
+		'/circuitsRoomRewards/grantRoomBadge',
+		describeRoute({
+			tags: ['Avatar'],
+			summary: 'Award a room badge from a circuit',
+			description:
+				'Grants a published room badge to a player in the caller’s live room instance. ' +
+				'The badge must belong to that room. ResponseCode is 0 on a new grant, 1 if already owned, ' +
+				'or 2 on an invalid grant. A new grant creates and announces a gift package.',
+			security: AUTHED,
+			requestBody: jsonBody(GrantRoomBadgeRequest, 'The badge, player and room instance'),
+			responses: {
+				200: json(GrantRoomBadgeResponse, 'The circuit result'),
+				401: UNAUTHORIZED_RESPONSE,
+			},
+		}),
+		async (c) => {
+			const id = await authedId(c)
+			if (id === null) return unauthorized(c)
+			const failed = (ErrorMessage: string) => c.json({ ResponseCode: 2, ErrorMessage })
+			const parsed = GrantRoomBadgeRequest.safeParse(await c.req.json().catch(() => null))
+			if (!parsed.success) return failed('Invalid room badge request')
+			const body = parsed.data
+			const [badge] = await getCustomAvatarItems(c.env.DB, [
+				body.BadgeCustomAvatarItemId.toLowerCase(),
+			])
+			const roomId = (badge?.CustomBadgeMetadata as { RoomId?: number } | null)?.RoomId
+			if (
+				!badge ||
+				badge.OutfitType !== 1000 ||
+				badge.Accessibility === 0 ||
+				badge.CurrentSaves.length === 0 ||
+				!roomId
+			)
+				return failed('No published room badge')
+			type BadgeInstance = { roomId: number; roomInstanceId: number }
+			const [caller, target] = await Promise.all([
+				getPresence<BadgeInstance>(c.env.DB, id),
+				getPresence<BadgeInstance>(c.env.DB, body.TargetAccountId),
+			])
+			if (
+				caller?.roomInstance?.roomId !== roomId ||
+				caller.roomInstance.roomInstanceId !== body.RoomInstanceId ||
+				target?.roomInstance?.roomId !== roomId ||
+				target.roomInstance.roomInstanceId !== body.RoomInstanceId
+			) {
+				return failed('Players must be in the badge’s room instance')
+			}
+			const owned = await ownedCustomAvatarItemIds(c.env.DB, body.TargetAccountId, [
+				badge.CustomAvatarItemId,
+			])
+			if (badge.CreatorAccountId === body.TargetAccountId || owned.size > 0) {
+				return c.json({ ResponseCode: 1, ErrorMessage: null })
+			}
+			// The insert decides the winner of concurrent grants, so only one box is created.
+			if (
+				!(await grantCustomAvatarItem(c.env.DB, body.TargetAccountId, badge.CustomAvatarItemId))
+			) {
+				return c.json({ ResponseCode: 1, ErrorMessage: null })
+			}
+			const content = toCustomGiftContent(
+				badge,
+				censorSwears(body.GrantMessage ?? ''),
+				COACH_ACCOUNT_ID,
+				null
+			)
+			const box = await createGift(c.env.DB, body.TargetAccountId, content)
+			await pushCustomGiftReceived(c, body.TargetAccountId, box.id, content)
+			return c.json({ ResponseCode: 0, ErrorMessage: null })
 		}
 	)
 
@@ -3752,7 +3977,15 @@ const app = new Hono<App>({ strict: false })
 					continue
 				}
 
-				const owned = await awardRoomConsumable(c.env.DB, accountId, consumableId, quantity)
+				const code = (request as { ConcurrencyCodes?: { NewConcurrencyCode?: unknown } })
+					.ConcurrencyCodes?.NewConcurrencyCode
+				const owned = await awardRoomConsumable(
+					c.env.DB,
+					accountId,
+					consumableId,
+					quantity,
+					typeof code === 'string' ? code : null
+				)
 				results.push({
 					ConsumableId: consumableId,
 					Success: true,
@@ -3760,13 +3993,209 @@ const app = new Hono<App>({ strict: false })
 					Response: {
 						PlayerId: accountId,
 						ConsumableId: consumableId,
-						Quantity: owned,
+						Quantity: owned.quantity,
 						AwardedAt: new Date().toISOString(),
 					},
 				})
 			}
 
 			return c.json(results)
+		}
+	)
+
+	// Buy some of a room's consumables, for the caller or as a gift. One route for both kinds of
+	// price: a listing in TOKENS pays the room's owner, as a room key does; a listing in a ROOM
+	// CURRENCY pays nobody — that money is the room's own invention. What is bought lands in
+	// `room_inventory`, the same holding `awardBulk` adds to.
+	.put(
+		// Two paths, one sale: the client posts a token listing to `/purchase/tokens` and a
+		// room-currency one to `/purchase/currency`, with the same body. The body's
+		// `ExpectedPriceAndCurrency` is what is checked against the listing, not the path.
+		'/api/roomconsumables/v1/roomconsumable/:id/purchase/:via{currency|tokens}',
+		describeRoute({
+			tags: ['Storefront'],
+			summary: 'Buy a room consumable',
+			description: [
+				'Buys `Quantity` of the consumable named in the path, at its listed price EACH.',
+				'The client posts a listing priced in tokens to `…/purchase/tokens` and one priced',
+				'in a room currency to `…/purchase/currency`; both take the same body and answer',
+				'the same way, and it is the body’s `ExpectedPriceAndCurrency` that must match.',
+				'',
+				'`ExpectedPriceAndCurrency` must be the listing’s own: `Price` its unit price and',
+				'`CurrencyId` its `PurchaseCurrencyId` — null for a listing priced in tokens.',
+				'`Quantity` must be at least 1 and, when the listing sets one, at most its',
+				'`MaximumCountPerPurchase`. `ConcurrencyCodes` is accepted and IGNORED.',
+				'',
+				'- In TOKENS: the total leaves the buyer and is paid to the room’s OWNER, who gets a',
+				'  StorefrontBalanceUpdate; the buyer gets a StorefrontBalancePurchase. Both carry',
+				'  a resulting total.',
+				'- In a ROOM CURRENCY: the total leaves the buyer’s holding of it (`room_balance`)',
+				'  and NOBODY is paid.',
+				'',
+				'The room’s creator and co-owners pay nothing: the client asks them `Price` 0 (the',
+				'listed price is accepted too).',
+				'',
+				'`GiftRecipientAccountId` sends what is bought to that player; the buyer still pays.',
+				'Null (or the buyer’s own id) keeps it. Either way the items are added to the',
+				'recipient’s `room_inventory`.',
+				'',
+				'Answers the client’s purchase result, observed from the live client:',
+				'`BalanceUpdateResult` (an UpdateResponse — 0 OK), `CurrencyBalanceResponse` (what',
+				'the BUYER now holds of what they paid in: `{ AccountId, CurrencyId, Balance,',
+				'ModifiedAt }`, `CurrencyId` null and `Balance` their token total for a token',
+				'listing) and `OperationResult` — `{ Status, InventoryItem }`, the item being what',
+				'the RECIPIENT now owns — the same `RoomConsumableInventoryItem` that',
+				'`…/roomConsumable/room/{roomId}/me` lists: `Count` the resulting total,',
+				'`ConcurrencyCode` the request’s `NewConcurrencyCode` (stored, not checked),',
+				'`Consumable` the listing plus `IsGiftable`/`Visibility`.',
+				'',
+				'A refusal is a 200 in the same shape — `Status` 1, a null `InventoryItem`, the',
+				'balance as it stands — with the reason in `BalanceUpdateResult`: 4 no such',
+				'consumable or room, 7 a bad `Quantity`, 8 a bad gift recipient, 6 a price or',
+				'currency that is not the listing’s, 2 not enough to pay. Nothing is charged or',
+				'given. The refusal form is an ASSUMPTION — only success has been observed.',
+			].join('\n'),
+			security: AUTHED,
+			parameters: [
+				{
+					name: 'id',
+					in: 'path',
+					required: true,
+					description: 'The consumable to buy — a `room_consumable` id',
+					schema: { type: 'string' },
+				},
+				{
+					name: 'via',
+					in: 'path',
+					required: true,
+					description: '`tokens` for a listing priced in tokens, `currency` for a room currency',
+					schema: { type: 'string', enum: ['tokens', 'currency'] },
+				},
+			],
+			requestBody: jsonBody(PurchaseRoomConsumableRequest, 'What to buy, and what the client saw'),
+			responses: {
+				200: json(PurchaseRoomConsumableResponse, 'What the recipient now owns, or a refusal'),
+				401: UNAUTHORIZED_RESPONSE,
+			},
+		}),
+		async (c) => {
+			const id = await authedId(c)
+			if (id === null) return unauthorized(c)
+
+			const startingTokens = intVar(c.env.STARTING_TOKENS, DEFAULT_STARTING_TOKENS)
+			const currencyType = CurrencyType.RecCenterTokens
+			const body = await c.req
+				.json<{
+					ConcurrencyCodes?: { NewConcurrencyCode?: unknown } | null
+					ExpectedPriceAndCurrency?: { Price?: unknown; CurrencyId?: unknown } | null
+					Quantity?: unknown
+					GiftRecipientAccountId?: unknown
+				}>()
+				.catch(() => null)
+			const request = body !== null && typeof body === 'object' ? body : {}
+			const expected = request.ExpectedPriceAndCurrency
+			const expectedCurrency =
+				typeof expected?.CurrencyId === 'string' && expected.CurrencyId !== ''
+					? expected.CurrencyId
+					: null
+			const consumable = await getRoomConsumable(c.env.DB, c.req.param('id'))
+			// The balance the answer reports on: what the listing is priced in once it is known,
+			// what the request named on a refusal that never got that far. Null is tokens.
+			const balanceCurrency = consumable ? consumable.PurchaseCurrencyId : expectedCurrency
+
+			// Every key is always sent: the client reads an omitted `Status` or
+			// `BalanceUpdateResult` as its enum's 0 member, which is success.
+			const answer = async (code: number, item: RoomConsumableInventoryItem | null) =>
+				c.json({
+					BalanceUpdateResult: code,
+					CurrencyBalanceResponse: {
+						AccountId: id,
+						CurrencyId: balanceCurrency,
+						Balance:
+							balanceCurrency === null
+								? await getBalance(c.env.DB, id, currencyType, startingTokens)
+								: await getRoomBalance(c.env.DB, balanceCurrency, id),
+						ModifiedAt: new Date().toISOString(),
+					},
+					OperationResult: {
+						Status: item === null ? ROOM_KEY_STATUS_FAILED : ROOM_KEY_STATUS_OK,
+						InventoryItem: item,
+					},
+				})
+
+			if (!consumable) return answer(UpdateResponse.NoItemAvailable, null)
+
+			const quantity = request.Quantity
+			if (
+				typeof quantity !== 'number' ||
+				!Number.isInteger(quantity) ||
+				quantity < 1 ||
+				(consumable.MaximumCountPerPurchase > 0 && quantity > consumable.MaximumCountPerPurchase)
+			) {
+				return answer(UpdateResponse.RequestedAmountNotAllowed, null)
+			}
+
+			const gift = request.GiftRecipientAccountId
+			if (
+				gift !== null &&
+				gift !== undefined &&
+				!(Number.isInteger(gift) && (gift as number) > 0)
+			) {
+				return answer(UpdateResponse.PlayerNotEligible, null)
+			}
+			const recipientId = (gift as number | null | undefined) ?? id
+
+			// Paid in the listing's own currency only — never whichever the request would rather.
+			if (expectedCurrency?.toLowerCase() !== consumable.PurchaseCurrencyId?.toLowerCase()) {
+				return answer(UpdateResponse.RequestedPriceDoesNotMatch, null)
+			}
+
+			const canManage = await canManageRoomById(c.env.DB, consumable.RoomId, id)
+			if (canManage === null) return answer(UpdateResponse.NoItemAvailable, null)
+			const expectedPrice = expected?.Price
+			if (expectedPrice !== consumable.Price && !(canManage && expectedPrice === 0)) {
+				return answer(UpdateResponse.RequestedPriceDoesNotMatch, null)
+			}
+
+			const total = canManage ? 0 : consumable.Price * quantity
+			if (total > 0 && consumable.PurchaseCurrencyId !== null) {
+				if (!(await spendRoomCurrency(c.env.DB, consumable.PurchaseCurrencyId, id, total))) {
+					return answer(UpdateResponse.NotEnoughCredit, null)
+				}
+			} else if (total > 0) {
+				const ownerId = await getRoomOwnerId(c.env.DB, consumable.RoomId)
+				if (ownerId === null) return answer(UpdateResponse.NoItemAvailable, null)
+				if (!(await spendCurrency(c.env.DB, id, currencyType, total, startingTokens))) {
+					return answer(UpdateResponse.NotEnoughCredit, null)
+				}
+				// Seed the owner's signup grant BEFORE crediting them, as the key sale does.
+				await ensureStartingBalances(c.env.DB, ownerId, startingTokens)
+				const ownerBalance = await creditCurrency(
+					c.env.DB,
+					ownerId,
+					currencyType,
+					total,
+					startingTokens
+				)
+				await pushBalanceUpdate(c, ownerId, currencyType, ownerBalance)
+				await pushBalancePurchase(
+					c,
+					id,
+					currencyType,
+					-total,
+					await getBalance(c.env.DB, id, currencyType, startingTokens)
+				)
+			}
+
+			const newCode = request.ConcurrencyCodes?.NewConcurrencyCode
+			const owned = await awardRoomConsumable(
+				c.env.DB,
+				recipientId,
+				consumable.RoomConsumableId,
+				quantity,
+				typeof newCode === 'string' ? newCode : null
+			)
+			return answer(UpdateResponse.OK, toInventoryItem(recipientId, owned, consumable))
 		}
 	)
 
@@ -3793,6 +4222,8 @@ const app = new Hono<App>({ strict: false })
 				'the thing actually lives.',
 				'',
 				'Gated to the room’s creator or a co-owner; a valid token from anyone else is a 403.',
+				'A listing priced in TOKENS (`CurrencyId` null) at a non-zero price also needs Rec',
+				'Room Plus (the token’s `rn.plus` claim), on a create or a replace; without it, 403.',
 				'`PriceAndCurrency` is collapsed into the flat `Price`/`PurchaseCurrencyId` the read',
 				'serves. Answers the `{ Value, Success, Error, error_id }` envelope the room-currency',
 				'writes use, or a 200 carrying `Success: false` when the body is unusable or the',
@@ -3806,7 +4237,10 @@ const app = new Hono<App>({ strict: false })
 					'The listing as stored, or a rejection with `Success: false`'
 				),
 				401: UNAUTHORIZED_RESPONSE,
-				403: { description: 'Not the room’s creator or a co-owner (empty body)' },
+				403: {
+					description:
+						'Not the room’s creator or a co-owner, or a token price without Rec Room Plus (empty body)',
+				},
 			},
 		}),
 		async (c) => {
@@ -3853,6 +4287,15 @@ const app = new Hono<App>({ strict: false })
 					: {}
 			) as Record<string, unknown>
 
+			const price = int(priceAndCurrency.Price, 0)
+			const purchaseCurrencyId = str(priceAndCurrency.CurrencyId)
+			// Selling for TOKENS is a Rec Room Plus perk (see `isSubscriber`); a listing in the
+			// room's own currency, or a free one, is open to every room manager. Checked on a
+			// replace too, so an edit can't turn a currency listing into a token one.
+			if (purchaseCurrencyId === null && price !== 0 && !(await isSubscriber(c))) {
+				return c.body(null, 403)
+			}
+
 			const consumable = await upsertRoomConsumable(c.env.DB, roomConsumableId, {
 				RoomId: roomId,
 				// Masked like every other player-typed string: a shop's contents are shown to
@@ -3860,8 +4303,8 @@ const app = new Hono<App>({ strict: false })
 				Name: censorSwears(name),
 				Description: censorSwears(str(body.Description) ?? ''),
 				ImageName: str(body.ImageName),
-				Price: int(priceAndCurrency.Price, 0),
-				PurchaseCurrencyId: str(priceAndCurrency.CurrencyId),
+				Price: price,
+				PurchaseCurrencyId: purchaseCurrencyId,
 				// The client has not been seen sending this, so it falls back to the CLR default
 				// for an int rather than to a guess at what the shop should allow.
 				MaximumCountPerPurchase: int(body.MaximumCountPerPurchase, 0),
@@ -3869,10 +4312,107 @@ const app = new Hono<App>({ strict: false })
 			return roomConsumableEnvelope(c, consumable)
 		}
 	)
+	// What the CALLER owns of one room's consumables. NOT the catalogue the same path without
+	// `/me` serves: a different element type (`RoomConsumableInventoryItem`), so a separate handler.
 	.get(
 		'/api/roomconsumables/v1/roomConsumable/room/:roomId/me',
-		listRoute('The caller’s room consumables', 'Empty stub'),
-		(c) => c.json([])
+		describeRoute({
+			tags: ['Econ'],
+			summary: 'The caller’s room consumables',
+			description: [
+				'A bare array of what the caller owns of the room’s consumables, in the shop’s order —',
+				'the client’s `RoomConsumableInventoryItem`, observed from the live client:',
+				'`{ RoomConsumableId, AccountId, Count, ConcurrencyCode, ModifiedAt, Consumable }`.',
+				'',
+				'`Count` is what they hold now; a consumable they hold none of (never had, or spent',
+				'down to zero) is absent. `ConcurrencyCode` is the last `NewConcurrencyCode` written',
+				'(stored, not checked). `Consumable` is the listing plus `IsGiftable` (false) and',
+				'`Visibility` (0), with `ImageName` as "" rather than null — NOT the catalogue',
+				'element `…/room/{roomId}` serves.',
+				'',
+				'An unknown room, or one the caller owns nothing of, is an empty list.',
+			].join('\n'),
+			security: AUTHED,
+			parameters: [
+				{
+					name: 'roomId',
+					in: 'path',
+					required: true,
+					description: 'The room whose consumables to list',
+					schema: { type: 'integer' },
+				},
+			],
+			responses: {
+				200: json(RoomConsumableInventoryItemDto.array(), 'What the caller owns, shop order'),
+				401: UNAUTHORIZED_RESPONSE,
+			},
+		}),
+		async (c) => {
+			const id = await authedId(c)
+			if (id === null) return unauthorized(c)
+			const roomId = Number.parseInt(c.req.param('roomId'), 10)
+			if (!Number.isInteger(roomId)) return c.json([])
+			return c.json(await getRoomInventory(c.env.DB, roomId, id))
+		}
+	)
+	// Use up one of a room consumable the CALLER holds — drinking the Health Potion. Auth-gated
+	// (401); a refusal is a 200 in the same shape, as the purchase's is.
+	.put(
+		'/api/roomconsumables/v1/roomConsumable/:id/consume',
+		describeRoute({
+			tags: ['Econ'],
+			summary: 'Consume a room consumable',
+			description: [
+				'Takes ONE of the consumable named in the path from what the caller holds. The body',
+				'is only `{ CurrentConcurrencyCode, NewConcurrencyCode }`, at the top level; there is',
+				'no quantity. `NewConcurrencyCode` is stored and served back as the item’s',
+				'`ConcurrencyCode`; `CurrentConcurrencyCode` is accepted and NOT checked.',
+				'',
+				'Answers `{ Status, InventoryItem }` — the purchase’s `OperationResult` — with the',
+				'`RoomConsumableInventoryItem` the caller now holds: `Count` the RESULTING total, 0',
+				'when they used their last (after which `…/room/{roomId}/me` omits it).',
+				'',
+				'A consumable that does not exist, or one the caller holds none of, is `Status` 1',
+				'with a null `InventoryItem`, and nothing is written. The refusal form is an',
+				'ASSUMPTION — only success has been observed.',
+			].join('\n'),
+			security: AUTHED,
+			parameters: [
+				{
+					name: 'id',
+					in: 'path',
+					required: true,
+					description: 'The consumable to use — a `room_consumable` id',
+					schema: { type: 'string' },
+				},
+			],
+			requestBody: jsonBody(ConsumeRoomConsumableRequest, 'The concurrency pair'),
+			responses: {
+				200: json(ConsumeRoomConsumableResponse, 'What the caller now holds, or a refusal'),
+				401: UNAUTHORIZED_RESPONSE,
+			},
+		}),
+		async (c) => {
+			const id = await authedId(c)
+			if (id === null) return unauthorized(c)
+
+			const body = await c.req.json<{ NewConcurrencyCode?: unknown }>().catch(() => null)
+			const newCode =
+				body !== null && typeof body === 'object' && typeof body.NewConcurrencyCode === 'string'
+					? body.NewConcurrencyCode
+					: null
+			// Every key is always sent: an omitted `Status` reads as its enum's 0, success.
+			const refused = () => c.json({ Status: ROOM_KEY_STATUS_FAILED, InventoryItem: null })
+
+			const consumable = await getRoomConsumable(c.env.DB, c.req.param('id'))
+			if (!consumable) return refused()
+			const held = await consumeRoomConsumable(c.env.DB, id, consumable.RoomConsumableId, newCode)
+			if (!held) return refused()
+			return c.json({
+				Status: ROOM_KEY_STATUS_OK,
+				InventoryItem: toInventoryItem(id, held, consumable),
+			})
+		}
 	)
 	// The custom currencies a room has minted. Public, like the room itself: a room's
 	// currencies are shown to every player who walks into it, so the list is not a secret
@@ -4165,7 +4705,8 @@ const app = new Hono<App>({ strict: false })
 				'offers are served sorted by it, so several at 0 keep the order they were added in.',
 				'',
 				'Gated to the creator or a co-owner of the room that minted the currency. A valid',
-				'token from anyone else is a 403. Answers the same',
+				'token from anyone else is a 403, and so is a non-zero `Price` without Rec Room Plus',
+				'(the token’s `rn.plus` claim) — the offer is paid in tokens. Answers the same',
 				'`{ Value, Success, Error, error_id }` envelope the currency writes use, with the',
 				'offer in `Value`, or a 200 carrying `Success: false` when the currency is unknown',
 				'or the body unusable.',
@@ -4178,7 +4719,10 @@ const app = new Hono<App>({ strict: false })
 					'The offer as created, or a rejection with `Success: false`'
 				),
 				401: UNAUTHORIZED_RESPONSE,
-				403: { description: 'Not the creator or a co-owner of the minting room (empty body)' },
+				403: {
+					description:
+						'Not the creator or a co-owner of the minting room, or a priced offer without Rec Room Plus (empty body)',
+				},
 			},
 		}),
 		async (c) => {
@@ -4209,6 +4753,9 @@ const app = new Hono<App>({ strict: false })
 			const canManage = await canManageRoomById(c.env.DB, currency.RoomId, accountId)
 			if (canManage === null) return purchaseOfferEnvelope(c, null, CREATE_OFFER_FAILED)
 			if (!canManage) return c.body(null, 403)
+			// An offer sells the currency for TOKENS, which is a Rec Room Plus perk (see
+			// `isSubscriber`). A free offer moves no tokens, so any room manager may make one.
+			if (price !== 0 && !(await isSubscriber(c))) return c.body(null, 403)
 
 			const offer = await createPurchaseOffer(c.env.DB, currencyId, {
 				// The body's `Amount` is the model's `CurrencyAmount`.
@@ -4489,7 +5036,8 @@ const app = new Hono<App>({ strict: false })
 				'offers are served sorted by it, so several at 0 keep the order they were added in.',
 				'',
 				'Gated to the creator or a co-owner of the room that minted the currency. A valid',
-				'token from anyone else is a 403. Answers the same',
+				'token from anyone else is a 403, and so is a non-zero `Price` without Rec Room Plus',
+				'(the token’s `rn.plus` claim) — the offer is paid in tokens. Answers the same',
 				'`{ Value, Success, Error, error_id }` envelope the currency writes use, with the',
 				'offer in `Value`, or a 200 carrying `Success: false` when the currency is unknown',
 				'or the body unusable.',
@@ -4502,7 +5050,10 @@ const app = new Hono<App>({ strict: false })
 					'The offer as created, or a rejection with `Success: false`'
 				),
 				401: UNAUTHORIZED_RESPONSE,
-				403: { description: 'Not the creator or a co-owner of the minting room (empty body)' },
+				403: {
+					description:
+						'Not the creator or a co-owner of the minting room, or a priced offer without Rec Room Plus (empty body)',
+				},
 			},
 		}),
 		async (c) => {
@@ -4533,6 +5084,9 @@ const app = new Hono<App>({ strict: false })
 			const canManage = await canManageRoomById(c.env.DB, currency.RoomId, accountId)
 			if (canManage === null) return purchaseOfferEnvelope(c, null, CREATE_OFFER_FAILED)
 			if (!canManage) return c.body(null, 403)
+			// An offer sells the currency for TOKENS, which is a Rec Room Plus perk (see
+			// `isSubscriber`). A free offer moves no tokens, so any room manager may make one.
+			if (price !== 0 && !(await isSubscriber(c))) return c.body(null, 403)
 
 			const offer = await createPurchaseOffer(c.env.DB, currencyId, {
 				// The body's `Amount` is the model's `CurrencyAmount`.
@@ -4550,6 +5104,59 @@ const app = new Hono<App>({ strict: false })
 	)
 	.get('/api/roomcurrencies/v1/getAllBalances', listRoute('Room balances', 'Empty stub'), (c) =>
 		c.json([])
+	)
+
+	// What one player holds of one room currency. Any signed-in caller may read any player's,
+	// as the query names the player rather than taking the caller.
+	.get(
+		'/api/roomcurrencies/v1/getBalance',
+		describeRoute({
+			tags: ['Econ'],
+			summary: 'A player’s balance of one room currency',
+			description: [
+				'What the player named by `accountId` holds of the room currency `currencyId`',
+				'(`room_balance`). A player who has never earned any — and a currency that does not',
+				'exist — is a `Balance` of 0, not a 404.',
+				'',
+				'`ModifiedAt` is the time of the response: `room_balance` keeps no modification time.',
+				'A missing `currencyId` or a non-integer `accountId` is a 400.',
+			].join('\n'),
+			security: AUTHED,
+			parameters: [
+				{
+					name: 'currencyId',
+					in: 'query',
+					required: true,
+					description: 'The room currency',
+					schema: { type: 'string' },
+				},
+				{
+					name: 'accountId',
+					in: 'query',
+					required: true,
+					description: 'The player whose balance to read',
+					schema: { type: 'integer' },
+				},
+			],
+			responses: {
+				200: json(RoomCurrencyBalance, 'The player’s balance'),
+				400: { description: 'A missing `currencyId` or a non-integer `accountId`' },
+				401: UNAUTHORIZED_RESPONSE,
+			},
+		}),
+		async (c) => {
+			if ((await authedId(c)) === null) return unauthorized(c)
+			const currencyId = c.req.query('currencyId')?.trim() ?? ''
+			const rawAccountId = c.req.query('accountId')?.trim() ?? ''
+			if (currencyId === '' || !/^\d+$/.test(rawAccountId)) return c.body(null, 400)
+			const accountId = Number(rawAccountId)
+			return c.json({
+				AccountId: accountId,
+				CurrencyId: currencyId,
+				Balance: await getRoomBalance(c.env.DB, currencyId, accountId),
+				ModifiedAt: new Date().toISOString(),
+			})
+		}
 	)
 
 	// Buy room currency with tokens, through one of the currency's purchase offers. The body
@@ -4720,8 +5327,30 @@ const app = new Hono<App>({ strict: false })
 	)
 	.get(
 		'/econ/roomOffer/room/:roomId/purchaseCounts',
-		listRoute('Per-offer purchase counts for a room', 'Empty stub'),
-		(c) => c.json([])
+		describeRoute({
+			summary: 'Per-offer purchase counts for a room',
+			responses: {
+				200: json(
+					z.union([
+						JsonArray,
+						z.object({
+							Value: JsonArray,
+							Success: z.boolean(),
+							Error: z.string().nullable(),
+							error_id: z.string().nullable(),
+						}),
+					]),
+					'2026: RecNet result envelope; older builds: a list'
+				),
+			},
+		}),
+		async (c) => {
+			if (((await authedBuild(c)) ?? 0) >= 20260323) {
+				// The 2026 client decodes RecNetResultListObject<RoomOfferPurchaseCountDTO>.
+				return c.json({ Value: [], Success: true, Error: null, error_id: null })
+			}
+			return c.json([])
+		}
 	)
 	.get(
 		'/econ/roomGiftDropShops/room/:roomId',
@@ -4757,6 +5386,78 @@ const app = new Hono<App>({ strict: false })
 			if (Number.isNaN(roomId)) return c.body(null, 400)
 			return c.json({ RoomId: roomId, EnableSortingTabs: false })
 		}
+	)
+
+	// The paintball battle pass's season config. A stub: nothing stores a season yet, so
+	// every caller is served the one example season below, verbatim.
+	.get(
+		'/paintball-battle-pass/config',
+		describeRoute({
+			tags: ['Econ'],
+			summary: 'The paintball battle pass config (stub)',
+			description: 'A fixed example season — no battle pass is stored yet.',
+			responses: { 200: json(JsonObject, 'The battle pass config') },
+		}),
+		(c) =>
+			c.json({
+				BattlePassId: 1,
+				Name: 'Season 1',
+				ValidRoomIds: [112],
+				StartTime: '2026-10-01T00:00:00Z',
+				EndTime: '2026-12-01T00:00:00Z',
+				Levels: [{ XpRequired: 100, RewardGiftDropIds: [1] }],
+				EventXP: { '1': 10, '2': 25, '3': 50, '4': 100 },
+				BoostConfig: {
+					TemporaryBoostDurationInMinutes: 60,
+					TemporaryBoostXpMultiplierPercentage: 50,
+					PermanentBoostXpMultiplierPercentage: 25,
+					SocialBoostXpMultiplierPercentage: 10,
+					MaxBoostXpMultiplierPercentage: 100,
+				},
+				DailyParticipationBonusLimit: 5,
+				MinimumParticipationTimeInSeconds: 120,
+				PurchasableSkus: [{ Type: 1, TokenPrice: 1000, BonusLevels: 0, PermanentBoost: false }],
+				PermanentBoostTokenPrice: 500,
+				LimitedTimeReward: { CompletionDeadline: '2026-11-01T00:00:00Z', GiftDropIds: [9] },
+			})
+	)
+
+	// The timed currency grant the client polls. A stub: nothing accrues or is granted yet,
+	// so every caller is served the one example grant below, verbatim. Takes no body.
+	.post(
+		'/api/timedCurrencyGrants/update',
+		describeRoute({
+			tags: ['Econ'],
+			summary: 'The timed currency grant (stub)',
+			description: 'A fixed example grant — no timed grant is stored or paid out yet.',
+			responses: { 200: json(JsonObject, 'The timed currency grant') },
+		}),
+		(c) =>
+			c.json({
+				TimedCurrencyGrantId: 1,
+				Name: 'Daily Tokens',
+				StartTime: '2026-10-01T00:00:00Z',
+				EndTime: '2026-12-01T00:00:00Z',
+				CurrencyType: 0,
+				OfflineRatePerHour: 1.0,
+				OnlineRatePerHour: 5.0,
+				ActiveExperiment: null,
+			})
+	)
+
+	// The client reporting how far the player has moved, towards a distance-moved reward
+	// track. A stub: the form body (`distanceMeters=12.5`) is not read, nothing is tracked,
+	// and the answer is an empty 200.
+	.post(
+		'/api/distanceMovedRewardTracks/distance',
+		describeRoute({
+			tags: ['Econ'],
+			summary: 'Report distance moved (stub)',
+			description:
+				'Takes a form-encoded `distanceMeters` and stores nothing — no reward track exists yet.',
+			responses: { 200: { description: 'Empty body' } },
+		}),
+		(c) => c.body(null, 200)
 	)
 
 	// Everything a room sells, in one list: its keys, its consumables and the purchase offers
@@ -4879,6 +5580,89 @@ const app = new Hono<App>({ strict: false })
 		}
 	)
 
+	// Store listings by `PurchasableItemId` — `{ PurchasableItemIds: [2594], GiftDropIds: null }`.
+	// Answers a bare array of the listings exactly as the served 2025 store (`sf3-2025.json`)
+	// lists them, read from the `catalog` table's `listing` column rather than the 4 MB file
+	// (a row's `catalog_id` IS its `PurchasableItemId`). Every item kind resolves; unknown ids
+	// are dropped, so the answer is in request order but not positional. `GiftDropIds` has only
+	// been seen null and is ignored. No auth: a listing is what the public store shows anyone.
+	.post(
+		'/api/storefronts/v1/purchasableitems',
+		describeRoute({
+			tags: ['Storefront'],
+			summary: 'Store listings by PurchasableItemId',
+			description: [
+				'Resolves `PurchasableItemIds[]` against the `catalog` table and answers each listing',
+				'verbatim as the served 2025 store (`sf3-2025.json`) lists it — `GiftDrop`, `Prices`,',
+				'`SubscriberPrices` and the rest. Avatar items, consumables, skins and custom avatar',
+				'items all resolve. Unknown ids (and repeats) are dropped, so the response follows',
+				'request order but is never a positional match. `GiftDropIds` is ignored.',
+			].join(' '),
+			requestBody: jsonBody(PurchasableItemsRequest, 'The listings to resolve'),
+			responses: {
+				200: json(JsonArray, 'The resolved listings (unknown ids omitted)'),
+				400: json(ErrorResponse, 'Malformed body'),
+			},
+		}),
+		async (c) => {
+			const body = (await c.req.json().catch(() => null)) as Record<string, unknown> | null
+			if (!body || typeof body !== 'object')
+				return c.json({ error: 'A JSON body is required' }, 400)
+			const raw = body.PurchasableItemIds
+			if (raw !== undefined && raw !== null && !Array.isArray(raw)) {
+				return c.json({ error: 'PurchasableItemIds must be an array' }, 400)
+			}
+			const ids = ((raw as unknown[] | null | undefined) ?? []).filter((id): id is number =>
+				Number.isInteger(id)
+			)
+			return c.json(await getStoreListings(c.env.DB, ids))
+		}
+	)
+
+	// The consumable DEFINITIONS the client knows how to use (`?supportedVersion=2`), as
+	// opposed to the ones a player owns. Served verbatim from `static/consumables.json`, the
+	// live game's list; `supportedVersion` is accepted and unused. A row's `ConfigurationData`
+	// is JSON escaped into a STRING (`"{\"MeshConfigurationData\":null,…}"`), or null.
+	.get(
+		'/api/consumables/v1/all',
+		describeRoute({
+			tags: ['Consumables'],
+			summary: 'All consumable definitions',
+			description:
+				'Every consumable definition, verbatim from static/consumables.json. supportedVersion is ignored.',
+			responses: { 200: json(JsonArray, 'The consumable definitions') },
+		}),
+		(c) => c.json(consumableDefinitions)
+	)
+
+	// STUB. The client's lookup of consumable definitions by descriptor
+	// (`?configurationVersion=2`), form-encoded with one repeated key:
+	// `descriptors=xfeDIDboPES-AS90CCn2xQ&descriptors=test_bad`. The answer is an array of
+	// definitions — `{ ConsumableItemDesc, InitialCount, CreatedAt, ThumbnailImageName,
+	// FriendlyName, RoomieCategory, ConsumableToolName, ConfigurationData }`, with
+	// `ConfigurationData` JSON escaped into a string as on `/all` — holding only the
+	// descriptors that resolve. Nothing here can resolve one yet, so every query answers [].
+	.post(
+		'/api/consumables/v1/query/bulk',
+		describeRoute({
+			tags: ['Consumables'],
+			summary: 'Look up consumable definitions by descriptor (stub)',
+			description: [
+				'STUB. Takes a form body repeating `descriptors` once per consumable descriptor and',
+				'answers the definitions that resolve. There is no lookup behind it yet, so the',
+				'answer is always []. configurationVersion is ignored.',
+			].join(' '),
+			requestBody: form(QueryConsumablesRequest, 'The descriptors to look up'),
+			responses: { 200: json(JsonArray, 'The matching definitions (always empty for now)') },
+		}),
+		async (c) => {
+			const body = await c.req.parseBody({ all: true }).catch(() => ({}) as Record<string, unknown>)
+			const descriptors = body['descriptors']
+			logger.info('consumable query/bulk (stub, nothing resolved)', { descriptors })
+			return c.json([])
+		}
+	)
+
 	// Unlocked consumables. [Authorize]. The consumables the player has bought (from
 	// `buyItem`, stored in the `consumable` table), grouped by item into the client's
 	// unlocked-consumable DTO. A player who has bought none gets an empty list.
@@ -4901,7 +5685,17 @@ const app = new Hono<App>({ strict: false })
 		async (c) => {
 			const id = await authedId(c)
 			if (id === null) return unauthorized(c)
-			return c.json(await getConsumables(c.env.DB, id))
+			const consumables = await getConsumables(c.env.DB, id)
+			// The 2026 client includes this flag in the instance key and verifies it against the
+			// definition, so it comes from the definition — see `isRroConsumable`.
+			return c.json(
+				((await authedBuild(c)) ?? 0) >= 20260323
+					? consumables.map((item) => ({
+							...item,
+							IsRRO: isRroConsumable(item.ConsumableItemDesc),
+						}))
+					: consumables
+			)
 		}
 	)
 
@@ -5882,9 +6676,11 @@ const app = new Hono<App>({ strict: false })
 	// posting the type and the message to show for it (`rewardType=FirstActivityOfDay&
 	// Message=First Game of the Day`, or `rewardType=PostGameActivity&Message=Activity
 	// completed!&giftContext=Soccer`) — so whether a reward is actually OWED is decided
-	// here, from `reward_status`: one claim per type per activity per hour, atomically.
+	// here, from `reward_status`: one claim per type per activity per hour, atomically —
+	// except FirstActivityOfDay, one per player per 24h.
 	//
-	// A claim pays GAME_REWARD_XP into `progression` and hands over a gift box carrying that
+	// A claim pays GAME_REWARD_XP into `progression` (up to GAME_REWARD_DAILY_XP_CAP per player
+	// per rolling 24h, FirstActivityOfDay's on top) and hands over a gift box carrying that
 	// XP, announced with the same GiftPackageReceivedImmediate frame the weekly gift uses —
 	// the client posted the message to show, so the box wears it. An on-cooldown ask changes
 	// nothing and pays nothing.
@@ -5894,19 +6690,20 @@ const app = new Hono<App>({ strict: false })
 	// reference answers its own (different, selection-based) flow with a success envelope,
 	// not a list of rewards.
 	//
-	// `giftContext` (the activity, e.g. `Soccer`) is part of the cooldown key: the first
-	// activity of the day is per ACTIVITY, so a player who moves from Soccer to Paintball is
-	// owed another reward while a second Soccer match inside the hour is not. An ask that
-	// sends no context keys on `''`.
+	// `giftContext` (the activity, e.g. `Soccer`) is part of the cooldown key, so a player who
+	// moves from Soccer to Paintball is owed another reward while a second Soccer match inside
+	// the hour is not. An ask that sends no context keys on `''` — as FirstActivityOfDay always
+	// does, being the player's first activity of the day, not each activity's.
 	//
 	// It also picks the PRIZE: a context that is a key of `static/quest-rewards.json`
 	// (`Dodgeball`, `Quest_Goblin_S`, …) draws one of that activity's rewards — an avatar item
 	// granted into the inventory, or Laser Tag's ticket payout — and the box carries it, with
 	// the activity's own `GiftContext`. A context the table doesn't know gets the XP-only box.
 	//
-	// And the FIRST claim ever in a context — a new activity for this player, whichever type
-	// asked — pays NEW_ACTIVITY_BONUS_TOKENS on top, credited to the balance and delivered in
-	// a second box of its own so the player sees what the tokens were for.
+	// A `PostGameActivity`/`PostQuestActivity` claim also pays GAME_REWARD_TOKENS, up to
+	// GAME_REWARD_DAILY_TOKEN_CAP per player per rolling 24h across every activity, and a
+	// FirstActivityOfDay claim pays them on top of the cap — credited to the balance and
+	// delivered in a second box of its own so the player sees what the tokens were for.
 	.post(
 		'/api/gamerewards/v1/request',
 		describeRoute({
@@ -5918,9 +6715,11 @@ const app = new Hono<App>({ strict: false })
 				'owed another reward while the same one is not; an ask with no `giftContext` keys on',
 				'the empty context. A `giftContext` that names an activity in `quest-rewards.json`',
 				'(`Dodgeball`, `Quest_Goblin_S`, …) draws one of that activity’s rewards and grants it;',
-				'any other claim pays XP only. The first claim ever in a `giftContext` — a new activity',
-				'for the player — also pays a one-off 250 tokens, in a box of its own. The reward rides',
-				'in a gift box, so a claim and a rejected (on-cooldown) ask both answer `[]`.',
+				'any other claim pays XP only. A `PostGameActivity` or `PostQuestActivity` claim also',
+				'pays 250 tokens, in a box of its own, up to 1250 per player per rolling 24 hours',
+				'whatever the activity. `FirstActivityOfDay` is once per player per 24 hours, whatever',
+				'the `giftContext`, and pays 250 tokens outside that cap. The reward rides in a gift',
+				'box, so a claim and a rejected (on-cooldown) ask both answer `[]`.',
 			].join(' '),
 			security: AUTHED,
 			requestBody: form(GameRewardRequest, 'The reward type and its display message'),
@@ -5937,29 +6736,44 @@ const app = new Hono<App>({ strict: false })
 			// No type, nothing to gate: don't write a row keyed on an empty string.
 			if (rewardType === '') return c.json([])
 			const giftContext = typeof body.giftContext === 'string' ? body.giftContext : ''
-			const claimed = await claimReward(c.env.DB, id, rewardType, giftContext)
+			// FirstActivityOfDay is the player's, not the activity's: claimed on the empty context
+			// and a day's cooldown. Its prize is still picked from the activity that asked.
+			const daily = rewardType === FIRST_ACTIVITY_OF_DAY
+			const claimed = daily
+				? await claimReward(c.env.DB, id, rewardType, '', new Date(), DAILY_REWARD_COOLDOWN_MS)
+				: await claimReward(c.env.DB, id, rewardType, giftContext)
 			// On cooldown: nothing was claimed, so nothing is paid and nothing is announced.
 			if (claimed === null) return c.json([])
 			const message =
 				typeof body.Message === 'string' && body.Message !== ''
 					? body.Message
 					: DEFAULT_GAME_REWARD_MESSAGE
+			// The XP draws on the player's daily allowance — FirstActivityOfDay's is a bonus on top,
+			// its once-a-day claim being limit enough. Past the cap the claim pays no XP.
+			const xpToday = daily
+				? null
+				: await claimAllowance(c.env.DB, id, '$xp', GAME_REWARD_XP, GAME_REWARD_DAILY_XP_CAP)
+			const xp = daily || xpToday !== null ? GAME_REWARD_XP : 0
 			// Bank the XP first: it is the reward, and the box is the wrapper the client shows.
 			// A failure here must not leave a box promising XP that was never credited.
-			const { progression, levelsGained } = await addXp(c.env.DB, id, GAME_REWARD_XP)
+			const gained = xp > 0 ? await addXp(c.env.DB, id, xp) : null
 			// An activity the reward table knows pays one of ITS rewards the player lacks — the
 			// item rides in the box and is granted with it. Anything else gets the plain XP box.
 			const questReward = await pickQuestReward(c.env.DB, id, giftContext)
 			const itemKey = questReward?.AvatarItemDesc || questReward?.EquipmentModificationGuid
 			const drop =
 				questReward === null
-					? toGameRewardDrop()
-					: toQuestRewardDrop(questReward, itemKey ? await getCatalogItem(c.env.DB, itemKey) : null)
+					? toGameRewardDrop(xp)
+					: toQuestRewardDrop(
+							questReward,
+							itemKey ? await getCatalogItem(c.env.DB, itemKey) : null,
+							xp
+						)
 			// A currency reward (Laser Tag's tickets) is credited here: `grantGiftDrop` grants
 			// items, not balances. Seed the signup grant first — `creditCurrency` upserts the
 			// row, and a never-touched RecCenterTokens balance would otherwise lose it.
+			const startingTokens = intVar(c.env.STARTING_TOKENS, DEFAULT_STARTING_TOKENS)
 			if (drop.Currency > 0 && drop.CurrencyType !== CurrencyType.Invalid) {
-				const startingTokens = intVar(c.env.STARTING_TOKENS, DEFAULT_STARTING_TOKENS)
 				await ensureStartingBalances(c.env.DB, id, startingTokens)
 				const balance = await creditCurrency(
 					c.env.DB,
@@ -5970,53 +6784,95 @@ const app = new Hono<App>({ strict: false })
 				)
 				await pushBalanceUpdate(c, id, drop.CurrencyType, balance)
 			}
-			const granted = await grantGiftDrop(c, id, drop, message)
-			await pushGiftReceived(c, id, granted, message, COACH_ACCOUNT_ID)
-			// A new activity pays its token bonus in a second box — after the reward's own, so
-			// the player sees the reward they asked for first and the bonus as the extra it is.
-			// Same order as the currency reward above: balance first, then the box that shows it.
-			let bonusGiftId: number | null = null
-			if (await isNewActivity(c.env.DB, id, giftContext, claimed)) {
-				const bonus = toNewActivityBonusDrop()
-				const startingTokens = intVar(c.env.STARTING_TOKENS, DEFAULT_STARTING_TOKENS)
-				await ensureStartingBalances(c.env.DB, id, startingTokens)
-				const balance = await creditCurrency(
+			// A box with nothing in it — the XP capped and no item or currency to carry — is not
+			// handed over at all.
+			let rewardGiftId: number | null = null
+			if (questReward !== null || xp > 0) {
+				const granted = await grantGiftDrop(c, id, drop, message)
+				await pushGiftReceived(c, id, granted, message, COACH_ACCOUNT_ID)
+				rewardGiftId = granted.id
+			}
+			// The tokens ride in a second box — after the reward's own, so the player sees the
+			// reward they asked for first — while the player's daily allowance has room. Same
+			// order as the currency reward above: balance first, then the box that shows it.
+			let tokensGiftId: number | null = null
+			let tokensToday: number | null = null
+			if (TOKEN_REWARD_TYPES.has(rewardType)) {
+				tokensToday = await claimAllowance(
 					c.env.DB,
 					id,
-					bonus.CurrencyType,
-					bonus.Currency,
+					'$tokens',
+					GAME_REWARD_TOKENS,
+					GAME_REWARD_DAILY_TOKEN_CAP
+				)
+			}
+			// FirstActivityOfDay's claim already held it to once a day: it pays without the cap.
+			if (daily || tokensToday !== null) {
+				const tokensDrop = toGameRewardTokensDrop()
+				await ensureStartingBalances(c.env.DB, id, startingTokens)
+				const tokenBalance = await creditCurrency(
+					c.env.DB,
+					id,
+					tokensDrop.CurrencyType,
+					tokensDrop.Currency,
 					startingTokens
 				)
-				await pushBalanceUpdate(c, id, bonus.CurrencyType, balance)
-				const bonusGift = await grantGiftDrop(c, id, bonus, NEW_ACTIVITY_BONUS_MESSAGE)
-				await pushGiftReceived(c, id, bonusGift, NEW_ACTIVITY_BONUS_MESSAGE, COACH_ACCOUNT_ID)
-				bonusGiftId = bonusGift.id
+				await pushBalanceUpdate(c, id, tokensDrop.CurrencyType, tokenBalance)
+				const tokensGift = await grantGiftDrop(c, id, tokensDrop, GAME_REWARD_TOKENS_MESSAGE)
+				await pushGiftReceived(c, id, tokensGift, GAME_REWARD_TOKENS_MESSAGE, COACH_ACCOUNT_ID)
+				tokensGiftId = tokensGift.id
 			}
-			// Every grant moves the bar, whether or not it crossed a level.
-			await pushProgressionUpdate(c, id, progression)
-			// …and every level crossed is worth a box of its own tier.
-			await grantLevelUpGifts(c, id, { progression, levelsGained })
+			if (gained !== null) {
+				// Every grant moves the bar, whether or not it crossed a level.
+				await pushProgressionUpdate(c, id, gained.progression)
+				// …and every level crossed is worth a box of its own tier.
+				await grantLevelUpGifts(c, id, gained)
+			}
 			logger.info('game reward claimed', {
 				accountId: id,
 				rewardType,
 				giftContext,
 				grantCount: claimed,
 				message,
-				xp: GAME_REWARD_XP,
-				level: progression.Level,
-				levelsGained,
-				levelXp: progression.XP,
-				giftId: granted.id,
-				newActivityBonus: bonusGiftId === null ? 0 : NEW_ACTIVITY_BONUS_TOKENS,
-				bonusGiftId,
+				xp,
+				xpToday,
+				level: gained?.progression.Level,
+				levelsGained: gained?.levelsGained,
+				levelXp: gained?.progression.XP,
+				giftId: rewardGiftId,
+				tokens: tokensGiftId === null ? 0 : GAME_REWARD_TOKENS,
+				tokensToday,
+				tokensGiftId,
 			})
 			return c.json([])
 		}
 	)
 
-	// The player's room keys. Returns "[]": nothing sells a key yet, so nobody holds one.
-	.get('/api/roomkeys/v1/mine', listRoute('The player’s room keys', 'Empty for now'), (c) =>
-		c.json([])
+	// The caller's room keys: every key they hold (`room_key_player`), across all rooms.
+	.get(
+		'/api/roomkeys/v1/mine',
+		describeRoute({
+			tags: ['Econ'],
+			summary: 'The player’s room keys',
+			description: [
+				'Every key the caller holds — bought, awarded, or taken free as a room manager —',
+				'across every room, oldest key first. No parameters.',
+				'',
+				'Each entry is the room key plus `IsGiftable` (false) and `Visibility` (0), with',
+				'`ImageName` as "" rather than null when the key has no art — the shape observed',
+				'from the live client, which differs from `/api/roomkeys/v1/room`’s.',
+			].join('\n'),
+			security: AUTHED,
+			responses: {
+				200: json(HeldRoomKeyDto.array(), 'The caller’s keys, oldest first'),
+				401: UNAUTHORIZED_RESPONSE,
+			},
+		}),
+		async (c) => {
+			const id = await authedId(c)
+			if (id === null) return unauthorized(c)
+			return c.json(await getHeldRoomKeys(c.env.DB, id))
+		}
 	)
 	// The keys a room has listed. Public, like the room's currencies: a key is offered to
 	// whoever walks up to the door it opens. A room with none, an unknown room and a missing
@@ -6059,20 +6915,25 @@ const app = new Hono<App>({ strict: false })
 			summary: 'Create a room key',
 			description: [
 				'Lists a key for one room — its name, its description and its price. Form-encoded',
-				'(`Type=Key&RoomId=1162&Name=my%20key&Description=…&Price=50`).',
+				'(`Type=Key&RoomId=1162&Name=my%20key&Description=…&Price=50`), optionally with a',
+				'`PurchaseCurrencyId` naming one of the room’s own currencies to price it in.',
 				'',
 				'Gated to the room’s CREATOR or a CO-OWNER, like minting a currency. A valid token',
-				'from anyone else is a 403.',
+				'from anyone else is a 403. A key priced in tokens (no `PurchaseCurrencyId`) at a',
+				'non-zero `Price` also needs Rec Room Plus (the token’s `rn.plus` claim); without it,',
+				'403. A room-currency price does not.',
 				'',
 				'`Name` and `Description` are masked by the same word list as every other string a',
 				'player types. A room may list at most 10 keys — the `RoomKeyConfig.MaxKeysPerRoom`',
-				'the `api` config tells the client — and the eleventh is refused. A new key is priced',
-				'in tokens (the body names no currency), so a `Price` over 1000 is refused too.',
+				'the `api` config tells the client — and the eleventh is refused. `Price` is capped by',
+				'what the key is priced in: 1000 in tokens, 1000000000 in a room currency.',
+				'`PurchaseCurrencyId` absent or blank is tokens; otherwise it must be a currency of',
+				'the key’s own room, as on `updateAll`.',
 				'',
 				'Answers `{ Status, RoomKey }` — `Status` 0 and the created key, as the live client',
 				'reads it — not the `{ Value, Success, Error, error_id }` envelope the room-currency',
 				'writes use. A recoverable refusal (an unusable `RoomId`, an empty `Name`, an unknown',
-				'room, a full room, a `Price` over the limit) is a 200 carrying a non-zero `Status` and a null `RoomKey`; only',
+				'room, a full room, a `Price` over the limit, an unknown or foreign currency) is a 200 carrying a non-zero `Status` and a null `RoomKey`; only',
 				'the auth gates answer with an HTTP status of their own.',
 				'',
 				'Pushes `LocalRoomKeyCreated` (120), carrying the same object, to everyone in the',
@@ -6083,7 +6944,10 @@ const app = new Hono<App>({ strict: false })
 			responses: {
 				200: json(RoomKeyEnvelope, 'The key as created, or a refusal with a non-zero `Status`'),
 				401: UNAUTHORIZED_RESPONSE,
-				403: { description: 'Not the room’s creator or a co-owner (empty body)' },
+				403: {
+					description:
+						'Not the room’s creator or a co-owner, or a token price without Rec Room Plus (empty body)',
+				},
 			},
 		}),
 		async (c) => {
@@ -6101,14 +6965,31 @@ const app = new Hono<App>({ strict: false })
 			if (!Number.isInteger(roomId)) return roomKeyEnvelope(c, null)
 			const name = str(body.Name).trim()
 			if (name === '') return roomKeyEnvelope(c, null)
-			// A key cannot cost less than nothing — nor, being priced in tokens until an edit
-			// says otherwise, more than the token cap.
+			// A key cannot cost less than nothing.
 			const price = Math.max(0, int(body.Price, 0))
-			if (price > MAX_KEY_PRICE_TOKENS) return roomKeyEnvelope(c, null)
 
 			const canManage = await canManageRoomById(c.env.DB, roomId, accountId)
 			if (canManage === null) return roomKeyEnvelope(c, null)
 			if (!canManage) return c.body(null, 403)
+
+			// Absent or blank is TOKENS; otherwise the key is sold in its own room's money, not
+			// another's — the same rule `updateAll` applies.
+			const postedCurrencyId = str(body.PurchaseCurrencyId).trim()
+			let purchaseCurrencyId: string | null = null
+			if (postedCurrencyId !== '') {
+				const currency = await getRoomCurrency(c.env.DB, postedCurrencyId)
+				if (!currency || currency.RoomId !== roomId) return roomKeyEnvelope(c, null)
+				purchaseCurrencyId = currency.CurrencyId
+			}
+
+			const maxPrice =
+				purchaseCurrencyId === null ? MAX_KEY_PRICE_TOKENS : MAX_KEY_PRICE_ROOM_CURRENCY
+			if (price > maxPrice) return roomKeyEnvelope(c, null)
+			// Selling for TOKENS is a Rec Room Plus perk (see `isSubscriber`). A room-currency
+			// price, or a free key, is open to any room manager.
+			if (purchaseCurrencyId === null && price !== 0 && !(await isSubscriber(c))) {
+				return c.body(null, 403)
+			}
 
 			if ((await getRoomKeys(c.env.DB, roomId)).length >= MAX_KEYS_PER_ROOM) {
 				return roomKeyEnvelope(c, null)
@@ -6120,6 +7001,7 @@ const app = new Hono<App>({ strict: false })
 				Name: censorSwears(name),
 				Description: censorSwears(str(body.Description)),
 				Price: price,
+				PurchaseCurrencyId: purchaseCurrencyId,
 			})
 
 			await pushRoomKeyCreated(c, key, accountId)
@@ -6140,8 +7022,10 @@ const app = new Hono<App>({ strict: false })
 				'Looks the key up by `RoomKeyId`, confirms the client’s `RequestedPrice` matches its',
 				'stored `Price`, debits the buyer that price in RecCenterTokens, pays it to the',
 				'room’s OWNER (its `CreatorAccountId`), and records the buyer as holding the key',
-				'(`room_key_player`). A free key, and an owner buying their own room’s key, move no',
-				'tokens. A GET because that is how the client sends it.',
+				'(`room_key_player`). A free key moves no tokens, and nor does a key bought by the',
+				'room’s creator or a CO-OWNER: they get their own room’s keys free, and the client',
+				'asks them `RequestedPrice=0` (the stored price is accepted too). A GET because that',
+				'is how the client sends it.',
 				'',
 				'Answers the client’s `RoomKeyPurchaseResponseDTO`: `RoomKeyResponse` is the',
 				'`{ Status, RoomKey }` the create answers in, and `BalanceUpdateResponse` carries one',
@@ -6211,17 +7095,21 @@ const app = new Hono<App>({ strict: false })
 			if (key === null || key.PurchaseCurrencyId !== null) {
 				return answer(UpdateResponse.NoItemAvailable)
 			}
-			if (requestedPrice !== key.Price) return answer(UpdateResponse.RequestedPriceDoesNotMatch)
 			const ownerId = await getRoomOwnerId(c.env.DB, key.RoomId)
 			if (ownerId === null) return answer(UpdateResponse.NoItemAvailable)
+			// The room's creator and co-owners get their own room's keys free — the client asks
+			// them `RequestedPrice=0` — and are never charged, whatever price they name.
+			const canManage = (await canManageRoomById(c.env.DB, key.RoomId, id)) === true
+			if (requestedPrice !== key.Price && !(canManage && requestedPrice === 0)) {
+				return answer(UpdateResponse.RequestedPriceDoesNotMatch)
+			}
 
 			// Claim the key BEFORE charging: the insert is atomic, so of two concurrent buys only
 			// one gets past here and only one is charged. A buyer who cannot pay gives it back.
 			if (!(await claimRoomKey(c.env.DB, id, key.RoomKeyId))) {
 				return answer(UpdateResponse.AlreadyOwned)
 			}
-			// The owner paying themselves would be a debit and a credit of the same tokens.
-			if (key.Price > 0 && ownerId !== id) {
+			if (key.Price > 0 && !canManage) {
 				if (!(await spendCurrency(c.env.DB, id, currencyType, key.Price, startingTokens))) {
 					await releaseRoomKey(c.env.DB, id, key.RoomKeyId)
 					return answer(UpdateResponse.NotEnoughCredit)
@@ -6268,7 +7156,10 @@ const app = new Hono<App>({ strict: false })
 				'NOBODY IS PAID — unlike the token sale, the price does not reach the room’s owner.',
 				'',
 				'`RequestedPurchaseCurrencyId` must be the key’s own `PurchaseCurrencyId` and',
-				'`RequestedPrice` its `Price`. A key priced in TOKENS (a null `PurchaseCurrencyId`)',
+				'`RequestedPrice` its `Price` — except that the room’s creator or a CO-OWNER gets',
+				'their own room’s keys free: the client asks them `RequestedPrice=0` (the stored',
+				'price is accepted too) and nothing is subtracted.',
+				'A key priced in TOKENS (a null `PurchaseCurrencyId`)',
 				'is not sold here — that is `GET /api/storefronts/v1/buyRoomKey`.',
 				'',
 				'Answers the client’s `RoomKeyPurchaseWithCurrencyResponseDTO`, a bare object with no',
@@ -6327,13 +7218,21 @@ const app = new Hono<App>({ strict: false })
 			if (requestedCurrencyId.toLowerCase() !== key.PurchaseCurrencyId.toLowerCase()) {
 				return answer(false)
 			}
-			if (int(body.RequestedPrice) !== key.Price) return answer(false)
+			// The room's creator and co-owners get their own room's keys free, as with the token
+			// sale — the client asks them `RequestedPrice=0` — and are never charged.
+			const canManage = await canManageRoomById(c.env.DB, key.RoomId, id)
+			if (canManage === null) return answer(false)
+			const requestedPrice = int(body.RequestedPrice)
+			if (requestedPrice !== key.Price && !(canManage && requestedPrice === 0)) {
+				return answer(false)
+			}
 
 			// Claim the key BEFORE charging, as the token sale does: the insert is atomic, so of
 			// two concurrent buys only one is charged. A buyer who cannot pay gives it back.
 			if (!(await claimRoomKey(c.env.DB, id, key.RoomKeyId))) return answer(false)
 			if (
 				key.Price > 0 &&
+				!canManage &&
 				!(await spendRoomCurrency(c.env.DB, key.PurchaseCurrencyId, id, key.Price))
 			) {
 				await releaseRoomKey(c.env.DB, id, key.RoomKeyId)
@@ -6357,7 +7256,9 @@ const app = new Hono<App>({ strict: false })
 				'(`RoomKeyId=43&Name=key1&Description=…&Price=1000&PurchaseCurrencyId=`).',
 				'',
 				'Gated to the CREATOR or a CO-OWNER of the room that lists the key; a valid token',
-				'from anyone else is a 403.',
+				'from anyone else is a 403. A key that ends up priced in tokens at a non-zero `Price`',
+				'also needs Rec Room Plus (the token’s `rn.plus` claim); without it, 403. A room',
+				'currency price does not.',
 				'',
 				'`PurchaseCurrencyId` sent EMPTY prices the key in tokens (stored and served as',
 				'null) — that is how a key on a room currency is taken back off it; otherwise it',
@@ -6382,7 +7283,10 @@ const app = new Hono<App>({ strict: false })
 			responses: {
 				200: json(RoomKeyEnvelope, 'The key as it now stands, or a refusal'),
 				401: UNAUTHORIZED_RESPONSE,
-				403: { description: 'Not the room’s creator or a co-owner (empty body)' },
+				403: {
+					description:
+						'Not the room’s creator or a co-owner, or a token price without Rec Room Plus (empty body)',
+				},
 			},
 		}),
 		async (c) => {
@@ -6428,6 +7332,12 @@ const app = new Hono<App>({ strict: false })
 			const maxPrice =
 				purchaseCurrencyId === null ? MAX_KEY_PRICE_TOKENS : MAX_KEY_PRICE_ROOM_CURRENCY
 			if (price > maxPrice) return roomKeyEnvelope(c, null)
+			// Judged on the RESULTING pair, like the cap: a token price is a Rec Room Plus perk
+			// (see `isSubscriber`), so an edit that leaves or puts a key on tokens at a non-zero
+			// price needs Plus. A room-currency price, or a free key, does not.
+			if (purchaseCurrencyId === null && price !== 0 && !(await isSubscriber(c))) {
+				return c.body(null, 403)
+			}
 
 			// Blank is a value here too: no art. Only absence leaves the stored name alone.
 			const postedImageName = str(body.ImageName)?.trim()
@@ -6638,13 +7548,41 @@ const app = new Hono<App>({ strict: false })
 		}
 	)
 
-	// The subscription seasons running right now (the RR+ seasonal reward tracks). Nothing
-	// here runs a season, so this is an empty-list stub — the client reads it as "no season
-	// in progress" and skips the seasonal UI, where a 404 stalls the RR+ page load.
+	// The 2026 decoder requires an object; RecNet rejects JSON null as an empty response.
 	.get(
 		'/api/subscriptionseasons/v1/seasons/current',
-		listRoute('Current subscription seasons', 'Empty stub — no RR+ season is running'),
-		(c) => c.json([])
+		describeRoute({
+			summary: 'Current subscription season',
+			responses: {
+				200: json(
+					z.union([
+						JsonArray,
+						z.object({
+							SubscriptionSeasonId: z.string().uuid(),
+							Name: z.string(),
+							ImageName: z.string(),
+							StartAt: z.string(),
+							NextSeasonStart: z.string().nullable(),
+							Milestones: JsonArray,
+						}),
+					]),
+					'2026: season object without milestones; older builds: []'
+				),
+			},
+		}),
+		async (c) =>
+			c.json(
+				((await authedBuild(c)) ?? 0) >= 20260323
+					? {
+							SubscriptionSeasonId: '00000000-0000-0000-0000-000000000000',
+							Name: '',
+							ImageName: '',
+							StartAt: '0001-01-01T00:00:00Z',
+							NextSeasonStart: null,
+							Milestones: [],
+						}
+					: []
+			)
 	)
 
 	// Whether the caller can start a Maker AI free trial. Always false, mirroring the

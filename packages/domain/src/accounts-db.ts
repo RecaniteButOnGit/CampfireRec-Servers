@@ -11,11 +11,13 @@
  * it from `@repo/domain` (each uses the subset it needs).
  */
 
+import { AVATAR_STUDIO_ACCESS } from './avatar-studio'
 import { bindPlaceholders, chunkForBinds } from './d1-binds'
 
 /**
  * Schema DDL — the head schema, i.e. what the table looks like after every migration
- * (0001_accounts + 0002_avatar + 0009_account_has_plus + 0012_account_is_influencer, sans
+ * (0001_accounts + 0002_avatar + 0009_account_has_plus + 0012_account_is_influencer +
+ * 0013_account_signup_ip_device_id, sans
  * seed INSERTs; 0004 added a `platform_id` generated column and 0008 dropped it again, so it
  * appears here in neither form).
  *
@@ -23,6 +25,7 @@ import { bindPlaceholders, chunkForBinds } from './d1-binds'
  * subscriber through its partial index instead of scanning every account's JSON. It is 1 for
  * JSON true, 0 for false and NULL when the key is absent; the index holds only the 1s.
  * `is_influencer` does the same for `isInfluencer`, for econ's influencer list.
+ * `signup_ip` and `device_id` (full indexes) back the signup caps' counts.
  */
 export const SCHEMA_DDL: string[] = [
 	`CREATE TABLE IF NOT EXISTS account (
@@ -31,12 +34,21 @@ export const SCHEMA_DDL: string[] = [
 		account_id INTEGER GENERATED ALWAYS AS (json_extract(data, '$.accountId')) VIRTUAL,
 		username_lower TEXT GENERATED ALWAYS AS (lower(json_extract(data, '$.username'))) VIRTUAL,
 		has_plus INTEGER GENERATED ALWAYS AS (json_extract(data, '$.hasPlus')) VIRTUAL,
-		is_influencer INTEGER GENERATED ALWAYS AS (json_extract(data, '$.isInfluencer')) VIRTUAL
+		is_influencer INTEGER GENERATED ALWAYS AS (json_extract(data, '$.isInfluencer')) VIRTUAL,
+		signup_ip TEXT GENERATED ALWAYS AS (json_extract(data, '$.signupIp')) VIRTUAL,
+		device_id TEXT GENERATED ALWAYS AS (json_extract(data, '$.deviceId')) VIRTUAL,
+		email_lower TEXT GENERATED ALWAYS AS (NULLIF(lower(json_extract(data, '$.email')), '')) VIRTUAL
 	)`,
 	`CREATE UNIQUE INDEX IF NOT EXISTS idx_accounts_account_id ON account (account_id)`,
 	`CREATE INDEX IF NOT EXISTS idx_accounts_username_lower ON account (username_lower)`,
 	`CREATE INDEX IF NOT EXISTS idx_account_has_plus ON account (has_plus) WHERE has_plus = 1`,
 	`CREATE INDEX IF NOT EXISTS idx_account_is_influencer ON account (is_influencer) WHERE is_influencer = 1`,
+	`CREATE INDEX IF NOT EXISTS idx_account_signup_ip ON account (signup_ip)`,
+	`CREATE INDEX IF NOT EXISTS idx_account_device_id ON account (device_id)`,
+	// An email address belongs to ONE account: password recovery (`auth`
+	// `POST /account/recoverpassword`) is handed nothing but the address and has to find the
+	// account from it. Case-insensitive, and an empty/absent email is NULL so it never collides.
+	`CREATE UNIQUE INDEX IF NOT EXISTS idx_account_email_lower ON account (email_lower) WHERE email_lower IS NOT NULL`,
 ]
 
 /** Client-facing account shape (camelCase, exactly as the client's AccountDTO). */
@@ -104,7 +116,12 @@ export interface Account {
 	signupIp?: string
 	/** The client IP of the most recent successful login; refreshed on every login. */
 	lastLoginIp?: string
-	/** Set via POST /account/me/email; absent until the player provides one. */
+	/**
+	 * Set via POST /account/me/email; absent until the player provides one. UNIQUE across
+	 * accounts, case-insensitively (`idx_account_email_lower`): it is the one thing a password
+	 * recovery is given to find the account by, so `accounts` refuses an address another account
+	 * holds. Look an account up by it with {@link getAccountByEmail}.
+	 */
 	email?: string
 	/** Set via POST /account/me/phone; absent until the player provides one. */
 	phone?: string
@@ -168,7 +185,10 @@ export interface Account {
 	 *
 	 * So never read a Discord link as a precondition for Plus, and never revoke one because
 	 * the other is missing: a manually granted account has `hasPlus` and no link at all, and
-	 * that is a normal, supported state.
+	 * that is a normal, supported state. The one thing that clears it besides an operator is
+	 * the player UNLINKING their Discord (`www` `POST /api/benefits/unlink`), which clears
+	 * this and `hasStudio` together — the player is handing back the proof — and does so
+	 * whoever set them, since nothing on the row says which.
 	 *
 	 * Nothing reads this per request. `auth` stamps it into every token it mints as the
 	 * `rn.plus` claim, and `econ` decides the CampusCard and the subscriber discount from
@@ -177,6 +197,21 @@ export interface Account {
 	 * real: the website's claim page warns about it, and so does `grant-plus`.
 	 */
 	hasPlus?: boolean
+	/**
+	 * Whether this account has EVER claimed its Discord benefits — had roles recorded on a
+	 * `PlatformType.Discord` link by `www`'s `POST /api/benefits/claim` — even if that link is
+	 * gone. Set only by the website's Discord UNLINK, when the link it removes carries roles:
+	 * while the link exists the link table itself says so (`hasRecordedRoles`), and a link
+	 * that never claimed has nothing to remember.
+	 *
+	 * What it protects is the first-link supporter gift. The claim pays that box the FIRST
+	 * time an account links a Discord, deciding "first" from the link table — which, after an
+	 * unlink, reads as if the account had never linked. Without this flag, link → unlink →
+	 * link would pay the one-time gift on every cycle. Nothing else reads it: `hasPlus` stands
+	 * on its own (above), and the once-only-per-Discord-user guard is the link table's.
+	 * Absent/false means no claim remembered.
+	 */
+	hasClaimedDiscord?: boolean
 	/**
 	 * Whether this account may upload from Rec Room Studio. The editor decides Full access
 	 * by reading the token for a `role` claim of exactly `betastudio`, which `auth` stamps
@@ -188,6 +223,18 @@ export interface Account {
 	 * open keeps its old access until it signs in again or refreshes.
 	 */
 	hasStudio?: boolean
+	/** Staff override for screen sharing. Absent means screen sharing is disabled. */
+	hasScreenshare?: boolean
+	/**
+	 * Whether the player has asked for this account to be deleted (`www`
+	 * `POST /api/account/delete`). A MARK, not a deletion: nothing is removed, nothing reads
+	 * it yet, and the account logs in and plays exactly as before. The intent is that a later
+	 * sweep compares `deletedAt` with `lastLoginTime` — a login AFTER the request is the
+	 * player changing their mind, and reverses it. Absent/false means not marked.
+	 */
+	isDeleted?: boolean
+	/** ISO-8601 time of the deletion request; set with `isDeleted`, absent otherwise. */
+	deletedAt?: string
 }
 
 interface AccountRow {
@@ -287,15 +334,47 @@ export async function getAccountByUsername(
 }
 
 /** Default cap on how many matches `searchAccounts` returns. */
+/**
+ * The account holding an email address, or null when none does. Case-insensitive, over the
+ * `email_lower` index, and an address is held by at most one account (see {@link Account.email}).
+ * Whitespace around the address is ignored; an empty address matches nothing.
+ */
+export async function getAccountByEmail(db: D1Database, email: string): Promise<Account | null> {
+	const needle = email.trim().toLowerCase()
+	if (needle === '') return null
+	const row = await db
+		.prepare('SELECT data FROM account WHERE email_lower = ?1')
+		.bind(needle)
+		.first<{ data: string }>()
+	return row ? (JSON.parse(row.data) as Account) : null
+}
+
 export const SEARCH_LIMIT = 20
 
 /** Escape LIKE wildcards so user input is matched literally (using `\` as the escape char). */
-const escapeLike = (s: string): string => s.replace(/[\\%_]/g, '\\$&')
+export const escapeLike = (s: string): string => s.replace(/[\\%_]/g, '\\$&')
+
+/**
+ * The smallest string that sorts after every string beginning with `prefix` under
+ * SQLite's default BINARY (byte-wise) collation: the prefix followed by U+10FFFF, whose
+ * UTF-8 encoding (F4 8F BF BF) is the highest valid sequence. The pair
+ * `>= prefix AND < prefixUpperBound(prefix)` is the prefix match as a range.
+ */
+export const prefixUpperBound = (prefix: string): string => `${prefix}\u{10FFFF}`
 
 /**
  * Prefix-search accounts by username (case-insensitive, "begins with"), ordered
- * alphabetically. Backed by the indexed `username_lower` generated column, so the
- * `name%` LIKE stays index-friendly. Returns up to `limit` matches.
+ * alphabetically. Returns up to `limit` matches.
+ *
+ * The prefix is applied as a RANGE on the indexed `username_lower` generated column
+ * (`>= name AND < name+U+10FFFF`), not as `LIKE 'name%'`. SQLite only turns a LIKE into
+ * an index seek when the LIKE is case-sensitive or the index is NOCASE, and never when
+ * it carries an ESCAPE clause, so the LIKE form was a full index scan on every call —
+ * 48k rows read per keystroke in the site's search bar, tens of millions a day on D1's
+ * meter. The range is a seek (`SEARCH … (username_lower>? AND username_lower<?)`) and
+ * walks the index in `ORDER BY` order, so the LIMIT stops it after `limit` rows. The
+ * LIKE stays as a residual filter on those rows so the match is exactly "begins with",
+ * with the user's `%`/`_` taken literally.
  */
 export async function searchAccounts(
 	db: D1Database,
@@ -306,9 +385,11 @@ export async function searchAccounts(
 	if (q === '') return []
 	const { results } = await db
 		.prepare(
-			`SELECT data FROM account WHERE username_lower LIKE ?1 ESCAPE '\\' ORDER BY username_lower LIMIT ?2`
+			`SELECT data FROM account
+			 WHERE username_lower >= ?1 AND username_lower < ?2 AND username_lower LIKE ?3 ESCAPE '\\'
+			 ORDER BY username_lower LIMIT ?4`
 		)
-		.bind(`${escapeLike(q)}%`, limit)
+		.bind(q, prefixUpperBound(q), `${escapeLike(q)}%`, limit)
 		.all<AccountRow>()
 	return parseAll(results)
 }
@@ -318,11 +399,8 @@ export async function searchAccounts(
  * at login). An empty id yields no matches (avoids matching every account with no
  * device recorded).
  *
- * Reads `deviceId` straight out of the JSON blob, so this is a table scan — no
- * generated column, no migration. Fine at our account count and for the occasional
- * linkup lookup this exists for; if it ever gets hot, promote `deviceId` to an indexed
- * generated column (migration 0004 did that for `platformId`, and 0008 undid it once
- * nothing queried it — that pair is the recipe both ways).
+ * Reads the indexed `device_id` generated column (migration 0013, added for the
+ * per-device signup cap), not the JSON blob, so it is an index lookup.
  *
  * The device id is unverified client input, so treat a match as a *hint* (these
  * accounts share a device) and never as proof of identity.
@@ -330,7 +408,7 @@ export async function searchAccounts(
 export async function getAccountsByDeviceId(db: D1Database, deviceId: string): Promise<Account[]> {
 	if (deviceId === '') return []
 	const { results } = await db
-		.prepare("SELECT data FROM account WHERE json_extract(data, '$.deviceId') = ?1")
+		.prepare('SELECT data FROM account WHERE device_id = ?1')
 		.bind(deviceId)
 		.all<AccountRow>()
 	return parseAll(results)
@@ -353,7 +431,7 @@ export async function getAccountsByDeviceId(db: D1Database, deviceId: string): P
 export async function countAccountsByDeviceId(db: D1Database, deviceId: string): Promise<number> {
 	if (deviceId === '') return 0
 	const row = await db
-		.prepare("SELECT COUNT(*) AS n FROM account WHERE json_extract(data, '$.deviceId') = ?1")
+		.prepare('SELECT COUNT(*) AS n FROM account WHERE device_id = ?1')
 		.bind(deviceId)
 		.first<{ n: number }>()
 	return row?.n ?? 0
@@ -422,7 +500,7 @@ export async function setLoginContext(
 export async function countAccountsBySignupIp(db: D1Database, ip: string): Promise<number> {
 	if (ip === '') return 0
 	const row = await db
-		.prepare("SELECT COUNT(*) AS n FROM account WHERE json_extract(data, '$.signupIp') = ?1")
+		.prepare('SELECT COUNT(*) AS n FROM account WHERE signup_ip = ?1')
 		.bind(ip)
 		.first<{ n: number }>()
 	return row?.n ?? 0
@@ -463,10 +541,23 @@ export async function listInfluencerIds(db: D1Database): Promise<number[]> {
  * Every account flagged `hasStudio`, lowest id first — the website's staff list. A JSON
  * scan rather than a generated column: the list is short and only staff read it.
  */
-export async function listStudioAccounts(db: D1Database): Promise<Account[]> {
+export async function listStudioAccounts(
+	db: D1Database,
+	kind: 'studio' | 'avatar' | 'screenshare' | keyof typeof AVATAR_STUDIO_ACCESS = 'studio'
+): Promise<Account[]> {
+	const mask =
+		kind === 'avatar'
+			? 7
+			: Object.hasOwn(AVATAR_STUDIO_ACCESS, kind)
+				? AVATAR_STUDIO_ACCESS[kind as keyof typeof AVATAR_STUDIO_ACCESS]
+				: 0
 	const { results } = await db
 		.prepare(
-			`SELECT data FROM account WHERE json_extract(data, '$.hasStudio') = 1 ORDER BY account_id`
+			mask !== 0
+				? `SELECT data FROM account WHERE account_id IN (SELECT account_id FROM avatar_studio_access WHERE (flags & ${mask}) != 0) ORDER BY account_id`
+				: kind === 'screenshare'
+					? `SELECT data FROM account WHERE json_extract(data, '$.hasScreenshare') = 1 ORDER BY account_id`
+					: `SELECT data FROM account WHERE json_extract(data, '$.hasStudio') = 1 ORDER BY account_id`
 		)
 		.all<AccountRow>()
 	return parseAll(results)

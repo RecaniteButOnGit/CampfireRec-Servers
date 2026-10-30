@@ -123,9 +123,22 @@ it('serves the caller’s CRM config', async () => {
 	const res = await SELF.fetch(`${ORIGIN}/crm/me/config/v3`, { headers: await bearer('205') })
 	expect(res.status).toBe(200)
 	expect(res.headers.get('content-type')).toContain('application/json')
-	// Empty rather than invented: there is no CRM behind this, and made-up keys would switch
-	// on client messaging paths with nothing to serve them.
-	expect(await res.json()).toEqual({})
+	// A RecNetResultObject envelope — the client reads `Value` off it. "No CRM assigned"
+	// rather than invented: there is no CRM behind this. `AssignedCrmType` and `AllowPush`
+	// are non-nullable on the client, so they must never be null.
+	expect(await res.json()).toEqual({
+		Value: {
+			UserConfig: {
+				AssignedCrmType: 0,
+				AssignedPushNotificationService: null,
+				AllowPush: false,
+			},
+			BrazeConfig: null,
+		},
+		Success: true,
+		Error: null,
+		error_id: null,
+	})
 })
 
 it('401s the CRM config read without a bearer token', async () => {

@@ -1,9 +1,12 @@
 import {
 	addUsernameChange,
 	addXp,
+	clearDormSaveBlob,
 	clearPasswordHash,
 	createGift,
+	deleteRoomInstancesByRoom,
 	getAccount,
+	getImageById,
 	getOnlinePlayerIds,
 	getPlayerIdsInRoom,
 	getPresences,
@@ -22,7 +25,7 @@ import { validateAndGetAccountId, validateAndGetRoles } from '@repo/jwt'
 // Imported rather than reimplemented: the SQL belongs with the table, and `banFromReport`
 // is the same write `api` would do. www owns the ENDPOINTS, not the storage — see the
 // module comment below.
-import { banEvasionMatch, linkedAccounts } from '../../api/src/bans-db'
+import { banEvasionMatch, linkedAccounts, resolveBan } from '../../api/src/bans-db'
 import { getCustomAvatarItem } from '../../api/src/custom-avatar-items-db'
 import {
 	banBlockDetails,
@@ -58,6 +61,7 @@ import {
 	toCatalogSkin,
 } from '../../econ/src/catalog-db'
 import { countConsumable, grantConsumable } from '../../econ/src/consumables-db'
+import { grantDiscordRoleGifts } from '../../econ/src/discord-role-gift'
 import { getEquipment, grantEquipment } from '../../econ/src/equipment-db'
 import { grantCustomAvatarItem, ownedCustomAvatarItemIds } from '../../econ/src/inventory-custom-db'
 // The notification ids and the kick frame's recovered shape, owned by `notify`. Both are
@@ -341,6 +345,22 @@ async function recordBanAudit(
 /** The evasion arms in force, read from the same knob `api` and `match` read. */
 const armsFor = (env: Env) => banEvasionMatch(env.BAN_EVASION_MATCH)
 
+/**
+ * Reports with the reported photo's `image_name` alongside its `image_id`, so the panel can
+ * link to the picture — `img` serves by name, and the row only stores the id. Read whatever
+ * the photo's accessibility: one made private after it was reported is still evidence. A
+ * photo since deleted gets a null name and the panel shows the bare id.
+ */
+async function withImageNames(db: D1Database, reports: ReportRow[]) {
+	const ids = [...new Set(reports.flatMap((r) => (r.image_id == null ? [] : [r.image_id])))]
+	const images = await Promise.all(ids.map((id) => getImageById(db, id)))
+	const names = new Map(ids.map((id, i) => [id, images[i]?.ImageName ?? null]))
+	return reports.map((r) => ({
+		...r,
+		image_name: r.image_id == null ? null : (names.get(r.image_id) ?? null),
+	}))
+}
+
 // ---- Handlers ---------------------------------------------------------------
 
 /**
@@ -362,7 +382,7 @@ export async function searchReportsHandler(c: Context<App>) {
 		skip: intQuery(c, 'skip') ?? 0,
 		take: Math.min(intQuery(c, 'take') ?? 50, MAX_TAKE),
 	})
-	return c.json(page)
+	return c.json({ ...page, reports: await withImageNames(c.env.DB, page.reports) })
 }
 
 /** One report by id — the detail behind a search row. */
@@ -371,7 +391,8 @@ export async function getReportHandler(c: Context<App>) {
 	if (Number.isNaN(id)) return c.json({ error: 'A numeric report id is required' }, 400)
 	const report = await getReportById(c.env.DB, id)
 	if (report === null) return c.json({ error: 'No such report' }, 404)
-	return c.json(report)
+	const [withName] = await withImageNames(c.env.DB, [report])
+	return c.json(withName)
 }
 
 /**
@@ -513,6 +534,11 @@ export async function bansInForceHandler(c: Context<App>) {
  * Everything on file about one player: every report against them, every warning handed
  * down, and the ban in force if there is one.
  *
+ * `activeBan` is the ban on THIS account. `blockedBy` is what `auth` and `match` actually
+ * enforce — the same `resolveBan` under the operator's arms — so it also catches a player
+ * who is locked out by a ban on an account they share a platform identity or an IP with.
+ * Without it, a ban evader's new account read "Not banned" while being unable to play.
+ *
  * One call because it is one screen — a moderator deciding what to do about an account
  * reads all three together, and three round trips would let the page render a decision
  * out of a partially-loaded history.
@@ -521,12 +547,19 @@ export async function playerHistoryHandler(c: Context<App>) {
 	const playerId = Number.parseInt(c.req.param('id') ?? '', 10)
 	if (Number.isNaN(playerId)) return c.json({ error: 'A numeric player id is required' }, 400)
 
-	const [reports, warnings, activeBan] = await Promise.all([
+	const [reports, warnings, activeBan, blockedBy] = await Promise.all([
 		getReportsAgainst(c.env.DB, playerId),
 		getWarningsAgainst(c.env.DB, playerId),
 		getActiveBan(c.env.DB, playerId),
+		resolveBan(c.env.DB, playerId, { arms: armsFor(c.env) }),
 	])
-	return c.json({ playerId, reports, warnings, activeBan })
+	return c.json({
+		playerId,
+		reports: await withImageNames(c.env.DB, reports),
+		warnings,
+		activeBan,
+		blockedBy,
+	})
 }
 
 /**
@@ -1020,6 +1053,28 @@ export async function giftRoomTokensHandler(c: Context<App>) {
 }
 
 /**
+ * Delete every instance of a room from `room_instance`, from the room's own page. For a
+ * room whose sessions have gone bad: the next player to matchmake in gets a fresh one.
+ * Clearing a room with no instances succeeds and deletes nothing.
+ */
+export async function clearRoomInstancesHandler(c: Context<App>) {
+	const roomId = Number(c.req.param('roomId'))
+	if (!Number.isInteger(roomId) || roomId <= 0) {
+		return c.json({ error: 'A numeric room id is required' }, 400)
+	}
+
+	const deleted = await deleteRoomInstancesByRoom(c.env.DB, roomId)
+
+	await recordPlayerAudit(c, 'clear_room_instances', { roomId, deleted })
+	logger.info('staff cleared room instances', {
+		moderatorId: staffId(c),
+		roomId,
+		deletedCount: deleted.length,
+	})
+	return c.json({ roomId, deleted })
+}
+
+/**
  * Send tokens to EVERYONE ONLINE right now — the server-wide drop behind the account page's
  * "Token drop" tab, beside the coach broadcast and the maintenance notice.
  *
@@ -1168,6 +1223,29 @@ export async function syncDiscordRolesHandler(c: Context<App>) {
 }
 
 /**
+ * Run econ's supporter gift NOW — the weekly cron (econ's discord-role-gift.ts) on a button,
+ * a bonus round for a developer who wants every supporter paid again today. Same function,
+ * same map (`DISCORD_ROLE_TOKENS`), same box: every account whose Discord link holds a mapped
+ * role is boxed its best role's tokens, online or not. The role drop above is the same
+ * audience with an operator's amount and message; this one pays what the map says and
+ * says so on the box.
+ *
+ * It pays everyone it finds, every time — the gift keeps no ledger, and that module is
+ * explicit that a hand run is an extra gift on purpose. So the panel asks before sending,
+ * and the run is on the audit log with how many boxes and tokens went out.
+ *
+ * Always a 200 with the run's summary, as the sweep's sync is: a `skipped` run (no role
+ * mapped) is the gift reporting on its configuration, and the panel shows the reason.
+ */
+export async function runDiscordRoleGiftHandler(c: Context<App>) {
+	const startingTokens = intVar(c.env.STARTING_TOKENS, DEFAULT_STARTING_TOKENS)
+	const summary = await grantDiscordRoleGifts(c.env, startingTokens)
+	await recordPlayerAudit(c, 'run_discord_role_gift', { ...summary })
+	logger.info('staff ran the discord supporter gift', { moderatorId: staffId(c), ...summary })
+	return c.json(summary)
+}
+
+/**
  * Give a player XP, in a gift box — the way a game reward pays its XP. The XP is banked
  * here (the box, like every box, grants nothing when opened) and spent on any levels it now
  * pays for; a `PlayerProgressionLevelUpdate` moves the level bar, and the box is announced
@@ -1282,8 +1360,11 @@ async function findGiftableItem(db: D1Database, requested: string): Promise<Gift
 		getCatalogItem(db, requested),
 	])
 	const item = custom !== null && custom.Accessibility !== 0 ? custom : null
-	const row =
+	const found =
 		byKey ?? (/^\d{1,9}$/.test(requested) ? await getCatalogItemById(db, Number(requested)) : null)
+	// A custom avatar item's catalog row only carries its store listing; the item itself is the
+	// `custom_avatar_item` record found above, so the row must not make its guid `ambiguous`.
+	const row = found?.kind === CatalogKind.CustomAvatarItem ? null : found
 
 	if (item !== null && row !== null) return { kind: 'ambiguous' }
 	if (item !== null) return { kind: 'custom_item', item }
@@ -1367,7 +1448,12 @@ async function giftCustomItem(
 		return c.json({ error: 'This player already owns that item' }, 409)
 	}
 
-	await grantCustomAvatarItem(c.env.DB, playerId, item.CustomAvatarItemId)
+	if (item.OutfitType === 1000 && item.CurrentSaves.length === 0) {
+		return c.json({ error: 'That badge has no published image' }, 400)
+	}
+	if (!(await grantCustomAvatarItem(c.env.DB, playerId, item.CustomAvatarItemId))) {
+		return c.json({ error: 'This player already owns that item' }, 409)
+	}
 	const content = staffGiftContent({
 		GiftContext: GIFT_CONTEXT_PURCHASED_GIFT_A,
 		CustomAvatarItemId: item.CustomAvatarItemId,
@@ -1393,7 +1479,7 @@ async function giftCustomItem(
 	await announceGift(c, playerId, gift.id, content)
 
 	return c.json({
-		kind: 'custom_item',
+		kind: item.OutfitType === 1000 ? 'badge' : 'custom_item',
 		playerId,
 		customAvatarItemId: item.CustomAvatarItemId,
 		name: item.Name,
@@ -1528,7 +1614,8 @@ export async function addUsernameChangeHandler(c: Context<App>) {
 
 /**
  * Remove a player's password so they can set a new one in game — the recovery for someone
- * who has forgotten it, since nothing here can send a reset email. `hadPassword` says whether
+ * who has forgotten it AND has no email on the account (with one, "Forgot password" in game
+ * or `/reset-password` here emails them a code via `auth`). `hadPassword` says whether
  * there was one to remove; clearing an already-clear password succeeds, and is still logged.
  */
 export async function clearPasswordHandler(c: Context<App>) {
@@ -1541,6 +1628,25 @@ export async function clearPasswordHandler(c: Context<App>) {
 	await recordPlayerAudit(c, 'clear_password', { playerId, hadPassword })
 	logger.info('staff cleared a password', { moderatorId: staffId(c), playerId, hadPassword })
 	return c.json({ playerId, hadPassword })
+}
+
+/**
+ * Blank the scene on a player's dorm, for a player going back to the 2023 client: a dorm
+ * saved by a newer one won't load there. It publishes a new, empty save rather than erasing
+ * anything, so `previousSaveId` is the save to restore if they want the old dorm back.
+ * `saveId` is null when there was nothing to clear, which writes nothing and is still
+ * logged; a player with no dorm at all is a 404.
+ */
+export async function clearDormHandler(c: Context<App>) {
+	const playerId = playerIdParam(c)
+	if (playerId === null) return c.json({ error: 'A numeric player id is required' }, 400)
+
+	const cleared = await clearDormSaveBlob(c.env.DB, playerId)
+	if (cleared === null) return c.json({ error: 'That player has no dorm' }, 404)
+
+	await recordPlayerAudit(c, 'clear_dorm', { playerId, ...cleared })
+	logger.info('staff cleared a dorm', { moderatorId: staffId(c), playerId, ...cleared })
+	return c.json({ playerId, ...cleared })
 }
 
 /**
@@ -1566,4 +1672,46 @@ export async function grantPlusHandler(c: Context<App>) {
 	await recordPlayerAudit(c, 'grant_plus', { playerId, hadPlus })
 	logger.info('staff granted plus', { moderatorId: staffId(c), playerId, hadPlus })
 	return c.json({ playerId, hasPlus: true, hadPlus })
+}
+
+/**
+ * Whether the acting staff member's OWN account is a sandbox account — the `isSandbox`
+ * flag `match` reads on every `GET /player/connection-info` to pick the sandbox Tachyon
+ * pool over the live one. Self-only: the toggle on the account page is how a moderator or
+ * developer moves THEMSELVES onto the test servers, not how anyone is moved by someone else
+ * (an operator does that with `runx admin`, if at all).
+ */
+export async function sandboxStatusHandler(c: Context<App>) {
+	const account = await getAccount(c.env.DB, staffId(c))
+	return c.json({ sandbox: account?.isSandbox === true })
+}
+
+/**
+ * Opt the acting staff member in to or out of the sandbox pool: `{ sandbox: boolean }` sets
+ * `isSandbox` on their own account. Idempotent — setting what's already set succeeds,
+ * changes nothing and still answers the current state. Logged on `audit_log` like every
+ * other account change staff make from the website, with `changed` saying whether anything
+ * moved.
+ *
+ * `match` reads the account per connection-info request, so the switch is honoured the next
+ * time the player joins a room instance; the instance they're standing in keeps its server.
+ */
+export async function setSandboxHandler(c: Context<App>) {
+	const body = (await c.req.json().catch(() => null)) as { sandbox?: unknown } | null
+	if (body === null || typeof body !== 'object' || typeof body.sandbox !== 'boolean') {
+		return c.json({ error: 'Expected a JSON body with a boolean `sandbox`' }, 400)
+	}
+	const playerId = staffId(c)
+	const account = await getAccount(c.env.DB, playerId)
+	const was = account?.isSandbox === true
+	const changed = was !== body.sandbox
+	if (changed) await updateAccount(c.env.DB, playerId, { isSandbox: body.sandbox })
+
+	await recordPlayerAudit(c, 'set_sandbox', { playerId, sandbox: body.sandbox, changed })
+	logger.info('staff set their sandbox flag', {
+		moderatorId: playerId,
+		sandbox: body.sandbox,
+		changed,
+	})
+	return c.json({ sandbox: body.sandbox, changed })
 }

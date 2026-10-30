@@ -69,6 +69,7 @@ export enum MessageType {
 	FriendStatusOnline = 20,
 	TextMessage = 30,
 	FriendRequestAccepted = 40,
+	FriendCodeUsed = 41,
 	PlayerCheer = 50,
 	PlayerCheerAnonymous = 51,
 	RoomCoOwnerAdded = 60,

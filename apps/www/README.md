@@ -87,9 +87,13 @@ The tests seed the same pair into their own local store in `beforeAll`.
 
 ### Benefits claim and Discord
 
-The **Claim benefits** tab on the account page lets a player prove they hold one of
-the qualifying roles in the community Discord and, if they do, gives their account Rec
-Room Plus (`account.hasPlus`). The same panel also renders at `/claim`, which is the
+The **Claim benefits** tab on the account page lets a player link their Discord to
+their account. Any member of the community Discord can link: the roles they hold there
+are recorded on the link (`platform_account.role`, which the game reads — `auth`'s
+rollout gate, for one — and `www`'s daily sweep keeps fresh), and if one of them is a
+qualifying role the claim also gives the account Rec Room Plus (`account.hasPlus`). A
+member with no qualifying role is still linked and answered `hasPlus: false`, not
+refused. The same panel also renders at `/claim`, which is the
 app's registered `redirect_uri` — Discord sends the browser back there mid-flow, so
 that route has to keep working on a cold load even though nothing links to it. It runs a standard
 OAuth2 **authorization code** flow:
@@ -102,8 +106,8 @@ OAuth2 **authorization code** flow:
    `POST /api/benefits/claim` with the player's bearer token.
 3. The worker swaps the code for an access token with the client secret, reads
    `GET /users/@me/guilds/{guild}/member` to get the player's roles, revokes the
-   token, and — if any one of the configured roles is there — writes `hasPlus` onto
-   the account and links the Discord id.
+   token, links the Discord id with the full role list, and — if any one of the
+   configured roles is there — writes `hasPlus` onto the account.
 
 **A claim takes effect on the player's next sign-in, not immediately.** `auth` stamps
 `hasPlus` into every token it mints as the `rn.plus` claim, and `econ` decides the
@@ -149,6 +153,23 @@ Discord identity on an account that already has one, both pay nothing. The respo
 box. The grant runs after Plus is granted and the link written, and a failure in it is
 logged rather than failing the claim. Unset, the var awards nothing and the claim is as
 before.
+
+**Unlinking.** The same panel offers **Unlink Discord** whenever any Discord is on the
+account — a claim's link or the bare one "Sign in with Discord" leaves — and
+`POST /api/benefits/unlink` removes every `PlatformType.Discord` link the account holds.
+It is refused (403) until the account has an **email address**: an account made from
+Discord has none until the player sets one, the link may be its only way in, and an address
+is what the account can be recovered through (a password is not required — a passwordless
+account sets one in game). The row decides, not the page; `/api/benefits/status` serves the
+same flag (`hasEmail`, beside `discordLinked`) so the panel can say so first. Afterwards that
+Discord opens no account — signing in with it makes a new one — and the once-only guard lets
+it claim elsewhere. **The grants go with the link**: `hasPlus` and `hasStudio` are both
+cleared, whoever set them (an operator's grant too — nothing on the row says which wrote
+it), and the panel warns before the confirm; both reach the game on the next token. What the
+account does keep is that it claimed: removing a link with roles recorded stamps
+`hasClaimedDiscord` on the account, and the claim's "first link" check consults it, or
+link → unlink → link would pay the one-time supporter gift on every cycle. The route is not gated on the Discord
+configuration — the link is in the table whether or not the claim is still open.
 
 The link also records the member's **roles** (`platform_account.role`, a JSON array of
 role ids). The claim writes them from the member record it read; on their own they'd be
@@ -216,11 +237,40 @@ won't pick up newly created secrets until it restarts.
 which one is missing. `wrangler tail www` shows it.
 
 In the [Discord developer portal](https://discord.com/developers/applications),
-add `https://<your domain>/claim` to the app's **Redirects**. It has to match byte
-for byte: `www` derives the redirect URI from the incoming request's own origin
-(never from the request body, which would turn the client secret into a redemption
-oracle for someone else's app), so add `http://localhost:5173/claim` too if you
-want the flow to work under `pnpm turbo dev`.
+add `https://<your domain>/claim` **and** `https://<your domain>/login/discord` to the
+app's **Redirects**. Each has to match byte for byte: `www` derives the redirect URI
+from the incoming request's own origin (never from the request body, which would turn
+the client secret into a redemption oracle for someone else's app), so add the
+`http://localhost:5173/…` pair too if you want the flows to work under `pnpm turbo dev`.
+
+### Sign in with Discord
+
+The same app also serves the login page's **Sign in with Discord** button, on the same
+switch (`/api/config` serves `discordLoginUrl` beside `discordAuthorizeUrl`, both null
+while the claim is closed). It asks Discord for the `identify` scope only and returns to
+`/login/discord`, where the SPA posts the code to `POST /api/login/discord`. `www`
+exchanges it, reads `GET /users/@me` for the Discord user id, revokes the token, and
+mints an **identity assertion** — a one-minute HS256 token signed with the shared
+`JWT_SECRET` naming platform `101` and that id — which it posts to `auth`'s
+`identity_assertion` grant over the service binding. `auth` resolves the id through
+`platform_account`:
+
+- **One linked account** (a player who claimed benefits on it) — signed in; the ordinary
+  token body comes back and the SPA stores it like a password sign-in's.
+- **No linked account** — `auth` **creates** one and links the Discord to it, under the
+  ban-evasion check and the per-IP / per-identity signup caps (but not `PASSWORD_SIGNUP`:
+  that switch exists because a password account has no identity but its address). The
+  body carries `created: true`, and the SPA stops to say so: the account has **no
+  password**, and setting one on the account page is what lets it sign in to the game —
+  on a sideloaded Quest without a Meta account, which is the case this is for. Its first
+  benefits claim still pays the welcome gift: the claim keys "first" on roles being
+  recorded on a Discord link, not on the link existing.
+- **Several linked accounts** — refused; the claim never produces this.
+
+`www` never chooses the account id: the assertion names an identity, and which account
+that is (or that there is none) is `auth`'s decision from the same table `cached_login`
+reads. The Discord snowflake stays off the new account's blob and token, as it does
+after a claim.
 
 ### Discord role refresh (cron)
 
@@ -277,6 +327,15 @@ call reports WHY (`halted: "the bot is not in the guild (Unknown Guild)"`) inste
 leaving a silent log line on a worker with observability off. Use it after changing the
 bot token or inviting the bot, or when the role drop needs this morning's roles. The run
 is written to `audit_log` as `sync_discord_roles` against the developer who pressed it.
+
+A developer can also pay `econ`'s scheduled supporter gift again, now, with
+`POST /api/staff/discord-roles/supporter-gift` (developer role required, empty body) — the
+"Bonus reward!" card on the account page's Token drop tab. It runs econ's
+`grantDiscordRoleGifts` with www's own bindings: every account whose Discord link holds a
+role mapped in `DISCORD_ROLE_TOKENS` is boxed that role's tokens, exactly as the cron does,
+and the response is the run's summary — `{ skipped, roles, links, granted, tokens, failed }`.
+The gift keeps no ledger, so each press pays everyone again on top of the schedule (the panel
+asks first). The run is written to `audit_log` as `run_discord_role_gift`.
 
 ## Development
 

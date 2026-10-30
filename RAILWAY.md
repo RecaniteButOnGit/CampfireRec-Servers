@@ -64,6 +64,15 @@ Optional integration and policy variables (exact names accepted by the runtime):
 | CV2 counter                                 | `RRTOKEN`                                                                                                                                                                                                              |
 | CV2 Escapees imports                        | `RRTOKEN`, `CDN_*` bucket credentials; optional `ESCAPEES_API_URL`                                                                                                                                                     |
 | Deployment metadata                         | `SENTRY_RELEASE`                                                                                                                                                                                                       |
+| Client support and staged rollout           | `SUPPORTED_GAME_VERSIONS`, `ROLLOUT_GAME_VERSIONS`, `DISCORD_ROLLOUT_ROLE_IDS`, `TACHYON_ROLLOUT_GAME_VERSIONS`, `TACHYON_HOST_PORT_ROLLOUT`                                                                             |
+| Studio cloud builds and distribution        | `CLOUD_BUILD_KEY`, `CLOUD_BUILD_TARGETS`, `CLOUD_BUILD_TEMPLATE_VERSION`, `STUDIO_DISTRIBUTION_MANIFEST`                                                                                                               |
+| Recovery and email change messages           | `RESEND_API_KEY`, `EMAIL_FROM`                                                                                                                                                                                         |
+
+The default client list remains Campfire's June 2024 build, `20240621`. `ROLLOUT_GAME_VERSIONS`
+is empty by default. Railway's email adapter sends via Resend; configure a verified sender
+in `EMAIL_FROM` and its API key in `RESEND_API_KEY` to enable recovery and email-change
+messages. Studio cloud builds stay disabled until `CLOUD_BUILD_KEY` is configured and an
+external build host is running.
 
 The CV2 discovery chip can request `/sections/pagesource/AIRequest[Prompt:"Hello",Model:"gpt-6-luna",SystemPrompt:"You are an AI created for Rec Room",Reasoning:"none"]8254TOKEN"<RRTOKEN value>"` (URL-encode the path segment). The response is a one-item discovery section list with the model's text in `id` and `sourceMetadata`. The trailing token must match `RRTOKEN`; the server uses `OPENAIKEY` only after that check. The supported fields are `Prompt`, `Model`, `SystemPrompt`, and `Reasoning`; `Temp` is no longer accepted or sent to OpenAI. Errors appear as `AIError:...` in the same section fields. The `Ping` probe also requires a token: `Ping8254TOKEN"<RRTOKEN value>"`. The Railway request logger records custom request names without their arguments or token.
 

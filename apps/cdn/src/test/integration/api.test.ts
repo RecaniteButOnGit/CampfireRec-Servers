@@ -12,11 +12,69 @@ declare module 'cloudflare:test' {
 
 const ORIGIN = 'https://example.com'
 
+test('serves opaque avatar source manifests and SDK avatar bundle GET/HEAD/ranges', async () => {
+	const source = '2026-10-18/11111111-1111-1111-1111-111111111111'
+	await env.CDN_ASSETS.put('avatarunityasset/' + source, '{"Version":3}')
+	expect(await (await exports.default.fetch(ORIGIN + '/avatarunityasset/' + source)).text()).toBe(
+		'{"Version":3}'
+	)
+	await env.DB.prepare(
+		'CREATE TABLE IF NOT EXISTS unity_asset(unity_asset_id TEXT NOT NULL,target INTEGER NOT NULL,version INTEGER NOT NULL,kind TEXT NOT NULL,filename TEXT NOT NULL,hash TEXT NOT NULL,PRIMARY KEY(unity_asset_id,target,version,kind))'
+	).run()
+	const name = 'quest/studio-avatar/test/item/lease.material.assetbundle'
+	await env.DB.prepare(
+		'INSERT INTO unity_asset(unity_asset_id,target,version,kind,filename,hash) VALUES (?,2,6,?,?,?)'
+	)
+		.bind('avatar-fixture', 'material', name, 'hash')
+		.run()
+	await env.CDN_ASSETS.put('avatar/' + name, 'UnityFS\0avatar')
+	expect(
+		(await exports.default.fetch(ORIGIN + '/unityasset/' + name, { method: 'HEAD' })).status
+	).toBe(200)
+	const response = await exports.default.fetch(ORIGIN + '/unityasset/' + name, {
+		headers: { Range: 'bytes=0-7' },
+	})
+	expect(response.status).toBe(206)
+	expect(await response.text()).toBe('UnityFS\0')
+})
+
 describe('cdn endpoints', () => {
 	test('GET / reports service status', async () => {
 		const res = await exports.default.fetch(`${ORIGIN}/`)
 		expect(res.status).toBe(200)
 		expect(await res.json()).toEqual({ service: 'cdn', status: 'ok' })
+	})
+
+	// A stored blob carries whatever type it was uploaded with; the routes force
+	// octet-stream, and these headers make that binding and sandbox anything that is served
+	// under its own type (the configs). The hand-rolled HEAD sits outside Hono and must
+	// carry them too.
+	test('every response carries headers that stop a stored document executing', async () => {
+		await env.CDN_ASSETS.put('data/a-stored-page', '<script>alert(1)</script>', {
+			httpMetadata: { contentType: 'text/html' },
+		})
+		for (const path of [
+			'/',
+			'/config/LoadingScreenTipData',
+			'/config/RRPlusConfig_v3',
+			'/data/a-stored-page',
+		]) {
+			const res = await exports.default.fetch(`${ORIGIN}${path}`)
+			expect(res.status, path).toBe(200)
+			expect(res.headers.get('x-content-type-options'), path).toBe('nosniff')
+			expect(res.headers.get('content-security-policy'), path).toBe("default-src 'none'; sandbox")
+		}
+		const blob = await exports.default.fetch(`${ORIGIN}/data/a-stored-page`)
+		expect(blob.headers.get('content-type')).toBe('application/octet-stream')
+
+		await env.CDN_ASSETS.put('unityasset/plain.assetbundle', new Uint8Array([1, 2, 3]))
+		const head = await exports.default.fetch(`${ORIGIN}/unityasset/plain.assetbundle`, {
+			method: 'HEAD',
+		})
+		expect(head.status).toBe(200)
+		expect(head.headers.get('content-length')).toBe('3')
+		expect(head.headers.get('x-content-type-options')).toBe('nosniff')
+		expect(head.headers.get('content-security-policy')).toBe("default-src 'none'; sandbox")
 	})
 
 	test('GET /config/LoadingScreenTipData returns the tip array', async () => {
@@ -358,6 +416,18 @@ describe('cdn endpoints', () => {
 		expect(head.status).toBe(200)
 		expect(head.headers.get('content-length')).toBe('4')
 		expect(await head.arrayBuffer()).toEqual(new ArrayBuffer(0))
+		// Current room/consumable builds live in the game's room namespace.
+		await env.CDN_ASSETS.put('room/' + filename, new Uint8Array([5, 6, 7, 8, 9]))
+		const current = await exports.default.fetch(`${ORIGIN}/unityasset/${filename}`, {
+			headers: { Range: 'bytes=1-2' },
+		})
+		expect(current.status).toBe(206)
+		expect(new Uint8Array(await current.arrayBuffer())).toEqual(new Uint8Array([6, 7]))
+		const currentHead = await exports.default.fetch(`${ORIGIN}/unityasset/${filename}`, {
+			method: 'HEAD',
+		})
+		expect(currentHead.status).toBe(200)
+		expect(currentHead.headers.get('content-length')).toBe('5')
 
 		expect((await exports.default.fetch(`${ORIGIN}/unityasset/other.assetbundle`)).status).toBe(404)
 		expect(
@@ -396,6 +466,7 @@ describe('cdn endpoints', () => {
 			'GET /invention/{dataBlob}',
 			'GET /room/{dataBlob}',
 			'GET /roommetadata/{dataBlob}',
+			'GET /roomunityasset/{filename}',
 			'GET /sigs/{sigName}',
 			'GET /unityasset/{filename}',
 			'HEAD /unityasset/{filename}',
@@ -410,4 +481,28 @@ describe('cdn endpoints', () => {
 		// Schemas must inline: a `$ref` here is a dangling reference (see openapi.ts).
 		expect(JSON.stringify(spec).includes('"$ref"')).toBe(false)
 	})
+})
+
+test('Studio authoring source manifests and source files remain distinct from baked bundles', async () => {
+	await env.CDN_ASSETS.put(
+		'roomunityasset/studio-source-fixture.json',
+		'{"Version":3,"Files":[]}',
+		{ httpMetadata: { contentType: 'application/json' } }
+	)
+	const source = await exports.default.fetch(`${ORIGIN}/roomunityasset/studio-source-fixture.json`)
+	expect(source.status).toBe(200)
+	expect(await source.json()).toEqual({ Version: 3, Files: [] })
+	await env.CDN_ASSETS.put('unityasset/studio-source-fixture.txt', 'source data')
+	const file = await exports.default.fetch(`${ORIGIN}/unityasset/studio-source-fixture.txt`)
+	expect(await file.text()).toBe('source data')
+	expect(
+		(
+			await exports.default.fetch(`${ORIGIN}/unityasset/studio-source-fixture.txt`, {
+				method: 'HEAD',
+			})
+		).status
+	).toBe(200)
+	expect((await exports.default.fetch(`${ORIGIN}/roomunityasset/missing-source.json`)).status).toBe(
+		404
+	)
 })

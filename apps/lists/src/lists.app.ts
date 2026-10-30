@@ -10,6 +10,7 @@ import {
 	getPlayerList,
 	getRecentlyUpdatedRooms,
 	getVisitedRooms,
+	removePlayerListItem,
 } from '@repo/domain'
 import { withCleanSpec, withNotFound, withOnError } from '@repo/hono-helpers'
 import { validateAndGetAccountId } from '@repo/jwt'
@@ -24,15 +25,17 @@ import {
 	AUTHED,
 	ContextualFeaturesAck,
 	CREATOR_ACCOUNT_ID_PARAM,
+	CuratedListEnvelope,
 	CuratedListRead,
-	CuratedListSaved,
 	CuratedListsBulk,
 	form,
 	ITEM_ID_PARAM,
 	json,
+	LIST_ID_PARAM,
 	LIST_IDS_PARAM,
 	LIST_NAME_PARAM,
 	LIST_TYPE_PARAM,
+	REMOVE_ITEM_ID_PARAM,
 	SAVE_LIST_NAME_PARAM,
 	SaveItemBody,
 	UNAUTHORIZED_RESPONSE,
@@ -52,6 +55,24 @@ import type { App } from './context'
  */
 async function authedId(c: Context<App>): Promise<number | null> {
 	return validateAndGetAccountId(c.req.raw, await c.env.JWT_SECRET.get())
+}
+
+/**
+ * What a list WRITE answers (the save and the remove): the list as it now stands, in the
+ * save's projection — every key the read serves minus `Accessibility`, a real difference
+ * from the read, not an oversight — wrapped in `{ Value, Success, Error, error_id }`. The
+ * reads serve the list bare; don't unify them.
+ *
+ * Spliced as a string because `serializeCuratedList` is what puts the 64-bit `ListId` on the
+ * wire unquoted with every digit intact, and `c.json` would undo that.
+ */
+function listWritten(c: Context<App>, list: CuratedList) {
+	const { Accessibility: _accessibility, ...saved } = list
+	return c.body(
+		`{"Value":${serializeCuratedList(saved)},"Success":true,"Error":null,"error_id":null}`,
+		200,
+		{ 'content-type': 'application/json' }
+	)
 }
 
 /** Results.Unauthorized() equivalent — 401 with empty body. */
@@ -219,9 +240,21 @@ const ROW_FEEDS: Record<string, RowFeed> = {
 const PERSONAL_ROW_FEEDS: Record<string, (db: D1Database, accountId: number) => Promise<Room[]>> = {
 	// Rooms the caller has been in, most recently visited first — the "Continue Playing"
 	// carousel as an algorithmic row. Backed by the `interaction` table's `last_visited_at`,
-	// which the `match` heartbeat stamps, and served straight from `getVisitedRooms` so this
+	// which every `match` matchmake stamps, and served straight from `getVisitedRooms` so this
 	// row and `rooms` `GET /rooms/visitedby/me` can never disagree about where someone has been.
 	recentlyvisited: (db, accountId) => getVisitedRooms(db, accountId, 0, LIST_SIZE),
+}
+
+/**
+ * Rows that are a HAND-CURATED list in the `list` table, keyed by row slug and naming the
+ * list behind it. The list is the Coach's (account 1), of the row's requested `type`, so
+ * staff edit a row by editing that list's `list_item`s; its insertion order is the row's.
+ *
+ * The owner is pinned rather than matched on name alone: any player can create a list of any
+ * name through `createlistifneeded`, and a name-only lookup would let one fill the row.
+ */
+const LIST_ROWS: Record<string, string> = {
+	staffpicks: 'staffpicks',
 }
 
 /**
@@ -731,7 +764,7 @@ const app = new Hono<App>()
 	// that took an owner from the client would let anyone write into anyone's list.
 	//
 	// Answers the list as it now stands rather than an acknowledgement, so the row the client
-	// re-renders is the one this call just changed.
+	// re-renders is the one this call just changed — wrapped, see `listWritten`.
 	.put(
 		'/curatedlists/:name/items/:itemId/createlistifneeded',
 		describeRoute({
@@ -751,15 +784,16 @@ const app = new Hono<App>()
 				're-renders is the one this call just changed. Saving the same item twice leaves it in',
 				'the list once.',
 				'',
-				'The response drops `Accessibility`, which the read keeps. That is a real difference in',
-				'what the client is sent, not an oversight — every other key, and their order, is the',
-				'read’s.',
+				'The list comes wrapped in a `{ Value, Success, Error, error_id }` envelope, which the',
+				'read does not use, and drops `Accessibility`, which the read keeps. Both are real',
+				'differences in what the client is sent, not oversights — every other key, and their',
+				'order, is the read’s.',
 			].join('\n'),
 			security: AUTHED,
 			parameters: [SAVE_LIST_NAME_PARAM, ITEM_ID_PARAM],
 			requestBody: form(SaveItemBody, 'Applied only when the list is created'),
 			responses: {
-				200: json(CuratedListSaved, 'The list as it now stands, without `Accessibility`'),
+				200: json(CuratedListEnvelope, 'The list as it now stands, wrapped'),
 				401: UNAUTHORIZED_RESPONSE,
 			},
 		}),
@@ -785,14 +819,50 @@ const app = new Hono<App>()
 				c.req.param('itemId')
 			)
 
-			// The SAVE's projection of a list drops `Accessibility`; the read's keeps it. That is a
-			// real difference in what the client is sent, not an oversight — don't unify them.
-			// Every other key, and their order, is the read's.
-			const { Accessibility: _accessibility, ...saved } = list
+			return listWritten(c, list)
+		}
+	)
 
-			// Serialized by hand for the same reason the read is: the 64-bit `ListId` has to reach
-			// the client unquoted with every digit intact.
-			return c.body(serializeCuratedList(saved), 200, { 'content-type': 'application/json' })
+	// Remove an item from one of the caller's own lists (`DELETE /curatedlists/:listId/items/:itemId`)
+	// — what the client calls to un-save a room. The path names the list by ID rather than by
+	// name, so unlike the save the owner is not implied by the token: the list must BE the
+	// caller's, or the call is refused. Answers the list as it now stands, exactly as the save
+	// does — see `listWritten`.
+	.delete(
+		'/curatedlists/:listId/items/:itemId',
+		describeRoute({
+			tags: ['Lists', '2025'],
+			summary: 'Remove an item from the caller’s list',
+			description: [
+				'Removes an item from one of the caller’s own lists — what the client calls to un-save',
+				'a room. The path names the list by ID, so the list must belong to the token’s account:',
+				'another player’s list is refused with 403, and an unknown id is 404.',
+				'',
+				'Answers the list as it now stands exactly as the save does: wrapped in a',
+				'`{ Value, Success, Error, error_id }` envelope, without `Accessibility`.',
+				'Removing an item the list doesn’t hold answers the list unchanged, and a list that',
+				'empties is kept rather than deleted.',
+			].join('\n'),
+			security: AUTHED,
+			parameters: [LIST_ID_PARAM, REMOVE_ITEM_ID_PARAM],
+			responses: {
+				200: json(CuratedListEnvelope, 'The list as it now stands, wrapped'),
+				401: UNAUTHORIZED_RESPONSE,
+				403: { description: 'The list is another player’s (empty body)' },
+				404: { description: 'No list has that id (empty body)' },
+			},
+		}),
+		async (c) => {
+			const accountId = await authedId(c)
+			if (accountId === null) return unauthorized(c)
+
+			const listId = Number(c.req.param('listId'))
+			if (!Number.isSafeInteger(listId)) return c.body(null, 404)
+
+			const result = await removePlayerListItem(c.env.DB, accountId, listId, c.req.param('itemId'))
+			if (!result.ok) return c.body(null, result.reason === 'not_owner' ? 403 : 404)
+
+			return listWritten(c, result.list)
 		}
 	)
 
@@ -828,7 +898,9 @@ const app = new Hono<App>()
 				'`recentlyvisited` is per-caller and is the one row that reads the token; without one it',
 				'answers EMPTY rather than 401ing, since canned rooms would claim the caller visited',
 				'rooms they never did — and an empty carousel is what a brand-new account legitimately',
-				'has. A couple of store rows are hand-picked id lists.',
+				'has. A couple of store rows are hand-picked id lists. `staffpicks` serves the Coach’s',
+				'(account 1) list named `staffpicks` of the requested type from the `list` table, in',
+				'insertion order — empty until that list exists.',
 				'',
 				'Every other row — an unknown key included — answers an EMPTY 200 rather than a 404,',
 				'which the client renders as a row that failed to load instead of one it hides.',
@@ -903,6 +975,13 @@ const app = new Hono<App>()
 				const accountId = await authedId(c)
 				const rooms = accountId === null ? [] : await personal(c.env.DB, accountId)
 				return c.json({ Type: echoed, Entities: toEntities(rooms) })
+			}
+
+			// A hand-curated row serves its list's ids as stored. No list yet answers an empty row.
+			const listName = LIST_ROWS[key]
+			if (listName !== undefined) {
+				const list = await getPlayerList(c.env.DB, COACH_ACCOUNT_ID, echoed, listName)
+				return c.json({ Type: echoed, Entities: entities(list?.ItemIds ?? []) })
 			}
 
 			// A row with a live feed behind it serves that; everything else gets the canned

@@ -143,10 +143,12 @@ export const TokenRequest = z.object({
 			'refresh_token',
 			'password',
 			'urn:ietf:params:oauth:grant-type:device_code',
+			'identity_assertion',
 		])
 		.describe(
 			'Anything unrecognised (including absent) is treated as a password grant, except the ' +
-				'Studio device-code URN, which polls a code from POST /connect/deviceauthorization'
+				'Studio device-code URN, which polls a code from POST /connect/deviceauthorization, ' +
+				'and identity_assertion, the website’s Discord sign-in'
 		),
 	account_id: z.string().optional().describe('Numeric account id, as a string'),
 	username: z
@@ -183,6 +185,13 @@ export const TokenRequest = z.object({
 		.string()
 		.optional()
 		.describe('Studio device-code grant: the device_code from /connect/deviceauthorization'),
+	assertion: z
+		.string()
+		.optional()
+		.describe(
+			'identity_assertion grant: the HS256 assertion `www` minted with the shared JWT_SECRET ' +
+				'after completing a Discord OAuth2 exchange, naming the platform and platform_id it proved'
+		),
 	device_id: z
 		.string()
 		.optional()
@@ -240,6 +249,30 @@ export const ChangePasswordResponse = z.object({
 	error: z.string().optional(),
 })
 
+/** `POST /account/recoverpassword` form body — the one thing the client sends. */
+export const RecoverPasswordRequest = z.object({
+	email: z.string().describe('The address on the account; nothing else identifies it'),
+})
+
+/**
+ * `POST /account/recoverpassword` response body: the client's PascalCase result envelope,
+ * `{ Success, Error, error_id }` — the one route here that answers in it. `Error` is null
+ * on success and a sentence otherwise; `error_id` is always null (nothing here numbers its
+ * errors) and is kept because the client's decoder wants the key.
+ */
+export const RecoverPasswordResponse = z.object({
+	Success: z.boolean(),
+	Error: z.string().nullable(),
+	error_id: z.number().nullable(),
+})
+
+/** `POST /account/resetpassword` form body — what the website's reset page posts. */
+export const ResetPasswordRequest = z.object({
+	email: z.string().describe('The address the code was sent to'),
+	code: z.string().describe('The six digits from the email'),
+	newPassword: z.string().describe('Required; empty is rejected'),
+})
+
 /**
  * Spec for the `/role/:role/:id` lookups, which are identical apart from the role.
  * Both return a BARE JSON boolean rather than an object — the client reads the whole
@@ -286,16 +319,18 @@ export const RestrictionDto = z.object({
 	DisplayReason: z.string().nullable().describe('Reason shown to the player. Free text'),
 })
 
-export function roleLookup(role: 'developer' | 'moderator') {
+export function roleLookup(role: 'developer' | 'moderator' | 'screenshare') {
 	return {
 		tags: ['Roles'],
 		summary: `Whether a player has the ${role} role`,
 		description:
-			`Returns a bare JSON boolean (\`true\`/\`false\`), not an object. Off by default and ` +
-			`granted only by an operator via \`runx admin grant-${role}\`. The same flag also rides ` +
-			`in the access token's \`role\` claim, so the client rarely needs this route.\n\n` +
-			`This is the ONE-player form. \`/role/${role}?id=\` is a different question with a ` +
-			`different answer shape — which of several players hold the role, as an array.`,
+			role === 'screenshare'
+				? 'Returns a bare JSON boolean. Screenshare is disabled by default and requires an explicit staff grant, matching the access-token role policy; unknown accounts return 404. Studio uses this to validate room-owner video permissions.'
+				: `Returns a bare JSON boolean (\`true\`/\`false\`), not an object. Off by default and ` +
+					`granted only by an operator via \`runx admin grant-${role}\`. The same flag also rides ` +
+					`in the access token's \`role\` claim, so the client rarely needs this route.\n\n` +
+					`This is the ONE-player form. \`/role/${role}?id=\` is a different question with a ` +
+					`different answer shape — which of several players hold the role, as an array.`,
 		parameters: [
 			{
 				name: 'id',

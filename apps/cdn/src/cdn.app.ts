@@ -3,8 +3,10 @@ import { describeRoute, openAPIRouteHandler, resolver } from 'hono-openapi'
 import { useWorkersLogger } from 'workers-tagged-logger'
 
 import {
+	applyNoExecuteHeaders,
 	withCleanSpec,
 	withDefaultCors,
+	withNoExecute,
 	withNotFound,
 	withOnError,
 	writeContentRange,
@@ -254,6 +256,13 @@ const app = new Hono<App>()
 	// unchanged by who may read a response they already had to name exactly.
 	.use('*', withDefaultCors())
 
+	// The blob routes force `application/octet-stream` over whatever type an upload was
+	// stored with, which is what keeps a stored HTML body from rendering; `nosniff` makes
+	// that type binding on the browser, and the sandboxing CSP covers the config files,
+	// which go out under their own types. The hand-rolled HEAD below is outside this chain
+	// and stamps the same headers itself.
+	.use('*', withNoExecute())
+
 	.onError(withOnError())
 	.notFound(withNotFound())
 
@@ -458,6 +467,29 @@ const app = new Hono<App>()
 		(c) => serveAsset(c, `avatar/${c.req.param('asset')}`)
 	)
 
+	// SDK source downloads use an opaque upload capability (no bearer on this
+	// request). Only creator-authenticated save history exposes these filenames.
+	.get('/avatarunityasset/:filename{.+}', (c) => {
+		const name = c.req.param('filename')
+		if (!/^\d{4}-\d{2}-\d{2}\/[0-9a-f-]{36}$/.test(name)) return c.notFound()
+		return serveAsset(c, `avatarunityasset/${name}`)
+	})
+	// Editable Unity source manifests. Baked bundles are served separately.
+	.get(
+		'/roomunityasset/:filename{.+}',
+		describeRoute({
+			tags: ['Assets'],
+			summary: 'Download a Studio authoring manifest',
+			parameters: [keyParam('filename', 'Uploaded JSON source manifest', true)],
+			responses: assetResponses('The source manifest'),
+		}),
+		async (c) => {
+			const name = c.req.param('filename')
+			if (name.includes('..')) return c.body(null, 400)
+			return serveAsset(c, `roomunityasset/${name}`)
+		}
+	)
+
 	// Rec Room Studio room bundles. The filename is the one a room save or
 	// `GET …/unityasset` advertises, as `unity_asset.filename` records it. Studio
 	// stores these under `room/studio/<roomId>/…`. Only a recorded filename is served, so this
@@ -510,15 +542,22 @@ const app = new Hono<App>()
  * prefix as the game's direct download URL. Null when no build is, or the table has not been migrated
  * yet (the rooms worker owns it).
  */
-async function unityAssetR2Key(db: D1Database, filename: string): Promise<string | null> {
+async function unityAssetR2Key(env: StudioAssetEnv, filename: string): Promise<string | null> {
 	try {
 		// Inlined rather than imported so this worker does not take a dependency on the
 		// domain package.
-		const row = await db
-			.prepare(`SELECT 1 AS stored FROM unity_asset WHERE filename = ?1 LIMIT 1`)
+		const row = await env.DB.prepare(
+			`SELECT 1 AS stored FROM unity_asset WHERE filename = ?1 LIMIT 1`
+		)
 			.bind(filename)
 			.first<{ stored: number }>()
-		return row ? (filename.startsWith('studio/') ? `room/${filename}` : filename) : null
+		if (!row) return null
+		if (/^(quest\/)?studio-avatar\//.test(filename)) return `avatar/${filename}`
+		// Room builds and consumable exports use the game's /room namespace.
+		// Retain older installations that stored the same filename at the bucket root.
+		if (filename.startsWith('studio/') && (await env.CDN_ASSETS.head(`room/${filename}`)))
+			return `room/${filename}`
+		return filename
 	} catch (err) {
 		const message = err instanceof Error ? err.message : String(err)
 		if (message.toLowerCase().includes('no such table')) return null
@@ -530,18 +569,16 @@ async function unityAssetR2Key(db: D1Database, filename: string): Promise<string
 async function serveUnityAsset(c: Context<App>) {
 	const name = c.req.param('filename') ?? ''
 	if (name.includes('..')) return c.body(null, 400)
-	const key = await unityAssetR2Key(c.env.DB, name)
-	if (!key) return c.notFound()
-	return serveAsset(c, key)
+	const key = await unityAssetR2Key(c.env, name)
+	return serveAsset(c, key ?? `unityasset/${name}`)
 }
 
 /** Build the Studio bundle HEAD response outside Hono's HEAD-to-GET fallback. */
 async function studioUnityAssetHead(env: StudioAssetEnv, name: string): Promise<Response> {
 	if (name.includes('..')) return new Response(null, { status: 400 })
-	const key = await unityAssetR2Key(env.DB, name)
-	if (!key) return new Response(null, { status: 404 })
 	if (!env.CDN_ASSETS) return new Response(null, { status: 404 })
-	const head = await env.CDN_ASSETS.head(key)
+	const key = await unityAssetR2Key(env, name)
+	const head = await env.CDN_ASSETS.head(key ?? `unityasset/${name}`)
 	if (!head) return new Response(null, { status: 404 })
 
 	const headers = new Headers()
@@ -550,6 +587,7 @@ async function studioUnityAssetHead(env: StudioAssetEnv, name: string): Promise<
 	headers.set('accept-ranges', 'bytes')
 	headers.set('cache-control', CACHE_CONTROL)
 	headers.set('access-control-allow-origin', '*')
+	applyNoExecuteHeaders(headers)
 	const response = new Response(null, { status: 200, headers, encodeBody: 'manual' })
 	response.headers.set('content-length', String(head.size))
 	return response

@@ -17,6 +17,23 @@ export type Env = SharedHonoEnv & {
 	// Shared `recflare-cdn` bucket. Local Studio builds land under
 	// `room/studio/<roomId>/`. The same bucket name the rooms and cdn workers bind.
 	CDN_ASSETS: R2Bucket
+	/**
+	 * Private pull-worker credential, out of the shared Secrets Store (same store as
+	 * JWT_SECRET). Read it through `cloudBuildKey()` in cloud-builds.ts, never `.get()`
+	 * directly: the value `off` (or an unreadable secret) means cloud building is disabled.
+	 */
+	CLOUD_BUILD_KEY: SecretsStoreSecret
+	CLOUD_BUILD_TARGETS?: string
+	CLOUD_BUILD_TEMPLATE_VERSION?: string
+	/** R2 key of an operator-published template catalog; unset disables downloads. */
+	STUDIO_DISTRIBUTION_MANIFEST?: string
+	/**
+	 * Discord role ids whose holders have Studio upload access without the account's
+	 * `hasStudio` flag (`RECFLARE_STUDIO_ROLLOUT` in the root `.env`; the same var `auth`
+	 * stamps `betastudio` from). The access lookups here rebuild the role from the account
+	 * rather than a token, so they read it through the same `hasStudioAccess`.
+	 */
+	STUDIO_ROLLOUT?: string
 }
 
 /** Variables can be extended */

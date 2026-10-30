@@ -1,4 +1,4 @@
-import { validateAndGetAccountId, validateAndGetRoles } from '@repo/jwt'
+import { validateAndGetAccountId, validateAndGetPlus, validateAndGetRoles } from '@repo/jwt'
 
 import type { Context } from 'hono'
 import type { App } from './context'
@@ -20,6 +20,15 @@ export async function authedId(c: Context<App>): Promise<number | null> {
  */
 export async function authedRoles(c: Context<App>): Promise<string[] | null> {
 	return validateAndGetRoles(c.req.raw, await c.env.JWT_SECRET.get())
+}
+
+/**
+ * Whether the caller's token carries the `rn.plus` claim — Rec Room Plus, stamped by `auth`
+ * from `account.hasPlus` at sign-in (so a newly granted player must sign in again). The same
+ * test as `econ`'s `isSubscriber`; nothing re-reads the account for it.
+ */
+export async function authedPlus(c: Context<App>): Promise<boolean> {
+	return validateAndGetPlus(c.req.raw, await c.env.JWT_SECRET.get())
 }
 
 /** Results.Unauthorized() equivalent — 401 with empty body. */

@@ -29,6 +29,13 @@ export const CatalogKind = {
 	Skin: 'skin',
 	/** A consumable: food, a potion, a KO icon. Its `item_key` is the `ConsumableItemDesc`. */
 	Consumable: 'consumable',
+	/**
+	 * A first-party custom avatar item the store lists. Its `item_key` is the
+	 * `CustomAvatarItemId`. The ITEM lives in `api`'s `custom_avatar_item` table (`just cai-load`)
+	 * and is resolved there; the row here exists for its LISTING, so a `PurchasableItemId` lookup
+	 * answers for every item the store sells. Only the shared columns are filled.
+	 */
+	CustomAvatarItem: 'custom_avatar_item',
 } as const
 
 export type CatalogKindValue = (typeof CatalogKind)[keyof typeof CatalogKind]
@@ -114,15 +121,13 @@ export interface SkinCapture {
 /**
  * What a store listing SELLS — the catalog kind it loads as, or why it loads as nothing.
  *
- * `custom_avatar_item` listings are first-party UGC: they live in the `custom_avatar_item`
- * table (`just cai-load`), not here. `query` is a loot box and `currency` a token bundle —
+ * `query` is a loot box and `currency` a token bundle —
  * neither is an item. `unknown` carries no id at all (two expo items the dump prices at
  * nothing). `consumable_pack` is assigned by the load rather than by {@link listingKind}: a
  * consumable the store sells singly AND as a pack ("Disco Dance Break", "… 3-Pack") is one
  * consumable listed twice, and the catalog is of things, not of listings.
  */
-export type ListingKind =
-	CatalogKindValue | 'custom_avatar_item' | 'query' | 'currency' | 'unknown' | 'consumable_pack'
+export type ListingKind = CatalogKindValue | 'query' | 'currency' | 'unknown' | 'consumable_pack'
 
 /** Classify one listing by which of its item ids is set. */
 export function listingKind(listing: StoreListing): ListingKind {
@@ -131,7 +136,7 @@ export function listingKind(listing: StoreListing): ListingKind {
 	if (drop.ConsumableItemDesc !== '') return CatalogKind.Consumable
 	if (drop.EquipmentModificationGuid !== '') return CatalogKind.Skin
 	if (drop.CustomAvatarItemId !== null && drop.CustomAvatarItemId !== '') {
-		return 'custom_avatar_item'
+		return CatalogKind.CustomAvatarItem
 	}
 	if (drop.IsQuery) return 'query'
 	if (drop.Currency > 0) return 'currency'
@@ -270,6 +275,7 @@ export const CATALOG_INSERT_COLUMNS = [
 	'created_at',
 	'prefab_name',
 	'unlocked_level',
+	'listing',
 ] as const
 
 /** A value bound into a load's INSERT. `undefined` is a key the capture omitted. */
@@ -332,6 +338,7 @@ function avatarItemRow(listing: StoreListing): CatalogLoadRow {
 			null,
 			null,
 			null,
+			JSON.stringify(listing),
 		],
 	}
 }
@@ -359,6 +366,7 @@ function consumableRow(listing: StoreListing): CatalogLoadRow {
 			null,
 			null,
 			null,
+			JSON.stringify(listing),
 		],
 	}
 }
@@ -386,6 +394,39 @@ function listedSkinRow(listing: StoreListing): CatalogLoadRow {
 			null,
 			drop.EquipmentPrefabName,
 			null,
+			JSON.stringify(listing),
+		],
+	}
+}
+
+/**
+ * A listed first-party custom avatar item: the shared columns, keyed by its
+ * `CustomAvatarItemId`. The record itself is `api`'s; this row carries the listing.
+ */
+function customAvatarItemRow(listing: StoreListing): CatalogLoadRow {
+	const drop = listing.GiftDrop
+	const guid = drop.CustomAvatarItemId as string
+	return {
+		key: guid,
+		id: listing.PurchasableItemId,
+		label: `${drop.FriendlyName} (custom avatar item)`,
+		values: [
+			guid,
+			listing.PurchasableItemId,
+			CatalogKind.CustomAvatarItem,
+			drop.FriendlyName,
+			drop.Tooltip,
+			drop.Rarity,
+			ALL_PLATFORMS,
+			drop.ThumbnailImageName,
+			null,
+			null,
+			null,
+			drop.TagList,
+			null,
+			null,
+			null,
+			JSON.stringify(listing),
 		],
 	}
 }
@@ -444,6 +485,9 @@ export function buildCatalogLoad(listings: StoreListing[]): CatalogLoad {
 				break
 			case CatalogKind.Skin:
 				push(listedSkinRow(listing))
+				break
+			case CatalogKind.CustomAvatarItem:
+				push(customAvatarItemRow(listing))
 				break
 			default:
 				skipped[kind] = (skipped[kind] ?? 0) + 1

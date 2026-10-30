@@ -48,12 +48,13 @@ const app = new Hono<App>()
 		return c.json([])
 	})
 
-	// Sampling configuration, asked for once per session (`?sessionId=<guid>`). An empty
-	// object carries no per-event overrides, which the client reads as "sample everything
-	// at the built-in default rates". Since the events are discarded anyway, the rate it
-	// picks makes no difference here.
+	// Sampling configuration, asked for once per session (`?sessionId=<guid>`). A BARE ARRAY
+	// of `{ EventType, ShouldBeSampled }` entries (the client decodes a `List<EventDTO>`),
+	// e.g. `[{ "EventType": "player_join", "ShouldBeSampled": true }]` — not an object: the
+	// `{}` this once served made the client's decoder throw. Empty says "sample nothing",
+	// which is the right answer since the events are discarded anyway.
 	.get('/sampling', async (c) => {
-		return c.json({})
+		return c.json([])
 	})
 
 export default app

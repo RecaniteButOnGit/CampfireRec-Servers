@@ -1,9 +1,11 @@
 import { Hono } from 'hono'
 import { describeRoute } from 'hono-openapi'
 
-import { isSupportedGameVersion } from '@repo/domain'
+import { GAME_VERSION, isSupportedGameVersion, supportedGameBuilds } from '@repo/domain'
+import { validateAndGetBuild } from '@repo/jwt'
 
 import apiConfigV2 from '../../static/api-config-v2.json'
+import gameConfigsV1All2025 from '../../static/gameconfigs-v1-all-2025.json'
 import gameConfigsV1All from '../../static/gameconfigs-v1-all.json'
 import {
 	AmplitudeConfig,
@@ -71,15 +73,15 @@ export const configRoutes = new Hono<App>({ strict: false })
 		}),
 		(c) =>
 			c.json({
-				ReportBudget: 125,
+				ReportBudget: 0,
 				FilterType: 0,
-				SampleRate: 1,
-				LogLineCount: 50,
-				CaptureNativeCrashes: 1,
-				AMRThresholdMS: 0,
-				MessageCount: 1000,
-				MessageRegex: '^.*$',
-				VersionRegex: '.*',
+				SampleRate: 0,
+				LogLineCount: 0,
+				CaptureNativeCrashes: 0,
+				ANRThresholdMs: 0,
+				MessageCount: 0,
+				MessageRegex: '',
+				VersionRegex: '',
 			})
 	)
 	// ShareBaseUrl is derived from the deploy-time base domain; the rest of the
@@ -104,13 +106,17 @@ export const configRoutes = new Hono<App>({ strict: false })
 			summary: 'Client version check',
 			description:
 				'Whether the client build is current. Compares the client’s `?v=` build against ' +
-				'the builds we serve (`SUPPORTED_GAME_VERSIONS`): `VersionStatus` is 0 when the ' +
-				'client is on one of them, 1 when it is on some other build.',
+				'the builds we serve — the operator’s `SUPPORTED_GAME_VERSIONS` var (or the ' +
+				'default list in `@repo/domain`) plus every build under rollout ' +
+				'(`ROLLOUT_GAME_VERSIONS`): `VersionStatus` is 0 when the client is on one of ' +
+				'them, 1 when it is on some other build. The same lists decide which builds ' +
+				'`auth` hands a token to, so a build dropped from them is told to update here ' +
+				'and refused there.',
 			responses: { 200: json(VersionCheck, 'Version status') },
 		}),
 		(c) =>
 			c.json({
-				VersionStatus: isSupportedGameVersion(c.req.query('v')) ? 0 : 1,
+				VersionStatus: isSupportedGameVersion(c.req.query('v'), supportedGameBuilds(c.env)) ? 0 : 1,
 				UpdateNotificationStage: 0,
 				IsVersionIslanded: false,
 				IsCrossPlayDisabled: false,
@@ -131,11 +137,20 @@ export const configRoutes = new Hono<App>({ strict: false })
 		}),
 		(c) => c.json([])
 	)
-	// The only supported client is the June 2024 build (`20240621`). The 2025 catalog
-	// contains keys that build does not know how to consume. Until we have an observed,
-	// build-matched 2024 catalog, serve the known pre-2025 catalog to every caller; the
-	// version gate rejects every other build separately. Keeping this route independent of
-	// auth also lets the client fetch bootstrap config before it has a token.
+	// Two catalogs, one per client generation: pre-2025 clients and 2025+ clients read
+	// different keys out of this, and the newer catalog carries entries (`Screens.*`, the
+	// creative-door queries) the older catalog never had.
+	//
+	// Which one a caller gets is decided by the token's `rn.ver` claim — the build the
+	// client posted at login — since the request itself carries no version. Anything NEWER
+	// than `GAME_VERSION` (20240621) gets the newer catalog; that build and anything older
+	// get the pre-2025 one. Builds are date-stamped (`20240621`, `20250718`), so they order
+	// as strings — compared as BUILDS, a same-day point release stays on the same catalog.
+	//
+	// A request with no readable token version gets the 2023 catalog, the same body this
+	// route has always served: unauthenticated is not evidence of a newer client, and this
+	// stack targets `GAME_VERSION`. Like the version gate on `featuredrooms`, the claim is
+	// unverified — a client that lies about its build only misconfigures itself.
 	.get(
 		'/api/gameconfigs/v1/all',
 		describeRoute({
@@ -144,11 +159,15 @@ export const configRoutes = new Hono<App>({ strict: false })
 			description:
 				'An opaque static catalog of per-game settings. This server supports the June 2024 ' +
 				'build and serves it the known pre-2025 catalog because the 2025 catalog includes ' +
-				'keys the 2024 client cannot consume. The endpoint is available before login; all ' +
-				'other builds are rejected by the version gate.',
+				'keys the 2024 client cannot consume. Newer builds receive the 2025 catalog. ' +
+				'The endpoint is available before login.',
 			responses: { 200: json(JsonObject, 'The game config catalog for the caller’s build') },
 		}),
-		(c) => c.json(gameConfigsV1All)
+		async (c) => {
+			const build = await validateAndGetBuild(c.req.raw, await c.env.JWT_SECRET.get())
+			const newerThanTarget = build !== null && build > GAME_VERSION
+			return c.json(newerThanTarget ? gameConfigsV1All2025 : gameConfigsV1All)
+		}
 	)
 
 	// The property bag the client would attach to its Statsig user. The reference server

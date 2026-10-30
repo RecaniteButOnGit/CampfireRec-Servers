@@ -2,6 +2,7 @@ import { resolve } from 'node:path'
 
 import { FileAssets } from './assets-adapter'
 import { SQLiteD1 } from './d1-adapter'
+import { ResendEmail } from './email-adapter'
 import { RedisKV } from './kv-adapter'
 import { NodeNotificationsHub } from './notifications-adapter'
 import { S3Bucket } from './r2-adapter'
@@ -27,6 +28,9 @@ export function buildEnvironment(db: SQLiteD1) {
   const base = {
     DB: db as unknown as D1Database,
     JWT_SECRET: secret(process.env.JWT_SECRET), META_APP_SECRET: secret(process.env.META_APP_SECRET),
+    CLOUD_BUILD_KEY: secret(process.env.CLOUD_BUILD_KEY || 'off'),
+    EMAIL: new ResendEmail(process.env.RESEND_API_KEY),
+    EMAIL_FROM: process.env.EMAIL_FROM,
     OPENAIKEY: process.env.OPENAIKEY ? secret(process.env.OPENAIKEY) : undefined,
     RRTOKEN: process.env.RRTOKEN ? secret(process.env.RRTOKEN) : undefined,
     OPENAI_REALTIME_MODEL: process.env.OPENAI_REALTIME_MODEL,
@@ -43,6 +47,9 @@ export function buildEnvironment(db: SQLiteD1) {
     ...Object.fromEntries([
       'PHOTON_REALTIME_APP_ID', 'PHOTON_VOICE_APP_ID', 'PHOTON_CHAT_APP_ID', 'PHOTON_REGION',
       'TACHYON_HOST_PORT', 'TACHYON_HOST_PORT_SANDBOX', 'STARTING_TOKENS', 'ROOM_REDIRECTS',
+      'TACHYON_HOST_PORT_ROLLOUT', 'TACHYON_ROLLOUT_GAME_VERSIONS',
+      'SUPPORTED_GAME_VERSIONS', 'ROLLOUT_GAME_VERSIONS', 'DISCORD_ROLLOUT_ROLE_IDS', 'STUDIO_ROLLOUT',
+      'CLOUD_BUILD_TARGETS', 'CLOUD_BUILD_TEMPLATE_VERSION', 'STUDIO_DISTRIBUTION_MANIFEST',
       'MAX_UPLOAD_BYTES', 'MAX_ACCOUNTS_PER_PLATFORM_ID', 'MAX_ACCOUNTS_PER_IP', 'MAX_ACCOUNTS_PER_DEVICE_ID',
       'PASSWORD_SIGNUP', 'MAX_ROOMS_PER_ACCOUNT',
       'MAX_CLUBS_PER_ACCOUNT', 'MAX_TOKEN_GIFT', 'MAX_XP_GIFT', 'BAN_EVASION_MATCH',

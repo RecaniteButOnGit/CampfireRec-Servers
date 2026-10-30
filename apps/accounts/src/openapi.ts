@@ -2,6 +2,7 @@ import { resolver } from 'hono-openapi'
 import { z } from 'zod'
 
 import {
+	displayNameRejection,
 	isValidBio,
 	isValidEmail,
 	MAX_DISPLAY_NAME_LENGTH,
@@ -97,6 +98,12 @@ export const SelfAccountDto = AccountDto.extend({
 		),
 	birthday: z.iso.datetime().describe('A fixed placeholder — birthdays are not stored'),
 	availableUsernameChanges: z.int().describe('Remaining username changes'),
+	isDeleted: z
+		.boolean()
+		.describe(
+			'Whether the player asked the website to delete this account (a mark, not a deletion)'
+		),
+	deletedAt: z.iso.datetime().optional().describe('When they asked; present only when isDeleted'),
 })
 
 /** Player bio, from `GET /account/:id/bio`. */
@@ -181,12 +188,12 @@ export const CreateAccountRequest = z.object({
  * sentence that explains it rather than two, and the swear check never sees the
  * punctuation the charset rule has already refused.
  */
-const nameCheck = (label: string, max: number) =>
+const nameCheck = (label: string, rejectionFor: (value: string) => string | null) =>
 	z
 		.string()
 		.trim()
 		.superRefine((value, ctx) => {
-			const rejection = nameRejection(value, label, max)
+			const rejection = rejectionFor(value)
 			if (rejection !== null) {
 				ctx.addIssue({ code: 'custom', message: rejection })
 			} else if (nameContainsSwears(value)) {
@@ -197,15 +204,15 @@ const nameCheck = (label: string, max: number) =>
 		})
 
 export const DisplayNameRequest = z.object({
-	displayName: nameCheck('display name', MAX_DISPLAY_NAME_LENGTH)
+	displayName: nameCheck('display name', displayNameRejection)
 		.min(1)
 		.describe(
-			'Trimmed; letters and digits only, max 15, no profanity. Empty or invalid is rejected (400)'
+			`Trimmed; Latin letters, digits, spaces and .,'!?_&()#@:+- only, max ${MAX_DISPLAY_NAME_LENGTH}, no profanity. Empty or invalid is rejected (400)`
 		),
 })
 
 export const UsernameRequest = z.object({
-	username: nameCheck('username', MAX_USERNAME_LENGTH)
+	username: nameCheck('username', (value) => nameRejection(value, 'username', MAX_USERNAME_LENGTH))
 		.min(1, 'You must enter a username.')
 		.describe(
 			'Trimmed; letters and digits only, max 50, no profanity. Must be unique and changes must remain'
@@ -229,6 +236,38 @@ export const EmailRequest = z.object({
 		.refine(isValidEmail, 'That email address looks wrong.')
 		.describe('A syntactically valid address (RFC 5321/5322, so at most 254); otherwise 400'),
 })
+
+/** `POST /account/me/email/confirm` form body. */
+export const EmailConfirmRequest = z.object({
+	code: z
+		.string()
+		.trim()
+		.min(1, 'Enter the code from the email.')
+		.describe('The six digits from the email'),
+})
+
+/** `POST /account/me/email/confirm` response body. */
+export const EmailConfirmResponse = z.object({
+	success: z.literal(true),
+	applied: z.boolean().describe('Whether the change has landed, or a second code is now out'),
+	pending: z.string().nullable().describe('The new address, while a second code is out'),
+	sentTo: z.string().nullable().describe('Where that second code went (the new address)'),
+})
+
+/** `GET /account/me/email/pending` response body. */
+export const PendingEmailResponse = z.object({
+	pending: z
+		.string()
+		.nullable()
+		.describe('The address awaiting confirmation, or null when no change is in flight'),
+	sentTo: z
+		.string()
+		.nullable()
+		.describe('Where the code went: the current address, or the new one when there was none'),
+})
+
+/** The `{ success: false, error }` the email routes refuse with. */
+export const EmailRefusal = z.object({ success: z.literal(false), error: z.string() })
 
 export const PhoneRequest = z.object({
 	// No shape rule on purpose: the client sends E.164 (`+15552223333`), which the name

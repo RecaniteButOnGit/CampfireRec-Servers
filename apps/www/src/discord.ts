@@ -5,8 +5,10 @@ import type { Env } from './context'
 /**
  * Discord OAuth2, the identity check behind the website's benefits claim.
  *
- * A player proves they hold one of the qualifying roles in the community Discord, and
- * the claim grants them Rec Room Plus (`account.hasPlus`). The proof is a real OAuth2
+ * A player links their Discord to their account: the claim records the roles they hold
+ * in the community Discord on the link (read in-game, e.g. by `auth`'s rollout gate), and
+ * if one of them is a qualifying role it also grants Rec Room Plus (`account.hasPlus`).
+ * The link happens whether or not a qualifying role is held. The proof is a real OAuth2
  * AUTHORIZATION CODE exchange, not a token the browser hands us: the SPA sends only the
  * short-lived `code` Discord redirected it back with, and this worker swaps that for an
  * access token using the client SECRET, which — like the Turnstile secret next door —
@@ -52,6 +54,15 @@ export const AUTHORIZE_URL = 'https://discord.com/oauth2/authorize'
  * A space-joined string because that is how the authorize URL takes them.
  */
 export const SCOPES = 'identify guilds.members.read'
+
+/**
+ * What "Sign in with Discord" asks for: the user's id and nothing else. The sign-in has no
+ * question to ask about the guild — it only needs to know WHO, so the account linked to that
+ * Discord user can be signed into (or made). Asking for the member read here would put a
+ * permission on the consent screen that the sign-in never uses; the benefits claim is where
+ * roles are read, with its own consent.
+ */
+export const LOGIN_SCOPES = 'identify'
 
 /** Everything the claim needs configured. Resolved per request; see `discordConfig`. */
 export interface DiscordConfig {
@@ -169,6 +180,15 @@ export async function readSecret(secret: SecretsStoreSecret, name: string): Prom
 export const redirectUri = (request: Request): string => new URL('/claim', request.url).toString()
 
 /**
+ * The sign-in's return leg — its own registered redirect, so Discord sends a sign-in back to
+ * a page that knows it is one. `/claim` can't double for it: that page needs a session
+ * before it does anything, and a sign-in is how the session gets made. Same derivation,
+ * same byte-for-byte rule, same reason the SPA doesn't get to supply it. See App.tsx.
+ */
+export const loginRedirectUri = (request: Request): string =>
+	new URL('/login/discord', request.url).toString()
+
+/**
  * Swap an authorization code for an access token. Returns null on any refusal — a code
  * that was already spent, expired (they live ~1 minute), issued to another app, or paired
  * with a different redirect URI all land here, and none of them is worth telling the
@@ -272,6 +292,39 @@ export async function fetchGuildMembership(
 		}
 	} catch (err) {
 		logger.error('could not reach discord to read a guild membership', { error: String(err) })
+		return null
+	}
+}
+
+/** Who a token belongs to — the `identify` scope's one answer. */
+export interface DiscordUser {
+	/** The Discord user's id (a snowflake, kept as a string — it exceeds 2^53). */
+	id: string
+	/** Their Discord username, for the confirmation line. Display only, never stored. */
+	username: string
+}
+
+/**
+ * The token owner's own Discord user, or null when Discord won't say or can't be reached.
+ * The sign-in's one read: it needs the id, and `identify` grants exactly `GET /users/@me`.
+ */
+export async function fetchUser(accessToken: string): Promise<DiscordUser | null> {
+	try {
+		const res = await fetch(`${API_BASE}/users/@me`, {
+			headers: { authorization: `Bearer ${accessToken}` },
+		})
+		if (!res.ok) {
+			logger.info('discord did not return the token owner', { status: res.status })
+			return null
+		}
+		const user = (await res.json()) as { id?: unknown; username?: unknown }
+		if (typeof user.id !== 'string' || user.id === '') {
+			logger.error('discord returned a user with no id')
+			return null
+		}
+		return { id: user.id, username: typeof user.username === 'string' ? user.username : '' }
+	} catch (err) {
+		logger.error('could not reach discord to read the token owner', { error: String(err) })
 		return null
 	}
 }

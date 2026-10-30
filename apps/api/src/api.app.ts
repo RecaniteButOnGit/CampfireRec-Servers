@@ -6,6 +6,7 @@ import { withCleanSpec, withDefaultCors, withNotFound, withOnError } from '@repo
 
 import { accountRoutes } from './routes/account'
 import { avatarRoutes } from './routes/avatar'
+import { avatarStudioRoutes } from './routes/avatar-studio'
 import { configRoutes } from './routes/config'
 import { eventRoutes } from './routes/events'
 import { gameplayRoutes } from './routes/gameplay'
@@ -56,6 +57,7 @@ const app = new Hono<App>({ strict: false })
 	.route('/', configRoutes)
 	.route('/', socialRoutes)
 	.route('/', progressionRoutes)
+	.route('/', avatarStudioRoutes)
 	.route('/', avatarRoutes)
 	.route('/', gameplayRoutes)
 	.route('/', eventRoutes)

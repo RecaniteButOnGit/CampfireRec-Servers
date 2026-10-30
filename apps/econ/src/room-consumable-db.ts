@@ -11,14 +11,17 @@
  *    names an existing `RoomConsumableId`
  *  - `GET /api/roomconsumables/v1/roomConsumable/room/{roomId}` lists a room's
  *  - `POST /api/roomconsumables/v1/roomConsumable/awardBulk` gives one to a player
+ *  - `PUT /api/roomconsumables/v1/roomconsumable/{id}/purchase/tokens` and `…/purchase/currency`
+ *    sell one, in tokens or the listing's room currency
+ *  - `PUT /api/roomconsumables/v1/roomConsumable/{id}/consume` uses up one the caller holds
  *
  * `PurchaseCurrencyId` is a `room_currency`, so a room prices its goods in its own money. It
  * is nullable — `Guid?` in the client's model — for a listing that names no currency, and
  * nothing here resolves or validates it yet: a consumable priced in a currency that has since
  * been deleted still lists, at a price nobody can pay.
  *
- * Nothing BUYS one yet. There is no purchase endpoint, so `MaximumCountPerPurchase` is stored
- * and served and read by nothing.
+ * A null `PurchaseCurrencyId` is priced in TOKENS, which the purchase pays to the room's
+ * owner; `MaximumCountPerPurchase` caps a purchase's `Quantity` (0 means no cap).
  *
  * This worker (`econ`) owns the tables and their migrations — see apps/econ/migrations/,
  * 0021 (the listings) and 0022 (what players own of them).
@@ -72,7 +75,7 @@ export interface RoomConsumable {
 	PurchaseCurrencyId: string | null
 	/** ISO-8601 UTC. */
 	ModifiedAt: string
-	/** How many may be bought at once. Stored and served; nothing buys a consumable yet. */
+	/** How many may be bought at once; 0 is no cap. */
 	MaximumCountPerPurchase: number
 }
 
@@ -201,7 +204,7 @@ export async function getRoomConsumables(
 
 /**
  * What a player owns of a room's consumables — the shop's other side, filled by
- * `POST /api/roomconsumables/v1/roomConsumable/awardBulk`.
+ * `POST /api/roomconsumables/v1/roomConsumable/awardBulk` and by the purchase.
  *
  * Keyed by CONSUMABLE, not by room: `room_consumable` already says which room a listing
  * belongs to, and repeating it here would be a second place for that to be wrong. A missing
@@ -212,12 +215,18 @@ export async function getRoomConsumables(
  * `consumable_id` is not a foreign key, but the award route checks the listing exists before
  * writing: an inventory row naming nothing would be a thing a player owns that cannot be
  * described.
+ *
+ * `concurrency_code` is the last `NewConcurrencyCode` a write sent, served back as the item's
+ * `ConcurrencyCode`; nothing checks it — no optimistic concurrency is implemented. It and
+ * `modified_at` came in migration 0029, so a row older than that has both null.
  */
 export const ROOM_INVENTORY_SCHEMA_DDL: string[] = [
 	`CREATE TABLE IF NOT EXISTS room_inventory (
 		player_id INTEGER NOT NULL,
 		consumable_id TEXT NOT NULL,
 		quantity INTEGER NOT NULL DEFAULT 0,
+		concurrency_code TEXT,
+		modified_at TEXT,
 		PRIMARY KEY (player_id, consumable_id)
 	)`,
 	// "What does this player own?" is the read the client makes on entering a room, so the
@@ -225,15 +234,67 @@ export const ROOM_INVENTORY_SCHEMA_DDL: string[] = [
 	`CREATE INDEX IF NOT EXISTS idx_room_inventory_player ON room_inventory (player_id)`,
 ]
 
-/** What a player owns of one consumable. */
-export interface RoomInventoryItem {
-	PlayerId: number
-	ConsumableId: string
-	Quantity: number
+/**
+ * The listing as it rides inside a {@link RoomConsumableInventoryItem}: the catalogue's
+ * {@link RoomConsumable} plus `IsGiftable` and `Visibility`, and `ImageName` as '' rather
+ * than null — observed from the live client, and NOT what the room's catalogue
+ * (`GET …/roomConsumable/room/{roomId}`) serves. Neither extra field is modelled here, so
+ * both are their false/0.
+ */
+export interface InventoryConsumable extends Omit<RoomConsumable, 'ImageName'> {
+	ImageName: string
+	IsGiftable: boolean
+	Visibility: number
 }
 
 /**
- * Give a player some of a consumable, returning what they own afterwards.
+ * What a player owns of one consumable, as the client reads it — `RoomConsumableInventoryItem`,
+ * observed from the live client. The element of `GET …/roomConsumable/room/{roomId}/me` and
+ * the `InventoryItem` a purchase answers with.
+ */
+export interface RoomConsumableInventoryItem {
+	RoomConsumableId: string
+	AccountId: number
+	/** The RESULTING total owned, never the change. */
+	Count: number
+	/** The last `NewConcurrencyCode` written; null on a row older than migration 0029. */
+	ConcurrencyCode: string | null
+	/** ISO-8601 UTC — the last write; the listing's own time on a row older than 0029. */
+	ModifiedAt: string
+	Consumable: InventoryConsumable
+}
+
+/** What a player holds of one consumable — the row, before it is joined to its listing. */
+export interface RoomInventoryHolding {
+	quantity: number
+	concurrencyCode: string | null
+	modifiedAt: string | null
+}
+
+/** Project a holding and its listing onto the client's inventory item. */
+export function toInventoryItem(
+	accountId: number,
+	holding: RoomInventoryHolding,
+	consumable: RoomConsumable
+): RoomConsumableInventoryItem {
+	return {
+		RoomConsumableId: consumable.RoomConsumableId,
+		AccountId: accountId,
+		Count: holding.quantity,
+		ConcurrencyCode: holding.concurrencyCode,
+		ModifiedAt: holding.modifiedAt ?? consumable.ModifiedAt,
+		Consumable: {
+			...consumable,
+			ImageName: consumable.ImageName ?? '',
+			IsGiftable: false,
+			Visibility: 0,
+		},
+	}
+}
+
+/**
+ * Give a player some of a consumable, returning what they hold afterwards. `concurrencyCode`
+ * is the request's `NewConcurrencyCode`, stored to be served back; null leaves the stored one.
  *
  * Floored at zero in the statement itself, so a negative `quantity` deducts without a
  * deduction and a concurrent award racing it below zero. Returns the RESULTING total, never
@@ -249,48 +310,116 @@ export async function awardRoomConsumable(
 	db: D1Database,
 	playerId: number,
 	consumableId: string,
-	quantity: number
-): Promise<number> {
+	quantity: number,
+	concurrencyCode: string | null = null
+): Promise<RoomInventoryHolding> {
 	const read = db.prepare(
-		'SELECT quantity FROM room_inventory WHERE player_id = ?1 AND consumable_id = ?2'
+		`SELECT quantity, concurrency_code, modified_at FROM room_inventory
+		 WHERE player_id = ?1 AND consumable_id = ?2`
 	)
-	const [, , after] = await db.batch<{ quantity: number }>([
+	const [, , after] = await db.batch<{
+		quantity: number
+		concurrency_code: string | null
+		modified_at: string | null
+	}>([
 		read.bind(playerId, consumableId),
 		db
 			.prepare(
-				`INSERT INTO room_inventory (player_id, consumable_id, quantity)
-				 VALUES (?1, ?2, MAX(0, ?3))
-				 ON CONFLICT (player_id, consumable_id)
-				   DO UPDATE SET quantity = MAX(0, room_inventory.quantity + ?3)`
+				`INSERT INTO room_inventory (player_id, consumable_id, quantity, concurrency_code, modified_at)
+				 VALUES (?1, ?2, MAX(0, ?3), ?4, ?5)
+				 ON CONFLICT (player_id, consumable_id) DO UPDATE SET
+				   quantity = MAX(0, room_inventory.quantity + ?3),
+				   concurrency_code = COALESCE(?4, room_inventory.concurrency_code),
+				   modified_at = ?5`
 			)
-			.bind(playerId, consumableId, quantity),
+			.bind(playerId, consumableId, quantity, concurrencyCode, new Date().toISOString()),
 		read.bind(playerId, consumableId),
 	])
 
 	// No row means a quantity of zero — nothing is inserted until a player is first given one.
-	return after.results[0]?.quantity ?? 0
+	const row = after.results[0]
+	return {
+		quantity: row?.quantity ?? 0,
+		concurrencyCode: row?.concurrency_code ?? null,
+		modifiedAt: row?.modified_at ?? null,
+	}
 }
 
-/** Everything a player owns of one room's consumables. A listing they own none of is absent. */
+/**
+ * Use up ONE of a consumable a player holds, returning what they hold afterwards — or null
+ * when they hold none, and nothing was written. `concurrencyCode` is the request's
+ * `NewConcurrencyCode`, stored to be served back; null leaves the stored one.
+ *
+ * A single conditional UPDATE: the `quantity >= 1` guard is what refuses, so two consumes
+ * racing over the last one cannot both succeed. Here an empty `RETURNING` is exactly the
+ * answer wanted — "you had none" — unlike the award, where it would be ambiguous.
+ */
+export async function consumeRoomConsumable(
+	db: D1Database,
+	playerId: number,
+	consumableId: string,
+	concurrencyCode: string | null = null
+): Promise<RoomInventoryHolding | null> {
+	const row = await db
+		.prepare(
+			`UPDATE room_inventory SET
+			   quantity = quantity - 1,
+			   concurrency_code = COALESCE(?3, concurrency_code),
+			   modified_at = ?4
+			 WHERE player_id = ?1 AND consumable_id = ?2 AND quantity >= 1
+			 RETURNING quantity, concurrency_code, modified_at`
+		)
+		.bind(playerId, consumableId, concurrencyCode, new Date().toISOString())
+		.first<{ quantity: number; concurrency_code: string | null; modified_at: string | null }>()
+
+	return row
+		? {
+				quantity: row.quantity,
+				concurrencyCode: row.concurrency_code,
+				modifiedAt: row.modified_at,
+			}
+		: null
+}
+
+/**
+ * Everything a player owns of one room's consumables, in the shop's order. A listing they own
+ * none of is absent — including one they held and spent down to zero.
+ */
 export async function getRoomInventory(
 	db: D1Database,
 	roomId: number,
 	playerId: number
-): Promise<RoomInventoryItem[]> {
+): Promise<RoomConsumableInventoryItem[]> {
 	const { results } = await db
 		.prepare(
-			`SELECT i.player_id AS playerId, i.consumable_id AS consumableId, i.quantity AS quantity
+			`SELECT ${SELECT_COLUMNS.split(', ')
+				.map((col) => `c.${col}`)
+				.join(', ')},
+			   i.quantity AS quantity, i.concurrency_code AS concurrency_code,
+			   i.modified_at AS inventory_modified_at
 			 FROM room_inventory AS i
 			 JOIN room_consumable AS c ON c.room_consumable_id = i.consumable_id
-			 WHERE c.room_id = ?1 AND i.player_id = ?2
+			 WHERE c.room_id = ?1 AND i.player_id = ?2 AND i.quantity > 0
 			 ORDER BY c.modified_at, c.room_consumable_id`
 		)
 		.bind(roomId, playerId)
-		.all<{ playerId: number; consumableId: string; quantity: number }>()
+		.all<
+			RoomConsumableRow & {
+				quantity: number
+				concurrency_code: string | null
+				inventory_modified_at: string | null
+			}
+		>()
 
-	return results.map((r) => ({
-		PlayerId: r.playerId,
-		ConsumableId: r.consumableId,
-		Quantity: r.quantity,
-	}))
+	return results.map((row) =>
+		toInventoryItem(
+			playerId,
+			{
+				quantity: row.quantity,
+				concurrencyCode: row.concurrency_code,
+				modifiedAt: row.inventory_modified_at,
+			},
+			toRoomConsumable(row)
+		)
+	)
 }

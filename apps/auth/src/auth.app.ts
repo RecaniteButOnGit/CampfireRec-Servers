@@ -4,22 +4,33 @@ import { useWorkersLogger } from 'workers-tagged-logger'
 import { z } from 'zod'
 
 import {
+	beginEmailCode,
+	completeEmailCode,
 	countAccountsByDeviceId,
 	countAccountsBySignupIp,
 	createAccount,
+	EMAIL_CODE_TTL_SECONDS,
+	emailSender,
 	GAME_VERSION,
 	getAccount,
+	getAccountByEmail,
 	getAccountByUsername,
 	getAccountsByIds,
 	getPasswordHash,
 	getRoomById,
 	hashPassword,
+	isRolloutGameVersion,
+	isSupportedGameVersion,
+	isValidEmail,
+	rolloutGameBuilds,
 	RoomInstanceType,
 	setLastLoginTime,
 	setLoginContext,
 	setPasswordHash,
 	setPresence,
 	subRoomDataBlob,
+	supportedGameBuilds,
+	takeRateLimit,
 	updateAccount,
 	verifyPassword,
 	writeAuditLog,
@@ -33,7 +44,12 @@ import {
 	withNotFound,
 	withOnError,
 } from '@repo/hono-helpers'
-import { generateToken, TOKEN_TTL_SECONDS, validateAndGetAccountId } from '@repo/jwt'
+import {
+	generateToken,
+	TOKEN_TTL_SECONDS,
+	validateAndGetAccountId,
+	validateIdentityAssertion,
+} from '@repo/jwt'
 
 // The account-wide ban lives on a `report` row, whose table the api worker owns; its db
 // module is plain D1 queries with no runtime deps, so it imports cleanly here.
@@ -54,6 +70,9 @@ import {
 	OAuthError,
 	PlatformIdsRequest,
 	PlatformType,
+	RecoverPasswordRequest,
+	RecoverPasswordResponse,
+	ResetPasswordRequest,
 	RestrictionDto,
 	roleFilter,
 	roleLookup,
@@ -62,13 +81,18 @@ import {
 } from './openapi'
 import { photonAuthenticate } from './photon-auth'
 import {
+	accountHoldsDiscordRole,
 	countAccountsForPlatformIdentity,
+	getLinksForIdentity,
 	getLinksForPlatformId,
 	getLinksForPlatformIdentity,
+	hasStudioAccess,
 	isPlatformIdentityLinked,
 	linkPlatformIdentity,
+	parseRoleIdList,
 } from './platform-db'
-import { consumeRefreshToken, issueRefreshToken } from './refresh-db'
+import { recoveryEmail } from './recovery-email'
+import { consumeRefreshToken, issueRefreshToken, revokeRefreshTokens } from './refresh-db'
 import { verifySteamTicket } from './steam-ticket'
 import {
 	approveDeviceGrant,
@@ -103,6 +127,34 @@ const TOKEN_SCOPE =
  * and `match` is what holds a blocked player to their dorm.
  */
 const BLOCKED_DESCRIPTION = 'this device or network is blocked'
+
+/**
+ * Password-recovery requests one IP may make per hour (`POST /account/recoverpassword`),
+ * whatever addresses they name and whether or not any is on an account. The route is
+ * unauthenticated and answers every address the same, so this is what stops one source
+ * from working through a list of addresses — the per-account daily cap on codes
+ * (@repo/domain's email-code-db.ts) is what protects each mailbox. Past the cap a request
+ * is answered as if it had succeeded and does nothing; generous enough that a household
+ * behind one address is never caught by it. A request with no `CF-Connecting-IP` (not a
+ * thing at the edge; tests) is not counted.
+ */
+const RECOVERY_REQUESTS_PER_IP = 10
+const RECOVERY_REQUESTS_PER_IP_WINDOW_SECONDS = 60 * 60
+
+/**
+ * The website's "Sign in with Discord". `www` completes the Discord OAuth2 exchange (it
+ * alone holds the client secret), then posts an `assertion` — an HS256 token signed with
+ * the shared JWT_SECRET naming the platform identity it just proved (see `@repo/jwt`'s
+ * `generateIdentityAssertion`). This grant trusts the assertion the way `cached_login`
+ * trusts a Steam ticket, resolves it through the link table, and issues the ordinary
+ * session. No account linked to the identity means a NEW one is made and linked, so a
+ * Discord account is a way to join without Steam or Meta; the player then sets a password
+ * on the website and signs in with it anywhere — a sideloaded Quest included.
+ */
+const IDENTITY_ASSERTION_GRANT = 'identity_assertion'
+
+/** What the grant answers when one identity opens several accounts; never true today. */
+const AMBIGUOUS_IDENTITY_DESCRIPTION = 'platform identity is linked to more than one account'
 
 /**
  * The platform id a SIDELOADED Oculus APK reports. It is not an identity: a sideloaded
@@ -172,6 +224,66 @@ const DEFAULT_MAX_ACCOUNTS_PER_DEVICE_ID = 3
  */
 const DEFAULT_PASSWORD_SIGNUP = false
 const PASSWORD_SIGNUP_DISABLED_DESCRIPTION = 'password signup is disabled'
+
+/**
+ * The build gates on `/connect/token`, both keyed on the grant's posted `ver` and both
+ * driven by the operator's game-version vars (`SUPPORTED_GAME_VERSIONS`,
+ * `ROLLOUT_GAME_VERSIONS` — see context.ts and `supportedGameBuilds`/`rolloutGameBuilds`
+ * in @repo/domain, which `api` and `match` read the same way). A grant posting no `ver`
+ * (a refresh, the website) is untouched by either.
+ *
+ * 1. The SUPPORT gate: a build outside `supportedGameBuilds` is refused as `invalid_grant`
+ *    with UNSUPPORTED_BUILD_DESCRIPTION, for every grant and every account — staff
+ *    included. `api`'s `/api/versioncheck/v4` tells the same builds to update; this is what
+ *    makes the update prompt stick, since a client that got a token anyway would play on.
+ *    Dropping a build from the list is how its players are made to upgrade.
+ * 2. The ROLLOUT gate: a build under staged rollout is refused unless the account is STAFF
+ *    (developer or moderator) or its Discord link holds a role named in
+ *    `DISCORD_ROLLOUT_ROLE_IDS` (see `accountMayUseRolloutBuild`), as `invalid_grant` with
+ *    ROLLOUT_GATED_DESCRIPTION. `create_account` is refused before anything is minted: a
+ *    brand-new account has no Discord link to hold a role, so the player makes their
+ *    account on a released build, links Discord on the website, and comes back. Ending the
+ *    rollout (`ROLLOUT_GAME_VERSIONS=off`) opens the build to everyone.
+ *
+ * `ver` is client-reported and unverified, like everything else about the build. That is
+ * fine for what these are: rollout and upgrade gates, not a security boundary. A player
+ * who lies about their build gets a token the surfaces of the build they claim would have
+ * handed them anyway, and then runs a client the server isn't answering for.
+ */
+const ROLLOUT_GATED_DESCRIPTION =
+	'this build is limited to Discord supporters; link your Discord on the website first'
+const UNSUPPORTED_BUILD_DESCRIPTION =
+	'this game version is not supported by this server; update your game'
+
+/**
+ * `DISCORD_ROLLOUT_ROLE_IDS` as a list of role ids: snowflakes separated by commas and/or
+ * whitespace (`parseRoleIdList`, the grammar `www`'s parseRoleIds reads
+ * DISCORD_BENEFITS_ROLE_IDS with). Unset or blank parses to an empty list, which
+ * `accountMayUseRolloutBuild` treats as a gate closed to everyone but staff.
+ */
+const rolloutRoleIds = parseRoleIdList
+
+/**
+ * Whether an account may sign in on a rollout-gated build. STAFF — a developer or moderator
+ * flag on the account, the same two `staff_login` audits — always may, configured roles or
+ * not: they are who tests a build before it reaches supporters, so a closed gate stays open
+ * to them. Anyone else needs a Discord link (platform 101, written by the website's benefits
+ * claim and refreshed by `www`'s daily sweep) recording at least one of the configured
+ * roles. The roles are a SNAPSHOT (see PlatformLink.roles), so a role granted in Discord
+ * today opens the gate once the player re-claims or the sweep runs — not instantly.
+ *
+ * An empty role list skips the link read: with no supporter role named, nobody is a
+ * supporter.
+ */
+async function accountMayUseRolloutBuild(
+	db: D1Database,
+	accountId: number,
+	roleIds: readonly string[]
+): Promise<boolean> {
+	const account = await getAccount(db, accountId)
+	if (account && (holdsRole(account, 'developer') || holdsRole(account, 'moderator'))) return true
+	return accountHoldsDiscordRole(db, accountId, roleIds)
+}
 
 /** New players start in the Orientation room (RoomId 13) — the new-user flow. */
 const ORIENTATION_ROOM_ID = 13
@@ -243,7 +355,9 @@ async function authedId(c: Context<App>): Promise<number | null> {
 }
 
 /** Whether one account row holds a role. Absent/false both mean no role. */
-function holdsRole(account: Account, role: 'developer' | 'moderator'): boolean {
+function holdsRole(account: Account, role: 'developer' | 'moderator' | 'screenshare'): boolean {
+	// Match the same staff override used when minting account tokens.
+	if (role === 'screenshare') return account.hasScreenshare === true
 	return (role === 'developer' ? account.isDeveloper : account.isModerator) === true
 }
 
@@ -253,7 +367,11 @@ function holdsRole(account: Account, role: 'developer' | 'moderator'): boolean {
  * mirroring the reference API. An id that is not a number is answered as unknown (404) rather
  * than as a 400: `/role/developer/nonsense` is just an id that matches nothing.
  */
-async function roleAnswer(c: Context<App>, role: 'developer' | 'moderator', id: string) {
+async function roleAnswer(
+	c: Context<App>,
+	role: 'developer' | 'moderator' | 'screenshare',
+	id: string
+) {
 	logger.info(`${role} role lookup`, { id })
 	const accountId = Number.parseInt(id, 10)
 	const account = Number.isNaN(accountId) ? null : await getAccount(c.env.DB, accountId)
@@ -289,30 +407,31 @@ async function roleFilterAnswer(c: Context<App>, role: 'developer' | 'moderator'
 
 /**
  * The role names beyond `gameClient` for an account's token `role` claim. Base roles
- * (gameClient) are added by generateToken. `screenshare` rides on EVERY token — the
- * client gates the screen-share feature on it and nothing grants it per-account, so it
- * is unconditional (even with no account resolved). The rest are the operator-granted
- * extras, plus `junior` off the account's own `isJunior` flag.
+ * (gameClient) are added by generateToken. `screenshare` requires an explicit staff
+ * grant via `hasScreenshare`. The other roles come from account flags and Studio access.
  *
- * `betastudio` rides on the account's `hasStudio` flag, and developer does not imply it.
- * RecFlare Studio treats that exact claim as Full access, which is what lets the editor
- * upload; staff set the flag from the website. `influencer` rides on `isInfluencer`
- * (`runx admin grant-influencer`) and lives only in the token — no `/role/*` lookup
- * answers it. Order is stable so tokens are deterministic: screenshare, developer,
- * moderator, junior, betastudio, then influencer.
+ * `betastudio` rides on `studio` — the account's Studio access as `hasStudioAccess`
+ * resolves it: the `hasStudio` flag staff set from the website, OR a Discord link holding
+ * a role in the `STUDIO_ROLLOUT` var — and developer does not imply it. RecFlare Studio
+ * treats that exact claim as Full access, which is what lets the editor upload. The
+ * caller resolves it (it costs a link read) so this stays a pure projection of the
+ * account. `influencer` rides on `isInfluencer` (`runx admin grant-influencer`) and lives
+ * only in the token — no `/role/*` lookup answers it. Order is stable so tokens are
+ * deterministic: screenshare, developer, moderator, junior, betastudio, then influencer.
  */
 function accountRoles(
 	account: Pick<
 		Account,
-		'isDeveloper' | 'isModerator' | 'isJunior' | 'hasStudio' | 'isInfluencer'
-	> | null
+		'isDeveloper' | 'isModerator' | 'isJunior' | 'isInfluencer' | 'hasScreenshare'
+	> | null,
+	studio: boolean
 ): string[] {
-	const roles = ['screenshare']
+	const roles: string[] = account?.hasScreenshare === true ? ['screenshare'] : []
 	if (!account) return roles
 	if (account.isDeveloper) roles.push('developer')
 	if (account.isModerator) roles.push('moderator')
 	if (account.isJunior) roles.push('junior')
-	if (account.hasStudio) roles.push('betastudio')
+	if (studio) roles.push('betastudio')
 	if (account.isInfluencer) roles.push('influencer')
 	return roles
 }
@@ -364,7 +483,13 @@ function oauthError(
  * already been authenticated — here, because the player approved a Studio code
  * on the website. Studio reads `expires_in` as seconds (`TimeSpan.FromSeconds`).
  */
-async function issueSession(c: Context<App>, accountId: number, grantType: string) {
+async function issueSession(
+	c: Context<App>,
+	accountId: number,
+	grantType: string,
+	/** Extra top-level fields on the token body — `created: true` on an identity signup. */
+	extra: Record<string, unknown> = {}
+) {
 	const clientIp = c.req.header('cf-connecting-ip') ?? ''
 	const ban = await resolveBan(c.env.DB, accountId, {
 		identity: { ip: clientIp },
@@ -394,7 +519,7 @@ async function issueSession(c: Context<App>, accountId: number, grantType: strin
 		roleAccount.platformId ?? '',
 		accountPlatform(roleAccount),
 		jwtSecret,
-		accountRoles(roleAccount),
+		accountRoles(roleAccount, await hasStudioAccess(c.env.DB, roleAccount, c.env.STUDIO_ROLLOUT)),
 		accountPrivileges(roleAccount),
 		GAME_VERSION,
 		roleAccount.hasPlus === true
@@ -437,7 +562,107 @@ async function issueSession(c: Context<App>, accountId: number, grantType: strin
 		refresh_token: refreshToken,
 		scope: TOKEN_SCOPE,
 		key: '8oQ+e+WQaOBPbEcakhqs3dwZZdOmmyDUmJSD9u4AHMY=',
+		...extra,
 	})
+}
+
+/**
+ * The `identity_assertion` grant: sign into — or create — the account behind a platform
+ * identity another worker has verified and signed for. See IDENTITY_ASSERTION_GRANT.
+ *
+ * Handled before the password fallback and outside the version/rollout gates, like the
+ * Studio device grant: nothing here posts a `ver`, and the credential is the assertion
+ * alone. The assertion names an IDENTITY, not an account; which account that is (or that
+ * there is none yet) is decided here, from the same table `cached_login` reads, so the
+ * website can never choose an account id for itself.
+ *
+ * Creating an account when the identity opens none is deliberate — it is the Discord
+ * sign-up — and takes the same guards `create_account` does for a verified platform
+ * identity: the evasion arms (a banned player's next move is a new account), the per-IP
+ * cap (`www` forwards the browser's real address over the service binding) and the
+ * per-identity cap. NOT the PASSWORD_SIGNUP switch: that exists because a password account
+ * has no identity but its address, and this one has a Discord user Discord itself vouched
+ * for, one account per user. The new account carries no `platform`/`platformId` on its
+ * blob — only the link — so its DTO and token read like a password account's and the
+ * Discord snowflake stays off the wire, exactly as the benefits claim keeps it.
+ */
+async function identityAssertionGrant(c: Context<App>, body: Record<string, unknown>) {
+	const assertion = typeof body.assertion === 'string' ? body.assertion : ''
+	const jwtSecret = await c.env.JWT_SECRET.get()
+	if (jwtSecret === '') {
+		logger.error('refusing an identity assertion: JWT_SECRET is empty')
+		return oauthError(c, 'server_error', 'token signing is not configured', 500)
+	}
+	const identity = assertion ? await validateIdentityAssertion(assertion, jwtSecret) : null
+	if (identity === null) {
+		return oauthError(c, 'invalid_grant', 'invalid or expired identity assertion')
+	}
+
+	const links = await getLinksForIdentity(c.env.DB, identity.platform, identity.platformId)
+	if (links.length > 1) {
+		// The benefits claim keeps a Discord identity on one account, so this is a data
+		// problem rather than a player's choice to make; refused rather than guessed.
+		logger.error('identity assertion names an identity linked to several accounts', {
+			platform: identity.platform,
+			accountIds: links.map((l) => l.accountId),
+		})
+		return oauthError(c, 'invalid_grant', AMBIGUOUS_IDENTITY_DESCRIPTION)
+	}
+	if (links.length === 1) {
+		return issueSession(c, links[0].accountId, IDENTITY_ASSERTION_GRANT)
+	}
+
+	// Nobody yet: the sign-up. Everything below mirrors create_account's platform path.
+	const clientIp = c.req.header('cf-connecting-ip') ?? ''
+	const blocked = await resolveBan(c.env.DB, null, {
+		identity: { ip: clientIp, platform: identity.platform, platformId: identity.platformId },
+		arms: banEvasionMatch(c.env.BAN_EVASION_MATCH),
+	})
+	if (blocked) {
+		logger.info('identity signup refused: player banned', {
+			via: blocked.via,
+			bannedAccountId: blocked.bannedAccountId,
+			ip: clientIp,
+			platform: identity.platform,
+		})
+		return oauthError(c, 'invalid_grant', BLOCKED_DESCRIPTION)
+	}
+	const maxPerPlatformId = intVar(
+		c.env.MAX_ACCOUNTS_PER_PLATFORM_ID,
+		DEFAULT_MAX_ACCOUNTS_PER_PLATFORM_ID
+	)
+	if (
+		maxPerPlatformId > 0 &&
+		(await countAccountsForPlatformIdentity(c.env.DB, identity.platform, identity.platformId)) >=
+			maxPerPlatformId
+	) {
+		logger.info('identity signup rejected: platform account limit', { platform: identity.platform })
+		return oauthError(c, 'invalid_grant', 'account limit reached for this platform account')
+	}
+	const maxPerIp = intVar(c.env.MAX_ACCOUNTS_PER_IP, DEFAULT_MAX_ACCOUNTS_PER_IP)
+	if (
+		maxPerIp > 0 &&
+		clientIp !== '' &&
+		(await countAccountsBySignupIp(c.env.DB, clientIp)) >= maxPerIp
+	) {
+		logger.info('identity signup rejected: per-IP account limit', { ip: clientIp })
+		return oauthError(c, 'invalid_grant', 'too many accounts created from this network')
+	}
+
+	const account = await createAccount(c.env.DB, {
+		platforms: 0,
+		lastLoginTime: new Date().toISOString(),
+		signupIp: clientIp || undefined,
+		lastLoginIp: clientIp || undefined,
+	})
+	await linkPlatformIdentity(c.env.DB, account.accountId, identity.platform, identity.platformId)
+	await placeNewPlayerInOrientation(c.env, account.accountId, 0)
+	logger.info('created an account from an identity assertion', {
+		accountId: account.accountId,
+		platform: identity.platform,
+		ip: clientIp,
+	})
+	return issueSession(c, account.accountId, IDENTITY_ASSERTION_GRANT, { created: true })
 }
 
 async function decideDeviceCode(c: Context<App>, decide: typeof approveDeviceGrant) {
@@ -907,7 +1132,7 @@ const app = new Hono<App>()
 			tags: ['Token'],
 			summary: 'OAuth token endpoint — issues a JWT',
 			description: [
-				'Issues an access token (plus a single-use refresh token) for one of four grants,',
+				'Issues an access token (plus a single-use refresh token) for one of six grants,',
 				'selected by `grant_type`. Every grant returns the same body on success.',
 				'',
 				'**`create_account`** — mints a new account with an auto-assigned random username',
@@ -929,6 +1154,17 @@ const app = new Hono<App>()
 				'',
 				'**`refresh_token`** — redeems a stored single-use refresh token, rotating it. The',
 				'platform and platform id come from what was stored at issue time, not the body.',
+				'',
+				'**`identity_assertion`** — the website’s "Sign in with Discord". `www` completes the',
+				'Discord OAuth2 code exchange (it alone holds the client secret) and posts an',
+				'`assertion`: an HS256 token signed with the shared JWT_SECRET naming the platform',
+				'(`101`) and platform id it proved, good for a minute. The identity is resolved through',
+				'the same link table as `cached_login`: one linked account is signed into; none means a',
+				'NEW account is created and linked (the body then carries `created: true`), under the',
+				'evasion check and the per-IP and per-identity signup caps but NOT the PASSWORD_SIGNUP',
+				'switch — the Discord user is the identity a password account lacks. The new account',
+				'has no password until its owner sets one on the website; with one, it signs in',
+				'anywhere the `password` grant does. Several linked accounts is refused.',
 				'',
 				'**`password`** (the fallback for any unrecognised or absent `grant_type`) —',
 				'identifies the account by `username` or numeric `account_id` and requires the',
@@ -957,9 +1193,10 @@ const app = new Hono<App>()
 				'',
 				'**Roles.** The token embeds a `role` claim from the account, so developer/moderator',
 				'powers refresh on every login and every refresh grant. `junior` rides along for an',
-				'account flagged `isJunior`, and `screenshare` is on every token — it is a feature',
-				'gate the client reads, not a privilege anyone is granted. `betastudio` is stamped',
-				'from the account’s `hasStudio` flag (staff set it on the website). RecFlare Studio',
+				'account flagged `isJunior`. `screenshare` requires a staff grant on the Studio Access',
+				'page. `betastudio` is stamped',
+				'from the account’s `hasStudio` flag (staff set it on the website) or from a Discord',
+				'link holding a role in the `STUDIO_ROLLOUT` var. RecFlare Studio',
 				'treats that claim as permission to upload; `developer` does not confer it. A junior',
 				'also carries',
 				'the `rn.privilege` CLAIM (`BanVChat`, `BanRmChat`) — scope-shaped name, but the',
@@ -984,6 +1221,23 @@ const app = new Hono<App>()
 				'refused BEFORE it mints anything: making a NEW account to evade with is a different',
 				'act from signing into one. The description is deliberately vague — the signup',
 				'refused may belong to a housemate of the banned player rather than to them.',
+				'',
+				'**Support gate.** A grant whose `ver` names a build this server does not serve —',
+				'outside the operator’s `SUPPORTED_GAME_VERSIONS` (default: the list in `@repo/domain`)',
+				'and not under rollout — is refused as `invalid_grant` "this game version is not',
+				'supported by this server; update your game", for every grant and every account.',
+				'`api`’s `/api/versioncheck/v4` flags the same builds, so dropping a build from the',
+				'list is how its players are made to upgrade. Grants posting no `ver` are untouched.',
+				'',
+				'**Rollout gate.** A grant whose `ver` names a build under staged rollout',
+				'(`ROLLOUT_GAME_VERSIONS`, by default `20260323` — every point release of it; `off` ends',
+				'the rollout and opens the build to everyone) is refused as `invalid_grant` "this build is limited to',
+				'Discord supporters" unless the account is staff (developer or moderator) or its',
+				'Discord link (made by the website’s benefits claim) holds one of the roles in the',
+				'operator’s `DISCORD_ROLLOUT_ROLE_IDS`. With none configured the gate is closed to',
+				'everyone but staff. `create_account` on such a',
+				'build is refused before it mints anything, since a new account has no Discord link.',
+				'Grants posting no `ver` (a refresh, the website) and every other build are untouched.',
 			].join('\n'),
 			requestBody: form(
 				TokenRequest,
@@ -1040,6 +1294,9 @@ const app = new Hono<App>()
 				}
 				return issueSession(c, polled.accountId, DEVICE_CODE_GRANT)
 			}
+			// The website's Discord sign-in, likewise before the fallback — and before the
+			// version gates, which it never posts a `ver` for. See identityAssertionGrant.
+			if (grantType === IDENTITY_ASSERTION_GRANT) return identityAssertionGrant(c, body)
 			// `platform`/`platform_id` come from the body for a fresh login; a refresh
 			// grant overrides them below with what was stored when the token was issued.
 			let platformId = typeof body.platform_id === 'string' ? body.platform_id : ''
@@ -1063,9 +1320,9 @@ const app = new Hono<App>()
 			// The client's own build (`ver`, e.g. `20250718.01`), stamped into the token's
 			// `rn.ver` claim so everything downstream reports the build the player is ACTUALLY
 			// running rather than this server's GAME_VERSION — `match` reads it back off the
-			// token when it writes presence. Unverified like the device fields, and only ever
-			// echoed, never trusted for a decision (the version CHECK is `api`'s
-			// `/api/versioncheck/v4`, against its own list).
+			// token when it writes presence. Unverified like the device fields: echoed, and
+			// gated (below, and the rollout gate further down), but never trusted as a
+			// credential.
 			//
 			// A grant that posts none — a refresh, or a caller that isn't the game — leaves it
 			// undefined and generateToken falls back to GAME_VERSION. An empty string is
@@ -1078,6 +1335,23 @@ const app = new Hono<App>()
 			// Recorded as the immutable `signupIp` at creation and as `lastLoginIp` on every
 			// login; both feed the per-IP signup cap. Absent (empty) outside the CF edge.
 			const clientIp = c.req.header('cf-connecting-ip') ?? ''
+
+			// The support gate (see UNSUPPORTED_BUILD_DESCRIPTION): a posted build this server
+			// doesn't serve gets no token, whatever the grant and whoever the account. Decided
+			// before any credential is read — it depends on nothing but the operator's list, so
+			// there is nothing about an account to probe here, and a closed door costs no D1
+			// round trip. The same list `api`'s `/api/versioncheck/v4` flags for an update.
+			if (version !== undefined && !isSupportedGameVersion(version, supportedGameBuilds(c.env))) {
+				logger.info('token refused: game version is not supported', {
+					grantType,
+					version,
+					ip: clientIp,
+				})
+				return c.json(
+					{ error: 'invalid_grant', error_description: UNSUPPORTED_BUILD_DESCRIPTION },
+					400
+				)
+			}
 
 			// A platform-authenticated login proves who you are with the platform itself, and
 			// we can verify exactly two: Steam (0), from its Steam-signed platform_auth ticket,
@@ -1178,6 +1452,21 @@ const app = new Hono<App>()
 			//    via create_account or /account/me/changepassword.
 			let accountId: string
 			if (grantType === 'create_account') {
+				// A rollout-gated build can't sign UP: the account it would mint has no Discord
+				// link, so it could never hold the role the gate wants. Refused before anything
+				// is read or minted, like the switch below — no row left behind, no cap slot
+				// burned.
+				if (isRolloutGameVersion(version, rolloutGameBuilds(c.env))) {
+					logger.info('signup refused: build is limited to Discord supporters', {
+						version,
+						ip: clientIp,
+					})
+					return c.json(
+						{ error: 'invalid_grant', error_description: ROLLOUT_GATED_DESCRIPTION },
+						400
+					)
+				}
+
 				// The password-account path (no platform) is a switch, off by default: see
 				// DEFAULT_PASSWORD_SIGNUP. Checked first, before anything is read or minted —
 				// a closed door costs no D1 round trip and burns no cap slot.
@@ -1405,6 +1694,33 @@ const app = new Hono<App>()
 				await setLoginContext(c.env.DB, resolvedId, { deviceId, deviceClass, ip: clientIp })
 			}
 
+			// The rollout gate: a build under staged rollout (`rolloutGameBuilds`) is for staff
+			// and Discord supporters only, so the account signing in on it must be staff or hold
+			// one of the configured roles.
+			// Deliberately AFTER the credential checks, like the ban lookup below — a wrong
+			// password on a gated build is still "invalid account_id or password", so the
+			// gate can't be used to probe whether an account exists. Unlike a ban, this IS a
+			// refusal: there is no block screen to reach, and the client surfaces the
+			// description on its sign-in failure.
+			if (isRolloutGameVersion(version, rolloutGameBuilds(c.env))) {
+				const roleIds = rolloutRoleIds(c.env.DISCORD_ROLLOUT_ROLE_IDS)
+				if (!(await accountMayUseRolloutBuild(c.env.DB, Number(accountId), roleIds))) {
+					logger.info('login refused: build is limited to Discord supporters', {
+						accountId,
+						grantType,
+						version,
+						// The COUNT, not the ids: zero here means the gate is closed because
+						// nothing is configured, which reads very differently from "not a
+						// supporter".
+						roleIdCount: roleIds.length,
+					})
+					return c.json(
+						{ error: 'invalid_grant', error_description: ROLLOUT_GATED_DESCRIPTION },
+						400
+					)
+				}
+			}
+
 			// EVERY account gets its token, banned or not — a ban of its own, or a link to
 			// somebody else's through the evasion arms. The client needs one to reach `api`'s
 			// moderationBlockDetails, which is where a banned player is TOLD they are banned
@@ -1474,7 +1790,10 @@ const app = new Hono<App>()
 				platformId,
 				platform,
 				jwtSecret,
-				accountRoles(roleAccount),
+				accountRoles(
+					roleAccount,
+					await hasStudioAccess(c.env.DB, roleAccount, c.env.STUDIO_ROLLOUT)
+				),
 				accountPrivileges(roleAccount),
 				version,
 				// Rec Room Plus, off the same account read as the roles above — `econ` decides the
@@ -1597,6 +1916,177 @@ const app = new Hono<App>()
 		}
 	)
 
+	// "Forgot password" — the game posts the address on the account and nothing else, so the
+	// address is how the account is found (which is why it is unique across accounts). A
+	// six-digit code is emailed, typed out and prefilled into a link to the website's
+	// `/reset-password` page, where the new password is chosen (`/account/resetpassword`
+	// below): the game has no screen to finish a recovery on.
+	//
+	// Unauthenticated, and so answered the same way whether or not the address is on an
+	// account: `Success: true`, "we've sent an email if there is one". The route is otherwise
+	// a way to ask which addresses have accounts here. The refusals it does voice are the
+	// ones the player can act on — no address, a malformed one, the mail not going out —
+	// in the client's PascalCase `{ Success, Error, error_id }` envelope, which is the one
+	// shape it has been seen to read for this route. See @repo/domain's email-code-db.ts for the code's
+	// rules (one attempt, a cooldown on resends, a 30-minute life).
+	.post(
+		'/account/recoverpassword',
+		describeRoute({
+			tags: ['Account'],
+			summary: 'Email a password-recovery code',
+			description: [
+				'Emails a six-digit code to the address, with a link to the website’s reset page',
+				'(`/reset-password?email=…&code=…`) where the new password is chosen via',
+				'`POST /account/resetpassword`. Answers `Success: true` whether or not the address',
+				'is on an account, so the route can’t be used to find out which addresses are.',
+				'A new request replaces the pending code; one is sent per address at most every',
+				'two minutes. The code works once: a wrong guess voids it and the recovery has to',
+				'be requested again. Refusals — no address, a malformed one, the email failing to',
+				'send — are `Success: false` with the reason in `Error`.',
+			].join(' '),
+			requestBody: form(RecoverPasswordRequest, 'The address on the account'),
+			responses: {
+				200: json(RecoverPasswordResponse, 'Sent, or nothing to send to; `Error` says if not'),
+			},
+		}),
+		async (c) => {
+			const body = await c.req.parseBody().catch(() => ({}) as Record<string, unknown>)
+			const email = typeof body.email === 'string' ? body.email.trim() : ''
+			const refuse = (error: string) => c.json({ Success: false, Error: error, error_id: null })
+			if (email === '') return refuse('Enter the email address on your account.')
+			if (!isValidEmail(email)) return refuse("That doesn't look like an email address.")
+
+			// Counted before the lookup, so a run through unknown addresses spends it too.
+			const clientIp = c.req.header('cf-connecting-ip') ?? ''
+			if (clientIp !== '') {
+				const ip = await takeRateLimit(
+					c.env.DB,
+					`recoverpassword:ip:${clientIp}`,
+					RECOVERY_REQUESTS_PER_IP,
+					RECOVERY_REQUESTS_PER_IP_WINDOW_SECONDS
+				)
+				if (!ip.allowed) {
+					logger.warn('password recovery rate-limited by ip; not sent', { count: ip.count })
+					return c.json({ Success: true, Error: null, error_id: null })
+				}
+			}
+
+			const account = await getAccountByEmail(c.env.DB, email)
+			if (account === null) {
+				// Answered exactly like a sent email, see above. Logged, since a run of these
+				// from one place is somebody probing.
+				logger.info('password recovery requested for an address on no account')
+				return c.json({ Success: true, Error: null, error_id: null })
+			}
+
+			const issue = await beginEmailCode(c.env.DB, 'password_reset', account.accountId)
+			if (issue.refused) {
+				// Within the cooldown, or the account's codes for the day are spent: answered
+				// like a sent email either way, so a loop learns nothing from the refusal.
+				logger.info('password recovery not resent', {
+					accountId: account.accountId,
+					refused: issue.refused,
+				})
+				return c.json({ Success: true, Error: null, error_id: null })
+			}
+			const code = issue.code
+
+			const message = recoveryEmail({
+				// The stored address, not the posted one: same account either way (the lookup
+				// is case-insensitive), and the stored one is the one the player chose to be
+				// reached at.
+				to: account.email ?? email,
+				from: emailSender(c.env),
+				domain: c.env.DOMAIN,
+				www: buildEndpoints(c.env.DOMAIN, c.env.SUBDOMAINS).WWW,
+				code,
+				validMinutes: Math.round(EMAIL_CODE_TTL_SECONDS / 60),
+			})
+			try {
+				await c.env.EMAIL.send(message)
+			} catch (err) {
+				// Told to the player: they would otherwise wait on an email that is never
+				// coming. The usual cause is the sender's domain not being enabled for Email
+				// Sending (see DEPLOYING.md), which is an operator's problem, hence the log.
+				logger.error('could not send the password recovery email', {
+					accountId: account.accountId,
+					error: err instanceof Error ? err.message : String(err),
+				})
+				return refuse('The recovery email could not be sent. Please try again later.')
+			}
+			logger.info('password recovery email sent', { accountId: account.accountId })
+			return c.json({ Success: true, Error: null, error_id: null })
+		}
+	)
+
+	// The other half: the website's `/reset-password` page posts the address, the code from
+	// the email and the new password. Unauthenticated — the code IS the credential. A wrong
+	// code voids the pending recovery (one guess per email), and the refusal reads the same
+	// whether the code was wrong, lapsed or never issued, so nothing here says whether a
+	// recovery is in flight for an address. Success sets the password and signs the account
+	// out everywhere else by revoking its refresh tokens. This is our own route, not the
+	// client's: the game never calls it, so it answers in the `{ success, error }` shape the
+	// website's other forms read.
+	.post(
+		'/account/resetpassword',
+		describeRoute({
+			tags: ['Account'],
+			summary: 'Finish a password recovery with the emailed code',
+			description: [
+				'Sets the password of the account under `email` when `code` is the one its recovery',
+				'email carried. Unauthenticated; the code is the credential, and it works ONCE — a',
+				'wrong code voids the recovery, and `POST /account/recoverpassword` has to be posted',
+				'again for a new one. The refusal is the same sentence whether the code was wrong,',
+				'has lapsed (30 minutes) or was never issued. On success the account’s refresh',
+				'tokens are revoked, so other sessions sign out. Posted by the website’s',
+				'`/reset-password` page, never by the game.',
+			].join(' '),
+			requestBody: form(ResetPasswordRequest, 'Address, emailed code and the new password'),
+			responses: {
+				200: json(ChangePasswordResponse, 'Password set'),
+				400: json(
+					ChangePasswordResponse,
+					'Missing field, or the code is wrong, lapsed or not issued (`error` says which, if the player can act on it)'
+				),
+			},
+		}),
+		async (c) => {
+			const body = await c.req.parseBody().catch(() => ({}) as Record<string, unknown>)
+			const email = typeof body.email === 'string' ? body.email.trim() : ''
+			const code = typeof body.code === 'string' ? body.code.trim() : ''
+			const newPassword = typeof body.newPassword === 'string' ? body.newPassword : ''
+			const refuse = (error: string) => c.json({ success: false, error }, 400)
+			if (email === '') return refuse('Enter the email address the code was sent to.')
+			if (code === '') return refuse('Enter the code from the email.')
+			if (newPassword === '') return refuse('You must enter a new password.')
+
+			const WRONG_CODE =
+				'That code is wrong or has expired. Request a new recovery email and try again.'
+			const account = await getAccountByEmail(c.env.DB, email)
+			if (account === null) {
+				logger.info('password reset posted for an address on no account')
+				return refuse(WRONG_CODE)
+			}
+
+			const { outcome } = await completeEmailCode(
+				c.env.DB,
+				'password_reset',
+				account.accountId,
+				code
+			)
+			if (outcome !== 'ok') {
+				logger.info('password reset refused', { accountId: account.accountId, outcome })
+				return refuse(WRONG_CODE)
+			}
+
+			const ok = await setPasswordHash(c.env.DB, account.accountId, await hashPassword(newPassword))
+			if (!ok) return c.body(null, 404)
+			const revoked = await revokeRefreshTokens(c.env.DB, account.accountId)
+			logger.info('password reset by email', { accountId: account.accountId, revoked })
+			return c.json({ success: true })
+		}
+	)
+
 	// The moderation restrictions on the caller's account — chat mutes and the like. STUB:
 	// nothing here issues restrictions, so every caller is unrestricted and the list is
 	// empty. An EMPTY ARRAY is the normal unrestricted answer, not null and not a 404: the
@@ -1658,6 +2148,11 @@ const app = new Hono<App>()
 	// Moderator's bulk form, kept in step with developer's above.
 	.get('/role/moderator', describeRoute(roleFilter('moderator')), (c) =>
 		roleFilterAnswer(c, 'moderator')
+	)
+
+	// Studio queries each room owner's screenshare role before validating video players.
+	.get('/role/screenshare/:id', describeRoute(roleLookup('screenshare')), (c) =>
+		roleAnswer(c, 'screenshare', c.req.param('id'))
 	)
 
 	// @guess Oculus nonce. The client asks for this before a Meta login; the exact shape

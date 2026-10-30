@@ -69,7 +69,7 @@ describe('SQLite D1 adapter and migrations', () => {
 	it('applies source migrations once and persists across reopen', async () => {
 		const path = join(temp(), 'recflare.sqlite')
 		const first = new SQLiteD1(path)
-		expect(migrate(first)).toBe(128)
+		expect(migrate(first)).toBeGreaterThan(128)
 		expect(await first.prepare('SELECT value FROM cv2_counter WHERE id = 1').first('value')).toBe(0)
 		expect(
 			await first

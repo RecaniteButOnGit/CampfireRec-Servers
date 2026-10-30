@@ -4,7 +4,7 @@ import { useWorkersLogger } from 'workers-tagged-logger'
 
 import { getRoomById } from '@repo/domain'
 import { withCleanSpec, withNotFound, withOnError } from '@repo/hono-helpers'
-import { validateAndGetAccountId } from '@repo/jwt'
+import { validateAndGetAccountId, validateAndGetBuild } from '@repo/jwt'
 
 import {
 	AUTHED,
@@ -198,32 +198,48 @@ const app = new Hono<App>()
 		}
 	)
 
-	// Roomie AI's energy budget. Granted, unlike Game AI above: Roomie runs on the client
-	// and only asks this service how much energy it has, so the honest answer for a server
-	// that meters nothing is "as much as you can count".
+	// The 20260323 build (20260323.14) has native low-energy and no-energy companion support. Advertising
+	// full energy selects a conversation backend we do not provide. Grant access with
+	// zero energy and the client's recognized no-credit result instead. A successful
+	// access response still opens a realtime session even when its energy is zero.
+	// Preserve the older client's budget and recharge-field contract.
 	.get(
 		'/roomieai/user/access',
 		describeRoute({
 			tags: ['Roomie AI', '2025'],
 			summary: 'The caller’s Roomie AI energy budget',
 			description: [
-				'What Roomie may spend: an energy ceiling, what is left of it, and when it next',
-				'refills. Nothing here meters energy, so the budget is `int.MaxValue` and never',
-				'depletes — which is why `NextSubscriptionEnergyRechargeAt` is null, there being no',
-				'spend to recharge from.',
+				'The 20260323 build receives the recognized no-credit result and zero energy for its native',
+				'companion mode. Its DTO has no recharge field. Older clients retain the full',
+				'int32-max budget and null recharge time. No model session is created.',
 				'',
 				'The envelope is `{ success, error_id, error, value }`, NOT the flat body the Game AI',
 				'check answers with. The two are different shapes on purpose — don’t unify them.',
 			].join(' '),
 			security: AUTHED,
 			responses: {
-				200: json(RoomieAiAccess, 'The energy budget — always granted, always full'),
+				200: json(RoomieAiAccess, 'Build-specific conversation access and companion fallback'),
 				401: UNAUTHORIZED_RESPONSE,
 			},
 		}),
 		async (c) => {
 			const id = await authedId(c)
 			if (id === null) return unauthorized(c)
+
+			// The build, not the version: every point release of 20260323 has the companion mode.
+			const build = await validateAndGetBuild(c.req.raw, await c.env.JWT_SECRET.get())
+			if (build === '20260323') {
+				return c.json({
+					success: false,
+					error_id: 'AI.InsufficientRoomieAICreditNoSub',
+					error: 'AI conversation is disabled. Roomie companion mode is available.',
+					value: {
+						MaxEnergyFromSubscriptions: 0,
+						EnergyLeft: 0,
+						OutputAudioEnabled: false,
+					},
+				})
+			}
 
 			return c.json({
 				success: true,

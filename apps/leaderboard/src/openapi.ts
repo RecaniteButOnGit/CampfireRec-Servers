@@ -89,36 +89,49 @@ export const CheckAndSetStatResponse = z
 // ---- Request schemas -------------------------------------------------------
 
 /**
- * The body the client posts to `GetRanks`, e.g.
- * `{"RankStart":0,"RankEnd":9,"PlayerId":2,"StatChannel":1,"RoomId":6,"FilterType":0,"SortAscending":false}`.
+ * The board selectors every read carries, in either client shape. A body is the 2026 shape
+ * when ANY of `PrimaryKey`/`SecondaryKey`/`LeaderboardType` is present, and its `RoomId` and
+ * `StatChannel` are then ignored. Otherwise it is the 2025 shape, read exactly as before.
  *
- * Recovered from a live client, not from a spec. `FilterType` 1 restricts the board to
- * `PlayerId` and their friends.
+ * - 2025: `{"PlayerId":205,"StatChannel":1,"RoomId":6,"FilterType":0,"SortAscending":false}`
+ * - 2026: `{"PlayerId":205,"PrimaryKey":6,"SecondaryKey":1,"FilterType":0,"SortAscending":false,"LeaderboardType":0}`
+ *
+ * Same room, same board. In 2026 a null key names no board (an empty answer, not room 0),
+ * and an Event board (`LeaderboardType` 1) is always empty because nothing stores event stats.
  */
-export const GetRanksBody = z.object({
-	RankStart: z.int().describe('First rank of the slice, 0-based and inclusive'),
-	RankEnd: z.int().describe('Last rank of the slice, inclusive — 0–9 is the first ten'),
-	PlayerId: z.int().describe('The player reading the board'),
-	StatChannel: z.int().describe('Which of the room’s tracked stats to rank on'),
-	RoomId: z.int().describe('The room whose board is being read'),
+const BoardSelectors = z.object({
+	PlayerId: z.int().describe('The player reading the board, or whose rank is asked for'),
+	StatChannel: z.int().optional().describe('≤2025: which of the room’s tracked stats to rank on'),
+	RoomId: z.int().optional().describe('≤2025: the room whose board is being read'),
+	PrimaryKey: z
+		.int()
+		.nullable()
+		.optional()
+		.describe('2026: the room id (`LeaderboardType` 0) or event id (1); null names no board'),
+	SecondaryKey: z
+		.int()
+		.nullable()
+		.optional()
+		.describe('2026: which of the room’s tracked stats to rank on; null names no board'),
+	LeaderboardType: z
+		.int()
+		.optional()
+		.describe('2026: 0 Room, 1 Event (always empty: no event stats are stored)'),
 	FilterType: z.int().describe('Who the board counts: 0 Global, 1 Friends'),
 	SortAscending: z.boolean().describe('false ranks highest-first, the usual leaderboard'),
 })
 
 /**
- * The body the client posts to `GetPlayerRank`, e.g.
- * `{"PlayerId":205,"StatChannel":2,"RoomId":14,"FilterType":0,"SortAscending":false}`.
- *
- * The same board selectors {@link GetRanksBody} carries, minus the slice — this asks about
- * one player rather than a page.
+ * The body the client posts to `GetRanks`: {@link BoardSelectors} plus the slice, e.g.
+ * `{"RankStart":0,"RankEnd":9,"PlayerId":2,"StatChannel":1,"RoomId":6,"FilterType":0,"SortAscending":false}`.
  */
-export const GetPlayerRankBody = z.object({
-	PlayerId: z.int().describe('The player whose rank is being asked for'),
-	StatChannel: z.int().describe('Which of the room’s tracked stats to rank on'),
-	RoomId: z.int().describe('The room whose board is being read'),
-	FilterType: z.int().describe('Who the board counts: 0 Global, 1 Friends'),
-	SortAscending: z.boolean().describe('false ranks highest-first, the usual leaderboard'),
+export const GetRanksBody = BoardSelectors.extend({
+	RankStart: z.int().describe('First rank of the slice, 0-based and inclusive'),
+	RankEnd: z.int().describe('Last rank of the slice, inclusive — 0–9 is the first ten'),
 })
+
+/** The body the client posts to `GetPlayerRank`: just {@link BoardSelectors}. */
+export const GetPlayerRankBody = BoardSelectors
 
 /**
  * The body the client posts to `CheckAndSetStat`, e.g.
@@ -127,6 +140,9 @@ export const GetPlayerRankBody = z.object({
  * A compare-and-set: `CurrentStatValue` is what the client believes is already stored (null
  * when it believes nothing is), and `StatValue` is what it wants stored. There is no
  * `PlayerId` — the stat belongs to whoever is calling.
+ *
+ * 20260323 still posts `RoomId` + `StatChannel` here, NOT the reads' `PrimaryKey` /
+ * `SecondaryKey`. Keep this model separate from {@link BoardSelectors}.
  */
 export const CheckAndSetStatBody = z.object({
 	StatChannel: z.int().describe('Which of the room’s tracked stats is being written'),
@@ -139,12 +155,10 @@ export const CheckAndSetStatBody = z.object({
 })
 
 /**
- * The body posted to `GetNearbyScores`: {@link GetPlayerRankBody} plus `WindowSize`. This
- * is the reference servers' shape (the client's `GetNearbyScoresRequestDTO` extends its
- * rank request with `WindowSize`); it has not yet been watched from a live client here,
- * which is why the handler still logs it.
+ * The body posted to `GetNearbyScores`: {@link BoardSelectors} plus `WindowSize`, e.g.
+ * `{"WindowSize":10,"PlayerId":205,"PrimaryKey":6,"SecondaryKey":1,"FilterType":0,"SortAscending":false,"LeaderboardType":0}`.
  */
-export const GetNearbyScoresBody = GetPlayerRankBody.extend({
+export const GetNearbyScoresBody = BoardSelectors.extend({
 	WindowSize: z
 		.int()
 		.describe('How many rows either side of the player to return; default and maximum 10'),

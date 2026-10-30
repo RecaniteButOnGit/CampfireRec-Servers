@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useState } from 'react'
 
 import { KickReportCategory } from '../../../notify/src/notification-payloads'
-import { accountIdForUsername, call, isAdmin, useAction, usernamesFor } from './api'
+import { accountIdForUsername, call, isAdmin, useAction, usernamesFor, where } from './api'
 
 import type { PublicAccount } from './api'
 
@@ -95,6 +95,11 @@ interface ReportRow {
 	banned_at: string | null
 	chat_message_id: number | null
 	image_id: number | null
+	/**
+	 * The reported photo's key on `img`, joined on by `www` (the `report` table stores only
+	 * the id). Null for a report that isn't against a photo, or one whose photo is gone.
+	 */
+	image_name?: string | null
 	/**
 	 * Who lifted the ban that once stood on this row, and when — null until one is lifted,
 	 * and cleared again by a re-ban. A lift wipes the four ban columns, so this pair is the
@@ -290,6 +295,111 @@ function useStaffData<T>(path: string | null, deps: unknown[] = []) {
 	}, [path, ...deps])
 
 	return { data, error }
+}
+
+/** A ban that blocks a player, and which arm of `resolveBan` it reached them by. */
+interface BanMatch {
+	ban: ReportRow
+	via: 'account' | 'platform' | 'ip'
+	bannedAccountId: number
+}
+
+/** What a linked arm rests on, in a moderator's words. */
+const VIA_LABEL: Record<BanMatch['via'], string> = {
+	account: 'their own account',
+	platform: 'a shared platform identity',
+	ip: 'a shared IP address',
+}
+
+/** The player-history endpoint's reply. */
+interface PlayerHistoryData {
+	playerId: number
+	reports: ReportRow[]
+	warnings: WarningRow[]
+	activeBan: ReportRow | null
+	blockedBy: BanMatch | null
+}
+
+/** A ban's report number, linked to the report's page in the panel. */
+function ReportLink({ report, navigate }: { report: ReportRow; navigate: (to: string) => void }) {
+	return (
+		<button
+			type="button"
+			className="linkish"
+			onClick={() => navigate(`/moderation/reports/${report.id}/ban`)}
+		>
+			report #{report.id}
+		</button>
+	)
+}
+
+/**
+ * The ban standing on a player, if any: their own, or — when their own account is clean —
+ * a linked account's that `auth`/`match` still lock them out with. Null when nothing blocks
+ * them. Shared by the profile line and the history page so the two can't disagree.
+ */
+function BanSummary({
+	data,
+	names,
+	navigate,
+}: {
+	data: PlayerHistoryData
+	names: Map<number, PublicAccount>
+	navigate: (to: string) => void
+}) {
+	const ban = data.activeBan ?? data.blockedBy?.ban ?? null
+	if (ban === null) return null
+	const expiry = ban.ban_expires === null ? 'permanently' : `until ${when(ban.ban_expires)}`
+	if (data.activeBan !== null) {
+		return (
+			<>
+				Banned on <ReportLink report={ban} navigate={navigate} /> for{' '}
+				{categoryLabel(ban.report_category)} — {expiry}.
+			</>
+		)
+	}
+	const match = data.blockedBy!
+	return (
+		<>
+			Blocked by the ban on <PlayerName id={match.bannedAccountId} names={names} /> (
+			<ReportLink report={ban} navigate={navigate} />, {categoryLabel(ban.report_category)} —{' '}
+			{expiry}), through {VIA_LABEL[match.via]}.
+		</>
+	)
+}
+
+/**
+ * One line for a player's profile page (`/user/<username>`): whether a ban blocks them right
+ * now — their own or a linked account's — and a link to their full history here.
+ */
+export function PlayerBanStatus({
+	playerId,
+	navigate,
+}: {
+	playerId: number
+	navigate: (to: string) => void
+}) {
+	const { data, error } = useStaffData<PlayerHistoryData>(`/api/staff/players/${playerId}`)
+	const names = useNames(data?.blockedBy ? [data.blockedBy.bannedAccountId] : [])
+	const history = (
+		<button
+			type="button"
+			className="linkish"
+			onClick={() => navigate(`/moderation/players/${playerId}`)}
+		>
+			Moderation history
+		</button>
+	)
+
+	if (error) return <p className="error">{error}</p>
+	if (data === null) return <p className="muted">Checking for a ban…</p>
+	return data.activeBan === null && data.blockedBy === null ? (
+		<p className="muted">Not banned. {history}</p>
+	) : (
+		<p className="error">
+			<BanSummary data={data} names={names} navigate={navigate} /> {history}
+		</p>
+	)
 }
 
 /**
@@ -925,7 +1035,20 @@ function ReportTable({
 							<td>
 								<PlayerName id={report.reporter_player_id} names={names} />
 							</td>
-							<td>{reportKind(report)}</td>
+							<td>
+								{report.image_name ? (
+									<a
+										href={`${where().img}/${report.image_name}`}
+										target="_blank"
+										rel="noreferrer"
+										title={`Photo #${report.image_id}`}
+									>
+										{reportKind(report)}
+									</a>
+								) : (
+									reportKind(report)
+								)}
+							</td>
 							<td>{categoryLabel(report.report_category)}</td>
 							{/* The reporter's own words, untruncated in the title so a long
 							    description is readable without leaving the table. */}
@@ -1094,12 +1217,10 @@ function PlayerHistory({
 }) {
 	// Bumped by a write that leaves you on this page — lifting a ban from the table below.
 	const [ownRevision, setOwnRevision] = useState(0)
-	const { data, error } = useStaffData<{
-		playerId: number
-		reports: ReportRow[]
-		warnings: WarningRow[]
-		activeBan: ReportRow | null
-	}>(`/api/staff/players/${playerId}`, [revision, ownRevision])
+	const { data, error } = useStaffData<PlayerHistoryData>(`/api/staff/players/${playerId}`, [
+		revision,
+		ownRevision,
+	])
 	const reports = data?.reports ?? []
 	const warnings = data?.warnings ?? []
 	const names = useNames([
@@ -1107,6 +1228,7 @@ function PlayerHistory({
 		...reports.map((r) => r.reporter_player_id),
 		...reports.map((r) => r.unbanned_by_player_id ?? 0),
 		...warnings.map((w) => w.moderator_player_id),
+		data?.blockedBy?.bannedAccountId ?? 0,
 	])
 	// The most recent lift, if any — it is the thing a moderator about to ban needs to know
 	// first, since the report rows below say "Ban again…" and the reason is up here.
@@ -1126,9 +1248,15 @@ function PlayerHistory({
 					!error && <p className="muted">Loading…</p>
 				) : data.activeBan === null ? (
 					<>
+						{data.blockedBy !== null && (
+							<p className="error">
+								<BanSummary data={data} names={names} navigate={navigate} />
+							</p>
+						)}
 						<p className="muted">
-							Not banned. {reports.length} report{reports.length === 1 ? '' : 's'} on file,{' '}
-							{warnings.length} warning{warnings.length === 1 ? '' : 's'} handed down.
+							{data.blockedBy === null ? 'Not banned.' : 'No ban on this account itself.'}{' '}
+							{reports.length} report{reports.length === 1 ? '' : 's'} on file, {warnings.length}{' '}
+							warning{warnings.length === 1 ? '' : 's'} handed down.
 						</p>
 						{lastLifted !== undefined && (
 							<p className="mod-lifted-note">
@@ -1139,12 +1267,7 @@ function PlayerHistory({
 					</>
 				) : (
 					<p className="ok">
-						Banned on report #{data.activeBan.id} for{' '}
-						{categoryLabel(data.activeBan.report_category)} —{' '}
-						{data.activeBan.ban_expires === null
-							? 'permanently'
-							: `until ${when(data.activeBan.ban_expires)}`}
-						.
+						<BanSummary data={data} names={names} navigate={navigate} />
 					</p>
 				)}
 			</section>
@@ -1423,8 +1546,12 @@ function BanDialog({ reportId, navigate }: { reportId: number; navigate: (to: st
 					<PlayerName id={report.reported_player_id} names={names} /> is already banned
 				</h2>
 				<p className="muted">
-					Report #{report.id} — {expiryLabel(report)}. Lift it from the tables if this was a
-					mistake.
+					Report #{report.id} — {categoryLabel(report.report_category)}
+					{report.details ? `: “${report.details}”` : ''}
+				</p>
+				<p className="muted">
+					Banned {report.ban_expires === null ? 'permanently' : `until ${when(report.ban_expires)}`}
+					. Lift it from the tables if this was a mistake.
 				</p>
 				<button onClick={() => navigate(`/moderation/players/${report.reported_player_id}`)}>
 					See their history

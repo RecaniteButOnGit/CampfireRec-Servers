@@ -236,6 +236,17 @@ export const AnnouncementIdEnvelope = z.object({
 	value: z.int().describe('The new announcement’s id'),
 })
 
+/**
+ * The reply to deleting an announcement (`DELETE /announcements/club/:clubId/:announcementId`).
+ * PascalCase with a snake_case `error_id` — not the `{ error, success, value }` envelope
+ * the rest of this worker answers.
+ */
+export const DeleteAnnouncementResponse = z.object({
+	Success: z.boolean(),
+	Error: z.string().nullable().describe('Null on success; the message shown otherwise'),
+	error_id: z.null(),
+})
+
 // ---- Other response shapes -------------------------------------------------
 
 /** `GET /club/search` — a page of clubs plus the full match count. */

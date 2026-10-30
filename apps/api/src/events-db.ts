@@ -926,10 +926,9 @@ export async function getEventById(db: D1Database, eventId: number): Promise<Pla
  */
 export async function getEventsByIds(db: D1Database, ids: number[]): Promise<PlayerEvent[]> {
 	if (ids.length === 0) return []
-	const placeholders = ids.map((_, i) => `?${i + 1}`).join(', ')
 	const { results } = await db
-		.prepare(`SELECT data FROM event WHERE id IN (${placeholders})`)
-		.bind(...ids)
+		.prepare(`SELECT data FROM event WHERE id IN (SELECT value FROM json_each(?1))`)
+		.bind(JSON.stringify(ids))
 		.all<EventRow>()
 	const byId = new Map<number, PlayerEvent>()
 	for (const r of results) {
@@ -1027,10 +1026,9 @@ export async function getPublicEventsByPlayer(
  */
 export async function getEventsByClubs(db: D1Database, clubIds: number[]): Promise<PlayerEvent[]> {
 	if (clubIds.length === 0) return []
-	const placeholders = clubIds.map((_, i) => `?${i + 1}`).join(', ')
 	const { results } = await db
-		.prepare(`SELECT data FROM event WHERE club_id IN (${placeholders})`)
-		.bind(...clubIds)
+		.prepare(`SELECT data FROM event WHERE club_id IN (SELECT value FROM json_each(?1))`)
+		.bind(JSON.stringify(clubIds))
 		.all<EventRow>()
 	return results.map((r) => JSON.parse(r.data) as PlayerEvent).sort(bySoonest)
 }

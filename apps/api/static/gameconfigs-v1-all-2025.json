@@ -4782,8 +4782,8 @@
 	},
 	{
 		"Key": "ShareCam.VideoEnabled",
-		"Value": "false",
-		"ActiveExperiments": "video_recording_2025q2",
+		"Value": "true",
+		"ActiveExperiments": "",
 		"StartTime": null,
 		"EndTime": null
 	},

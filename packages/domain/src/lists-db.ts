@@ -223,3 +223,41 @@ export async function getPlayerList(
 	if (row === null) return undefined
 	return toCuratedList(row, await getListItems(db, row.list_id))
 }
+
+/** What {@link removePlayerListItem} found: the list as it now stands, or why it can't be. */
+export type RemoveListItemResult =
+	{ ok: true; list: CuratedList } | { ok: false; reason: 'not_found' | 'not_owner' }
+
+/**
+ * Remove an item from a list the caller owns — `DELETE /curatedlists/:listId/items/:itemId`,
+ * which the client calls to un-save a room. Unlike the save, the path names the list by ID,
+ * so ownership has to be CHECKED rather than implied: the list must be the caller's.
+ *
+ * Removing an item the list doesn't hold is not an error — the list already says what the
+ * caller wants it to — and answers the list unchanged. The list itself is kept when it
+ * empties: the client created it and expects to find it again by name.
+ */
+export async function removePlayerListItem(
+	db: D1Database,
+	accountId: number,
+	listId: number,
+	itemId: string
+): Promise<RemoveListItemResult> {
+	const row = await db
+		.prepare(
+			`SELECT list_id, creator_account_id, list_type, list_name, list_description,
+			        image_name, accessibility, created_at
+			 FROM list WHERE list_id = ?1`
+		)
+		.bind(listId)
+		.first<ListRow>()
+	if (row === null) return { ok: false, reason: 'not_found' }
+	if (row.creator_account_id !== accountId) return { ok: false, reason: 'not_owner' }
+
+	await db
+		.prepare('DELETE FROM list_item WHERE list_id = ?1 AND item_id = ?2')
+		.bind(listId, itemId)
+		.run()
+
+	return { ok: true, list: toCuratedList(row, await getListItems(db, listId)) }
+}

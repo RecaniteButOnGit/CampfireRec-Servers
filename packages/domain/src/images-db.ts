@@ -467,6 +467,46 @@ export function toImagesPlayer(img: SavedImage): ImagesPlayer {
 	}
 }
 
+/**
+ * The bulk-lookup projection (`GET /api/images/v5/bulk`): the {@link ImagesPlayer} shape
+ * plus a `ClubId`. Images aren't filed under clubs here, so it is always null — but the
+ * key is part of the shape and must be present.
+ */
+export interface ImagesBulk {
+	SavedImageId: number
+	ImageName: string
+	PlayerId: number
+	RoomId: number | null
+	PlayerEventId: number | null
+	ClubId: number | null
+	Description: string | null
+	Accessibility: number
+	AccessibilityLocked: boolean
+	SavedImageType: number
+	CreatedAt: string
+	CheerCount: number
+	CommentCount: number
+}
+
+/** Project a stored image to the bulk lookup's {@link ImagesBulk} shape. */
+export function toImagesBulk(img: SavedImage): ImagesBulk {
+	return {
+		SavedImageId: img.Id,
+		ImageName: img.ImageName,
+		PlayerId: img.PlayerId,
+		RoomId: img.RoomId,
+		PlayerEventId: img.PlayerEventId,
+		ClubId: null,
+		Description: img.Description,
+		Accessibility: img.Accessibility,
+		AccessibilityLocked: img.AccessibilityLocked,
+		SavedImageType: img.Type,
+		CreatedAt: img.CreatedAt,
+		CheerCount: img.CheerCount,
+		CommentCount: img.CommentCount,
+	}
+}
+
 /** How many recent images the slideshow feed returns when the caller doesn't say. */
 export const SLIDESHOW_LIMIT = 10
 

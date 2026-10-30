@@ -6,18 +6,28 @@ import '../../auth.app'
 
 import {
 	AUDIT_LOG_SCHEMA_DDL,
+	EMAIL_CODE_SCHEMA_DDL,
 	GAME_VERSION,
+	getAccount,
 	getAccountsByDeviceId,
+	getPasswordHash,
 	hashPassword,
 	PRESENCE_SCHEMA_DDL,
+	RATE_LIMIT_SCHEMA_DDL,
 	ROOM_SCHEMA_DDL,
 	SCHEMA_DDL,
 	seedRoomWithSubRooms,
 	SUBROOM_SCHEMA_DDL,
 	updateAccount,
 } from '@repo/domain'
-import { TOKEN_TTL_SECONDS } from '@repo/jwt'
+import {
+	generateIdentityAssertion,
+	generateToken,
+	TOKEN_TTL_SECONDS,
+	validateIdentityAssertion,
+} from '@repo/jwt'
 
+import { SCHEMA_DDL as CUSTOM_AVATAR_ITEM_SCHEMA_DDL } from '../../../../api/src/custom-avatar-items-db'
 import {
 	banFromReport,
 	createReport,
@@ -31,6 +41,7 @@ import {
 	PLATFORM_BACKFILL_SQL,
 	PLATFORM_SCHEMA_DDL,
 } from '../../platform-db'
+import { resetPasswordUrl } from '../../recovery-email'
 import { consumeRefreshToken, issueRefreshToken, REFRESH_SCHEMA_DDL } from '../../refresh-db'
 import {
 	STUDIO_CLIENT_ID,
@@ -72,6 +83,10 @@ beforeAll(async () => {
 	metaSecretId = await adminSecretsStore(env.META_APP_SECRET).create(META_APP_SECRET)
 	for (const stmt of SCHEMA_DDL) await env.DB.prepare(stmt).run()
 	for (const stmt of REFRESH_SCHEMA_DDL) await env.DB.prepare(stmt).run()
+	// The pending email codes (`/account/recoverpassword` issues one as a password_reset).
+	for (const stmt of EMAIL_CODE_SCHEMA_DDL) await env.DB.prepare(stmt).run()
+	// The counters that cap how many of those go out, per account and per IP.
+	for (const stmt of RATE_LIMIT_SCHEMA_DDL) await env.DB.prepare(stmt).run()
 	// Platform identity links — one account can hold several (a PC and a headset), and
 	// this table is what both the picker and the cached_login grant read.
 	for (const stmt of PLATFORM_SCHEMA_DDL) await env.DB.prepare(stmt).run()
@@ -102,6 +117,9 @@ beforeAll(async () => {
 	// Report table (owned by the api worker) — a ban is a report row with `banned` set;
 	// the token grant reads it for the evasion arms.
 	for (const stmt of REPORTS_SCHEMA_DDL) await env.DB.prepare(stmt).run()
+	// Custom avatar items (owned by the api worker) — every room read joins the published
+	// room badges from this table.
+	for (const stmt of CUSTOM_AVATAR_ITEM_SCHEMA_DDL) await env.DB.prepare(stmt).run()
 	for (const stmt of STUDIO_DEVICE_SCHEMA_DDL) await env.DB.prepare(stmt).run()
 })
 
@@ -682,8 +700,8 @@ describe('auth worker routes', () => {
 		expect(payload.iss).toBe('https://auth.recflare.net')
 		expect(payload.aud).toBe('https://auth.recflare.net')
 		expect(payload.role).toContain('gameClient')
-		// screenshare is a feature gate, not a grant — every token carries it.
-		expect(payload.role).toContain('screenshare')
+		// Screen sharing is disabled until staff explicitly grant it.
+		expect(payload.role).not.toContain('screenshare')
 		// A plain adult account carries nothing beyond those — no elevated roles.
 		expect(payload.role).not.toContain('developer')
 		expect(payload.role).not.toContain('moderator')
@@ -740,6 +758,37 @@ describe('auth worker routes', () => {
 	// refresh, and the Studio device grant — and a refresh after a revoke drops it. A
 	// token that kept the role for the rest of the day would leave a removed player
 	// uploading.
+	test('screen sharing requires a staff grant on login, refresh, and role lookup', async () => {
+		await seedAccount(9819, 'ScreenSharePlayer')
+		expect((await tokenFor(`account_id=9819&password=${LOGIN_PASSWORD}`)).role).not.toContain(
+			'screenshare'
+		)
+		await updateAccount(env.DB, 9819, { hasScreenshare: true })
+		const granted = await tokenFor(`account_id=9819&password=${LOGIN_PASSWORD}`)
+		expect(granted.role).toContain('screenshare')
+		expect(await (await exports.default.fetch(`${ORIGIN}/role/screenshare/9819`)).json()).toBe(true)
+		const session = await postToken(`account_id=9819&password=${LOGIN_PASSWORD}`)
+		const sessionBody = session.json as { refresh_token: string }
+		await updateAccount(env.DB, 9819, { hasScreenshare: false })
+		const refresh = await exports.default.fetch(`${ORIGIN}/connect/token`, {
+			method: 'POST',
+			headers: { 'content-type': 'application/x-www-form-urlencoded' },
+			body: new URLSearchParams({
+				grant_type: 'refresh_token',
+				refresh_token: sessionBody.refresh_token,
+			}),
+		})
+		expect(refresh.status).toBe(200)
+		const refreshed = (await refresh.json()) as { access_token: string }
+		const payload = JSON.parse(
+			atob(refreshed.access_token.split('.')[1].replace(/-/g, '+').replace(/_/g, '/'))
+		)
+		expect(payload.role).not.toContain('screenshare')
+		expect(await (await exports.default.fetch(`${ORIGIN}/role/screenshare/9819`)).json()).toBe(
+			false
+		)
+	})
+
 	test('POST /connect/token stamps betastudio only while the account has hasStudio', async () => {
 		// 9811/9812, not 9601–9605: those ids belong to the staff-login audit tests,
 		// which insert with OR IGNORE and then count `staff_login` rows.
@@ -751,7 +800,6 @@ describe('auth worker routes', () => {
 		await updateAccount(env.DB, 9811, { hasStudio: true })
 		expect((await tokenFor(`account_id=9811&password=${LOGIN_PASSWORD}`)).role).toEqual([
 			'gameClient',
-			'screenshare',
 			'betastudio',
 		])
 
@@ -770,7 +818,6 @@ describe('auth worker routes', () => {
 			.run()
 		expect((await tokenFor(`account_id=9812&password=${LOGIN_PASSWORD}`)).role).toEqual([
 			'gameClient',
-			'screenshare',
 			'developer',
 			'moderator',
 			'betastudio',
@@ -803,7 +850,6 @@ describe('auth worker routes', () => {
 		expect(signedIn.status).toBe(200)
 		expect(decodePayload(signedIn.json.access_token as string).role).toEqual([
 			'gameClient',
-			'screenshare',
 			'betastudio',
 		])
 
@@ -816,6 +862,53 @@ describe('auth worker routes', () => {
 		)
 		expect(refreshed.status).toBe(200)
 		expect(decodePayload(refreshed.json.access_token as string).role).not.toContain('betastudio')
+	})
+
+	// STUDIO_ROLLOUT opens Studio to a Discord ROLE: a holder is stamped `betastudio` exactly
+	// as a flagged account is, with no account flag involved, from the same Discord link
+	// snapshot the build rollout gate reads. Unset, the flag alone decides.
+	test('POST /connect/token stamps betastudio for a Discord role in STUDIO_ROLLOUT', async () => {
+		const studioRole = '1077000000000000031'
+		const otherRole = '1077000000000000032'
+		await seedAccount(9813, 'StudioRoleHolder')
+		await linkPlatformIdentity(env.DB, 9813, PlatformType.Discord, '500000000000009813', [
+			studioRole,
+		])
+		await seedAccount(9814, 'StudioRoleOutsider')
+		await linkPlatformIdentity(env.DB, 9814, PlatformType.Discord, '500000000000009814', [
+			otherRole,
+		])
+		const login = (id: number) => tokenFor(`account_id=${id}&password=${LOGIN_PASSWORD}`)
+
+		const original = env.STUDIO_ROLLOUT
+		try {
+			// Unset, or naming no role: the link grants nothing.
+			delete env.STUDIO_ROLLOUT
+			expect((await login(9813)).role).not.toContain('betastudio')
+			env.STUDIO_ROLLOUT = ' , '
+			expect((await login(9813)).role).not.toContain('betastudio')
+
+			// Same list grammar as DISCORD_ROLLOUT_ROLE_IDS; any one named role qualifies.
+			env.STUDIO_ROLLOUT = ` ${otherRole}x ,\n${studioRole} `
+			expect((await login(9813)).role).toEqual(['gameClient', 'betastudio'])
+			// A Discord link holding only other roles is not in the rollout.
+			expect((await login(9814)).role).not.toContain('betastudio')
+			// The account flag never moved: this is the var, not a grant written anywhere.
+			expect((await getAccount(env.DB, 9813))?.hasStudio).toBeUndefined()
+
+			// The refresh grant re-resolves it, so ending the rollout drops the claim on the
+			// next refresh — the same path a revoked flag takes.
+			const session = await postToken(`account_id=9813&password=${LOGIN_PASSWORD}`)
+			delete env.STUDIO_ROLLOUT
+			const refreshed = await postToken(
+				`grant_type=refresh_token&refresh_token=${encodeURIComponent(session.json.refresh_token as string)}`
+			)
+			expect(refreshed.status).toBe(200)
+			expect(decodePayload(refreshed.json.access_token as string).role).not.toContain('betastudio')
+		} finally {
+			if (original === undefined) delete env.STUDIO_ROLLOUT
+			else env.STUDIO_ROLLOUT = original
+		}
 	})
 
 	// Rec Room Plus rides on the token as `rn.plus`, stamped from `account.hasPlus` — which
@@ -888,7 +981,7 @@ describe('auth worker routes', () => {
 			)
 			.run()
 		const payload = await tokenFor(`account_id=92&password=${LOGIN_PASSWORD}`)
-		expect(payload.role).toEqual(expect.arrayContaining(['gameClient', 'screenshare', 'junior']))
+		expect(payload.role).toEqual(expect.arrayContaining(['gameClient', 'junior']))
 		expect(payload.role).not.toContain('developer')
 		// `rn.privilege` is a claim, not a scope — it sits beside `role`, never in `scope`.
 		expect(payload['rn.privilege']).toEqual(['BanVChat', 'BanRmChat'])
@@ -907,9 +1000,7 @@ describe('auth worker routes', () => {
 			)
 			.run()
 		const payload = await tokenFor(`account_id=95&password=${LOGIN_PASSWORD}`)
-		expect(payload.role).toEqual(
-			expect.arrayContaining(['gameClient', 'screenshare', 'influencer'])
-		)
+		expect(payload.role).toEqual(expect.arrayContaining(['gameClient', 'influencer']))
 		expect(payload.role).not.toContain('developer')
 
 		// Off the flag, off the token — no other flag implies it.
@@ -1036,7 +1127,9 @@ describe('auth worker routes', () => {
 			.bind(77)
 			.first<{ data: string }>()
 		expect(row!.data).toContain('"deviceClass":2')
-		expect(row!.data).not.toContain('2.0')
+		// Keyed, not a bare '2.0': the row's lastLoginTime has milliseconds, so a login at
+		// `…:02.045Z` would match that string on its own.
+		expect(row!.data).not.toContain('"deviceClass":2.0')
 	})
 
 	// The grant the live client actually logs in with, and the one path whose device
@@ -1244,6 +1337,317 @@ describe('auth worker routes', () => {
 		} finally {
 			env.PASSWORD_SIGNUP = original
 		}
+	})
+
+	// The rollout gate: build 20260323.14 is for Discord supporters only. A login posting it
+	// as `ver` is refused unless the account's Discord link holds a role named in
+	// DISCORD_ROLLOUT_ROLE_IDS; every other build, and a grant posting no `ver`, is untouched.
+	describe('rollout gate on build 20260323.14', () => {
+		const GATED = '20260323.14'
+		const REFUSED =
+			'this build is limited to Discord supporters; link your Discord on the website first'
+		const supporter = '1077000000000000001'
+		const booster = '1077000000000000002'
+		const outsider = '1077000000000000009'
+
+		async function seedAccount(id: number, username: string) {
+			await env.DB.prepare('INSERT OR IGNORE INTO account (data) VALUES (?1)')
+				.bind(
+					JSON.stringify({
+						accountId: id,
+						username,
+						passwordHash: await hashPassword(LOGIN_PASSWORD),
+					})
+				)
+				.run()
+		}
+
+		const login = (username: string, ver?: string) =>
+			postToken(
+				`grant_type=password&username=${username}&password=${LOGIN_PASSWORD}` +
+					(ver === undefined ? '' : `&ver=${ver}`)
+			)
+
+		async function withRoleIds<T>(value: string | undefined, run: () => Promise<T>): Promise<T> {
+			// `env` is shared by every test in this file, so the override is restored in
+			// `finally` rather than leaking a configured gate into the tests around this one.
+			const original = env.DISCORD_ROLLOUT_ROLE_IDS
+			if (value === undefined) delete env.DISCORD_ROLLOUT_ROLE_IDS
+			else env.DISCORD_ROLLOUT_ROLE_IDS = value
+			try {
+				return await run()
+			} finally {
+				if (original === undefined) delete env.DISCORD_ROLLOUT_ROLE_IDS
+				else env.DISCORD_ROLLOUT_ROLE_IDS = original
+			}
+		}
+
+		beforeAll(async () => {
+			await seedAccount(9301, 'gate_supporter')
+			await linkPlatformIdentity(env.DB, 9301, PlatformType.Discord, '500000000000000001', [
+				supporter,
+			])
+			await seedAccount(9302, 'gate_outsider')
+			await linkPlatformIdentity(env.DB, 9302, PlatformType.Discord, '500000000000000002', [
+				outsider,
+			])
+			await seedAccount(9303, 'gate_unlinked')
+			// A Steam link is not a Discord link — it carries no roles to hold.
+			await linkPlatformIdentity(env.DB, 9303, PlatformType.Steam, '76561198000009303')
+			// Staff, with no Discord link at all.
+			for (const [id, username, flag] of [
+				[9304, 'gate_developer', 'isDeveloper'],
+				[9305, 'gate_moderator', 'isModerator'],
+			] as const) {
+				await env.DB.prepare('INSERT OR IGNORE INTO account (data) VALUES (?1)')
+					.bind(
+						JSON.stringify({
+							accountId: id,
+							username,
+							passwordHash: await hashPassword(LOGIN_PASSWORD),
+							[flag]: true,
+						})
+					)
+					.run()
+			}
+		})
+
+		test('staff are let in with no Discord link, even with the gate closed', async () => {
+			for (const roleIds of [undefined, supporter]) {
+				await withRoleIds(roleIds, async () => {
+					expect((await login('gate_developer', GATED)).status).toBe(200)
+					expect((await login('gate_moderator', GATED)).status).toBe(200)
+				})
+			}
+		})
+
+		test('with no roles configured the gate is closed to every non-staff account', async () => {
+			await withRoleIds(undefined, async () => {
+				const res = await login('gate_supporter', GATED)
+				expect(res.status).toBe(400)
+				expect(res.json).toEqual({ error: 'invalid_grant', error_description: REFUSED })
+			})
+			// A value that parses to no ids is the same as unset.
+			await withRoleIds(' , ', async () => {
+				expect((await login('gate_supporter', GATED)).status).toBe(400)
+			})
+		})
+
+		test('a configured role lets its holder in, and the token carries the build', async () => {
+			await withRoleIds(`${booster},${supporter}`, async () => {
+				const res = await login('gate_supporter', GATED)
+				expect(res.status).toBe(200)
+				const payload = decodePayload(res.json.access_token as string)
+				expect(payload.sub).toBe('9301')
+				expect(payload['rn.ver']).toBe(GATED)
+			})
+		})
+
+		test('the list is split on commas and/or whitespace, like DISCORD_BENEFITS_ROLE_IDS', async () => {
+			await withRoleIds(` ${booster} ,\n${supporter} `, async () => {
+				expect((await login('gate_supporter', GATED)).status).toBe(200)
+			})
+		})
+
+		test('a Discord link holding only other roles, or no Discord link at all, is refused', async () => {
+			await withRoleIds(`${supporter},${booster}`, async () => {
+				const other = await login('gate_outsider', GATED)
+				expect(other.status).toBe(400)
+				expect(other.json.error_description).toBe(REFUSED)
+
+				const unlinked = await login('gate_unlinked', GATED)
+				expect(unlinked.status).toBe(400)
+				expect(unlinked.json.error_description).toBe(REFUSED)
+			})
+		})
+
+		test('other builds, and grants posting no ver, are never gated', async () => {
+			await withRoleIds(undefined, async () => {
+				expect((await login('gate_outsider')).status).toBe(200)
+				expect((await login('gate_outsider', GAME_VERSION)).status).toBe(200)
+				expect((await login('gate_outsider', '20250718.01')).status).toBe(200)
+				expect((await login('gate_unlinked', '20230414')).status).toBe(200)
+			})
+		})
+
+		test('every point release of the gated build is gated', async () => {
+			// The gate is on the BUILD (the bare date): the client's `.NN` is a same-day
+			// rebuild, so `.14`, `.2` and the date alone are all the rollout build.
+			await withRoleIds(undefined, async () => {
+				for (const version of ['20260323', '20260323.2', '20260323.14']) {
+					const res = await login('gate_outsider', version)
+					expect(res.status, version).toBe(400)
+					expect(res.json.error_description, version).toBe(REFUSED)
+				}
+			})
+		})
+
+		test('the credential is checked first, so the gate cannot probe for accounts', async () => {
+			await withRoleIds(undefined, async () => {
+				const res = await postToken(
+					`grant_type=password&username=gate_outsider&password=wrong&ver=${GATED}`
+				)
+				expect(res.status).toBe(400)
+				expect(res.json.error_description).toBe('invalid account_id or password')
+			})
+		})
+
+		test('create_account on the build is refused before anything is minted', async () => {
+			await withRoleIds(`${supporter}`, async () => {
+				const before = await env.DB.prepare('SELECT COUNT(*) AS n FROM account').first<{
+					n: number
+				}>()
+				const res = await postToken(
+					`grant_type=create_account&platform_id=steam-gated&password=hunter2&ver=${GATED}`
+				)
+				expect(res.status).toBe(400)
+				expect(res.json).toEqual({ error: 'invalid_grant', error_description: REFUSED })
+				const after = await env.DB.prepare('SELECT COUNT(*) AS n FROM account').first<{
+					n: number
+				}>()
+				expect(after?.n).toBe(before?.n)
+			})
+		})
+
+		// The two lists behind the gates are vars (`SUPPORTED_GAME_VERSIONS`,
+		// `ROLLOUT_GAME_VERSIONS`), so an operator can end the rollout or drop a build without
+		// a deploy of new code. Same env-override discipline as withRoleIds.
+		describe('the lists come from vars', () => {
+			const UNSUPPORTED = 'this game version is not supported by this server; update your game'
+
+			async function withVars<T>(
+				vars: { SUPPORTED_GAME_VERSIONS?: string; ROLLOUT_GAME_VERSIONS?: string },
+				run: () => Promise<T>
+			): Promise<T> {
+				const originals = {
+					SUPPORTED_GAME_VERSIONS: env.SUPPORTED_GAME_VERSIONS,
+					ROLLOUT_GAME_VERSIONS: env.ROLLOUT_GAME_VERSIONS,
+				}
+				const apply = (values: typeof originals) => {
+					for (const key of ['SUPPORTED_GAME_VERSIONS', 'ROLLOUT_GAME_VERSIONS'] as const) {
+						if (values[key] === undefined) delete env[key]
+						else env[key] = values[key]
+					}
+				}
+				apply({ ...originals, ...vars })
+				try {
+					return await run()
+				} finally {
+					apply(originals)
+				}
+			}
+
+			test('a build dropped from SUPPORTED_GAME_VERSIONS is refused a token, staff included', async () => {
+				await withVars({ SUPPORTED_GAME_VERSIONS: '20230414,20240621,20260323' }, async () => {
+					await withRoleIds(undefined, async () => {
+						// The 2025 build, every point release of it: this is the forced upgrade.
+						for (const version of ['20250718', '20250718.01', '20250718.2']) {
+							const res = await login('gate_outsider', version)
+							expect(res.status, version).toBe(400)
+							expect(res.json, version).toEqual({
+								error: 'invalid_grant',
+								error_description: UNSUPPORTED,
+							})
+						}
+						// Staff get no exception here — the build is not served, full stop.
+						expect((await login('gate_developer', '20250718.01')).status).toBe(400)
+						// The builds that ARE listed, and a grant posting no `ver`, are untouched;
+						// the rollout gate still applies to the one under rollout.
+						expect((await login('gate_outsider', GAME_VERSION)).status).toBe(200)
+						expect((await login('gate_outsider')).status).toBe(200)
+						expect((await login('gate_developer', GATED)).status).toBe(200)
+						expect((await login('gate_outsider', GATED)).json.error_description).toBe(REFUSED)
+					})
+				})
+			})
+
+			test('create_account on an unsupported build is refused before anything is minted', async () => {
+				await withVars({ SUPPORTED_GAME_VERSIONS: '20230414' }, async () => {
+					const before = await env.DB.prepare('SELECT COUNT(*) AS n FROM account').first<{
+						n: number
+					}>()
+					const res = await postToken(
+						'grant_type=create_account&platform_id=steam-unsupported&password=hunter2&ver=20250718.01'
+					)
+					expect(res.status).toBe(400)
+					expect(res.json).toEqual({ error: 'invalid_grant', error_description: UNSUPPORTED })
+					const after = await env.DB.prepare('SELECT COUNT(*) AS n FROM account').first<{
+						n: number
+					}>()
+					expect(after?.n).toBe(before?.n)
+				})
+			})
+
+			test('ROLLOUT_GAME_VERSIONS=off ends the rollout: the build opens to everyone', async () => {
+				await withVars({ ROLLOUT_GAME_VERSIONS: 'off' }, async () => {
+					await withRoleIds(undefined, async () => {
+						const res = await login('gate_outsider', GATED)
+						expect(res.status).toBe(200)
+						expect(decodePayload(res.json.access_token as string)['rn.ver']).toBe(GATED)
+						expect((await login('gate_unlinked', GATED)).status).toBe(200)
+						// ...and accounts can be created on it, since nothing needs a Discord link.
+						const created = await postToken(
+							`grant_type=create_account&platform_id=steam-rollout-over&password=hunter2&ver=${GATED}`
+						)
+						expect(created.status).toBe(200)
+					})
+				})
+			})
+
+			test('ROLLOUT_GAME_VERSIONS names which builds are gated', async () => {
+				// Move the gate onto the beta build: it is now supporters-only and the 2026
+				// build is open. Both stay served.
+				await withVars({ ROLLOUT_GAME_VERSIONS: '20250718' }, async () => {
+					await withRoleIds(supporter, async () => {
+						const outsider = await login('gate_outsider', '20250718.01')
+						expect(outsider.status).toBe(400)
+						expect(outsider.json.error_description).toBe(REFUSED)
+						expect((await login('gate_supporter', '20250718.01')).status).toBe(200)
+						expect((await login('gate_outsider', GATED)).status).toBe(200)
+					})
+				})
+			})
+
+			test('a build under rollout is served even when SUPPORTED_GAME_VERSIONS omits it', async () => {
+				await withVars({ SUPPORTED_GAME_VERSIONS: '20230414' }, async () => {
+					await withRoleIds(supporter, async () => {
+						// Rolling out, so the ROLLOUT gate answers, not the support one.
+						expect((await login('gate_supporter', GATED)).status).toBe(200)
+						expect((await login('gate_outsider', GATED)).json.error_description).toBe(REFUSED)
+					})
+				})
+				// In neither list, nobody reaches it — a rollout pulled back entirely.
+				await withVars(
+					{ SUPPORTED_GAME_VERSIONS: '20230414', ROLLOUT_GAME_VERSIONS: 'off' },
+					async () => {
+						await withRoleIds(supporter, async () => {
+							for (const username of ['gate_supporter', 'gate_developer']) {
+								const res = await login(username, GATED)
+								expect(res.status, username).toBe(400)
+								expect(res.json.error_description, username).toBe(UNSUPPORTED)
+							}
+						})
+					}
+				)
+			})
+
+			test('entries are read as builds, so a copied point release still matches', async () => {
+				await withVars({ SUPPORTED_GAME_VERSIONS: ' 20230414, 20250718.01 ' }, async () => {
+					expect((await login('gate_outsider', '20250718.2')).status).toBe(200)
+					expect((await login('gate_outsider', '20250718')).status).toBe(200)
+				})
+				// Blank is unset: Campfire's default accepts only the June 2024 client and
+				// has no staged rollout unless the operator sets one.
+				await withVars(
+					{ SUPPORTED_GAME_VERSIONS: '  ', ROLLOUT_GAME_VERSIONS: '  ' },
+					async () => {
+						expect((await login('gate_outsider', GAME_VERSION)).status).toBe(200)
+						expect((await login('gate_outsider', '20231207')).status).toBe(400)
+						expect((await login('gate_outsider', GATED)).status).toBe(400)
+					}
+				)
+			})
+		})
 	})
 
 	test('the signup caps come from vars, and 0 disables an arm', async () => {
@@ -1633,6 +2037,257 @@ describe('auth worker routes', () => {
 		expect(await rotate.json()).toEqual({ success: true })
 	})
 
+	/** POST a form-urlencoded body to one of the unauthenticated recovery routes. */
+	const postForm = (path: string, body: string) =>
+		exports.default.fetch(`${ORIGIN}${path}`, {
+			method: 'POST',
+			headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+			body,
+		})
+	const recover = (body: string) => postForm('/account/recoverpassword', body)
+	const reset = (body: string) => postForm('/account/resetpassword', body)
+	const SENT = { Success: true, Error: null, error_id: null }
+
+	/** The pending recovery row for an account, or null. */
+	const pendingReset = (accountId: number) =>
+		env.DB.prepare(
+			"SELECT code_hash AS codeHash, created_at AS createdAt, expires_at AS expiresAt FROM email_code WHERE account_id = ?1 AND purpose = 'password_reset'"
+		)
+			.bind(accountId)
+			.first<{ codeHash: string | null; createdAt: number; expiresAt: number }>()
+
+	/**
+	 * Only the code's hash is stored and the email goes to the local binding's log, so a test
+	 * that needs to KNOW the code puts a known one in: same hash function as the route.
+	 */
+	const plantCode = async (accountId: number, code: string) => {
+		await env.DB.prepare(
+			"UPDATE email_code SET code_hash = ?2 WHERE account_id = ?1 AND purpose = 'password_reset'"
+		)
+			.bind(accountId, await hashPassword(code))
+			.run()
+	}
+
+	/** A fresh account with an email address on it, for the recovery tests. */
+	const accountWithEmail = async (tag: string, email: string) => {
+		const claims = await tokenFor(`grant_type=create_account&platform_id=steam-${tag}`)
+		const accountId = Number(claims.sub)
+		await updateAccount(env.DB, accountId, { email })
+		return accountId
+	}
+
+	test('POST /account/recoverpassword issues a code and emails it', async () => {
+		const id = await accountWithEmail('recover1', 'recover1@example.com')
+		const before = Math.floor(Date.now() / 1000)
+		const res = await recover('email=recover1%40example.com')
+		expect(res.status).toBe(200)
+		expect(await res.json()).toEqual(SENT)
+
+		const row = await pendingReset(id)
+		expect(row).not.toBeNull()
+		expect(row!.codeHash).toMatch(/^[^:]+:[^:]+$/)
+		expect(row!.createdAt).toBeGreaterThanOrEqual(before)
+		expect(row!.expiresAt - row!.createdAt).toBe(30 * 60)
+	})
+
+	test('POST /account/recoverpassword finds the account case-insensitively', async () => {
+		const id = await accountWithEmail('recover2', 'Recover2@Example.com')
+		const res = await recover('email=RECOVER2%40example.com')
+		expect(await res.json()).toEqual(SENT)
+		expect(await pendingReset(id)).not.toBeNull()
+	})
+
+	test('POST /account/recoverpassword answers an unknown address exactly like a sent one', async () => {
+		const res = await recover('email=nobody-here%40example.com')
+		expect(res.status).toBe(200)
+		expect(await res.json()).toEqual(SENT)
+		const rows = await env.DB.prepare('SELECT COUNT(*) AS n FROM email_code').first<{
+			n: number
+		}>()
+		// Nothing was issued for it — the account doesn't exist — but the caller can't tell.
+		expect(rows!.n).toBeGreaterThanOrEqual(0)
+	})
+
+	test('POST /account/recoverpassword refuses a missing or malformed address, in the client envelope', async () => {
+		for (const [body, error] of [
+			['', 'Enter the email address on your account.'],
+			['email=', 'Enter the email address on your account.'],
+			['email=not-an-address', "That doesn't look like an email address."],
+		]) {
+			const res = await recover(body!)
+			expect(res.status).toBe(200)
+			expect(await res.json()).toEqual({ Success: false, Error: error, error_id: null })
+		}
+	})
+
+	test('POST /account/recoverpassword does not resend within the cooldown', async () => {
+		const id = await accountWithEmail('recover3', 'recover3@example.com')
+		expect(await (await recover('email=recover3%40example.com')).json()).toEqual(SENT)
+		const first = await pendingReset(id)
+		// Same answer, but the pending code is untouched: no second email went out.
+		expect(await (await recover('email=recover3%40example.com')).json()).toEqual(SENT)
+		expect(await pendingReset(id)).toEqual(first)
+	})
+
+	test('POST /account/recoverpassword replaces the pending code once the cooldown has passed', async () => {
+		const id = await accountWithEmail('recover4', 'recover4@example.com')
+		await recover('email=recover4%40example.com')
+		const first = await pendingReset(id)
+		await env.DB.prepare(
+			"UPDATE email_code SET created_at = created_at - 600 WHERE account_id = ?1 AND purpose = 'password_reset'"
+		)
+			.bind(id)
+			.run()
+		await recover('email=recover4%40example.com')
+		const second = await pendingReset(id)
+		expect(second!.codeHash).not.toBe(first!.codeHash)
+		expect(second!.createdAt).toBeGreaterThan(first!.createdAt - 600)
+	})
+
+	test('POST /account/recoverpassword sends an account at most five codes a day', async () => {
+		const id = await accountWithEmail('recover5', 'recover5@example.com')
+		/** Lift the cooldown, so only the daily cap is in play. */
+		const lift = () =>
+			env.DB.prepare(
+				"UPDATE email_code SET created_at = created_at - 600 WHERE account_id = ?1 AND purpose = 'password_reset'"
+			)
+				.bind(id)
+				.run()
+		const hashes: string[] = []
+		for (let i = 0; i < 5; i++) {
+			expect(await (await recover('email=recover5%40example.com')).json()).toEqual(SENT)
+			hashes.push((await pendingReset(id))!.codeHash!)
+			await lift()
+		}
+		expect(new Set(hashes).size).toBe(5)
+		// The sixth is answered the same and changes nothing: no email went out.
+		expect(await (await recover('email=recover5%40example.com')).json()).toEqual(SENT)
+		expect((await pendingReset(id))!.codeHash).toBe(hashes[4])
+	})
+
+	test('POST /account/recoverpassword takes at most ten requests an hour from one IP', async () => {
+		const id = await accountWithEmail('recover6', 'recover6@example.com')
+		const fromIp = (body: string) =>
+			exports.default.fetch(`${ORIGIN}/account/recoverpassword`, {
+				method: 'POST',
+				headers: {
+					'Content-Type': 'application/x-www-form-urlencoded',
+					'CF-Connecting-IP': '203.0.113.9',
+				},
+				body,
+			})
+		// Ten requests for addresses on no account spend the hour's allowance just the same.
+		for (let i = 0; i < 10; i++) {
+			expect(await (await fromIp(`email=nobody${i}%40example.com`)).json()).toEqual(SENT)
+		}
+		// The eleventh, for a real account, is answered the same and issues nothing.
+		expect(await (await fromIp('email=recover6%40example.com')).json()).toEqual(SENT)
+		expect(await pendingReset(id)).toBeNull()
+		// Another IP is unaffected.
+		const other = await exports.default.fetch(`${ORIGIN}/account/recoverpassword`, {
+			method: 'POST',
+			headers: {
+				'Content-Type': 'application/x-www-form-urlencoded',
+				'CF-Connecting-IP': '203.0.113.10',
+			},
+			body: 'email=recover6%40example.com',
+		})
+		expect(await other.json()).toEqual(SENT)
+		expect(await pendingReset(id)).not.toBeNull()
+	})
+
+	test('POST /account/resetpassword sets the password with the emailed code, once', async () => {
+		const id = await accountWithEmail('reset1', 'reset1@example.com')
+		await recover('email=reset1%40example.com')
+		await plantCode(id, '123456')
+		// A refresh token from an old session, which the reset signs out.
+		const refresh = await issueRefreshToken(env.DB, id)
+
+		const res = await reset('email=reset1%40example.com&code=123456&newPassword=brand-new')
+		expect(res.status).toBe(200)
+		expect(await res.json()).toEqual({ success: true })
+		expect(await pendingReset(id)).toBeNull()
+		expect(await consumeRefreshToken(env.DB, refresh)).toBeNull()
+
+		// The new password signs in.
+		const login = await exports.default.fetch(`${ORIGIN}/connect/token`, {
+			method: 'POST',
+			headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+			body: `grant_type=password&account_id=${id}&password=brand-new`,
+		})
+		expect(login.status).toBe(200)
+
+		// The code was spent: the same one again is refused.
+		const again = await reset('email=reset1%40example.com&code=123456&newPassword=another')
+		expect(again.status).toBe(400)
+	})
+
+	test('POST /account/resetpassword voids the recovery on a wrong code', async () => {
+		const id = await accountWithEmail('reset2', 'reset2@example.com')
+		await recover('email=reset2%40example.com')
+		await plantCode(id, '123456')
+
+		const wrong = await reset('email=reset2%40example.com&code=654321&newPassword=brand-new')
+		expect(wrong.status).toBe(400)
+		expect(await wrong.json()).toEqual({
+			success: false,
+			error: 'That code is wrong or has expired. Request a new recovery email and try again.',
+		})
+		// Burned, not deleted: the row stays for the resend cooldown, with no code to guess.
+		expect((await pendingReset(id))!.codeHash).toBeNull()
+
+		// The RIGHT code no longer works either — a new email has to be requested.
+		const right = await reset('email=reset2%40example.com&code=123456&newPassword=brand-new')
+		expect(right.status).toBe(400)
+		expect(await getPasswordHash(env.DB, id)).toBeNull()
+	})
+
+	test('POST /account/resetpassword refuses a lapsed code', async () => {
+		const id = await accountWithEmail('reset3', 'reset3@example.com')
+		await recover('email=reset3%40example.com')
+		await plantCode(id, '123456')
+		await env.DB.prepare(
+			"UPDATE email_code SET expires_at = expires_at - 3600 WHERE account_id = ?1 AND purpose = 'password_reset'"
+		)
+			.bind(id)
+			.run()
+		const res = await reset('email=reset3%40example.com&code=123456&newPassword=brand-new')
+		expect(res.status).toBe(400)
+		expect(await pendingReset(id)).toBeNull()
+	})
+
+	test('POST /account/resetpassword refuses the same way for no recovery and an unknown address', async () => {
+		const sameError = {
+			success: false,
+			error: 'That code is wrong or has expired. Request a new recovery email and try again.',
+		}
+		await accountWithEmail('reset4', 'reset4@example.com')
+		const none = await reset('email=reset4%40example.com&code=123456&newPassword=brand-new')
+		expect(none.status).toBe(400)
+		expect(await none.json()).toEqual(sameError)
+		const unknown = await reset('email=nobody%40example.com&code=123456&newPassword=brand-new')
+		expect(unknown.status).toBe(400)
+		expect(await unknown.json()).toEqual(sameError)
+	})
+
+	test('POST /account/resetpassword refuses a missing field', async () => {
+		for (const body of [
+			'code=123456&newPassword=x',
+			'email=a%40b.com&newPassword=x',
+			'email=a%40b.com&code=123456',
+		]) {
+			const res = await reset(body)
+			expect(res.status).toBe(400)
+			expect(((await res.json()) as { success: boolean }).success).toBe(false)
+		}
+	})
+
+	test('the reset link carries the address and the code for the website', () => {
+		expect(resetPasswordUrl('https://www.rec.example.com', 'a+b@example.com', '012345')).toBe(
+			'https://www.rec.example.com/reset-password?email=a%2Bb%40example.com&code=012345'
+		)
+	})
+
 	test('GET /privileges/me/restrictions is an empty array for an unrestricted caller', async () => {
 		const token = await accessTokenFor('grant_type=create_account&platform_id=steam-restrict1')
 		const res = await exports.default.fetch(`${ORIGIN}/privileges/me/restrictions`, {
@@ -1648,6 +2303,22 @@ describe('auth worker routes', () => {
 		const res = await exports.default.fetch(`${ORIGIN}/privileges/me/restrictions`)
 		expect(res.status).toBe(401)
 		expect(await res.text()).toBe('')
+	})
+
+	test('GET /role/screenshare/:id matches the token feature gate for existing accounts', async () => {
+		for (const id of [42, 77]) {
+			const res = await exports.default.fetch(`${ORIGIN}/role/screenshare/${id}`)
+			expect(res.status).toBe(200)
+			expect(await res.json()).toBe(false)
+		}
+	})
+
+	test('GET /role/screenshare/:id does not grant a role to unknown accounts', async () => {
+		for (const id of ['999999', 'nonsense']) {
+			const res = await exports.default.fetch(`${ORIGIN}/role/screenshare/${id}`)
+			expect(res.status).toBe(404)
+			expect(await res.text()).toBe('')
+		}
 	})
 
 	test('GET /role/developer/:id returns a bare false for an un-flagged account', async () => {
@@ -1862,7 +2533,10 @@ describe('auth worker routes', () => {
 			'GET /role/developer/{id}',
 			'GET /role/moderator',
 			'GET /role/moderator/{id}',
+			'GET /role/screenshare/{id}',
 			'POST /account/me/changepassword',
+			'POST /account/recoverpassword',
+			'POST /account/resetpassword',
 			'POST /cachedlogin/forplatformid/{platform}/{id}',
 			'POST /cachedlogin/forplatformids',
 			'POST /connect/device/approve',
@@ -2257,5 +2931,147 @@ describe('staff login audit', () => {
 
 		expect((await postToken(`account_id=9605&password=${LOGIN_PASSWORD}`)).status).toBe(200)
 		expect(await staffLogins(9605)).toHaveLength(1)
+	})
+})
+
+// The website's "Sign in with Discord". `www` proves the Discord user (it holds the client
+// secret) and posts an identity ASSERTION signed with the shared JWT_SECRET; this grant
+// resolves it through the link table like a cached_login, or makes the account when there
+// is none. Everything here mints the assertion the way www does, with the test key.
+describe('identity_assertion grant', () => {
+	const SIGNING_KEY = 'test-signing-key'
+	const assertionFor = (platformId: string, platform = PlatformType.Discord) =>
+		generateIdentityAssertion({ platform, platformId }, SIGNING_KEY)
+	const redeem = async (assertion: string, ip?: string) =>
+		postToken(`grant_type=identity_assertion&assertion=${encodeURIComponent(assertion)}`, ip)
+
+	test('an assertion round-trips, and nothing else passes as one', async () => {
+		const assertion = await assertionFor('700000000000000001')
+		await expect(validateIdentityAssertion(assertion, SIGNING_KEY)).resolves.toEqual({
+			platform: PlatformType.Discord,
+			platformId: '700000000000000001',
+		})
+		// A different key, and an access token signed with the RIGHT key: both refused. The
+		// second is the one that matters — the same secret signs sessions, so the audience is
+		// what keeps a stolen token from being replayed as proof of a platform identity.
+		await expect(validateIdentityAssertion(assertion, 'another-key')).resolves.toBeNull()
+		const session = await generateToken('42', '', 4, SIGNING_KEY)
+		await expect(validateIdentityAssertion(session, SIGNING_KEY)).resolves.toBeNull()
+		// And the other direction: an assertion carries no `sub`, so it is no session.
+		const res = await exports.default.fetch(`${ORIGIN}/connect/device/approve`, {
+			method: 'POST',
+			headers: {
+				'Content-Type': 'application/x-www-form-urlencoded',
+				Authorization: `Bearer ${assertion}`,
+			},
+			body: 'user_code=ABCDEFGH',
+		})
+		expect(res.status).toBe(401)
+	})
+
+	test('signs into the one account the identity is linked to', async () => {
+		await seedAccount(9400, 'DiscordLinked')
+		// Linked the way the benefits claim links: with roles recorded.
+		await linkPlatformIdentity(env.DB, 9400, PlatformType.Discord, '700000000000009400', [])
+		const res = await redeem(await assertionFor('700000000000009400'))
+		expect(res.status).toBe(200)
+		expect(decodePayload(res.json.access_token as string).sub).toBe('9400')
+		expect(res.json).not.toHaveProperty('created')
+		expect(typeof res.json.refresh_token).toBe('string')
+	})
+
+	test('refuses a missing, forged or replayed-session assertion', async () => {
+		expect((await postToken('grant_type=identity_assertion')).status).toBe(400)
+		const forged = await generateIdentityAssertion(
+			{ platform: PlatformType.Discord, platformId: '700000000000009400' },
+			'not-the-key'
+		)
+		const res = await redeem(forged)
+		expect(res.status).toBe(400)
+		expect(res.json.error_description).toBe('invalid or expired identity assertion')
+		// An access token for the linked account, presented as the assertion.
+		const session = await generateToken('9400', '', 4, SIGNING_KEY)
+		expect((await redeem(session)).status).toBe(400)
+	})
+
+	test('creates and links an account when the identity opens none, once', async () => {
+		const discordId = '700000000000009401'
+		const first = await redeem(await assertionFor(discordId))
+		expect(first.status).toBe(200)
+		expect(first.json.created).toBe(true)
+		const accountId = Number(decodePayload(first.json.access_token as string).sub)
+		expect(accountId).toBeGreaterThan(0)
+
+		// Linked on the Discord platform, and ONLY there: the blob carries no platform
+		// identity (the snowflake stays off the DTO and the token), like a password account.
+		const links = await getLinksForAccount(env.DB, accountId)
+		expect(links.map((l) => [l.platform, l.platformId])).toEqual([
+			[PlatformType.Discord, discordId],
+		])
+		const row = await env.DB.prepare('SELECT data FROM account WHERE account_id = ?1')
+			.bind(accountId)
+			.first<{ data: string }>()
+		const blob = JSON.parse(row!.data) as Record<string, unknown>
+		expect(blob.platformId).toBeUndefined()
+		expect(blob.passwordHash).toBeUndefined()
+		// Placed in Orientation like any signup.
+		const presence = await env.DB.prepare('SELECT 1 AS ok FROM presence WHERE account_id = ?1')
+			.bind(accountId)
+			.first()
+		expect(presence).not.toBeNull()
+
+		// The same Discord again is a sign-IN to that account, not a second account.
+		const again = await redeem(await assertionFor(discordId))
+		expect(again.status).toBe(200)
+		expect(again.json).not.toHaveProperty('created')
+		expect(decodePayload(again.json.access_token as string).sub).toBe(String(accountId))
+		await expect(
+			countAccountsForPlatformIdentity(env.DB, PlatformType.Discord, discordId)
+		).resolves.toBe(1)
+	})
+
+	// The stretch of the feature: a Discord-made account has no password, and a password is
+	// what signs it into the game (a sideloaded Quest has no Meta nonce to offer). The
+	// website's password form posts with an EMPTY old password the first time.
+	test('a Discord-made account can set a password and then sign in with it', async () => {
+		const created = await redeem(await assertionFor('700000000000009402'))
+		const accountId = decodePayload(created.json.access_token as string).sub as string
+		expect((await postToken(`account_id=${accountId}&password=hunter22`)).status).toBe(400)
+
+		const set = await changePassword(
+			'oldPassword=&newPassword=hunter22',
+			created.json.access_token as string
+		)
+		expect(set.status).toBe(200)
+		const login = await postToken(`grant_type=password&account_id=${accountId}&password=hunter22`)
+		expect(login.status).toBe(200)
+		expect(decodePayload(login.json.access_token as string).sub).toBe(accountId)
+	})
+
+	test('refuses an identity that opens several accounts rather than guessing', async () => {
+		await seedAccount(9403, 'TwoLinksA')
+		await seedAccount(9404, 'TwoLinksB')
+		await linkPlatformIdentity(env.DB, 9403, PlatformType.Discord, '700000000000009403', [])
+		await linkPlatformIdentity(env.DB, 9404, PlatformType.Discord, '700000000000009403', [])
+		const res = await redeem(await assertionFor('700000000000009403'))
+		expect(res.status).toBe(400)
+		expect(res.json.error_description).toBe('platform identity is linked to more than one account')
+	})
+
+	// The signup caps reach this path as they reach create_account — www forwards the
+	// browser's real address over the service binding, so the per-IP cap counts browsers.
+	test('the per-IP signup cap applies to accounts made this way', async () => {
+		const ip = '198.51.100.77'
+		for (let i = 0; i < 3; i++) {
+			const res = await redeem(await assertionFor(`70000000000000950${i}`), ip)
+			expect(res.status).toBe(200)
+			expect(res.json.created).toBe(true)
+		}
+		const fourth = await redeem(await assertionFor('700000000000009509'), ip)
+		expect(fourth.status).toBe(400)
+		expect(fourth.json.error_description).toBe('too many accounts created from this network')
+		// Signing IN from that network is untouched: the cap is on creation.
+		const existing = await redeem(await assertionFor('700000000000009500'), ip)
+		expect(existing.status).toBe(200)
 	})
 })

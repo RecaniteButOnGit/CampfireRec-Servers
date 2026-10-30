@@ -16,6 +16,7 @@ import {
 	getRoomInstance,
 	modifySubRoom,
 	PRESENCE_SCHEMA_DDL,
+	recordRoomVisit,
 	ROOM_INSTANCE_SCHEMA_DDL,
 	ROOM_INVITE_SCHEMA_DDL,
 	ROOM_SCHEMA_DDL,
@@ -25,6 +26,7 @@ import {
 	SUBROOM_SCHEMA_DDL,
 } from '@repo/domain'
 
+import { SCHEMA_DDL as CUSTOM_AVATAR_ITEM_SCHEMA_DDL } from '../../../../api/src/custom-avatar-items-db'
 import { SCHEMA_DDL as EVENTS_SCHEMA_DDL } from '../../../../api/src/events-db'
 import {
 	banFromReport,
@@ -295,6 +297,9 @@ beforeAll(async () => {
 	// Platform identity links (owned by the auth worker) — a ban also reaches the
 	// accounts sharing a proven identity with the banned one.
 	for (const stmt of PLATFORM_SCHEMA_DDL) await env.DB.prepare(stmt).run()
+	// Custom avatar items (owned by the api worker) — every room read joins the published
+	// room badges from this table.
+	for (const stmt of CUSTOM_AVATAR_ITEM_SCHEMA_DDL) await env.DB.prepare(stmt).run()
 })
 
 /**
@@ -347,6 +352,12 @@ describe('public endpoints', () => {
 		const res = await exports.default.fetch(`${ORIGIN}/player/exclusivelogin`, { method: 'POST' })
 		expect(res.status).toBe(200)
 		expect(await res.json()).toEqual({ errorCode: 0 })
+	})
+
+	test('POST /player/verifylock returns 200 with no body', async () => {
+		const res = await exports.default.fetch(`${ORIGIN}/player/verifylock`, { method: 'POST' })
+		expect(res.status).toBe(200)
+		expect(await res.text()).toBe('')
 	})
 
 	test('POST /player/notifydisconnect returns 200', async () => {
@@ -778,6 +789,57 @@ describe('public endpoints', () => {
 			headers: await bearer('96'),
 		})
 		expect(((await res.json()) as { errorCode: number }).errorCode).toBe(20)
+		expect(
+			await env.DB.prepare('SELECT 1 FROM interaction WHERE player_id = 96').first()
+		).toBeNull()
+	})
+
+	test('a matchmake stamps the room on the player’s visited history', async () => {
+		const enter = async (player: string) => {
+			const res = await exports.default.fetch(`${ORIGIN}/matchmake/room/77`, {
+				method: 'POST',
+				headers: {
+					...(await bearer(player)),
+					'Content-Type': 'application/x-www-form-urlencoded',
+				},
+				body: new URLSearchParams({ JoinMode: '2' }).toString(),
+			})
+			expect(res.status).toBe(200)
+		}
+		const row = () =>
+			env.DB.prepare(
+				'SELECT cheered, favorited, last_visited_at FROM interaction WHERE player_id = 97 AND room_id = 77'
+			).first<{ cheered: number; favorited: number; last_visited_at: string | null }>()
+
+		// First visit creates the row with no cheer/favorite.
+		await enter('97')
+		const first = await row()
+		expect(first).toMatchObject({ cheered: 0, favorited: 0 })
+		expect(first!.last_visited_at).not.toBeNull()
+
+		// A later visit moves the timestamp and leaves an existing favorite alone.
+		await env.DB.prepare(
+			"UPDATE interaction SET favorited = 1, last_visited_at = '2000-01-01T00:00:00.000Z' WHERE player_id = 97 AND room_id = 77"
+		).run()
+		await enter('97')
+		const second = await row()
+		expect(second!.favorited).toBe(1)
+		expect(second!.last_visited_at! > '2000-01-01T00:00:00.000Z').toBe(true)
+
+		// A dorm is counted as a visit but kept off the history. Seeded as a bare row and
+		// visited directly: matchmaking into a fresh dorm would take subroom ids other
+		// tests seed by hand.
+		await env.DB.prepare('INSERT INTO room (data) VALUES (?1)')
+			.bind(JSON.stringify({ RoomId: 98_000, Name: 'DormVisitTest', IsDorm: true }))
+			.run()
+		await recordRoomVisit(env.DB, 98_000, 98)
+		const visits = await env.DB.prepare('SELECT visits FROM room WHERE room_id = 98000').first<{
+			visits: number
+		}>()
+		expect(visits!.visits).toBe(1)
+		expect(
+			await env.DB.prepare('SELECT 1 FROM interaction WHERE player_id = 98').first()
+		).toBeNull()
 	})
 
 	test('POST /matchmake/room/:roomId seeds presence with the account device class', async () => {
@@ -1093,27 +1155,69 @@ describe('public endpoints', () => {
 			})
 		type Body = {
 			errorCode: number
-			roomInstance: { roomId: number; location: string; roomInstanceId: number } | null
+			roomInstance: {
+				roomId: number
+				location: string
+				roomInstanceId: number
+				eventId: number
+			} | null
 		}
 		const join = async (path: string, sub?: string) =>
 			(await (await matchmake(path, sub)).json()) as Body
 
-		// An invited player lands in an instance of the event's room (2)...
+		// An invited player lands in an instance of the event's room (2), which names the
+		// event it is for...
 		const invited = await join('/matchmake/event/8', '301')
 		expect(invited.errorCode).toBe(0)
-		expect(invited.roomInstance).toMatchObject({ roomId: 2, location: RECCENTER_SCENE })
+		expect(invited.roomInstance).toMatchObject({
+			roomId: 2,
+			location: RECCENTER_SCENE,
+			eventId: 8,
+		})
 
 		// ...recorded as their presence, like any other matchmake.
 		const row = await env.DB.prepare('SELECT data FROM presence WHERE account_id = ?1')
 			.bind(301)
 			.first<{ data: string }>()
-		const presence = JSON.parse(row!.data) as { roomInstance: { roomInstanceId: number } }
+		const presence = JSON.parse(row!.data) as {
+			roomInstance: { roomInstanceId: number; eventId: number }
+		}
 		expect(presence.roomInstance.roomInstanceId).toBe(invited.roomInstance!.roomInstanceId)
+		expect(presence.roomInstance.eventId).toBe(8)
+
+		// The instance itself is stamped, which is what the next guest's search matches on.
+		const stored = await env.DB.prepare('SELECT event_id FROM room_instance WHERE id = ?1')
+			.bind(invited.roomInstance!.roomInstanceId)
+			.first<{ event_id: number }>()
+		expect(stored!.event_id).toBe(8)
 
 		// The creator gets in, and so does someone who was invited and DECLINED — the row
-		// is the invite, whatever the answer.
-		expect((await join('/matchmake/event/8', '300')).errorCode).toBe(0)
+		// is the invite, whatever the answer. They join the SAME session: the event's.
+		const creator = await join('/matchmake/event/8', '300')
+		expect(creator.errorCode).toBe(0)
+		expect(creator.roomInstance).toMatchObject({
+			roomInstanceId: invited.roomInstance!.roomInstanceId,
+			eventId: 8,
+		})
 		expect((await join('/matchmake/event/8', '302')).errorCode).toBe(0)
+
+		// A plain matchmake into the same room stays out of the event's session, and
+		// another event in that room gets a session of its own.
+		const plain = await join('/matchmake/room/2', '399')
+		expect(plain.errorCode).toBe(0)
+		expect(plain.roomInstance!.eventId).toBe(0)
+		expect(plain.roomInstance!.roomInstanceId).not.toBe(invited.roomInstance!.roomInstanceId)
+		const other = await join('/matchmake/event/9', '303')
+		expect(other.roomInstance!.eventId).toBe(9)
+		expect(other.roomInstance!.roomInstanceId).not.toBe(invited.roomInstance!.roomInstanceId)
+
+		// Coming back to the event from elsewhere lands in the event's session again, not
+		// the room's ordinary one.
+		expect((await join('/matchmake/room/2', '300')).roomInstance!.eventId).toBe(0)
+		expect((await join('/matchmake/event/8', '300')).roomInstance).toMatchObject({
+			roomInstanceId: invited.roomInstance!.roomInstanceId,
+			eventId: 8,
+		})
 
 		// A stranger doesn't — and is told why (35 EventIsPrivate), not fobbed off with 20.
 		expect(await join('/matchmake/event/8', '399')).toEqual(refused(35))
@@ -1205,8 +1309,7 @@ describe('public endpoints', () => {
 				roomId: 77,
 			})
 
-			// The 2023 build and anything older is never substituted, nor is a token naming no
-			// build (it matchmakes as GAME_VERSION): they enter the room they asked for.
+			// The 2023 build and anything older is never substituted.
 			for (const [player, version] of [
 				['8808', '20230414'],
 				['8809', '20230414.01'],
@@ -1217,8 +1320,9 @@ describe('public endpoints', () => {
 					name: '^RecCenter',
 				})
 			}
+			// A token with no build uses the configured Campfire build, which is newer than 2023.
 			expect((await matchmake('/matchmake/room/2', '8811', '')).roomInstance).toMatchObject({
-				roomId: 2,
+				roomId: 77,
 			})
 
 			// Targeting by id works the same, and substitution is a single hop: 2 and 77
@@ -1249,9 +1353,125 @@ describe('public endpoints', () => {
 		}
 	})
 
+	test('visibility changes persist and push the updated own-player cache', async () => {
+		const hub = () => env.RECFLARE_NOTIFICATIONS_HUB.getByName('global')
+		await hub().fetch('http://do/all', { method: 'DELETE' })
+		const headers = await bearer('9200', '20260323.14')
+		await env.DB.prepare(
+			'INSERT INTO relationship (requester_id, target_id, relationship_type) VALUES (9200, 9201, 3)'
+		).run()
+		await setPresence(env.DB, {
+			accountId: 9200,
+			roomInstance: null,
+			statusVisibility: 0,
+			deviceClass: 0,
+			vrMovementMode: 1,
+			platform: 0,
+			appVersion: '20260323.14',
+		})
+		const update = async (body: string, contentType: string) =>
+			exports.default.fetch(`${ORIGIN}/player/statusvisibility`, {
+				method: 'PUT',
+				headers: { ...headers, 'Content-Type': contentType },
+				body,
+			})
+		for (const value of [1, 2, 3, 0]) {
+			expect((await update(JSON.stringify(value), 'application/json')).status).toBe(200)
+			const response = await exports.default.fetch(`${ORIGIN}/player/heartbeat`, {
+				method: 'POST',
+				headers,
+			})
+			expect(await response.json()).toMatchObject({ statusVisibility: value })
+		}
+		await update('statusVisibility=2', 'application/x-www-form-urlencoded')
+		await update('99', 'application/json')
+		const response = await exports.default.fetch(`${ORIGIN}/player/heartbeat`, {
+			method: 'POST',
+			headers,
+		})
+		expect(await response.json()).toMatchObject({ statusVisibility: 2 })
+		const sent = await (
+			await hub().fetch('http://do/all')
+		).json<
+			Array<{
+				playerIds: number[]
+				notificationType: string
+				data: { statusVisibility: number; playerId: number }
+			}>
+		>()
+		expect(sent).toHaveLength(10)
+		expect(sent[8]).toMatchObject({
+			playerIds: [9200],
+			notificationType: 'PresenceUpdate',
+			data: { playerId: 9200, statusVisibility: 2 },
+		})
+		expect(sent[9]).toMatchObject({
+			playerIds: [9201],
+			notificationType: 'PresenceUpdate',
+			data: { playerId: 9200, statusVisibility: 2 },
+		})
+	})
 	test('PUT /player/statusvisibility returns 200', async () => {
 		const res = await exports.default.fetch(`${ORIGIN}/player/statusvisibility`, { method: 'PUT' })
 		expect(res.status).toBe(200)
+	})
+
+	// The 2026 client posts its VR locomotion here. It's presence state (the heartbeat
+	// echoes it), not a playersettings key.
+	test('PUT /player/vrmovementmode stores the mode on presence', async () => {
+		const hub = () => env.RECFLARE_NOTIFICATIONS_HUB.getByName('global')
+		await hub().fetch('http://do/all', { method: 'DELETE' })
+		const headers = await bearer('9210', '20260323.14')
+		await setPresence(env.DB, {
+			accountId: 9210,
+			roomInstance: null,
+			statusVisibility: 0,
+			deviceClass: 0,
+			vrMovementMode: 1,
+			platform: 0,
+			appVersion: '20260323.14',
+		})
+		const update = async (body: string, contentType: string) =>
+			exports.default.fetch(`${ORIGIN}/player/vrmovementmode`, {
+				method: 'PUT',
+				headers: { ...headers, 'Content-Type': contentType },
+				body,
+			})
+		const heartbeat = async () =>
+			(
+				await exports.default.fetch(`${ORIGIN}/player/heartbeat`, { method: 'POST', headers })
+			).json()
+
+		expect((await update('vrMovementMode=2', 'application/x-www-form-urlencoded')).status).toBe(200)
+		expect(await heartbeat()).toMatchObject({ vrMovementMode: 2 })
+
+		// JSON forms too, and the other presence fields are left alone.
+		await update(JSON.stringify({ VrMovementMode: 0 }), 'application/json')
+		expect(await heartbeat()).toMatchObject({ vrMovementMode: 0, statusVisibility: 0 })
+
+		// Junk and negatives are ignored rather than stored.
+		await update('vrMovementMode=walk', 'application/x-www-form-urlencoded')
+		await update('vrMovementMode=-1', 'application/x-www-form-urlencoded')
+		expect(await heartbeat()).toMatchObject({ vrMovementMode: 0 })
+
+		// The player's own cached presence is refreshed; nobody else is told.
+		const sent = await (
+			await hub().fetch('http://do/all')
+		).json<Array<{ playerIds: number[]; data: { vrMovementMode: number } }>>()
+		expect(sent).toHaveLength(2)
+		expect(sent[0]).toMatchObject({ playerIds: [9210], data: { vrMovementMode: 2 } })
+		expect(sent[1]).toMatchObject({ playerIds: [9210], data: { vrMovementMode: 0 } })
+	})
+
+	test('PUT /player/vrmovementmode without a token or presence returns 200', async () => {
+		const res = await exports.default.fetch(`${ORIGIN}/player/vrmovementmode`, { method: 'PUT' })
+		expect(res.status).toBe(200)
+		const authed = await exports.default.fetch(`${ORIGIN}/player/vrmovementmode`, {
+			method: 'PUT',
+			headers: { ...(await bearer('9211')), 'Content-Type': 'application/x-www-form-urlencoded' },
+			body: 'vrMovementMode=1',
+		})
+		expect(authed.status).toBe(200)
 	})
 
 	test('GET /player/connection-info 401s without a token', async () => {
@@ -1347,6 +1567,38 @@ describe('auth-gated endpoints', () => {
 		expect(priv2.roomInstance.photonRoomId).not.toBe(a.roomInstance.photonRoomId)
 		expect(priv2.roomInstance.photonRoomId).not.toBe(priv.roomInstance.photonRoomId)
 		expect(priv2.roomInstance.roomInstanceId).not.toBe(priv.roomInstance.roomInstanceId)
+	})
+
+	test('POST /matchmake/room/:roomId pools every point release of a build into one instance', async () => {
+		const matchmake = async (sub: string, version: string) =>
+			(await (
+				await exports.default.fetch(`${ORIGIN}/matchmake/room/2`, {
+					method: 'POST',
+					headers: await bearer(sub, version),
+				})
+			).json()) as { roomInstance: { photonRoomId: string; roomInstanceId: number } }
+
+		// The `.NN` after the date is a same-day rebuild of the same build, so a `.01` client,
+		// a `.2` client and one reporting the bare date all belong in one session.
+		const first = await matchmake('9170', '20250718.01')
+		const point = await matchmake('9171', '20250718.2')
+		const bare = await matchmake('9172', '20250718')
+		expect(point.roomInstance.roomInstanceId).toBe(first.roomInstance.roomInstanceId)
+		expect(bare.roomInstance.roomInstanceId).toBe(first.roomInstance.roomInstanceId)
+
+		// The instance is stamped with the BUILD, not the version that opened it — the key
+		// the lookups match on. (The same shape migrations/0028 backfills older rows into.)
+		const row = await env.DB.prepare('SELECT game_version FROM room_instance WHERE id = ?1')
+			.bind(first.roomInstance.roomInstanceId)
+			.first<{ game_version: string }>()
+		expect(row?.game_version).toBe('20250718')
+
+		// The point release doesn't leak into presence: that still reports the version the
+		// client posted, which is what describes the player to their friends.
+		const presence = await env.DB.prepare(
+			'SELECT data FROM presence WHERE account_id = 9171'
+		).first<{ data: string }>()
+		expect(JSON.parse(presence?.data ?? '{}').appVersion).toBe('20250718.2')
 	})
 
 	test('POST /matchmake/room/:roomId only pools players on the same client build', async () => {
@@ -1613,7 +1865,7 @@ describe('auth-gated endpoints', () => {
 		}
 	})
 
-	test('a sandbox account is served out of the sandbox Tachyon pool', async () => {
+	test('a sandbox account is served out of the sandbox Tachyon pool, a rollout build out of the rollout one', async () => {
 		// Sandbox accounts run against their own Tachyon servers, so the whole pool is swapped
 		// for them; selection inside it is the same instance-id round-robin as the live pool.
 		await env.DB.prepare('INSERT OR IGNORE INTO account (data) VALUES (?1)')
@@ -1621,8 +1873,12 @@ describe('auth-gated endpoints', () => {
 			.run()
 		const original = env.TACHYON_HOST_PORT
 		const originalSandbox = env.TACHYON_HOST_PORT_SANDBOX
+		const originalRollout = env.TACHYON_HOST_PORT_ROLLOUT
+		const originalRolloutVersions = env.ROLLOUT_GAME_VERSIONS
+		const originalTachyonRolloutVersions = env.TACHYON_ROLLOUT_GAME_VERSIONS
 		try {
 			env.TACHYON_HOST_PORT = '198.51.100.12:7777'
+			env.TACHYON_ROLLOUT_GAME_VERSIONS = undefined
 			env.TACHYON_HOST_PORT_SANDBOX = '203.0.113.30:7777, 203.0.113.30:7778'
 
 			const voiceFor = async (player: string, roomInstanceId?: number) => {
@@ -1665,6 +1921,135 @@ describe('auth-gated endpoints', () => {
 			// In no instance there is no server, sandbox or not.
 			expect(await voiceFor('974')).toEqual({ voiceConnectionInfo: '', voiceServerId: '' })
 
+			// A caller on a build under staged rollout gets the ROLLOUT pool, a third list with
+			// its own ids, read off the token's rn.ver. A sandbox account on that build still
+			// gets the sandbox pool: sandbox wins.
+			env.TACHYON_HOST_PORT_ROLLOUT = '198.51.100.13:7777,198.51.100.13:7778'
+			const rolloutPool = [
+				{ voiceConnectionInfo: '198.51.100.13:7777', voiceServerId: 'rollout-1' },
+				{ voiceConnectionInfo: '198.51.100.13:7778', voiceServerId: 'rollout-2' },
+			]
+			const rolloutVoiceFor = async (player: string, version: string, roomInstanceId: number) => {
+				const res = await exports.default.fetch(
+					`${ORIGIN}/player/connection-info?roomInstanceId=${roomInstanceId}`,
+					{ headers: await bearer(player, version) }
+				)
+				const body = (await res.json()) as {
+					value: { voiceConnectionInfo: string; voiceServerId: string }
+				}
+				return {
+					voiceConnectionInfo: body.value.voiceConnectionInfo,
+					voiceServerId: body.value.voiceServerId,
+				}
+			}
+			for (const photonRoomId of ['tachyon-rollout-a', 'tachyon-rollout-b']) {
+				const rollout = await createRoomInstance(env.DB, {
+					ownerAccountId: 976,
+					roomId: 2,
+					photonRoomId,
+					maxCapacity: 12,
+				})
+				expect(await rolloutVoiceFor('976', '20260323.14', rollout.roomInstanceId)).toEqual(
+					rolloutPool[rollout.roomInstanceId % rolloutPool.length]
+				)
+				expect(await rolloutVoiceFor('974', '20260323.14', rollout.roomInstanceId)).toEqual(
+					sandboxPool[rollout.roomInstanceId % sandboxPool.length]
+				)
+				// Released builds — the default, the beta, and a token carrying no build — stay live.
+				for (const version of [GAME_VERSION, '20250718.01']) {
+					expect(await rolloutVoiceFor('976', version, rollout.roomInstanceId)).toEqual({
+						voiceConnectionInfo: '198.51.100.12:7777',
+						voiceServerId: 'tachyon-1',
+					})
+				}
+				expect(await voiceFor('976', rollout.roomInstanceId)).toEqual({
+					voiceConnectionInfo: '198.51.100.12:7777',
+					voiceServerId: 'tachyon-1',
+				})
+			}
+
+			// WHICH builds are under rollout is the ROLLOUT_GAME_VERSIONS var, the same one
+			// `auth` gates on. `off` ends the rollout and its callers join the live pool; naming
+			// another build moves the pool to that build's players instead.
+			const movedRollout = await createRoomInstance(env.DB, {
+				ownerAccountId: 976,
+				roomId: 2,
+				photonRoomId: 'tachyon-rollout-moved',
+				maxCapacity: 12,
+			})
+			env.ROLLOUT_GAME_VERSIONS = 'off'
+			expect(await rolloutVoiceFor('976', '20260323.14', movedRollout.roomInstanceId)).toEqual({
+				voiceConnectionInfo: '198.51.100.12:7777',
+				voiceServerId: 'tachyon-1',
+			})
+			env.ROLLOUT_GAME_VERSIONS = '20250718'
+			expect(await rolloutVoiceFor('976', '20250718.01', movedRollout.roomInstanceId)).toEqual(
+				rolloutPool[movedRollout.roomInstanceId % rolloutPool.length]
+			)
+			expect(await rolloutVoiceFor('976', '20260323.14', movedRollout.roomInstanceId)).toEqual({
+				voiceConnectionInfo: '198.51.100.12:7777',
+				voiceServerId: 'tachyon-1',
+			})
+
+			// TACHYON_ROLLOUT_GAME_VERSIONS decouples the pool from the gate: set, it alone
+			// decides which builds get the rollout pool, so a build opened to everyone
+			// (ROLLOUT_GAME_VERSIONS=off) keeps its own voice servers while the 2025 build
+			// stays live. Matched as a build — a listed point release covers every point
+			// release of it, and a token carrying the bare build matches a listed one.
+			env.ROLLOUT_GAME_VERSIONS = 'off'
+			const keptRollout = await createRoomInstance(env.DB, {
+				ownerAccountId: 976,
+				roomId: 2,
+				photonRoomId: 'tachyon-rollout-kept',
+				maxCapacity: 12,
+			})
+			for (const listed of ['20260323', '20260323.14', ' 20260323.2 ,20231207']) {
+				env.TACHYON_ROLLOUT_GAME_VERSIONS = listed
+				for (const version of ['20260323', '20260323.14', '20260323.99']) {
+					expect(await rolloutVoiceFor('976', version, keptRollout.roomInstanceId)).toEqual(
+						rolloutPool[keptRollout.roomInstanceId % rolloutPool.length]
+					)
+				}
+				expect(await rolloutVoiceFor('976', '20250718.01', keptRollout.roomInstanceId)).toEqual({
+					voiceConnectionInfo: '198.51.100.12:7777',
+					voiceServerId: 'tachyon-1',
+				})
+			}
+			// Sandbox still wins over it.
+			env.TACHYON_ROLLOUT_GAME_VERSIONS = '20260323'
+			expect(await rolloutVoiceFor('974', '20260323.14', keptRollout.roomInstanceId)).toEqual(
+				sandboxPool[keptRollout.roomInstanceId % sandboxPool.length]
+			)
+			// Set, it overrides the gate's list in BOTH directions: `off` sends a build still
+			// under rollout to the live pool.
+			env.ROLLOUT_GAME_VERSIONS = '20260323'
+			env.TACHYON_ROLLOUT_GAME_VERSIONS = 'off'
+			expect(await rolloutVoiceFor('976', '20260323.14', keptRollout.roomInstanceId)).toEqual({
+				voiceConnectionInfo: '198.51.100.12:7777',
+				voiceServerId: 'tachyon-1',
+			})
+			// Blank is unset: the gate's list decides again.
+			env.TACHYON_ROLLOUT_GAME_VERSIONS = ''
+			expect(await rolloutVoiceFor('976', '20260323.14', keptRollout.roomInstanceId)).toEqual(
+				rolloutPool[keptRollout.roomInstanceId % rolloutPool.length]
+			)
+			env.TACHYON_ROLLOUT_GAME_VERSIONS = undefined
+			env.ROLLOUT_GAME_VERSIONS = originalRolloutVersions
+
+			// With no rollout pool configured, a rollout build falls back to the live one, not
+			// the sandbox one.
+			env.TACHYON_HOST_PORT_ROLLOUT = undefined
+			const unsetRollout = await createRoomInstance(env.DB, {
+				ownerAccountId: 976,
+				roomId: 2,
+				photonRoomId: 'tachyon-rollout-unset',
+				maxCapacity: 12,
+			})
+			expect(await rolloutVoiceFor('976', '20260323.14', unsetRollout.roomInstanceId)).toEqual({
+				voiceConnectionInfo: '198.51.100.12:7777',
+				voiceServerId: 'tachyon-1',
+			})
+
 			// With no sandbox pool configured, a sandbox account falls back to the live one.
 			env.TACHYON_HOST_PORT_SANDBOX = undefined
 			const instance = await createRoomInstance(env.DB, {
@@ -1680,6 +2065,9 @@ describe('auth-gated endpoints', () => {
 		} finally {
 			env.TACHYON_HOST_PORT = original
 			env.TACHYON_HOST_PORT_SANDBOX = originalSandbox
+			env.TACHYON_HOST_PORT_ROLLOUT = originalRollout
+			env.ROLLOUT_GAME_VERSIONS = originalRolloutVersions
+			env.TACHYON_ROLLOUT_GAME_VERSIONS = originalTachyonRolloutVersions
 		}
 	})
 
@@ -2586,9 +2974,11 @@ describe('auth-gated endpoints', () => {
 		const older = await spawn('915', '20250424.01')
 		expect(await join(older, '20250718.01')).toEqual(refused(20))
 
-		// Same build → in they go.
+		// Same build → in they go — and a point release IS the same build: the instance holds
+		// the bare date, and the caller's `.2` reduces to it.
 		const same = await spawn('916', '20250718.01')
 		expect(await join(same, '20250718.01')).toMatchObject({ errorCode: 0 })
+		expect(await join(same, '20250718.2')).toMatchObject({ errorCode: 0 })
 	})
 
 	test('POST /matchmake/instance/:id joins that exact instance, owner-only', async () => {
@@ -3957,12 +4347,14 @@ describe('auth-gated endpoints', () => {
 			'POST /player/login',
 			'POST /player/logout',
 			'POST /player/notifydisconnect',
+			'POST /player/verifylock',
 			'POST /roominstance/{id}/markprivate',
 			'POST /roominstance/{id}/reportjoinresult',
 			'PUT /player/avoidjuniors',
 			'PUT /player/gameserverregionpings',
 			'PUT /player/photonregionpings',
 			'PUT /player/statusvisibility',
+			'PUT /player/vrmovementmode',
 			'PUT /roominstance/{id}/inprogress',
 			'PUT /roominstance/{id}/matchpolicy',
 		])

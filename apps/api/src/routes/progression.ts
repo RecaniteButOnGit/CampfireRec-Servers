@@ -13,6 +13,20 @@ import { logger } from '@repo/hono-helpers'
 // The notification-type ids the hub carries (owned by the `notify` worker). Imported as a
 // value — the enum has no runtime dependencies.
 import { NotificationType } from '../../../notify/src/notification-types'
+import progressionEvent13 from '../../static/progression-events/Anime_Season_EventId_13.json'
+import progressionEvent8 from '../../static/progression-events/Base_Event_EventId_8.json'
+import progressionEvent2 from '../../static/progression-events/Coming_in_Hot_Progression_Event_Alpha_EventId_2.json'
+import progressionEvent9 from '../../static/progression-events/Invasion_2_EventId_9.json'
+import progressionEvent6 from '../../static/progression-events/Invasion_EventId_6.json'
+import progressionEvent15 from '../../static/progression-events/Medieval_Season_EventId_15.json'
+import progressionEvent5 from '../../static/progression-events/Progression_Event_Alpha_Repeat_EventId_5.json'
+import progressionEvent3 from '../../static/progression-events/Rec_Room_EventId_3.json'
+import progressionEvent12 from '../../static/progression-events/Science_Experiment_Restoration_EventId_12.json'
+import progressionEvent7 from '../../static/progression-events/Science_Party_EventId_7.json'
+import progressionEvent14 from '../../static/progression-events/Summer_Party_EventId_14.json'
+import progressionEvent16 from '../../static/progression-events/Treat_Collection_Challenge_EventId_16.json'
+import progressionEvent17 from '../../static/progression-events/Tricks_Challenge_EventId_17.json'
+import progressionEvent18 from '../../static/progression-events/Yetis_Challenge_EventId_18.json'
 import { authedId, parseFormIds, queryIds, unauthorized } from '../http'
 import {
 	AUTHED,
@@ -20,15 +34,18 @@ import {
 	BulkIdsRequest,
 	CheerPlayerRequest,
 	CheerPlayerResponse,
-	SetSelectedCheerRequest,
 	form,
 	idParam,
 	intQuery,
 	json,
 	JsonArray,
+	JsonObject,
 	ProgressionDto,
+	ProgressionEventRecordDto,
 	ReputationDto,
+	SetSelectedCheerRequest,
 	UNAUTHORIZED_RESPONSE,
+	XpBoostActivationsResponse,
 } from '../openapi'
 import {
 	addCheer,
@@ -46,6 +63,32 @@ import type { Progression } from '@repo/domain'
 import type { ReputationPayload } from '../../../notify/src/notification-payloads'
 import type { App } from '../context'
 import type { Reputation } from '../reputation-db'
+
+/**
+ * The archived official progression events, by `ProgressionEventId` — each the event record
+ * exactly as the official API served it. They are held as TEXT and served byte for byte, not
+ * imported as JSON: a keepsake room's `RoomId` is a 64-bit number (`8364812036745705361`)
+ * that a JS parse rounds to a different room. The archive has gaps (no 1, 4, 10, 11).
+ *
+ * The text import is a `rules` entry in wrangler.jsonc, which TypeScript cannot see — it
+ * types a `.json` import as the parsed object — hence the cast.
+ */
+const PROGRESSION_EVENTS = new Map([
+	[2, progressionEvent2],
+	[3, progressionEvent3],
+	[5, progressionEvent5],
+	[6, progressionEvent6],
+	[7, progressionEvent7],
+	[8, progressionEvent8],
+	[9, progressionEvent9],
+	[12, progressionEvent12],
+	[13, progressionEvent13],
+	[14, progressionEvent14],
+	[15, progressionEvent15],
+	[16, progressionEvent16],
+	[17, progressionEvent17],
+	[18, progressionEvent18],
+] as Array<[number, unknown]> as Array<[number, string]>)
 
 /** The notifications hub is a single global DO instance (see the `notify` worker). */
 const HUB_INSTANCE = 'global'
@@ -255,6 +298,28 @@ export const progressionRoutes = new Hono<App>({ strict: false })
 			responses: { 200: json(ReputationDto, 'The player’s reputation') },
 		}),
 		async (c) => c.json(await getReputation(c.env.DB, Number.parseInt(c.req.param('id'), 10)))
+	)
+	// How much XP the caller has earned today — what the client measures against its daily
+	// XP cap. A BARE INTEGER (the client decodes a plain `int`), not a progression record.
+	//
+	// Registered BEFORE `/progression/:id` below, which otherwise takes `xpEarnedToday` as
+	// an account id and answers `{ PlayerId: null, Level: 1, XP: 0 }` — the client's decoder
+	// threw on that (`expected:'Number Token', actual:'{'`).
+	//
+	// STUB: always 0. Nothing here records when XP was earned, only the running total. No
+	// auth while the answer is the same for everybody; it will need the caller once it is
+	// real, since the path names no player.
+	.get(
+		'/api/players/v1/progression/xpEarnedToday',
+		describeRoute({
+			tags: ['Progression'],
+			summary: 'XP the caller earned today (stub)',
+			description:
+				'The XP earned so far today, as a bare integer. Always `0` — XP is banked as a ' +
+				'running total and nothing records when it was earned.',
+			responses: { 200: json(BareInteger, 'A bare `0`') },
+		}),
+		(c) => c.json(0)
 	)
 	.get(
 		'/api/players/v1/progression/:id',
@@ -524,22 +589,111 @@ export const progressionRoutes = new Hono<App>({ strict: false })
 	// The progression event running right now — the limited-time XP event the client shows
 	// a banner and a progress track for.
 	//
-	// STUB: a bare `0` — the id of the active event, or 0 when there is none (this once
-	// served -1 for the same meaning). The client reads it as "no event on" and skips the
-	// event UI entirely. That is the honest answer (nothing here runs events) and the safe
-	// one: a fabricated event would draw a track that never fills. No auth — whether an
-	// event is running is the same fact for everybody, and the client asks while loading.
+	// STUB: a bare `18` — the id of the active event, or 0 when there is none (this once
+	// served -1 for the same meaning). 18 is hardcoded: it names an event the archive above
+	// holds, so the client can fetch its definition from `/event/18`, but nothing here
+	// tracks progress through it yet. No auth — whether an event is running is the same
+	// fact for everybody, and the client asks while loading.
 	.get(
 		'/api/progressionEvents/active',
 		describeRoute({
 			tags: ['Progression'],
 			summary: 'Progression event currently running (stub)',
 			description:
-				'The limited-time XP event in progress, as a bare event id. Always `0` — the ' +
-				'“no active event” value; nothing on this server runs one — which the client reads ' +
-				'as “no event” and skips the event UI, where a 404 would stall the load. No auth: ' +
+				'The limited-time XP event in progress, as a bare event id (`0` would mean “no ' +
+				'active event”). Always `18` for now — a hardcoded archived event; nothing on this ' +
+				'server tracks progress through it yet. A 404 here would stall the load. No auth: ' +
 				'it is the same answer for every player.',
-			responses: { 200: json(BareInteger, 'A bare `0` — no event is running') },
+			responses: { 200: json(BareInteger, 'A bare `18` — the hardcoded active event') },
 		}),
-		(c) => c.json(0)
+		(c) => c.json(18)
+	)
+
+	// One progression event's definition — its reward track, keepsake rooms, dates and boost
+	// settings — served from the archive of official events above. Reading a definition says
+	// nothing about whether the event is running (`/active` above is a hardcoded 18), and no
+	// auth for the same reason as there: it is the same record for everybody.
+	.get(
+		'/api/progressionEvents/event/:id{[0-9]+}',
+		describeRoute({
+			tags: ['Progression'],
+			summary: 'A progression event’s definition',
+			description:
+				'The archived official event with this `ProgressionEventId`, verbatim: rewards, ' +
+				'keepsake room lists, start/end/collection times and boost settings. 404 for an ' +
+				'id the archive does not hold. No auth.',
+			parameters: [idParam('id', 'The `ProgressionEventId`')],
+			responses: {
+				200: json(JsonObject, 'The progression event'),
+				404: { description: 'No such event (empty body)' },
+			},
+		}),
+		(c) => {
+			const event = PROGRESSION_EVENTS.get(Number(c.req.param('id')))
+			if (event === undefined) return c.body(null, 404)
+			return c.body(event, 200, { 'Content-Type': 'application/json' })
+		}
+	)
+
+	// The caller's progress through one progression event — the XP, minutes and rewards the
+	// client draws its event track from.
+	//
+	// STUB: every counter 0, for any event id, echoing the id requested. Nothing tracks
+	// progress through an event yet (see `/active` above). Auth-gated because the record is
+	// the CALLER's and the path names no player.
+	.get(
+		'/api/progressionEvents/record/:id{[0-9]+}',
+		describeRoute({
+			tags: ['Progression'],
+			summary: 'The caller’s progress through a progression event (stub)',
+			description:
+				'The caller’s record for the event with this `ProgressionEventId`. Always empty ' +
+				'for now — 0 XP, nothing collected, `XpBoostLastPurchasedAt` null — for any id: ' +
+				'nothing on this server tracks progress through an event yet.',
+			security: AUTHED,
+			parameters: [idParam('id', 'The `ProgressionEventId`')],
+			responses: {
+				200: json(ProgressionEventRecordDto, 'An empty record for the event requested'),
+				401: UNAUTHORIZED_RESPONSE,
+			},
+		}),
+		async (c) => {
+			const id = await authedId(c)
+			if (id === null) return unauthorized(c)
+			return c.json({
+				AccountId: id,
+				ProgressionEventId: Number(c.req.param('id')),
+				Xp: 0,
+				GameMinutesToday: 0,
+				RewardsCollected: 0,
+				BonusRewardsCollected: 0,
+				XpBoostLastPurchasedAt: null,
+				PremiumRewardsCollected: 0,
+				LimitedRewardCollectionState: 0,
+			})
+		}
+	)
+
+	// The XP boosts the caller has bought and has running — the client multiplies the XP it
+	// shows by them and draws a timer for each.
+	//
+	// STUB: always the empty page. Nothing sells boosts yet, so nobody has one running. No
+	// auth while the answer is the same for everybody, like `xpEarnedToday` above; it will
+	// need the caller once it is real, since the path names no player.
+	.get(
+		'/api/purchasableXpBoosts/activations',
+		describeRoute({
+			tags: ['Progression'],
+			summary: 'The caller’s active XP boosts (stub)',
+			description:
+				'The XP boosts the caller has running, as `{ Results, TotalResults }`. Always the ' +
+				'empty page (`{ "Results": [], "TotalResults": 0 }`) — nothing on this server sells ' +
+				'boosts yet. Each entry, once there are any, names the purchase ' +
+				'(`PurchasableXpBoostLedgerEntryId`), the boost bought (`PurchasableXpBoostId`), its ' +
+				'`XpMultiplier`, and when it runs (`StartTime`/`EndTime`, ISO-8601 UTC).',
+			responses: {
+				200: json(XpBoostActivationsResponse, 'Always `{ "Results": [], "TotalResults": 0 }`'),
+			},
+		}),
+		(c) => c.json({ Results: [], TotalResults: 0 })
 	)

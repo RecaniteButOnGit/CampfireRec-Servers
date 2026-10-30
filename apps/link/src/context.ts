@@ -8,6 +8,8 @@ export type Env = SharedHonoEnv & {
 	 * `auth` verify here.
 	 */
 	JWT_SECRET: SecretsStoreSecret
+	/** Shared `recflare` D1 — this worker owns the `link` table. */
+	DB: D1Database
 }
 
 /** Variables can be extended */

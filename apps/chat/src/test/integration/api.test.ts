@@ -50,10 +50,10 @@ function b64url(input: ArrayBuffer | string): string {
 	return btoa(binary).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '')
 }
 
-async function bearer(sub: number): Promise<Record<string, string>> {
+async function bearer(sub: number, version?: string): Promise<Record<string, string>> {
 	const now = Math.floor(Date.now() / 1000)
 	const signingInput = `${b64url(JSON.stringify({ alg: 'HS256', typ: 'JWT' }))}.${b64url(
-		JSON.stringify({ sub: String(sub), exp: now + 3600 })
+		JSON.stringify({ sub: String(sub), exp: now + 3600, 'rn.ver': version })
 	)}`
 	const key = await crypto.subtle.importKey(
 		'raw',
@@ -74,6 +74,18 @@ beforeAll(async () => {
 })
 
 describe('chat endpoints', () => {
+	it('2026 party reads return a list, including when the caller has no party', async () => {
+		const empty = await SELF.fetch(`${ORIGIN}/thread/party`, {
+			headers: await bearer(42601, '20260323.14'),
+		})
+		expect(empty.status).toBe(200)
+		expect(await empty.json()).toEqual([])
+		const threadId = await createThread(env.DB, [42601], null, undefined, ChatThreadType.Party)
+		const present = await SELF.fetch(`${ORIGIN}/thread/party`, {
+			headers: await bearer(42601, '20260323.14'),
+		})
+		expect(await present.json()).toMatchObject([{ ChatThreadId: threadId }])
+	})
 	it('GET / reports service status', async () => {
 		const res = await SELF.fetch(`${ORIGIN}/`)
 		expect(res.status).toBe(200)
@@ -2152,13 +2164,17 @@ describe('PUT /thread/:id/favorite', () => {
 
 		const res = await favorite(caller, chatThreadId, 'favorite=True')
 		expect(res.status).toBe(200)
-		expect(await res.json()).toBe(0)
+		// The client's FavoriteChatResponse: a bare 2-key object, no envelope.
+		expect(await res.json()).toEqual({ ChatResult: 0, IsFavorited: true })
 
 		expect((await getThreadForPlayer(env.DB, chatThreadId, caller))?.isFavorited).toBe(true)
 		// Per-member, like snoozing: the other player's inbox is untouched.
 		expect((await getThreadForPlayer(env.DB, chatThreadId, other))?.isFavorited).toBe(false)
 
-		await favorite(caller, chatThreadId, 'favorite=False')
+		expect(await (await favorite(caller, chatThreadId, 'favorite=False')).json()).toEqual({
+			ChatResult: 0,
+			IsFavorited: false,
+		})
 		expect((await getThreadForPlayer(env.DB, chatThreadId, caller))?.isFavorited).toBe(false)
 	})
 
@@ -2166,13 +2182,19 @@ describe('PUT /thread/:id/favorite', () => {
 		const caller = 893003
 		const chatThreadId = await createThread(env.DB, [caller, 893004], null, caller)
 
-		expect(await (await favorite(caller, chatThreadId, 'favorite=True', 'POST')).json()).toBe(0)
+		expect(await (await favorite(caller, chatThreadId, 'favorite=True', 'POST')).json()).toEqual({
+			ChatResult: 0,
+			IsFavorited: true,
+		})
 		expect((await getThreadForPlayer(env.DB, chatThreadId, caller))?.isFavorited).toBe(true)
 	})
 
 	it('refuses a thread the caller is not on', async () => {
 		const chatThreadId = await createThread(env.DB, [893005, 893006], null, 893005)
-		expect(await (await favorite(893007, chatThreadId, 'favorite=True')).json()).toBe(3)
+		expect(await (await favorite(893007, chatThreadId, 'favorite=True')).json()).toEqual({
+			ChatResult: 3,
+			IsFavorited: false,
+		})
 	})
 
 	it('401s without a token', async () => {

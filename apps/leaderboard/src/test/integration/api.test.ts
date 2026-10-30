@@ -440,6 +440,108 @@ describe('the nearby window', () => {
 	})
 })
 
+describe('the 2026 body shape', () => {
+	// 20260323 renamed the read selectors: `PrimaryKey` is the room, `SecondaryKey` the
+	// channel, and `LeaderboardType` 0 says it's a room board. Same room, same board as the
+	// 2025 body. `CheckAndSetStat` did NOT change.
+	const ROOM = 400
+	const body2026 = (extra: object) => ({
+		PlayerId: 51,
+		PrimaryKey: ROOM,
+		SecondaryKey: 1,
+		FilterType: 0,
+		SortAscending: false,
+		LeaderboardType: 0,
+		...extra,
+	})
+	const ROWS = {
+		Rows: [
+			{ PlayerId: 52, Score: 9, Rank: 0 },
+			{ PlayerId: 51, Score: 7, Rank: 1 },
+		],
+	}
+	beforeAll(async () => {
+		await setStat(51, ROOM, 7, null, 1)
+		await setStat(52, ROOM, 9, null, 1)
+	})
+
+	it('reads the board 2025’s RoomId + StatChannel name', async () => {
+		const legacy = await post('GetNearbyScores', {
+			WindowSize: 10,
+			PlayerId: 51,
+			StatChannel: 1,
+			RoomId: ROOM,
+			FilterType: 0,
+			SortAscending: false,
+		})
+		expect(await legacy.json()).toEqual(ROWS)
+		const modern = await post('GetNearbyScores', body2026({ WindowSize: 10 }))
+		expect(await modern.json()).toEqual(ROWS)
+		const ranks = await post('GetRanks', body2026({ RankStart: 0, RankEnd: 9 }))
+		expect(await ranks.json()).toEqual(ROWS)
+		const rank = await post('GetPlayerRank', body2026({}))
+		expect(await rank.json()).toEqual({ PlayerId: 51, Score: 7, Rank: 1 })
+	})
+
+	it('ignores RoomId/StatChannel once a 2026 key is present', async () => {
+		// The 2026 keys name no board here, so the stale 2025 ones must not be used instead.
+		const res = await post(
+			'GetRanks',
+			body2026({ PrimaryKey: null, RoomId: ROOM, StatChannel: 1, RankStart: 0, RankEnd: 9 })
+		)
+		expect(await res.json()).toEqual({ Rows: [] })
+	})
+
+	it('answers a null-keyed Event board on GetPlayerRank with the full object', async () => {
+		const res = await post(
+			'GetPlayerRank',
+			body2026({ PrimaryKey: null, SecondaryKey: null, LeaderboardType: 1 })
+		)
+		// 20260323 throws "Response was empty" on null/empty/204: always the three keys.
+		expect(res.status).toBe(200)
+		expect(await res.json()).toEqual({ PlayerId: 51, Score: 0, Rank: 99999 })
+	})
+
+	it('answers an unranked player with the full object', async () => {
+		const res = await post('GetPlayerRank', body2026({ PlayerId: 53 }))
+		expect(res.status).toBe(200)
+		expect(await res.json()).toEqual({ PlayerId: 53, Score: 0, Rank: 99999 })
+	})
+
+	it('answers null keys and Event boards with an empty Rows, never a bare array', async () => {
+		for (const extra of [{ PrimaryKey: null }, { SecondaryKey: null }, { LeaderboardType: 1 }]) {
+			const ranks = await post('GetRanks', body2026({ RankStart: 0, RankEnd: 9, ...extra }))
+			expect(ranks.status).toBe(200)
+			expect(await ranks.text()).toBe('{"Rows":[]}')
+			const nearby = await post('GetNearbyScores', body2026({ WindowSize: 10, ...extra }))
+			expect(nearby.status).toBe(200)
+			expect(await nearby.text()).toBe('{"Rows":[]}')
+		}
+	})
+
+	it('still writes CheckAndSetStat by RoomId + StatChannel, answering a bare 0', async () => {
+		const res = await post(
+			'CheckAndSetStat',
+			{ StatChannel: 1, RoomId: ROOM, StatValue: 12, CurrentStatValue: 7 },
+			await bearer(51)
+		)
+		// The whole body is the number: not `{"result":0}`, not an envelope.
+		expect(res.headers.get('content-type')).toContain('application/json')
+		expect(await res.text()).toBe('0')
+		expect(await stored(51, ROOM, 1)).toEqual({ stat_value: 12 })
+	})
+
+	it('does not write CheckAndSetStat by the read-side PrimaryKey/SecondaryKey', async () => {
+		const res = await post(
+			'CheckAndSetStat',
+			{ PrimaryKey: ROOM + 1, SecondaryKey: 1, StatValue: 5, CurrentStatValue: null },
+			await bearer(51)
+		)
+		expect(await res.text()).toBe('0')
+		expect(await stored(51, ROOM + 1, 1)).toBeNull()
+	})
+})
+
 it('serves an openapi spec with no dangling refs', async () => {
 	const res = await SELF.fetch('https://example.com/openapi.json')
 	expect(res.status).toBe(200)

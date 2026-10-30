@@ -163,11 +163,12 @@ export const RoomTagDto = z.object({
 })
 
 /**
- * A room's engagement counters. `CheerCount`/`FavoriteCount` are aggregated from the
- * per-player `interaction` rows on every read. `VisitCount` is the room's lifetime
- * visits — the `room.visits` column, bumped by the `match` worker on every successful
- * matchmake into the room. Nothing records distinct visitors, so `VisitorCount` stays
- * at 0.
+ * A room's engagement counters. `CheerCount`/`FavoriteCount` are the `room.cheers`/
+ * `favorites` columns, moved by the cheer/favorite toggles as they flip the per-player
+ * `interaction` row (so a count is how many players currently have the flag set).
+ * `VisitCount` is the room's lifetime visits — the `room.visits` column, bumped by the
+ * `match` worker on every successful matchmake into the room. Nothing records distinct
+ * visitors, so `VisitorCount` stays at 0.
  */
 export const RoomStatsDto = z.object({
 	CheerCount: z.int(),
@@ -206,8 +207,11 @@ export const SubRoomDataSaveResponseDto = z.object({
 		.string()
 		.nullable()
 		.describe('Base64 SHA-256 of `unityAsset` when that file is set; otherwise null'),
-	dataBlob: z.string(),
+	dataBlob: z.string().nullable(),
 	dataBlobHash: z.string().nullable().describe('Echoed from the request’s `SubRoomData.Hash`'),
+	persistenceVersion: z.int(),
+	omVersion: z.int(),
+	ugcSubVersion: z.int(),
 	savedByAccountId: z.int().nullable(),
 	savedOnPlatform: z
 		.int()
@@ -239,11 +243,11 @@ export const UnitySubAssetDto = z.object({
 export const SubRoomDataSaveDto = z.object({
 	UnitySubAssets: z
 		.array(UnitySubAssetDto)
-		.describe('Main Studio bundles for this save; empty for a maker-pen save'),
+		.describe('Subasset dependencies, excluding the main bundle; empty when none'),
 	ReferencedUnityAssets: z.array(z.unknown()).describe('Always empty'),
 	SubRoomDataSaveId: z.int().describe('Numbered from 1, incremented on every save'),
 	SubRoomId: z.int().describe('The owning subroom — re-pointed when a subroom is cloned'),
-	DataBlob: z.string().describe('The scene-data key the client downloads from the CDN'),
+	DataBlob: z.string().nullable().describe('Scene-data key; null uses the built-in empty template'),
 	ReferencedUnityAssetIds: z.array(z.string()).describe('Always empty'),
 	PersistenceVersion: z.int(),
 	OMVersion: z.int(),
@@ -444,11 +448,16 @@ export const ExperienceRequest = z.object({
  */
 export const DormRoomId = z.int().describe('The caller’s dorm RoomId')
 
+/** `GET /rooms/{roomId}/boosts/{playerId}/count` — a bare integer, no envelope. */
+export const RoomBoostCount = z
+	.int()
+	.describe('Boosts the player has put on the room. Nothing grants boosts here, so always 0')
+
 /**
  * A room lookup result: the room, or `{}` when nothing matched. The by-id/by-name
  * lookups answer an empty object rather than a 404 — the client reads that as "no room".
  */
-export const RoomLookup = z.union([RoomDto, z.object({})])
+export const RoomLookup = z.union([RoomDto, z.object({}), z.null()])
 
 /** The bare JSON string the lookup routes answer with when neither `id` nor `name` is given. */
 export const MissingLookupParam = z
@@ -596,6 +605,14 @@ export const RoomEnvelope = z.object({
 	error: z.string().describe('Empty on success'),
 	value: RoomDto.nullable(),
 })
+
+/** Result<T> consumed by Studio's v2 settings API. */
+export const StudioRoomEnvelope = z.object({
+	Success: z.boolean(),
+	Error: z.string().nullable(),
+	Value: RoomDto.nullable(),
+})
+export const RoomRestrictionsEnvelope = z.union([RoomEnvelope, StudioRoomEnvelope])
 
 /**
  * What `POST /rooms/{roomId}/subrooms/{subRoomId}/data` answers: `value` carries BOTH the
@@ -805,6 +822,7 @@ export const BulkRoomsRequest = z.object({
  * the fields actually posted are changed, and the names are matched case-insensitively.
  */
 export const RestrictionsRequest = z.object({
+	ageRating: z.string().optional().describe('0 unset, 1 all ages, 2 ages 13 and up'),
 	supportsScreens: z.string().optional().describe('`True` / `False`'),
 	supportsWalkVR: z.string().optional().describe('`True` / `False`'),
 	supportsTeleportVR: z.string().optional().describe('`True` / `False`'),
@@ -824,6 +842,20 @@ export const LoadScreenRequest = z.object({
 /** `PUT /rooms/{roomId}/accessibility`. */
 export const AccessibilityRequest = z.object({
 	accessibility: z.string().describe('0 = Private, 1 = Public, 2 = Unlisted'),
+})
+
+/**
+ * `PUT /rooms/{roomId}/exclude` — the staff listing toggle. Not a game endpoint: the real
+ * service set `ExcludeFromLists` / `ExcludeFromSearch` from an admin tool the client never
+ * had a screen for, so this is recflare's own, called from the website's room page.
+ */
+export const ExcludeRequest = z.object({
+	excluded: z
+		.string()
+		.describe(
+			'`true` hides the room from every browse feed AND from search; `false` lists it again. ' +
+				'Both flags are always set together.'
+		),
 })
 
 /**
@@ -944,6 +976,8 @@ export const SaveSubRoomDataRequest = z.object({
 		.optional()
 		.describe('The save comment — a description of THIS revision, not the room’s description'),
 	PersistenceVersion: z.int().optional().describe('Recorded on the save and the subroom'),
+	OMVersion: z.int().optional().describe('Object-model format version; retained when omitted'),
+	UgcSubVersion: z.int().optional().describe('UGC format revision; retained when omitted'),
 	InventionUsage: z.string().optional().describe('Recorded on the subroom'),
 	UnityAssetId: z.string().nullable().optional().describe('Recorded on the save when set'),
 	AutoPublish: z
@@ -977,7 +1011,7 @@ export const SubRoomDataSaveNoUnityAssetsDto = z.object({
 	SubRoomId: z.int(),
 	UnityAssetId: z.string().nullable().describe('Null unless the save carried one'),
 	ReferencedUnityAssetIds: z.array(z.string()).describe('Always empty — we record none'),
-	DataBlob: z.string().describe('The scene-data key the client downloads from the CDN'),
+	DataBlob: z.string().nullable().describe('Scene-data key; null uses the built-in empty template'),
 	DataBlobHash: z.string().nullable(),
 	PersistenceVersion: z.int(),
 	OMVersion: z.int(),
@@ -1022,7 +1056,7 @@ export const SubRoomDataSaveDetailDto = z.object({
 	SubRoomId: z.int(),
 	UnityAssetId: z.string().nullable().describe('Null unless the save carried one'),
 	ReferencedUnityAssetIds: z.array(z.string()).describe('Always empty — we record none'),
-	DataBlob: z.string().describe('The scene-data key the client downloads from the CDN'),
+	DataBlob: z.string().nullable().describe('Scene-data key; null uses the built-in empty template'),
 	DataBlobHash: z.string().nullable(),
 	PersistenceVersion: z.int(),
 	OMVersion: z.int(),

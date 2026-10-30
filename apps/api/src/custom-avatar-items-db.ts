@@ -29,7 +29,7 @@
 
 import { COACH_ACCOUNT_ID } from './custom-avatar-items-load'
 
-/** Schema DDL (mirror of migrations/0022_custom_avatar_item_json.sql). */
+/** Schema DDL (mirror of migrations/0022_custom_avatar_item_json.sql and 0035_custom_avatar_item_badge_room.sql). */
 export const SCHEMA_DDL: string[] = [
 	`CREATE TABLE IF NOT EXISTS custom_avatar_item (
 		data TEXT NOT NULL,
@@ -45,6 +45,9 @@ export const SCHEMA_DDL: string[] = [
 	)`,
 	`CREATE UNIQUE INDEX IF NOT EXISTS idx_custom_avatar_item_id ON custom_avatar_item (custom_avatar_item_id)`,
 	`CREATE INDEX IF NOT EXISTS idx_custom_avatar_item_creator ON custom_avatar_item (creator_account_id)`,
+	// The room-badge lookup (`attachBadges`, packages/domain/src/rooms-db.ts) runs on every room
+	// page; partial over the badge rows, keyed by the badge's room (migrations/0035).
+	`CREATE INDEX IF NOT EXISTS idx_custom_avatar_item_badge_room ON custom_avatar_item (json_extract(data, '$.CustomBadgeMetadata.RoomId')) WHERE outfit_type = 1000`,
 ]
 
 /**
@@ -72,6 +75,9 @@ export interface CustomAvatarItemSave {
 	UnityAssetHash: string
 	UnityAsset2: string | null
 	UnityAsset2Hash: string | null
+	/** Studio builds persist separate target hashes; legacy imports omit these. */
+	QuestUnityAssetHash?: string | null
+	QuestUnityAsset2Hash?: string | null
 }
 
 /** A tag on an item (`{ TagType: 0, Value: "export" }` on the imported first-party items). */
@@ -140,6 +146,13 @@ export const OUTFIT_TYPE_CUSTOM_SHIRT = 105
  * rows, told apart by `BaseAvatarItemId`).
  */
 export const MAX_PLAYER_ITEM_PRICE = 1000
+
+/**
+ * The fewest tokens a player-made item may sell for: a price is 0 (free, open to anyone) or
+ * at least this. Served as `minPriceForPublicItem`, which the client's creation UI enforces,
+ * and checked on the create and the edit as well so the API can't price an item at 1.
+ */
+export const MIN_PLAYER_ITEM_PRICE = 100
 
 /** What `POST /api/customAvatarItems/v1` needs to create an item. */
 export interface CreateCustomAvatarItemInput {
@@ -297,10 +310,11 @@ export async function getCustomAvatarItems(
 	ids: string[]
 ): Promise<CustomAvatarItem[]> {
 	if (ids.length === 0) return []
-	const placeholders = ids.map((_, i) => `?${i + 1}`).join(', ')
 	const { results } = await db
-		.prepare(`SELECT data FROM custom_avatar_item WHERE custom_avatar_item_id IN (${placeholders})`)
-		.bind(...ids)
+		.prepare(
+			`SELECT data FROM custom_avatar_item WHERE custom_avatar_item_id IN (SELECT value FROM json_each(?1))`
+		)
+		.bind(JSON.stringify(ids))
 		.all<Row>()
 	const byId = new Map(results.map(toDto).map((item) => [item.CustomAvatarItemId, item]))
 	return ids.flatMap((id) => byId.get(id) ?? [])
@@ -355,6 +369,8 @@ export function toQuestCustomAvatarItem(item: CustomAvatarItem): CustomAvatarIte
 			...save,
 			UnityAsset: questAsset(save.UnityAsset),
 			UnityAsset2: questAsset(save.UnityAsset2),
+			UnityAssetHash: save.QuestUnityAssetHash ?? save.UnityAssetHash,
+			UnityAsset2Hash: save.QuestUnityAsset2Hash ?? save.UnityAsset2Hash,
 		})),
 	}
 }

@@ -15,6 +15,7 @@ import {
 	updateAccount,
 } from '@repo/domain/src/accounts-db'
 import { AUDIT_LOG_SCHEMA_DDL } from '@repo/domain/src/audit-db'
+import { AVATAR_STUDIO_SCHEMA, avatarStudioFlags } from '@repo/domain/src/avatar-studio'
 import { PlatformType } from '@repo/domain/src/enums'
 import { getPendingGifts, RECEIVED_GIFT_SCHEMA_DDL } from '@repo/domain/src/gifts-db'
 import { OUTFIT_SCHEMA_DDL } from '@repo/domain/src/outfits-db'
@@ -24,11 +25,16 @@ import {
 	setPresence,
 } from '@repo/domain/src/presence-db'
 import { getProgression, PROGRESSION_SCHEMA_DDL } from '@repo/domain/src/progression-db'
-import { ROOM_INSTANCE_SCHEMA_DDL } from '@repo/domain/src/room-instance-db'
+import {
+	createRoomInstance,
+	getRoomInstancesByRoom,
+	ROOM_INSTANCE_SCHEMA_DDL,
+} from '@repo/domain/src/room-instance-db'
 // Banning a player moves them into their own dorm, which is a room (created on demand) with
 // a subroom — so those tables have to be here, as they are on the shared database.
 import {
 	getRoomById,
+	getOrCreateDormRoom,
 	ROOM_SCHEMA_DDL,
 	setRoomTags,
 	SUBROOM_SCHEMA_DDL,
@@ -39,6 +45,7 @@ import { generateToken } from '@repo/jwt'
 import {
 	createCustomAvatarItem,
 	SCHEMA_DDL as CUSTOM_AVATAR_ITEM_SCHEMA_DDL,
+	importCustomAvatarItem,
 } from '../../../../api/src/custom-avatar-items-db'
 import {
 	createReport,
@@ -51,9 +58,12 @@ import {
 	countAccountsForPlatformIdentity,
 	getLinksForAccount,
 	getLinksForPlatform,
+	hasRecordedRoles,
 	isPlatformIdentityLinked,
 	linkPlatformIdentity,
 	PLATFORM_SCHEMA_DDL,
+	recordFirstRoles,
+	unlinkPlatform,
 } from '../../../../auth/src/platform-db'
 import {
 	BALANCE_SCHEMA_DDL,
@@ -75,7 +85,13 @@ import {
 	INVENTORY_CUSTOM_SCHEMA_DDL,
 	ownedCustomAvatarItemIds,
 } from '../../../../econ/src/inventory-custom-db'
-import { discordConfig, parseRoleIds, qualifies } from '../../discord'
+import {
+	discordConfig,
+	loginRedirectUri,
+	parseRoleIds,
+	qualifies,
+	redirectUri,
+} from '../../discord'
 import { fetchMemberRoles, refreshDiscordRoles } from '../../discord-roles'
 import { DOCUMENTED_SERVICES } from '../../docs'
 import { DISCORD_INVITE, ISSUES_URL, PRIVACY_EMAIL } from '../../links'
@@ -128,6 +144,7 @@ beforeAll(async () => {
 	// `account` likewise: owned by `auth`, read and (for the benefits claim) written here.
 	for (const stmt of ACCOUNT_SCHEMA_DDL) await env.DB.prepare(stmt).run()
 	for (const stmt of OUTFIT_SCHEMA_DDL) await env.DB.prepare(stmt).run()
+	for (const stmt of AVATAR_STUDIO_SCHEMA) await env.DB.prepare(stmt).run()
 	// And `platform_account`, where a claimed Discord identity is linked.
 	for (const stmt of PLATFORM_SCHEMA_DDL) await env.DB.prepare(stmt).run()
 	// `report` and `warning` are owned (and migrated) by `api`; www serves the staff panel
@@ -176,6 +193,8 @@ it('advertises signup and where the other workers live', async () => {
 		// even be started. Note the client id is NOT leaked by a closed config.
 		benefitsEnabled: false,
 		discordAuthorizeUrl: null,
+		// "Sign in with Discord" is on the same switch, and closed with it.
+		discordLoginUrl: null,
 		hosts: {
 			auth: 'https://auth.rec.example.com',
 			accounts: 'https://accounts.rec.example.com',
@@ -678,16 +697,261 @@ it('reports where an account stands on benefits', async () => {
 		headers: { authorization: `Bearer ${token}` },
 	})
 	expect(res.status).toBe(200)
-	expect(await res.json()).toEqual({ hasPlus: false, linked: false })
+	// No email either: the unlink's one precondition, served alongside so the page can say
+	// so first. Nothing linked, so there is nothing to unlink yet.
+	expect(await res.json()).toEqual({
+		hasPlus: false,
+		linked: false,
+		discordLinked: false,
+		hasEmail: false,
+	})
 
+	// A bare link — what "Sign in with Discord" leaves on an account it just made — is NOT a
+	// claim: no roles were ever recorded, so the page must still offer the claim. It IS a
+	// Discord on the account, though, so `discordLinked` says so: the unlink is offered for
+	// it as much as for a claim's link.
 	await updateAccount(env.DB, 4003, { hasPlus: true })
 	await linkPlatformIdentity(env.DB, 4003, PlatformType.Discord, '99001')
 	res = await SELF.fetch('https://example.com/api/benefits/status', {
 		headers: { authorization: `Bearer ${token}` },
 	})
-	// `linked` says THAT a Discord identity is attached, never which one — the id is of no
-	// use to the page, and an account's linked identities have no business on the wire.
-	expect(await res.json()).toEqual({ hasPlus: true, linked: true })
+	expect(await res.json()).toEqual({
+		hasPlus: true,
+		linked: false,
+		discordLinked: true,
+		hasEmail: false,
+	})
+
+	// Claimed (roles recorded, even none). `linked` says THAT a Discord identity has claimed,
+	// never which one — the id is of no use to the page, and an account's linked identities
+	// have no business on the wire.
+	await updateAccount(env.DB, 4003, { email: 'p4003@example.com' })
+	await linkPlatformIdentity(env.DB, 4003, PlatformType.Discord, '99001', [])
+	res = await SELF.fetch('https://example.com/api/benefits/status', {
+		headers: { authorization: `Bearer ${token}` },
+	})
+	expect(await res.json()).toEqual({
+		hasPlus: true,
+		linked: true,
+		discordLinked: true,
+		hasEmail: true,
+	})
+})
+
+// ---- Discord unlink --------------------------------------------------------
+// Taking the Discord off an account. The link may be the only way in — an account made by
+// "Sign in with Discord" has no email until the player sets one — so the unlink is refused
+// until the account has an address to be recovered through, decided from the row and never
+// from the page. A password is NOT required: a passwordless account sets one in game.
+
+const unlink = (token: string) =>
+	SELF.fetch('https://example.com/api/benefits/unlink', {
+		method: 'POST',
+		headers: { authorization: `Bearer ${token}`, 'content-type': 'application/json' },
+		body: '{}',
+	})
+
+const requestDeletion = (token: string) =>
+	SELF.fetch('https://example.com/api/account/delete', {
+		method: 'POST',
+		headers: { authorization: `Bearer ${token}`, 'content-type': 'application/json' },
+		body: '{}',
+	})
+
+it('requires a valid session to mark an account for deletion', async () => {
+	expect((await requestDeletion('')).status).toBe(401)
+	const forged = await generateToken('4030', '', 4, 'not-the-real-secret')
+	expect((await requestDeletion(forged)).status).toBe(401)
+	// A token for an account that doesn't exist marks nothing.
+	expect((await requestDeletion(await tokenFor(4031))).status).toBe(404)
+})
+
+it('marks the account for deletion without deleting it, once', async () => {
+	const token = await tokenFor(4032)
+	await updateAccount(env.DB, 4032, { username: 'Leaving', email: 'p4032@example.com' })
+
+	const res = await requestDeletion(token)
+	expect(res.status).toBe(200)
+	const body = (await res.json()) as { isDeleted: boolean; deletedAt: string }
+	expect(body.isDeleted).toBe(true)
+	expect(Date.parse(body.deletedAt)).not.toBeNaN()
+
+	// A mark, not a deletion: the row is still there, untouched but for the flag.
+	const marked = await getAccount(env.DB, 4032)
+	expect(marked).toMatchObject({
+		username: 'Leaving',
+		email: 'p4032@example.com',
+		isDeleted: true,
+		deletedAt: body.deletedAt,
+	})
+
+	// Idempotent, keeping the ORIGINAL request time: a second click can't push the mark
+	// past a sign-in that already reversed it.
+	const again = (await (await requestDeletion(token)).json()) as { deletedAt: string }
+	expect(again.deletedAt).toBe(body.deletedAt)
+	expect((await getAccount(env.DB, 4032))?.deletedAt).toBe(body.deletedAt)
+})
+
+it('requires a valid session to unlink a discord', async () => {
+	expect((await unlink('')).status).toBe(401)
+	const forged = await generateToken('4020', '', 4, 'not-the-real-secret')
+	expect((await unlink(forged)).status).toBe(401)
+})
+
+it('refuses to unlink a discord until the account has an email address', async () => {
+	const token = await tokenFor(4021)
+	await linkPlatformIdentity(env.DB, 4021, PlatformType.Discord, '99021')
+
+	// No email — and a password doesn't stand in for one.
+	await updateAccount(env.DB, 4021, { passwordHash: 'salt:hash' })
+	const res = await unlink(token)
+	expect(res.status).toBe(403)
+	expect(await res.json()).toEqual({
+		error:
+			'Add an email address to your account before unlinking Discord, so the account can be recovered without it.',
+	})
+
+	// Refused means untouched: the link is still there.
+	await expect(isPlatformIdentityLinked(env.DB, 4021, PlatformType.Discord, '99021')).resolves.toBe(
+		true
+	)
+
+	// An email alone, no password, is enough.
+	await updateAccount(env.DB, 4021, { passwordHash: undefined, email: 'p4021@example.com' })
+	expect((await unlink(token)).status).toBe(200)
+	await expect(isPlatformIdentityLinked(env.DB, 4021, PlatformType.Discord, '99021')).resolves.toBe(
+		false
+	)
+})
+
+it('unlinks every discord on the account, and takes plus and studio with it', async () => {
+	const token = await tokenFor(4022)
+	await updateAccount(env.DB, 4022, {
+		username: 'Leaver',
+		email: 'p4022@example.com',
+		hasPlus: true,
+		hasStudio: true,
+	})
+	// A claimed link and (the once-only guard aside) a second identity, both Discord — and a
+	// Steam login that must survive: only the Discord goes.
+	await linkPlatformIdentity(env.DB, 4022, PlatformType.Discord, '99022', ['r1'])
+	await linkPlatformIdentity(env.DB, 4022, PlatformType.Discord, '99023')
+	await linkPlatformIdentity(env.DB, 4022, PlatformType.Steam, '76561000000000022')
+
+	const res = await unlink(token)
+	expect(res.status).toBe(200)
+	// The status as it now stands, in `/api/benefits/status`'s shape: the grants went with
+	// the link.
+	expect(await res.json()).toEqual({
+		hasPlus: false,
+		linked: false,
+		discordLinked: false,
+		hasEmail: true,
+	})
+	expect((await getLinksForAccount(env.DB, 4022)).map((l) => [l.platform, l.platformId])).toEqual([
+		[PlatformType.Steam, '76561000000000022'],
+	])
+	// The identity is free again: the once-only guard counts nobody holding it now.
+	await expect(
+		countAccountsForPlatformIdentity(env.DB, PlatformType.Discord, '99022')
+	).resolves.toBe(0)
+	// The account remembers it CLAIMED (a link with roles recorded was removed), so a re-link
+	// won't be a "first" one to the gift — see the test below. Plus and Studio are CLEARED —
+	// dropped from the blob, not written false — and the rest of the row is untouched.
+	const after = await getAccount(env.DB, 4022)
+	expect(after?.hasClaimedDiscord).toBe(true)
+	expect(after?.hasPlus).toBeUndefined()
+	expect(after?.hasStudio).toBeUndefined()
+	expect(after?.username).toBe('Leaver')
+	expect(after?.email).toBe('p4022@example.com')
+
+	// Nothing left to unlink.
+	const again = await unlink(token)
+	expect(again.status).toBe(404)
+	expect(await again.json()).toEqual({ error: 'No Discord account is linked to this account.' })
+})
+
+// Removing a BARE link (a Discord sign-in's, no roles recorded) is not a claim to remember:
+// that player's first claim, on whatever account they next link, is still their first.
+it('does not remember a claim when the unlinked discord never claimed', async () => {
+	const token = await tokenFor(4023)
+	await updateAccount(env.DB, 4023, { email: 'p4023@example.com' })
+	await linkPlatformIdentity(env.DB, 4023, PlatformType.Discord, '99024')
+	expect((await unlink(token)).status).toBe(200)
+	expect((await getAccount(env.DB, 4023))?.hasClaimedDiscord).toBeUndefined()
+
+	// But a claim that found NO roles is still a claim — `[]` is recorded, NULL is not — and
+	// `unlinkPlatform`'s parsed rows can't tell the two apart, which is why the route asks
+	// the raw column before it deletes.
+	await linkPlatformIdentity(env.DB, 4023, PlatformType.Discord, '99024', [])
+	expect((await unlink(token)).status).toBe(200)
+	expect((await getAccount(env.DB, 4023))?.hasClaimedDiscord).toBe(true)
+})
+
+// The helper itself: returns what it removed (so the caller knows what the rows carried),
+// and an account with nothing on that platform yields an empty list and no write.
+it('removes every link on one platform and returns them', async () => {
+	await linkPlatformIdentity(env.DB, 4024, PlatformType.Discord, '99025', ['r1', 'r2'])
+	await linkPlatformIdentity(env.DB, 4024, PlatformType.Steam, '76561000000000024')
+	await expect(unlinkPlatform(env.DB, 4024, PlatformType.Oculus)).resolves.toEqual([])
+	const removed = await unlinkPlatform(env.DB, 4024, PlatformType.Discord)
+	expect(removed.map((l) => [l.platformId, l.roles])).toEqual([['99025', ['r1', 'r2']]])
+	await expect(unlinkPlatform(env.DB, 4024, PlatformType.Discord)).resolves.toEqual([])
+	expect((await getLinksForAccount(env.DB, 4024)).map((l) => l.platform)).toEqual([
+		PlatformType.Steam,
+	])
+})
+
+// How the claim decides "first claim" now that a Discord link can predate it: a link made by
+// "Sign in with Discord" has no roles, and writing the first roles onto it is a one-shot
+// flip — the single-winner write the gift is gated on, which a fresh link gets from its
+// INSERT instead. Exercised at the helpers, since the route runs through discord.com.
+it('tells a sign-in’s bare link from a claim, and records the first roles once', async () => {
+	await expect(hasRecordedRoles(env.DB, 4010, PlatformType.Discord)).resolves.toBe(false)
+	await linkPlatformIdentity(env.DB, 4010, PlatformType.Discord, '99010')
+	await expect(hasRecordedRoles(env.DB, 4010, PlatformType.Discord)).resolves.toBe(false)
+
+	// Nothing to flip on a link that isn't there.
+	await expect(recordFirstRoles(env.DB, 4010, PlatformType.Discord, '99011', ['r1'])).resolves.toBe(
+		false
+	)
+	// The first write wins; the second finds roles already recorded and writes nothing.
+	await expect(recordFirstRoles(env.DB, 4010, PlatformType.Discord, '99010', ['r1'])).resolves.toBe(
+		true
+	)
+	await expect(recordFirstRoles(env.DB, 4010, PlatformType.Discord, '99010', ['r2'])).resolves.toBe(
+		false
+	)
+	await expect(hasRecordedRoles(env.DB, 4010, PlatformType.Discord)).resolves.toBe(true)
+	const [link] = await getLinksForAccount(env.DB, 4010)
+	expect(link.roles).toEqual(['r1'])
+
+	// A claim on a FRESH link records roles in the insert itself — an empty list included.
+	await linkPlatformIdentity(env.DB, 4011, PlatformType.Discord, '99012', [])
+	await expect(hasRecordedRoles(env.DB, 4011, PlatformType.Discord)).resolves.toBe(true)
+})
+
+// ---- Sign in with Discord ------------------------------------------------
+
+// Closed on the same switch as the claim, and refused the same way: the half-configured
+// app the tests run with has a client id and secret and nothing else.
+it('refuses a discord sign-in while the discord app is only half configured', async () => {
+	const res = await SELF.fetch('https://example.com/api/login/discord', {
+		method: 'POST',
+		headers: { 'content-type': 'application/json' },
+		body: JSON.stringify({ code: 'whatever' }),
+	})
+	expect(res.status).toBe(403)
+	expect(await res.json()).toEqual({ error: 'Signing in with Discord is not available here.' })
+})
+
+// The two return legs are different registered redirects, both derived from the request's
+// own origin (never the body). A sign-in can't come back to `/claim`: that page wants a
+// session before it does anything, and a sign-in is how one gets made.
+it('sends a sign-in back to its own redirect, derived from the request origin', () => {
+	const request = new Request('https://play.example.com/api/config')
+	expect(redirectUri(request)).toBe('https://play.example.com/claim')
+	expect(loginRedirectUri(request)).toBe('https://play.example.com/login/discord')
 })
 
 // The once-only guard the claim is built on. Without it, one Discord member holding the
@@ -934,6 +1198,7 @@ it('refuses every staff endpoint without a token, and without a staff role', asy
 		'/api/staff/players/1',
 		'/api/staff/players/1/linked',
 		'/api/staff/studio-access',
+		'/api/staff/sandbox',
 	]
 	const writes = [
 		'/api/staff/players/1/gift-tokens',
@@ -941,6 +1206,8 @@ it('refuses every staff endpoint without a token, and without a staff role', asy
 		'/api/staff/players/1/gift-xp',
 		'/api/staff/players/1/username-changes',
 		'/api/staff/players/1/clear-password',
+		'/api/staff/players/1/clear-dorm',
+		'/api/staff/rooms/1/clear-instances',
 		'/api/staff/studio-access',
 		'/api/staff/players/1/grant-plus',
 	]
@@ -949,7 +1216,8 @@ it('refuses every staff endpoint without a token, and without a staff role', asy
 		'/api/staff/rooms/1/rro-tag',
 		'/api/staff/online/gift-tokens',
 		'/api/staff/discord-roles/1/gift-tokens',
-		'/api/staff/discord-roles/sync'
+		'/api/staff/discord-roles/sync',
+		'/api/staff/discord-roles/supporter-gift'
 	)
 	for (const path of writes) {
 		expect((await SELF.fetch(`https://example.com${path}`, { method: 'POST' })).status).toBe(401)
@@ -960,14 +1228,15 @@ it('refuses every staff endpoint without a token, and without a staff role', asy
 		expect(res.status).toBe(403)
 	}
 
-	// The gifts, the Plus grant and the role sweep are narrower: a moderator is staff, but
-	// not a developer.
+	// The gifts, the Plus grant, the role sweep and the supporter gift are narrower: a
+	// moderator is staff, but not a developer.
 	for (const path of writes.filter(
 		(p) =>
 			p.includes('/gift-') ||
 			p.endsWith('/rro-tag') ||
 			p.includes('/grant-plus') ||
-			p.endsWith('/sync')
+			p.endsWith('/sync') ||
+			p.endsWith('/supporter-gift')
 	)) {
 		expect((await staffPost(path, 8101, { amount: 1 })).status).toBe(403)
 	}
@@ -1005,6 +1274,22 @@ it('refuses every staff endpoint without a token, and without a staff role', asy
 		headers: { authorization: `Bearer ${await tokenFor(8101, ['gameClient'])}` },
 	})
 	expect(playerRemove.status).toBe(403)
+	// The sandbox toggle is a PUT, so the loop over POSTs above doesn't cover it.
+	const sandboxUnauthed = await SELF.fetch('https://example.com/api/staff/sandbox', {
+		method: 'PUT',
+		headers: { 'content-type': 'application/json' },
+		body: JSON.stringify({ sandbox: true }),
+	})
+	expect(sandboxUnauthed.status).toBe(401)
+	const sandboxPlayer = await SELF.fetch('https://example.com/api/staff/sandbox', {
+		method: 'PUT',
+		headers: {
+			authorization: `Bearer ${await tokenFor(8101, ['gameClient'])}`,
+			'content-type': 'application/json',
+		},
+		body: JSON.stringify({ sandbox: true }),
+	})
+	expect(sandboxPlayer.status).toBe(403)
 })
 
 it('lets a developer enable RRO settings and system tags without changing other room tags', async () => {
@@ -1588,6 +1873,41 @@ it('previews which other accounts a ban would reach', async () => {
 	})
 	// Never the account asked about: the question is who ELSE.
 	expect(preview.linked.map((l) => l.accountId)).not.toContain(8220)
+})
+
+// A ban evader's new account has no ban of its own, but `auth`/`match` lock it out through
+// the linked arms — so the history must say so rather than read "Not banned".
+it('reports a linked account’s ban as what blocks a player', async () => {
+	const seedAccount = (data: Record<string, unknown>) =>
+		env.DB.prepare('INSERT OR REPLACE INTO account (data) VALUES (?1)')
+			.bind(JSON.stringify(data))
+			.run()
+	await seedAccount({ accountId: 8230, username: 'Banned', lastLoginIp: '203.0.113.30' })
+	await seedAccount({ accountId: 8231, username: 'Alt', signupIp: '203.0.113.30' })
+	await seedAccount({ accountId: 8232, username: 'Stranger', signupIp: '203.0.113.31' })
+	const report = await createReport(env.DB, { reporterPlayerId: 8233, reportedPlayerId: 8230 })
+	expect((await staffPost(`/api/staff/reports/${report.id}/ban`, 8110, { days: 1 })).status).toBe(
+		200
+	)
+
+	type History = {
+		activeBan: { id: number } | null
+		blockedBy: { via: string; bannedAccountId: number; ban: { id: number } } | null
+	}
+	const history = async (id: number) =>
+		(await (await staffGet(`/api/staff/players/${id}`, 8110)).json()) as History
+
+	// The banned account itself: its own ban, matched directly.
+	expect(await history(8230)).toMatchObject({
+		activeBan: { id: report.id },
+		blockedBy: { via: 'account', bannedAccountId: 8230 },
+	})
+	// The alt: no ban of its own, blocked through the shared IP — naming whose ban it is.
+	expect(await history(8231)).toMatchObject({
+		activeBan: null,
+		blockedBy: { via: 'ip', bannedAccountId: 8230, ban: { id: report.id } },
+	})
+	expect(await history(8232)).toMatchObject({ activeBan: null, blockedBy: null })
 })
 
 // The panel's own URLs must reach the SPA, not the worker's API surface. `requireStaff`
@@ -2249,6 +2569,112 @@ it('clears a player’s password so they can set a new one in game', async () =>
 	expect((await staffPost('/api/staff/players/8397/clear-password', 8110, {})).status).toBe(404)
 })
 
+it('clears a player’s dorm by publishing an empty save over the newest one', async () => {
+	await updateAccount(env.DB, 8340, { username: 'Timetraveler' })
+	expect((await staffPost('/api/staff/players/8340/clear-dorm', 8110, {})).status).toBe(404)
+
+	const dorm = await getOrCreateDormRoom(env.DB, 8340)
+	const roomId = Number(dorm.RoomId)
+	const { sub_room_id: subRoomId } = (await env.DB.prepare(
+		'SELECT sub_room_id FROM subroom WHERE room_id = ?1 LIMIT 1'
+	)
+		.bind(roomId)
+		.first<{ sub_room_id: number }>())!
+
+	// A dorm that has never been saved: nothing to clear, still a success.
+	let res = await staffPost('/api/staff/players/8340/clear-dorm', 8110, {})
+	expect(await res.json()).toEqual({ playerId: 8340, roomId, previousSaveId: null, saveId: null })
+
+	const insertSave = (blob: string) =>
+		env.DB.prepare(
+			'INSERT INTO subroom_save (sub_room_id, data) VALUES (?1, ?2) RETURNING sub_room_data_save_id AS id'
+		)
+			.bind(
+				subRoomId,
+				JSON.stringify({
+					DataBlob: blob,
+					DataBlobHash: 'hash',
+					Description: blob,
+					PersistenceVersion: 7,
+					CreatedAt: '2025-08-01T00:00:00.000Z',
+				})
+			)
+			.first<{ id: number }>()
+	const older = (await insertSave('old.blob'))!.id
+	const newer = (await insertSave('new.blob'))!.id
+	await env.DB.prepare(
+		'UPDATE subroom SET current_save_id = ?2, staged_save_id = ?2 WHERE sub_room_id = ?1'
+	)
+		.bind(subRoomId, newer)
+		.run()
+	const saveData = async (id: number) =>
+		JSON.parse(
+			(await env.DB.prepare('SELECT data FROM subroom_save WHERE sub_room_data_save_id = ?1')
+				.bind(id)
+				.first<{ data: string }>())!.data
+		)
+	const pointers = () =>
+		env.DB.prepare('SELECT current_save_id, staged_save_id FROM subroom WHERE sub_room_id = ?1')
+			.bind(subRoomId)
+			.first<{ current_save_id: number; staged_save_id: number | null }>()
+
+	res = await staffPost('/api/staff/players/8340/clear-dorm', 8110, {})
+	expect(res.status).toBe(200)
+	const { saveId } = (await res.json()) as { saveId: number }
+	expect(saveId).toBeGreaterThan(newer)
+
+	// The blank save copies the newest one but for the blob, and goes live.
+	const blank = await saveData(saveId)
+	expect(blank).toEqual({
+		DataBlob: '',
+		DataBlobHash: null,
+		Description: 'Cleared by staff',
+		PersistenceVersion: 7,
+		CreatedAt: expect.any(String),
+	})
+	expect(blank.CreatedAt).not.toBe('2025-08-01T00:00:00.000Z')
+	expect(await pointers()).toEqual({ current_save_id: saveId, staged_save_id: null })
+	// Nothing is erased: both earlier saves are as they were.
+	expect((await saveData(newer)).DataBlob).toBe('new.blob')
+	expect((await saveData(older)).DataBlob).toBe('old.blob')
+
+	// Clearing an already-empty dorm writes nothing more.
+	res = await staffPost('/api/staff/players/8340/clear-dorm', 8110, {})
+	expect(await res.json()).toEqual({ playerId: 8340, roomId, previousSaveId: saveId, saveId: null })
+	expect(await pointers()).toEqual({ current_save_id: saveId, staged_save_id: null })
+
+	expect((await auditRows('clear_dorm', 8340)).map((r) => r.data)).toEqual([
+		{ playerId: 8340, roomId, previousSaveId: null, saveId: null },
+		{ playerId: 8340, roomId, previousSaveId: newer, saveId },
+		{ playerId: 8340, roomId, previousSaveId: saveId, saveId: null },
+	])
+})
+
+it('clears every instance of a room, for any staff member', async () => {
+	const make = (roomId: number, photonRoomId: string) =>
+		createRoomInstance(env.DB, { ownerAccountId: 8110, roomId, photonRoomId })
+	const a = await make(7740, 'clear-a')
+	const b = await make(7740, 'clear-b')
+	const other = await make(7741, 'clear-other')
+
+	// A moderator, not only a developer, may clear a room.
+	const res = await staffPost('/api/staff/rooms/7740/clear-instances', 8101, {})
+	expect(res.status).toBe(200)
+	const body = (await res.json()) as { roomId: number; deleted: number[] }
+	expect(body.roomId).toBe(7740)
+	expect(body.deleted.toSorted()).toEqual([a.roomInstanceId, b.roomInstanceId].toSorted())
+	expect(await getRoomInstancesByRoom(env.DB, 7740)).toEqual([])
+	// Another room's instances are untouched.
+	expect((await getRoomInstancesByRoom(env.DB, 7741)).map((i) => i.roomInstanceId)).toEqual([
+		other.roomInstanceId,
+	])
+
+	// Clearing an empty room succeeds and deletes nothing.
+	const again = await staffPost('/api/staff/rooms/7740/clear-instances', 8101, {})
+	expect(await again.json()).toEqual({ roomId: 7740, deleted: [] })
+	expect((await staffPost('/api/staff/rooms/abc/clear-instances', 8101, {})).status).toBe(400)
+})
+
 it('grants a player Plus, developers only', async () => {
 	await updateAccount(env.DB, 8330, { username: 'Plusless' })
 	const hasPlus = async () =>
@@ -2380,6 +2806,77 @@ it('gifts a player a custom item in a gift box', async () => {
 			},
 		},
 	])
+})
+
+it('grants a published room badge through profile gifting without room presence, once', async () => {
+	await clearHub()
+	await updateAccount(env.DB, 8530, { username: 'BadgeRecipient' })
+	const seed = await seedCustomItem('0a1b2c3d-0000-4000-8000-000000000030', 8531)
+	const badge = await importCustomAvatarItem(env.DB, {
+		...seed,
+		Name: 'Room Champion',
+		OutfitType: 1000,
+		CustomBadgeMetadata: { RoomId: 12345 },
+		CurrentSaves: [
+			{
+				CustomAvatarItemSaveId: 1,
+				CustomAvatarItemId: seed.CustomAvatarItemId,
+				UnityAssetId: crypto.randomUUID(),
+				BodyType: 0,
+				OutfitType: 1000,
+				QAState: 0,
+				CreatedAt: seed.CreatedAt,
+				ModifiedAt: seed.ModifiedAt,
+				Description: null,
+				ThumbnailFileName: 'badge.png',
+				AdditionalConfiguration: '{}',
+				UnityAsset: 'badge.png',
+				UnityAssetHash: '',
+				UnityAsset2: null,
+				UnityAsset2Hash: null,
+			},
+		],
+	})
+	const responses = await Promise.all([
+		giftItem(8530, badge.CustomAvatarItemId.toUpperCase(), 'Congratulations!'),
+		giftItem(8530, badge.CustomAvatarItemId, 'Congratulations!'),
+	])
+	expect(responses.map((r) => r.status).sort((a, b) => a - b)).toEqual([200, 409])
+	const body = await responses.find((r) => r.status === 200)!.json()
+	expect(body).toMatchObject({ kind: 'badge', name: 'Room Champion' })
+	await expect(ownedCustomAvatarItemIds(env.DB, 8530, [badge.CustomAvatarItemId])).resolves.toEqual(
+		new Set([badge.CustomAvatarItemId])
+	)
+	const gifts = await getPendingGifts(env.DB, 8530)
+	expect(gifts).toHaveLength(1)
+	expect(gifts[0]).toMatchObject({
+		CustomAvatarItemId: badge.CustomAvatarItemId,
+		AvatarItemType: 0,
+		GiftContext: 500,
+		Message: 'Congratulations!',
+	})
+	const frames = await hubFrames()
+	expect(frames).toHaveLength(1)
+	expect(frames[0]).toMatchObject({
+		playerId: 8530,
+		notificationType: 31,
+		data: { CustomAvatarItemId: badge.CustomAvatarItemId, Message: 'Congratulations!' },
+	})
+	expect(await auditRows('gift_custom_item', 8530)).toHaveLength(1)
+	expect((await giftItem(8530, badge.CustomAvatarItemId)).status).toBe(409)
+	const draft = await importCustomAvatarItem(env.DB, {
+		...badge,
+		CustomAvatarItemId: crypto.randomUUID(),
+		Accessibility: 0,
+	})
+	expect((await giftItem(8530, draft.CustomAvatarItemId)).status).toBe(404)
+	const unbuilt = await importCustomAvatarItem(env.DB, {
+		...badge,
+		CustomAvatarItemId: crypto.randomUUID(),
+		CurrentSaves: [],
+	})
+	expect((await giftItem(8530, unbuilt.CustomAvatarItemId)).status).toBe(400)
+	expect(await getPendingGifts(env.DB, 8530)).toHaveLength(1)
 })
 
 it('refuses a custom item gift the store would refuse', async () => {
@@ -2792,6 +3289,41 @@ it('runs the sweep on demand for a developer and answers with the summary', asyn
 	expect(JSON.parse(row?.data ?? '{}')).toMatchObject({ skipped: true })
 })
 
+// The supporter gift on a button: econ's cron run (`grantDiscordRoleGifts`, covered in econ's
+// own tests) with www's bindings, answered with its summary and written to the audit log.
+// The test bindings map no role, so the run is a `skipped` one and pays nothing — which is
+// also what the panel must be able to tell the developer.
+it('runs the supporter gift on demand for a developer and answers with the summary', async () => {
+	await onlyDiscordLinks([[9100, '900000000000000100', [ROLE_A]]])
+	const before = await getBalance(
+		env.DB,
+		9100,
+		CurrencyType.RecCenterTokens,
+		DEFAULT_STARTING_TOKENS
+	)
+
+	const res = await devPost('/api/staff/discord-roles/supporter-gift', 8110, {})
+	expect(res.status).toBe(200)
+	expect(await res.json()).toEqual({
+		skipped: true,
+		roles: 0,
+		links: 0,
+		granted: 0,
+		tokens: 0,
+		failed: 0,
+	})
+	expect(
+		await getBalance(env.DB, 9100, CurrencyType.RecCenterTokens, DEFAULT_STARTING_TOKENS)
+	).toBe(before)
+
+	const row = await env.DB.prepare(
+		`SELECT player_id, data FROM audit_log WHERE action = 'run_discord_role_gift'
+		 ORDER BY audit_log_id DESC LIMIT 1`
+	).first<{ player_id: number; data: string }>()
+	expect(row?.player_id).toBe(8110)
+	expect(JSON.parse(row?.data ?? '{}')).toMatchObject({ skipped: true, granted: 0 })
+})
+
 it('re-reads every discord link and writes the roles back', async () => {
 	await onlyDiscordLinks([
 		[9111, '900000000000000111', [ROLE_A]],
@@ -2979,7 +3511,28 @@ it('tells a signed-in player whether they can upload, and nobody else', async ()
 		headers: { authorization: `Bearer ${await tokenFor(8601, ['gameClient'])}` },
 	})
 	expect(res.status).toBe(200)
-	expect(await res.json()).toEqual({ granted: false })
+	expect(await res.json()).toMatchObject({ granted: false, avatar: false, screenshare: false })
+
+	// A Discord role named in STUDIO_ROLLOUT grants the same access without the flag, and the
+	// page reads it from the same helper `auth` stamps `betastudio` from, so the two agree.
+	// The account has to exist: a link alone, with no account behind it, grants nothing.
+	await updateAccount(env.DB, 8601, { username: 'StudioFan' })
+	await linkPlatformIdentity(env.DB, 8601, PlatformType.Discord, '500000000000008601', [
+		'1077000000000000031',
+	])
+	const original = env.STUDIO_ROLLOUT
+	try {
+		env.STUDIO_ROLLOUT = '1077000000000000031'
+		const rolled = await SELF.fetch('https://example.com/api/studio-access', {
+			headers: { authorization: `Bearer ${await tokenFor(8601, ['gameClient'])}` },
+		})
+		expect(await rolled.json()).toMatchObject({ granted: true, avatar: false, screenshare: false })
+		// The flag itself never moved; the staff list is still empty of this account.
+		expect((await getAccount(env.DB, 8601))?.hasStudio).not.toBe(true)
+	} finally {
+		if (original === undefined) delete env.STUDIO_ROLLOUT
+		else env.STUDIO_ROLLOUT = original
+	}
 })
 
 it('lets staff add, list, and remove studio upload access', async () => {
@@ -3016,13 +3569,13 @@ it('lets staff add, list, and remove studio upload access', async () => {
 	const mine = await SELF.fetch('https://example.com/api/studio-access', {
 		headers: { authorization: `Bearer ${await tokenFor(8601, ['gameClient'])}` },
 	})
-	expect(await mine.json()).toEqual({ granted: true })
+	expect(await mine.json()).toMatchObject({ granted: true, avatar: false, screenshare: false })
 
 	const list = await staffGet('/api/staff/studio-access', 8110)
 	expect(list.status).toBe(200)
 	const body = (await list.json()) as { accounts: Array<{ accountId: number }> }
 	expect(body.accounts).toEqual([
-		{ accountId: 8601, username: 'StudioFan', displayName: expect.any(String) },
+		{ accountId: 8601, username: 'StudioFan', displayName: expect.any(String), enabled: true },
 	])
 	expect((await getAccount(env.DB, 8601))?.hasStudio).toBe(true)
 
@@ -3039,7 +3592,7 @@ it('lets staff add, list, and remove studio upload access', async () => {
 	const after = await SELF.fetch('https://example.com/api/studio-access', {
 		headers: { authorization: `Bearer ${await tokenFor(8601, ['gameClient'])}` },
 	})
-	expect(await after.json()).toEqual({ granted: false })
+	expect(await after.json()).toMatchObject({ granted: false, avatar: false, screenshare: false })
 
 	expect(await auditRows('grant_studio_access', 8601)).toEqual([
 		{
@@ -3055,4 +3608,196 @@ it('lets staff add, list, and remove studio upload access', async () => {
 		{ actor: 8110, data: { playerId: 8601, username: 'StudioFan', removed: true } },
 		{ actor: 8110, data: { playerId: 8601, username: 'StudioFan', removed: false } },
 	])
+})
+
+// ---- Sandbox opt-in ---------------------------------------------------------
+// `match` picks the Tachyon pool off the account's `isSandbox` flag. Staff flip their OWN
+// flag from the account page; the route never takes a player id, so nobody can be moved by
+// someone else here.
+
+it('lets staff opt themselves in and out of the sandbox pool, and only themselves', async () => {
+	await updateAccount(env.DB, 8120, { username: 'SandboxMod' })
+
+	const staffPut = (accountId: number, body: unknown, roles = ['moderator']) =>
+		tokenFor(accountId, roles).then((token) =>
+			SELF.fetch('https://example.com/api/staff/sandbox', {
+				method: 'PUT',
+				headers: { authorization: `Bearer ${token}`, 'content-type': 'application/json' },
+				body: JSON.stringify(body),
+			})
+		)
+
+	// Off until opted in, for a moderator and a developer alike.
+	let res = await staffGet('/api/staff/sandbox', 8120)
+	expect(res.status).toBe(200)
+	expect(await res.json()).toEqual({ sandbox: false })
+	expect((await staffGet('/api/staff/sandbox', 8120, ['developer'])).status).toBe(200)
+
+	// Not a boolean, not a body.
+	expect((await staffPut(8120, { sandbox: 'yes' })).status).toBe(400)
+	expect((await staffPut(8120, {})).status).toBe(400)
+
+	res = await staffPut(8120, { sandbox: true })
+	expect(res.status).toBe(200)
+	expect(await res.json()).toEqual({ sandbox: true, changed: true })
+	expect((await getAccount(env.DB, 8120))?.isSandbox).toBe(true)
+	expect(await (await staffGet('/api/staff/sandbox', 8120)).json()).toEqual({ sandbox: true })
+
+	// Idempotent: opting in again changes nothing and says so.
+	res = await staffPut(8120, { sandbox: true })
+	expect(await res.json()).toEqual({ sandbox: true, changed: false })
+
+	// A developer's token works the same, and the flag is theirs, not the moderator's.
+	res = await staffPut(8121, { sandbox: true }, ['developer'])
+	expect(await res.json()).toEqual({ sandbox: true, changed: true })
+	expect((await getAccount(env.DB, 8121))?.isSandbox).toBe(true)
+
+	res = await staffPut(8120, { sandbox: false })
+	expect(await res.json()).toEqual({ sandbox: false, changed: true })
+	expect((await getAccount(env.DB, 8120))?.isSandbox).toBe(false)
+	expect((await getAccount(env.DB, 8121))?.isSandbox).toBe(true)
+
+	// Each flip is on the audit log against the staff member who made it.
+	const rows = await env.DB.prepare(
+		"SELECT player_id, data FROM audit_log WHERE action = 'set_sandbox' ORDER BY audit_log_id"
+	).all<{ player_id: number; data: string }>()
+	expect(rows.results.map((r) => [r.player_id, JSON.parse(r.data).sandbox])).toEqual([
+		[8120, true],
+		[8120, true],
+		[8121, true],
+		[8120, false],
+	])
+})
+
+it('manages Avatar Studio flags and screen sharing independently, with staff authorization', async () => {
+	await updateAccount(env.DB, 8611, { username: 'AvatarFan', hasStudio: true })
+	await updateAccount(env.DB, 8612, { username: 'ScreenFan' })
+	const url = '/api/staff/studio-access'
+	for (const kind of ['avatar', 'screenshare']) {
+		const denied = await SELF.fetch(`https://example.com${url}`, {
+			method: 'POST',
+			headers: {
+				authorization: `Bearer ${await tokenFor(8612)}`,
+				'content-type': 'application/json',
+			},
+			body: JSON.stringify({ accountId: 8612, kind }),
+		})
+		expect(denied.status).toBe(403)
+		expect((await SELF.fetch(`https://example.com${url}?kind=${kind}`)).status).toBe(401)
+		const deniedDelete = await SELF.fetch(`https://example.com${url}/8611?kind=${kind}`, {
+			method: 'DELETE',
+			headers: { authorization: `Bearer ${await tokenFor(8612)}` },
+		})
+		expect(deniedDelete.status).toBe(403)
+	}
+	expect((await staffPost(url, 8110, { accountId: 8611, kind: 'unknown' })).status).toBe(400)
+	expect((await staffGet(`${url}?kind=unknown`, 8110)).status).toBe(400)
+	expect((await staffDelete(`${url}/8611?kind=unknown`, 8110)).status).toBe(400)
+	expect((await staffPost(url, 8110, { accountId: 99999999, kind: 'avatar' })).status).toBe(404)
+	await env.DB.prepare('INSERT INTO avatar_studio_access VALUES (?, ?, ?, ?)')
+		.bind(8611, 9, 'before', 'before')
+		.run()
+	expect((await staffPost(url, 8110, { username: '@AvatarFan', kind: 'avatar' })).status).toBe(200)
+	expect(await avatarStudioFlags(env.DB, 8611)).toBe(15)
+	const repeated = await staffPost(url, 8110, { accountId: 8611, kind: 'avatar' })
+	expect(await repeated.json()).toMatchObject({ alreadyGranted: true })
+	const avatarList = await staffGet(`${url}?kind=avatar`, 8110)
+	expect(await avatarList.json()).toMatchObject({ accounts: [{ accountId: 8611, enabled: true }] })
+	expect((await getAccount(env.DB, 8611))?.hasScreenshare).toBeUndefined()
+	await staffDelete(`${url}/8611?kind=avatar`, 8110)
+	expect(await avatarStudioFlags(env.DB, 8611)).toBe(8)
+	expect((await getAccount(env.DB, 8611))?.hasStudio).toBe(true)
+	expect((await staffPost(url, 8110, { username: 'ScreenFan', kind: 'screenshare' })).status).toBe(
+		200
+	)
+	expect((await getAccount(env.DB, 8612))?.hasScreenshare).toBe(true)
+	const screenList = await staffGet(`${url}?kind=screenshare`, 8110)
+	expect(await screenList.json()).toMatchObject({ accounts: [{ accountId: 8612, enabled: true }] })
+	const status = await SELF.fetch('https://example.com/api/studio-access', {
+		headers: { authorization: `Bearer ${await tokenFor(8612)}` },
+	})
+	expect(await status.json()).toMatchObject({ granted: false, avatar: false, screenshare: true })
+	await staffDelete(`${url}/8612?kind=screenshare`, 8110)
+	expect((await getAccount(env.DB, 8612))?.hasScreenshare).toBe(false)
+	expect(await (await staffGet(`${url}?kind=screenshare`, 8110)).json()).toEqual({ accounts: [] })
+	expect(await auditRows('grant_avatar_access', 8611)).toHaveLength(2)
+	expect(await auditRows('revoke_screenshare_access', 8612)).toHaveLength(1)
+})
+
+it('grants and revokes each Avatar Studio feature without changing other permissions', async () => {
+	const features = {
+		'avatar-items': 1,
+		'avatar-costumes': 2,
+		'avatar-badges': 4,
+		'avatar-consumables': 8,
+	}
+	const url = '/api/staff/studio-access'
+	await updateAccount(env.DB, 8621, {
+		username: 'FeatureFan',
+		hasStudio: true,
+		hasScreenshare: false,
+	})
+	await env.DB.prepare('INSERT INTO avatar_studio_access VALUES (?, ?, ?, ?)')
+		.bind(8621, 16, 'original', 'original')
+		.run()
+	let expected = 16
+	const status = async () => {
+		const response = await SELF.fetch('https://example.com/api/studio-access', {
+			headers: { authorization: `Bearer ${await tokenFor(8621)}` },
+		})
+		expect(response.status).toBe(200)
+		return response.json() as Promise<Record<string, boolean>>
+	}
+	for (const [kind, mask] of Object.entries(features)) {
+		expect((await status())[kind]).toBe(false)
+		const denied = await SELF.fetch(`https://example.com${url}`, {
+			method: 'POST',
+			headers: {
+				authorization: `Bearer ${await tokenFor(8621)}`,
+				'content-type': 'application/json',
+			},
+			body: JSON.stringify({ accountId: 8621, kind }),
+		})
+		expect(denied.status).toBe(403)
+		const deniedDelete = await SELF.fetch(`https://example.com${url}/8621?kind=${kind}`, {
+			method: 'DELETE',
+			headers: { authorization: `Bearer ${await tokenFor(8621)}` },
+		})
+		expect(deniedDelete.status).toBe(403)
+		expect((await staffPost(url, 8110, { username: '@FeatureFan', kind })).status).toBe(200)
+		expected |= mask
+		expect(await avatarStudioFlags(env.DB, 8621)).toBe(expected)
+		const repeated = await staffPost(url, 8110, { accountId: 8621, kind })
+		expect(await repeated.json()).toMatchObject({ alreadyGranted: true })
+		expect((await status())[kind]).toBe(true)
+		const list = await staffGet(`${url}?kind=${kind}`, 8110)
+		expect(await list.json()).toMatchObject({
+			accounts: expect.arrayContaining([
+				expect.objectContaining({ accountId: 8621, enabled: true }),
+			]),
+		})
+	}
+	for (const [kind, mask] of Object.entries(features)) {
+		expect((await staffDelete(`${url}/8621?kind=${kind}`, 8110)).status).toBe(200)
+		expected &= ~mask
+		expect(await avatarStudioFlags(env.DB, 8621)).toBe(expected)
+		expect((await status())[kind]).toBe(false)
+		for (const [otherKind, otherMask] of Object.entries(features)) {
+			expect((await status())[otherKind]).toBe((expected & otherMask) !== 0)
+		}
+		const list = await staffGet(`${url}?kind=${kind}`, 8110)
+		const remaining = (await list.json()) as { accounts: Array<{ accountId: number }> }
+		expect(remaining.accounts.some((a) => a.accountId === 8621)).toBe(false)
+		const repeat = await staffDelete(`${url}/8621?kind=${kind}`, 8110)
+		expect(await repeat.json()).toMatchObject({ removed: false })
+		expect(await auditRows(`grant_${kind}_access`, 8621)).toHaveLength(2)
+		expect(await auditRows(`revoke_${kind}_access`, 8621)).toHaveLength(2)
+	}
+	expect((await getAccount(env.DB, 8621))?.hasStudio).toBe(true)
+	expect((await getAccount(env.DB, 8621))?.hasScreenshare).toBe(false)
+	expect(
+		await env.DB.prepare('SELECT created_at FROM avatar_studio_access WHERE account_id=8621').first(
+			'created_at'
+		)
+	).toBe('original')
 })

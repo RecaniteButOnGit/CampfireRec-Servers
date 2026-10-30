@@ -36,10 +36,10 @@ resulting in bugs getting fixed faster. I hope.
 
 ## Game client
 
-Campfire targets the June 2024 PC build `20240621` (Steam depot manifest
-`5652464073904128818`). It is the only build accepted by the version check.
-Full protocol and room compatibility are still being verified; passing the version
-check alone does not mean a saved room can be loaded by this client.
+Campfire defaults to the June 2024 PC build `20240621` (Steam depot manifest
+`5652464073904128818`). Other builds remain disabled until an operator opts them in
+through the game version variables. The server includes newer RecFlare protocols and
+Studio features while keeping this client default for Railway deployments.
 
 ## Services
 
@@ -53,8 +53,9 @@ Want to run it yourself? See [DEPLOYING.md](DEPLOYING.md)
 
 ### What year is this for?
 
-The target is the June 2024 client (`20240621`). Other builds are rejected by the
-version check.
+The default target is the June 2024 client (`20240621`). Operators can configure
+additional builds after reviewing client compatibility and completing the deployment
+setup in [RAILWAY.md](RAILWAY.md) or [DEPLOYING.md](DEPLOYING.md).
 
 See the "Game client" section above for instructions on how to modify a client to connect to this server.
 

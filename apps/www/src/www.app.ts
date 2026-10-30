@@ -6,7 +6,7 @@ import { PlatformType } from '@repo/domain/src/enums'
 import { countOnlinePlayers } from '@repo/domain/src/presence-db'
 import { getStatSeries } from '@repo/domain/src/stats-db'
 import { intVar, logger, withDefaultCors, withOnError } from '@repo/hono-helpers'
-import { validateAndGetAccountId } from '@repo/jwt'
+import { generateIdentityAssertion, validateAndGetAccountId } from '@repo/jwt'
 
 // The `platform_account` link table, owned (and migrated) by the `auth` worker. A claimed
 // Discord identity is stored there as a PlatformType.Discord link — it is an account ↔
@@ -17,8 +17,11 @@ import { validateAndGetAccountId } from '@repo/jwt'
 import {
 	countAccountsForPlatformIdentity,
 	getLinksForAccount,
+	hasRecordedRoles,
 	isPlatformIdentityLinked,
 	linkPlatformIdentity,
+	recordFirstRoles,
+	unlinkPlatform,
 } from '../../auth/src/platform-db'
 // The signup grant's default and the Discord supporter gift, both `econ`'s. The gift is
 // econ's cron paid on demand: the first time an account links its Discord, the claim hands
@@ -32,6 +35,9 @@ import {
 	discordConfig,
 	exchangeCode,
 	fetchGuildMembership,
+	fetchUser,
+	LOGIN_SCOPES,
+	loginRedirectUri,
 	qualifies,
 	redirectUri,
 	revokeToken,
@@ -45,7 +51,9 @@ import {
 	addUsernameChangeHandler,
 	banReportHandler,
 	bansInForceHandler,
+	clearDormHandler,
 	clearPasswordHandler,
+	clearRoomInstancesHandler,
 	createReportHandler,
 	getReportHandler,
 	giftItemHandler,
@@ -59,7 +67,10 @@ import {
 	playerHistoryHandler,
 	requireDeveloper,
 	requireStaff,
+	runDiscordRoleGiftHandler,
+	sandboxStatusHandler,
 	searchReportsHandler,
+	setSandboxHandler,
 	syncDiscordRolesHandler,
 	topReportedHandler,
 } from './staff'
@@ -130,14 +141,27 @@ const claimant = async (c: Context<App>): Promise<number | null> =>
  * (see App.tsx). Everything else about the request is fixed by the server.
  */
 function authorizeUrl(request: Request, clientId: string): string {
+	return consentUrl(clientId, SCOPES, redirectUri(request))
+}
+
+/**
+ * The consent URL for "Sign in with Discord": the same app, the narrower `identify` scope,
+ * and the sign-in's own return leg (`/login/discord`). Served beside the claim's URL so the
+ * SPA never assembles either.
+ */
+function loginAuthorizeUrl(request: Request, clientId: string): string {
+	return consentUrl(clientId, LOGIN_SCOPES, loginRedirectUri(request))
+}
+
+function consentUrl(clientId: string, scope: string, redirect: string): string {
 	const url = new URL(AUTHORIZE_URL)
 	url.search = new URLSearchParams({
 		client_id: clientId,
 		response_type: 'code',
-		scope: SCOPES,
-		redirect_uri: redirectUri(request),
+		scope,
+		redirect_uri: redirect,
 		// Skip Discord's "you've already authorized this app, continue?" interstitial on a
-		// repeat claim; the player has already pressed a button that says what this does.
+		// repeat visit; the player has already pressed a button that says what this does.
 		prompt: 'none',
 	}).toString()
 	return url.toString()
@@ -193,6 +217,10 @@ const app = new Hono<App>()
 			// ids never leave the worker, since it's the worker that asks Discord the question.
 			benefitsEnabled: discord !== null,
 			discordAuthorizeUrl: discord ? authorizeUrl(c.req.raw, discord.clientId) : null,
+			// "Sign in with Discord", on the SAME switch: the sign-in resolves (or makes) the
+			// account through the Discord link, and only the claim ever writes one with roles, so
+			// an operator who hasn't set the claim up has no reason to offer the door either.
+			discordLoginUrl: discord ? loginAuthorizeUrl(c.req.raw, discord.clientId) : null,
 			hosts: {
 				auth: authBase(c.env),
 				accounts: accountsBase(c.env),
@@ -342,6 +370,90 @@ const app = new Hono<App>()
 		return c.json(token)
 	})
 
+	// ---- Sign in with Discord -----------------------------------------------
+
+	/**
+	 * Redeem a Discord authorization code from the SIGN-IN consent (`/login/discord`), prove
+	 * who the Discord user is, and ask `auth` for a session on the account linked to them —
+	 * or, when there is none, for a brand-new account linked to them.
+	 *
+	 * The browser sends ONLY the code, as it does for the claim, and for the same reason: the
+	 * exchange needs the client secret. What is different is what comes after. The claim acts
+	 * on a session the caller already has; this is how one GETS a session, so there is no
+	 * bearer token and nothing here writes to the account. Instead the proven identity is
+	 * signed into an ASSERTION with the shared JWT_SECRET and posted to `auth`'s
+	 * `identity_assertion` grant, which resolves it through the link table exactly as
+	 * `cached_login` resolves a Steam ticket, and answers the ordinary token body. Resolving
+	 * the account — and minting one — stays `auth`'s: www never picks an account id.
+	 *
+	 * Posted over the service binding with the browser's real IP forwarded, like signup, so
+	 * the per-IP cap on the sign-up path counts the browser and not Cloudflare. The token
+	 * response is relayed verbatim; `created: true` on it is the SPA's cue to say an account
+	 * was just made and that setting a password is what makes it usable in the game.
+	 */
+	.post('/api/login/discord', async (c) => {
+		const config = await discordConfig(c.env)
+		if (!config) return c.json({ error: 'Signing in with Discord is not available here.' }, 403)
+
+		type LoginBody = { code?: string }
+		const { code } = await c.req.json<LoginBody>().catch(() => ({}) as LoginBody)
+		if (!code) return c.json({ error: 'No Discord authorization code was provided.' }, 400)
+
+		const accessToken = await exchangeCode(config, code, loginRedirectUri(c.req.raw))
+		if (accessToken === null) {
+			return c.json(
+				{ error: 'That Discord sign-in could not be completed. Please try again.' },
+				400
+			)
+		}
+		const user = await fetchUser(accessToken)
+		await revokeToken(config, accessToken)
+		if (user === null) {
+			return c.json(
+				{ error: 'That Discord sign-in could not be completed. Please try again.' },
+				400
+			)
+		}
+
+		const jwtSecret = await c.env.JWT_SECRET.get().catch(() => '')
+		if (jwtSecret === '') {
+			logger.error('cannot sign an identity assertion: JWT_SECRET is unreadable')
+			return c.json({ error: authUnreachable('login') }, 502)
+		}
+		const assertion = await generateIdentityAssertion(
+			{ platform: PlatformType.Discord, platformId: user.id },
+			jwtSecret
+		)
+		const res = await postAuthForm(
+			c.env,
+			'/connect/token',
+			{ grant_type: 'identity_assertion', assertion },
+			{ clientIp: c.req.header('cf-connecting-ip') }
+		).catch(() => null)
+		if (res === null) {
+			logger.error('could not reach auth to redeem an identity assertion')
+			return c.json({ error: authUnreachable('login') }, 502)
+		}
+		if (!res.ok) {
+			const failure = await readAuthError(res, 'login')
+			logger.info('auth refused a discord sign-in', {
+				status: res.status,
+				upstream: failure.upstream,
+			})
+			return c.json({ error: failure.message }, failure.status)
+		}
+		const token = (await res.json().catch(() => null)) as {
+			access_token?: string
+			created?: boolean
+		} | null
+		if (!token?.access_token) {
+			logger.error('auth answered a discord sign-in with no access_token')
+			return c.json({ error: authUnreachable('login') }, 502)
+		}
+		logger.info(token.created ? 'created an account from a discord sign-in' : 'discord sign-in')
+		return c.json({ ...token, discordUsername: user.username })
+	})
+
 	// ---- Discord benefits claim ---------------------------------------------
 
 	/**
@@ -356,22 +468,120 @@ const app = new Hono<App>()
 	.get('/api/benefits/status', async (c) => {
 		const accountId = await claimant(c)
 		if (accountId === null) return c.body(null, 401)
-		const [account, links] = await Promise.all([
+		const [account, claimed, links] = await Promise.all([
 			getAccount(c.env.DB, accountId),
+			hasRecordedRoles(c.env.DB, accountId, PlatformType.Discord),
 			getLinksForAccount(c.env.DB, accountId),
 		])
 		return c.json({
 			hasPlus: account?.hasPlus ?? false,
-			// Whether this account is already tied to a Discord identity — not WHICH one. The
-			// player knows their own Discord; the id is of no use to the page and every reason
-			// to keep an account's linked identities off the wire.
-			linked: links.some((link) => link.platform === PlatformType.Discord),
+			// Whether this account has CLAIMED through a Discord identity — a link with roles
+			// recorded — not WHICH one. The player knows their own Discord; the id is of no use to
+			// the page and every reason to keep an account's linked identities off the wire. A
+			// bare link, which "Sign in with Discord" leaves on a new account, reads as not yet
+			// claimed: the page then offers the claim, which is what that player still has to do.
+			linked: claimed,
+			// Whether ANY Discord identity is on the account, claimed or bare — what the unlink
+			// button keys on, since a sign-in's bare link is as much a link to take off as a
+			// claim's. Still never WHICH one.
+			discordLinked: links.some((link) => link.platform === PlatformType.Discord),
+			// The unlink's one precondition (see `/api/benefits/unlink`), served beside the link
+			// so the page can say so before the button fails. The self DTO carries the address
+			// too; this is the server's own reading of the same row the unlink will decide from.
+			hasEmail: !!account?.email,
 		})
 	})
 
 	/**
-	 * Redeem a Discord authorization code and, if the player holds the configured role in
-	 * the configured guild, give the account Rec Room Plus.
+	 * Take the account's Discord off it: every `PlatformType.Discord` link goes, whether a
+	 * claim wrote it or "Sign in with Discord" did. Afterwards that Discord opens no account —
+	 * signing in with it makes a NEW one — and the benefits claim's once-only guard lets it
+	 * claim on another account.
+	 *
+	 * Refused unless the account has an EMAIL ADDRESS. The link may be the only way into the
+	 * account: an account made by "Sign in with Discord" has no password and no email until
+	 * the player sets them, and removing its link would leave nothing to recover the account
+	 * by. An address is enough — it is what the account can be recovered through — so a
+	 * password is NOT required: a player with an email and no password sets one in game, as
+	 * any passwordless account does. Checked here, on the row, and not trusted from the page
+	 * (which shows the same flag from `/api/benefits/status` so it can say so before anyone
+	 * presses anything).
+	 *
+	 * The grants the link carried go with it. `hasPlus` and `hasStudio` are both cleared:
+	 * the Discord roles are what the claim granted Plus for and what the Studio rollout reads,
+	 * and a player taking the link off is giving that proof back — unlike a role that merely
+	 * lapses, which the claim deliberately never revokes for. This clears an operator's
+	 * grant too (`runx admin grant-plus`/`grant-studio` write the same flags, and nothing on
+	 * the row says which wrote them); the page warns, and staff can re-grant. Both reach the
+	 * game on the NEXT token, like every account flag.
+	 *
+	 * What it does NOT do is forget that the account has claimed. A link with roles recorded
+	 * was a claim, and the first-link supporter gift keys on "never claimed before", read from
+	 * the link table — which would read as never-linked once the row is gone. So a claimed
+	 * link's removal stamps `hasClaimedDiscord` on the account, and the claim consults both;
+	 * otherwise link → unlink → link would pay the one-time box on every cycle.
+	 *
+	 * Not gated on the Discord configuration: the link is in the table whether or not the
+	 * operator still runs the claim, and a player can always take it off. Answers the same
+	 * shape `/api/benefits/status` does, as the account now stands.
+	 */
+	.post('/api/benefits/unlink', async (c) => {
+		const accountId = await claimant(c)
+		if (accountId === null) return c.body(null, 401)
+
+		const account = await getAccount(c.env.DB, accountId)
+		if (!account?.email) {
+			return c.json(
+				{
+					error:
+						'Add an email address to your account before unlinking Discord, so the account can be recovered without it.',
+				},
+				403
+			)
+		}
+
+		// Whether what's being removed includes a CLAIM — a link with `role` recorded, even as
+		// `[]`. Asked of the raw column BEFORE the delete: the parsed `PlatformLink` reads a
+		// NULL role and an empty list both as `[]`, and only the column tells a sign-in's bare
+		// link from a claim that found no roles.
+		const claimed = await hasRecordedRoles(c.env.DB, accountId, PlatformType.Discord)
+		const removed = await unlinkPlatform(c.env.DB, accountId, PlatformType.Discord)
+		if (removed.length === 0) {
+			return c.json({ error: 'No Discord account is linked to this account.' }, 404)
+		}
+		// One write: remember the claim (when there was one), and take back what the link
+		// carried. `undefined` drops the key from the blob, which is how "no Plus" is spelled.
+		await updateAccount(c.env.DB, accountId, {
+			hasClaimedDiscord: claimed || account.hasClaimedDiscord === true ? true : undefined,
+			hasPlus: undefined,
+			hasStudio: undefined,
+		})
+		logger.info('unlinked a discord from an account', {
+			accountId,
+			links: removed.length,
+			claimed,
+			hadPlus: account.hasPlus === true,
+			hadStudio: account.hasStudio === true,
+		})
+		return c.json({
+			hasPlus: false,
+			linked: false,
+			discordLinked: false,
+			hasEmail: true,
+		})
+	})
+
+	/**
+	 * Redeem a Discord authorization code, link the Discord identity to the account with the
+	 * roles the player holds in the configured guild, and — if any of those is a configured
+	 * qualifying role — give the account Rec Room Plus.
+	 *
+	 * The LINK is not gated on the roles: any member of the guild is linked, and the whole
+	 * role list is recorded on the link whether or not a qualifying one is among them. The
+	 * roles are read in-game (`auth`'s rollout gate reads them, and the daily sweep keeps
+	 * them fresh), so a member with no supporter role still has a reason to link. Only the
+	 * `hasPlus` grant asks the qualifying question; a claim without a qualifying role
+	 * answers 200 with `hasPlus: false` rather than refusing.
 	 *
 	 * The browser sends ONLY the code. It never sees an access token: the exchange happens
 	 * here with the client secret, the roles are read with the resulting token, and the
@@ -382,14 +592,15 @@ const app = new Hono<App>()
 	 * The claim is once-only PER DISCORD USER, not per account: the Discord id is stored
 	 * beside the flag, and a code from a Discord member who has already claimed elsewhere
 	 * is refused. Otherwise one person with the role could walk it around every account
-	 * they own. Re-claiming on the same account is allowed and simply re-affirms the flag,
-	 * which is what makes the page safe to reload and a lapsed-then-restored role
-	 * re-claimable.
+	 * they own. Re-claiming on the same account is allowed: it refreshes the roles and, if
+	 * a qualifying one is held, re-affirms the flag, which is what makes the page safe to
+	 * reload and a lapsed-then-restored role re-claimable.
 	 *
 	 * Nothing here ever REVOKES Plus: losing the Discord role later leaves the flag set.
 	 * That's deliberate for now — a sweep would need a bot token to enumerate the guild,
 	 * which this design specifically avoids — but it does mean the flag records "held the
-	 * role once", not "holds it today".
+	 * role once", not "holds it today". The player's own unlink (`/api/benefits/unlink`) is
+	 * the one thing that takes it back.
 	 *
 	 * The FIRST time an account links a Discord, the claim also pays the supporter gift
 	 * econ's cron would (`DISCORD_ROLE_TOKENS`, the amount for the best of the roles just
@@ -431,18 +642,11 @@ const app = new Hono<App>()
 		if (membership === null) {
 			return c.json({ error: 'You are not a member of our Discord server.' }, 403)
 		}
-		// Any ONE of the configured roles qualifies — see `qualifies`. The message stays
-		// singular-ish and names no role: which roles qualify is the operator's business to
-		// advertise in their own server, and listing them here would leak the guild's role
-		// layout to anyone who pressed the button.
-		if (!qualifies(membership.roles, config.roleIds)) {
-			return c.json({ error: 'Your Discord account does not have a qualifying role.' }, 403)
-		}
 
 		// The once-only guard, asked of the link table: is this Discord identity already on an
 		// account, and is that account someone else's? Re-claiming on the caller's OWN account
-		// is the idempotent case and must fall through — it's how a player whose role lapsed
-		// and came back re-affirms Plus, and it's what makes the page safe to reload.
+		// is the idempotent case and must fall through — it's how a player whose roles changed
+		// refreshes them and re-affirms Plus, and it's what makes the page safe to reload.
 		//
 		// `countAccountsForPlatformIdentity` counts EVERY link for the identity, unfiltered by
 		// platform, which is why the claim can use the same helper `auth`'s per-identity
@@ -453,12 +657,6 @@ const app = new Hono<App>()
 			PlatformType.Discord,
 			membership.userId
 		)
-		// Whether this claim is the account's FIRST Discord link — what the one-time gift below
-		// keys on. Decided before the write, from the table: an account re-claiming with the
-		// same Discord is not first (`alreadyMine`), and neither is one that already carries a
-		// DIFFERENT Discord identity, which the once-only guard doesn't stop. Only asked when
-		// it could be true, to spare the re-claim a query.
-		let firstLink = false
 		if (!alreadyMine) {
 			const claimedElsewhere = await countAccountsForPlatformIdentity(
 				c.env.DB,
@@ -474,18 +672,42 @@ const app = new Hono<App>()
 					409
 				)
 			}
-			const links = await getLinksForAccount(c.env.DB, accountId)
-			firstLink = !links.some((link) => link.platform === PlatformType.Discord)
 		}
+		// Whether this is the account's FIRST CLAIM — what the one-time gift below keys on.
+		// Decided before the write, from the table: a claim is recorded as roles on a Discord
+		// link, so an account with any Discord link carrying roles (this identity's, or a
+		// DIFFERENT one the once-only guard doesn't stop) has claimed before. A link with NO
+		// roles has not: that is what "Sign in with Discord" leaves on an account it just made,
+		// and that player's first claim is still their first.
+		//
+		// AND from the account: an unlink removes a claimed link's row, and stamps
+		// `hasClaimedDiscord` on the account so the table reading as never-linked afterwards
+		// doesn't make the next link a "first" one. Both are asked; either says not-first.
+		const firstClaim =
+			(await getAccount(c.env.DB, accountId))?.hasClaimedDiscord !== true &&
+			!(await hasRecordedRoles(c.env.DB, accountId, PlatformType.Discord))
+		// On a link that already exists without roles, writing them is the claim's one-shot
+		// write — the single-winner guard a fresh link gets from its INSERT below. Asked only
+		// when the link is the caller's: on anyone else's it would be refused above.
+		const recordedFirst =
+			alreadyMine &&
+			(await recordFirstRoles(
+				c.env.DB,
+				accountId,
+				PlatformType.Discord,
+				membership.userId,
+				membership.roles
+			))
 
-		// Both writes are idempotent: the link is INSERT OR IGNORE (so `linkedAt` keeps the
-		// FIRST claim's time), and the flag is already true on a re-claim.
+		// The link is written for EVERY guild member, qualifying role or not, and it is
+		// idempotent: INSERT OR IGNORE (so `linkedAt` keeps the FIRST claim's time), with the
+		// roles refreshed on a re-claim.
 		//
 		// The member's roles ride along onto the link's `role` column — the WHOLE list Discord
 		// served, not just the ones that qualified. `hasPlus` records only that a qualifying
-		// role was held; this records which, so an operator can tell a supporter from a
-		// booster from staff without going and asking Discord, and can still read a grant made
-		// under a role that has since been retired from the config. Roles are the one part of
+		// role was held; this records which, so the game can act on any role an operator cares
+		// about (`auth`'s rollout gate reads this list) and an operator can tell a supporter
+		// from a booster from staff without going and asking Discord. Roles are the one part of
 		// the row a re-claim REFRESHES, because they're a snapshot of a membership that moves
 		// and this reading is the fresher one.
 		const created = await linkPlatformIdentity(
@@ -495,17 +717,34 @@ const app = new Hono<App>()
 			membership.userId,
 			membership.roles
 		)
-		await updateAccount(c.env.DB, accountId, { hasPlus: true })
-		logger.info('granted plus from a discord benefits claim', { accountId })
+
+		// Any ONE of the configured roles qualifies — see `qualifies`. Without one, the link
+		// stands and the flag is left exactly as it was: never set, and never REVOKED either —
+		// a player whose role lapsed keeps the Plus they were granted (see the note above).
+		// Which roles qualify is the operator's business to advertise in their own server, so
+		// nothing here names them.
+		let hasPlus: boolean
+		if (qualifies(membership.roles, config.roleIds)) {
+			await updateAccount(c.env.DB, accountId, { hasPlus: true })
+			logger.info('granted plus from a discord benefits claim', { accountId })
+			hasPlus = true
+		} else {
+			hasPlus = (await getAccount(c.env.DB, accountId))?.hasPlus ?? false
+			logger.info('linked a discord without a qualifying role', {
+				accountId,
+				roleCount: membership.roles.length,
+			})
+		}
 
 		// The one-time supporter gift: the box econ's cron would hand this member, paid now,
-		// once. Gated on the insert having happened too (`created`), so two claims racing on
+		// once. Gated on a single-winner write having happened too — the insert (`created`), or
+		// the first roles onto a sign-in's bare link (`recordedFirst`) — so two claims racing on
 		// one fresh account can't both pay. Best-effort AFTER Plus is granted and the link is
 		// written: a grant that fails partway is logged with what to check, as econ's cron
 		// logs its own, and the claim still answers — the player got what they came for, and
 		// a retry that also failed partway is how a balance gets credited twice.
 		let tokensAwarded: number | null = null
-		if (created && firstLink) {
+		if ((created || recordedFirst) && firstClaim) {
 			try {
 				const role = await grantDiscordRoleGift(
 					c.env,
@@ -529,14 +768,46 @@ const app = new Hono<App>()
 			}
 		}
 
-		// The username is echoed for the confirmation line only — it is never stored, and a
-		// Discord member who has since renamed themselves is not a problem to solve here.
-		return c.json({ hasPlus: true, discordUsername: membership.username, tokensAwarded })
+		// `hasPlus` is where the account stands AFTER this claim, so the page can tell "linked
+		// and granted" from "linked, no qualifying role" without a second read. The username
+		// is echoed for the confirmation line only — it is never stored, and a Discord member
+		// who has since renamed themselves is not a problem to solve here.
+		return c.json({
+			hasPlus,
+			linked: true,
+			discordUsername: membership.username,
+			tokensAwarded,
+		})
 	})
 
 	// Whether the signed-in account has studio upload access (`hasStudio`). The page
 	// Studio opens (`/settings/recroomstudio`) asks this; it does not list anyone
 	// else. Staff manage the flag on the routes below.
+	/**
+	 * Mark the caller's account for deletion. A MARK only: `isDeleted` and `deletedAt` go on
+	 * the account blob and nothing else changes — no row is removed, the session stays
+	 * valid, and the game keeps serving the account. Reversal is meant to be the player
+	 * signing in again (a `lastLoginTime` later than `deletedAt`), which is why there is no
+	 * "undo" here and why this never touches `auth`. Idempotent: re-posting keeps the
+	 * ORIGINAL `deletedAt`, so a second click can't push the mark past a login that already
+	 * reversed it.
+	 */
+	.post('/api/account/delete', async (c) => {
+		const accountId = await claimant(c)
+		if (accountId === null) return c.body(null, 401)
+
+		const account = await getAccount(c.env.DB, accountId)
+		if (!account) return c.json({ error: 'No such account.' }, 404)
+
+		const deletedAt =
+			account.isDeleted === true && account.deletedAt ? account.deletedAt : new Date().toISOString()
+		if (!(account.isDeleted === true && account.deletedAt)) {
+			await updateAccount(c.env.DB, accountId, { isDeleted: true, deletedAt })
+			logger.info('a player marked their account for deletion', { accountId })
+		}
+		return c.json({ isDeleted: true, deletedAt })
+	})
+
 	.get('/api/studio-access', studioAccessStatusHandler)
 
 	// ---- Staff moderation panel ---------------------------------------------
@@ -571,6 +842,8 @@ const app = new Hono<App>()
 	// Everyone standing in a room, across all of its instances.
 	.post('/api/staff/rooms/:roomId/gift-tokens', requireDeveloper, giftRoomTokensHandler)
 	.post('/api/staff/rooms/:roomId/rro-tag', requireDeveloper, addRoomRroTagHandler)
+	// Delete every live instance of a room — for one whose sessions are stuck. All staff.
+	.post('/api/staff/rooms/:roomId/clear-instances', clearRoomInstancesHandler)
 	// The account page's token drop: the same gift to everyone online at once.
 	.post('/api/staff/online/gift-tokens', requireDeveloper, giftOnlineTokensHandler)
 	// Its sibling: the same gift to every account whose Discord link holds a role, offline
@@ -579,12 +852,21 @@ const app = new Hono<App>()
 	// The daily role sweep, run now and answered with its summary (halt reason included) —
 	// the cron reports only to a log line, and this is the way to see why it wrote nothing.
 	.post('/api/staff/discord-roles/sync', requireDeveloper, syncDiscordRolesHandler)
+	// Econ's weekly supporter gift, paid now: a bonus round for everyone holding a mapped role.
+	.post('/api/staff/discord-roles/supporter-gift', requireDeveloper, runDiscordRoleGiftHandler)
 	// Rec Room Plus is worth tokens and a discount, so granting it is developer-only too.
 	.post('/api/staff/players/:id/grant-plus', requireDeveloper, grantPlusHandler)
 	.post('/api/staff/players/:id/username-changes', addUsernameChangeHandler)
 	.post('/api/staff/players/:id/clear-password', clearPasswordHandler)
 	// Exclusive to the verified session for account 2; accepts a protobuf file or ZIP.
 	.post('/api/avatar-import/players/:id', importAvatarHandler)
+	// Blanks the dorm's newest save so a player can go back to the 2023 client.
+	.post('/api/staff/players/:id/clear-dorm', clearDormHandler)
+	// The signed-in staff member's OWN sandbox flag: read it, and opt in or out. Self-only,
+	// so plain staff (not developer-only) — it moves nobody but the caller, and `match`
+	// honours it on their next room join.
+	.get('/api/staff/sandbox', sandboxStatusHandler)
+	.put('/api/staff/sandbox', setSandboxHandler)
 	// RecFlare Studio upload access. The same staff gate as moderation: a moderator
 	// decides who can upload, and the role lands on the player's next token.
 	.get('/api/staff/studio-access', listStudioAccessHandler)

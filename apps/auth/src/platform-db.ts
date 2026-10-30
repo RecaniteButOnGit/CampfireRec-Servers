@@ -314,6 +314,147 @@ export async function getLinksForPlatformId(
 	return results.map(toLink)
 }
 
+/**
+ * Every account a platform identity is linked to, on ANY platform — including the ones
+ * {@link CACHED_LOGIN_PLATFORMS} keeps out of the picker.
+ *
+ * This is the unfiltered twin of {@link getLinksForPlatformIdentity}, and it must stay off
+ * every public route: the filter there exists so nobody can learn which account a Discord
+ * user owns by naming their snowflake. The one caller is `auth`'s `identity_assertion`
+ * grant, where the identity being asked about has just been PROVEN by the worker that
+ * minted the assertion — the website's Discord sign-in — so the answer goes to the person
+ * it is about and nobody else. Add a caller only under the same condition.
+ */
+export async function getLinksForIdentity(
+	db: D1Database,
+	platform: number,
+	platformId: string
+): Promise<PlatformLink[]> {
+	if (platformId === '') return []
+	const { results } = await db
+		.prepare(
+			`${SELECT_LINK} WHERE platform = ?1 AND platform_id = ?2 ORDER BY linked_at, account_id`
+		)
+		.bind(platform, platformId)
+		.all<LinkRow>()
+	return results.map(toLink)
+}
+
+/**
+ * Whether any of the account's links on `platform` has roles RECORDED — a non-null `role`
+ * column, which only the website's benefits claim (and the sweep behind it) ever writes.
+ *
+ * This is what "has this account claimed its Discord benefits" means now that a Discord
+ * link can exist WITHOUT a claim: signing in with Discord (`auth`'s `identity_assertion`
+ * grant) links the identity on a brand-new account with `role` NULL. The claim's one-time
+ * gift and its page both ask this rather than "is there a link", so a player who made
+ * their account from Discord is still owed, and still shown, their first claim.
+ * An EMPTY role list counts as recorded: that is a claim that found no roles.
+ */
+export async function hasRecordedRoles(
+	db: D1Database,
+	accountId: number,
+	platform: number
+): Promise<boolean> {
+	const row = await db
+		.prepare(
+			`SELECT 1 AS ok FROM platform_account
+			 WHERE account_id = ?1 AND platform = ?2 AND role IS NOT NULL LIMIT 1`
+		)
+		.bind(accountId, platform)
+		.first<{ ok: number }>()
+	return row !== null
+}
+
+/**
+ * Record roles on an existing link that has NONE yet (`role` NULL), atomically. True when
+ * this call was the one that did it; false when the link is missing or already carries a
+ * role list — in which case nothing is written, and {@link linkPlatformIdentity}'s refresh
+ * is the caller's next step.
+ *
+ * The one-shot flip is the point: the benefits claim pays its first-claim gift on the
+ * INSERT of a fresh link, which two racing claims cannot both win. A link made by a Discord
+ * sign-in is already inserted by the time the claim comes, so this gives the claim the
+ * same single-winner write on the roles column instead.
+ */
+export async function recordFirstRoles(
+	db: D1Database,
+	accountId: number,
+	platform: number,
+	platformId: string,
+	roles: readonly string[]
+): Promise<boolean> {
+	if (platformId === '') return false
+	const res = await db
+		.prepare(
+			`UPDATE platform_account SET role = ?4
+			 WHERE account_id = ?1 AND platform = ?2 AND platform_id = ?3 AND role IS NULL`
+		)
+		.bind(accountId, platform, platformId, JSON.stringify([...roles]))
+		.run()
+	return res.meta.changes > 0
+}
+
+/**
+ * A list of Discord role ids out of an operator var — numeric snowflakes separated by
+ * commas and/or whitespace, the grammar every `*_ROLE_IDS`-shaped var here shares
+ * (`auth`'s DISCORD_ROLLOUT_ROLE_IDS, `STUDIO_ROLLOUT`; `www` reads
+ * DISCORD_BENEFITS_ROLE_IDS the same way). Unset or blank parses to an empty list.
+ */
+export function parseRoleIdList(raw: string | undefined): string[] {
+	return (raw ?? '')
+		.split(/[\s,]+/)
+		.map((id) => id.trim())
+		.filter((id) => id !== '')
+}
+
+/**
+ * Whether an account's Discord link records ANY of `roleIds`. False with none configured —
+ * the link read is skipped, so a var that names no role grants nobody anything. Roles are
+ * the SNAPSHOT the website's benefits claim and `www`'s daily sweep keep (see
+ * {@link PlatformLink.roles}), so a role granted in Discord today counts once the player
+ * re-claims or the sweep runs — not instantly.
+ */
+export async function accountHoldsDiscordRole(
+	db: D1Database,
+	accountId: number,
+	roleIds: readonly string[]
+): Promise<boolean> {
+	if (roleIds.length === 0) return false
+	const links = await getLinksForAccount(db, accountId)
+	return links.some(
+		(link) => link.platform === PlatformType.Discord && link.roles.some((r) => roleIds.includes(r))
+	)
+}
+
+/**
+ * Whether an account has Rec Room Studio upload access — what `auth` stamps into the
+ * token as the `betastudio` role, `studio` answers on its access lookups and `www`'s
+ * `/api/studio-access` reports. Two grants, either suffices:
+ *
+ *  - the account's own `hasStudio` flag, set by staff on the website or
+ *    `runx admin grant-studio`;
+ *  - the STUDIO ROLLOUT: a Discord link holding a role named in the `STUDIO_ROLLOUT` var
+ *    (`RECFLARE_STUDIO_ROLLOUT` in the root `.env`, reaching every worker), which hands a
+ *    whole Discord role the same access without touching anyone's account. Unset, or
+ *    naming no role, it grants nobody — the flag alone decides, as before.
+ *
+ * Every reader goes through this so the three surfaces cannot disagree: a role holder
+ * whom `auth` stamps `betastudio` for must also be told "granted" by the website, and
+ * `studio`'s lookups (which rebuild the role from the account rather than a token) must
+ * see the same answer. The flag is checked first so an account that has it costs no
+ * link read.
+ */
+export async function hasStudioAccess(
+	db: D1Database,
+	account: { accountId: number; hasStudio?: boolean } | null | undefined,
+	studioRolloutRoleIds: string | undefined
+): Promise<boolean> {
+	if (!account) return false
+	if (account.hasStudio === true) return true
+	return accountHoldsDiscordRole(db, account.accountId, parseRoleIdList(studioRolloutRoleIds))
+}
+
 /** Every platform identity linked to an account (a player's PC and headset, say). */
 export async function getLinksForAccount(
 	db: D1Database,
@@ -346,6 +487,40 @@ export async function isPlatformIdentityLinked(
 		.bind(accountId, platform, platformId)
 		.first<{ ok: number }>()
 	return row !== null
+}
+
+/**
+ * Remove EVERY link an account holds on one platform, and return the links that were
+ * removed (empty when it held none). The website's Discord unlink is the one caller:
+ * a player taking their Discord off their account, which gives the identity back —
+ * "Sign in with Discord" with it afterwards makes a NEW account, and the benefits claim's
+ * once-only guard lets it claim elsewhere again.
+ *
+ * The removed rows are returned rather than a count because the caller needs to know what
+ * they carried: a link whose `role` was recorded is a CLAIM, and the account must remember
+ * having made one after the row is gone (see `account.hasClaimedDiscord`), or the
+ * first-link gift would pay again on every link/unlink cycle. Read-then-delete, not
+ * `DELETE … RETURNING`, so it runs on every D1 the tests do.
+ *
+ * Not for Steam or Meta: those links are what a cached login redeems, and nothing on the
+ * website removes one. The helper doesn't refuse them — the table has no idea what a
+ * platform is for — so a caller must only ever name a platform nobody logs in with.
+ */
+export async function unlinkPlatform(
+	db: D1Database,
+	accountId: number,
+	platform: number
+): Promise<PlatformLink[]> {
+	const { results } = await db
+		.prepare(`${SELECT_LINK} WHERE account_id = ?1 AND platform = ?2 ORDER BY linked_at`)
+		.bind(accountId, platform)
+		.all<LinkRow>()
+	if (results.length === 0) return []
+	await db
+		.prepare(`DELETE FROM platform_account WHERE account_id = ?1 AND platform = ?2`)
+		.bind(accountId, platform)
+		.run()
+	return results.map(toLink)
 }
 
 /**

@@ -135,6 +135,27 @@ export const SAVE_LIST_NAME_PARAM: OpenAPIV3_1.ParameterObject = {
 	schema: { type: 'string', example: '__SavedForLater_Rooms' },
 }
 
+/** `{listId}` on the remove — one of the caller's own lists, by id. */
+export const LIST_ID_PARAM: OpenAPIV3_1.ParameterObject = {
+	name: 'listId',
+	in: 'path',
+	required: true,
+	description: 'The list to remove from. It must be the caller’s own.',
+	schema: { type: 'integer', example: 3437 },
+}
+
+/** `{itemId}` on the remove — what comes out of the list, as a string. */
+export const REMOVE_ITEM_ID_PARAM: OpenAPIV3_1.ParameterObject = {
+	name: 'itemId',
+	in: 'path',
+	required: true,
+	description: [
+		'The item to remove, as a string. Removing one the list doesn’t hold answers the list',
+		'unchanged.',
+	].join(' '),
+	schema: { type: 'string', example: '2576' },
+}
+
 /** `{itemId}` on the save — what goes into the list, as a string. */
 export const ITEM_ID_PARAM: OpenAPIV3_1.ParameterObject = {
 	name: 'itemId',
@@ -231,6 +252,18 @@ export const CuratedListRead = z.object({
 
 /** The SAVE's projection: every key of the read, in the read's order, minus `Accessibility`. */
 export const CuratedListSaved = z.object(CuratedListFields)
+
+/**
+ * What the WRITES answer (`PUT …/createlistifneeded`, `DELETE …/items/{itemId}`): the save's
+ * projection of the list, wrapped in a `{ Value, Success, Error, error_id }` envelope. The
+ * reads serve the list bare.
+ */
+export const CuratedListEnvelope = z.object({
+	Value: CuratedListSaved,
+	Success: z.literal(true),
+	Error: z.null(),
+	error_id: z.null(),
+})
 
 /** `GET /curatedlists/bulk` — a list per id asked for; today one canned list, always. */
 export const CuratedListsBulk = CuratedListRead.array()

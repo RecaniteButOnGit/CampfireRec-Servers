@@ -4,6 +4,7 @@ import { afterEach, beforeAll, describe, expect, it, vi } from 'vitest'
 
 import { SCHEMA_DDL as ACCOUNT_SCHEMA_DDL, ROOM_SCHEMA_DDL, SUBROOM_SCHEMA_DDL } from '@repo/domain'
 
+import { SCHEMA_DDL as CUSTOM_AVATAR_ITEM_SCHEMA_DDL } from '../../../../api/src/custom-avatar-items-db'
 import { app } from '../../discovery.app'
 import { buildEscapeesRoom } from '../../escapees-room'
 import { decodeEscapeesSnapshot } from '../../escapees-snapshot'
@@ -147,6 +148,7 @@ beforeAll(async () => {
 	for (const ddl of ACCOUNT_SCHEMA_DDL) await env.DB.prepare(ddl).run()
 	for (const ddl of ROOM_SCHEMA_DDL) await env.DB.prepare(ddl).run()
 	for (const ddl of SUBROOM_SCHEMA_DDL) await env.DB.prepare(ddl).run()
+	for (const ddl of CUSTOM_AVATAR_ITEM_SCHEMA_DDL) await env.DB.prepare(ddl).run()
 	await env.DB.prepare(
 		`CREATE TABLE IF NOT EXISTS escapees_import_job (
 		map_id TEXT PRIMARY KEY, job_id TEXT NOT NULL, rr_account_id INTEGER NOT NULL,

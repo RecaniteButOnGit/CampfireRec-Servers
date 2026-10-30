@@ -17,6 +17,22 @@ export type Env = SharedHonoEnv & {
 	DOMAIN: string
 	/** Maximum accepted size of each API-owned image upload, in bytes. */
 	RECFLARE_MAX_API_UPLOAD_BYTES?: string
+	/**
+	 * The client builds `/api/versioncheck/v4` answers "current" for, as a comma-separated
+	 * list of builds (`20230414,20250718`), or `off` for none. Unset means the default
+	 * `SUPPORTED_GAME_VERSIONS` in @repo/domain. Set for every worker from the root `.env`
+	 * (`RECFLARE_SUPPORTED_GAME_VERSIONS`), so `auth` refuses a token to exactly the builds
+	 * this flags for an update. Read through `supportedGameBuilds`, which also folds in
+	 * every build under rollout (below).
+	 */
+	SUPPORTED_GAME_VERSIONS?: string
+	/**
+	 * The builds under staged rollout (`RECFLARE_ROLLOUT_GAME_VERSIONS`), same format;
+	 * `off` ends the rollout. Unset means the default `ROLLOUT_GAME_VERSIONS` in
+	 * @repo/domain. A rollout build is always "current" here — it is `auth` that decides who
+	 * may sign in on it — so the version check never sends a supporter to update.
+	 */
+	ROLLOUT_GAME_VERSIONS?: string
 	// Shared rooms database (schema/migrations owned by the `rooms` worker). Used
 	// read-only here to resolve room roles for `/api/rooms/v1/verifyRole`.
 	DB: D1Database

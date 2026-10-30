@@ -76,6 +76,35 @@ export type Env = SharedHonoEnv & {
 	 */
 	TACHYON_HOST_PORT_SANDBOX?: string
 	/**
+	 * The Tachyon pool a caller on a build under staged rollout (`ROLLOUT_GAME_VERSIONS` in
+	 * @repo/domain, read off their token's `rn.ver`) is served from
+	 * (`RECFLARE_TACHYON_HOST_PORT_ROLLOUT` in `.env`) — same list format, ids `rollout-1`,
+	 * `rollout-2`, …. A sandbox account is served the sandbox pool even on that build. Unset
+	 * means rollout callers use the live pool. See `tachyonPoolFor` in match.app.ts.
+	 */
+	TACHYON_HOST_PORT_ROLLOUT?: string
+	/**
+	 * The builds under staged rollout, overriding `ROLLOUT_GAME_VERSIONS` in @repo/domain:
+	 * a comma-separated list of builds, or `off` for none. Set for every worker from the
+	 * root `.env` (`RECFLARE_ROLLOUT_GAME_VERSIONS`), so this agrees with the gate `auth`
+	 * applies by construction. Read through `rolloutGameBuilds`; the DEFAULT for which
+	 * builds are served the rollout Tachyon pool above (see `TACHYON_ROLLOUT_GAME_VERSIONS`),
+	 * so ending the rollout (`off`) moves those callers to the live pool unless that var
+	 * keeps them.
+	 */
+	ROLLOUT_GAME_VERSIONS?: string
+	/**
+	 * The builds served the rollout Tachyon pool, decoupled from the sign-in gate
+	 * (`RECFLARE_TACHYON_ROLLOUT_GAME_VERSIONS` in `.env`): the same comma-separated list of
+	 * builds, or `off` for none. Unset means `ROLLOUT_GAME_VERSIONS` decides, as above. Set,
+	 * it is the only thing that does — so a build opened to everyone (`ROLLOUT_GAME_VERSIONS=off`)
+	 * can stay on its own voice servers by naming it here. Matched as a BUILD: a listed
+	 * `20260323` (or `20260323.14` — the point release is stripped) covers every point
+	 * release of it, the way every other version gate compares. Read through
+	 * `tachyonRolloutGameBuilds` in match.app.ts.
+	 */
+	TACHYON_ROLLOUT_GAME_VERSIONS?: string
+	/**
 	 * The Photon region every session is pinned to — both the region named in the connection
 	 * info and the one stamped on every room instance, which must agree. Optional; unlike the
 	 * app ids this DOES default (`us`, us-east1 in the QoS list), because an instance stamped

@@ -372,6 +372,8 @@ describe('lossless CV2 compiler', () => {
 async function setup() {
 	const db = new SQLiteD1(':memory:')
 	for (const ddl of [...ROOM_SCHEMA_DDL, ...SUBROOM_SCHEMA_DDL]) await db.exec(ddl)
+	// Room hydration reads published Studio badges from api-owned storage.
+	await db.exec('CREATE TABLE custom_avatar_item (data TEXT, outfit_type INTEGER, accessibility INTEGER)')
 	await db.exec(
 		readFileSync(new URL('../../discovery/migrations/0004_cv2_agent.sql', import.meta.url), 'utf8')
 	)

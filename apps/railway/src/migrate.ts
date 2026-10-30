@@ -17,6 +17,7 @@ const MIGRATION_SERVICES = [
 	'roomcomments',
 	'discovery',
 	'studio',
+	'link',
 ] as const
 const repo = resolve(import.meta.dirname, '../../..')
 

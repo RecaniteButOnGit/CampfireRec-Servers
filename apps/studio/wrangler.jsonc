@@ -37,6 +37,20 @@
 			"binding": "JWT_SECRET",
 			"store_id": "local",
 			"secret_name": "JWT_SECRET"
+		},
+		// The credential the cloud-building pull worker (recflare/cloud-building, its
+		// STUDIO_WORKER_KEY) presents as a bearer token on /internal/cloud-builds/*. A real
+		// secret, so it lives in the same store rather than riding along as a `--var` from
+		// .env, which would put it in plaintext on every worker. The binding must resolve
+		// for this worker to deploy: create it with the value `off` to run without cloud
+		// builds (creation then answers 503 and the private routes refuse everyone).
+		//
+		//   wrangler secrets-store secret create <store-id> --name CLOUD_BUILD_KEY \
+		//     --scopes workers --remote
+		{
+			"binding": "CLOUD_BUILD_KEY",
+			"store_id": "local",
+			"secret_name": "CLOUD_BUILD_KEY"
 		}
 	],
 	"upload_source_maps": true,

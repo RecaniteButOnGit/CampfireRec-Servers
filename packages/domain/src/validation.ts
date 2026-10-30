@@ -58,7 +58,7 @@ export const MAX_EVENT_DURATION_MS = 24 * 60 * 60 * 1000
  * offers `Untitled` rather than an empty box.
  */
 export const MIN_INVENTION_NAME_LENGTH = 3
-export const MAX_INVENTION_NAME_LENGTH = 24
+export const MAX_INVENTION_NAME_LENGTH = 40
 export const MAX_INVENTION_DESCRIPTION_LENGTH = 512
 
 /**
@@ -111,6 +111,34 @@ export function nameRejection(value: string, label: string, max: number): string
 	}
 	if (!NAME_PATTERN.test(value)) {
 		return `Your ${label} can only contain letters and numbers.`
+	}
+	return null
+}
+
+/**
+ * The display name charset, taken from the Rec Room build's own check rather than chosen
+ * here: Latin-script letters (accented ones included), digits, spaces and the punctuation
+ * listed. Wider than `NAME_PATTERN` because a display name is a label other players read,
+ * not something typed into a sign-in box — the username stays on the narrow rule.
+ *
+ * Matching the client matters in both directions: a narrower rule refuses a name the
+ * game's own box accepted, and a wider one stores a name the game can't re-enter. The
+ * dash stays last in the class so it reads as a literal rather than a range.
+ */
+const DISPLAY_NAME_PATTERN = /^[\p{Script=Latin}0-9 .,'!?_&()#@:+-]+$/u
+
+/**
+ * Why a player-supplied display name is unacceptable, or `null` when it's fine.
+ *
+ * Callers pass the TRIMMED name. Length is counted in code points, since the charset now
+ * reaches letters outside the basic plane.
+ */
+export function displayNameRejection(value: string): string | null {
+	if (glyphLength(value) > MAX_DISPLAY_NAME_LENGTH) {
+		return `Your display name can be at most ${MAX_DISPLAY_NAME_LENGTH} characters.`
+	}
+	if (!DISPLAY_NAME_PATTERN.test(value)) {
+		return "Your display name can only contain letters, numbers, spaces and .,'!?_&()#@:+-"
 	}
 	return null
 }

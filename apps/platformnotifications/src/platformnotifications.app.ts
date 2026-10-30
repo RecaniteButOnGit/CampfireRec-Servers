@@ -96,14 +96,24 @@ const app = new Hono<App>()
 		})
 	})
 
-	// The caller's CRM configuration — the campaign/messaging settings the client fetches on
-	// startup before it will ask about anything else here. An object, not an envelope.
+	// The caller's CRM configuration — which CRM (Braze, Rengage) and push service the
+	// client is assigned, fetched on startup before it will ask about anything else here.
 	//
-	// STUB: there is no CRM behind this, so the config is EMPTY rather than invented. An
-	// empty object is the honest answer and the client reads it as "nothing configured";
-	// made-up keys would switch on messaging paths that have nothing to serve them. Unlike
-	// `/config/categories` there is no visible text to mark as a stub — nothing here is
-	// rendered — so the marker stays in this comment.
+	// ENVELOPED: the client decodes a `RecNetResultObject<CrmAssignmentDTO>` and reads
+	// `Value` off it itself, so the `{ Value, Success, Error, error_id }` wrapper is on the
+	// wire — this once served a bare `{}`, which leaves `Value` null. Note the casing:
+	// PascalCase `Success`/`Error` beside a snake_case `error_id`.
+	//
+	// `Value` has exactly two keys. `UserConfig.AssignedCrmType` is the `CrmType` enum (None
+	// 0, Braze 1, Rengage 2) and `AllowPush` a bool — both NON-nullable on the client, so
+	// never null. `AssignedPushNotificationService` is a nullable `PushNotificationServices`
+	// (APNS 0, Firebase 1, Mock 2, Braze 3, Rengage 4). `BrazeConfig` is `{ AppId,
+	// SdkEndpoint }` or null.
+	//
+	// STUB: there is no CRM behind this, so the answer is "none assigned" — type 0, no push
+	// service, push off, no Braze config — rather than an invented assignment that would
+	// switch on messaging paths with nothing to serve them. Nothing here is rendered, so
+	// the stub marker stays in this comment.
 	//
 	// Auth-gated because the route is `me`-scoped, like `/preferences` below: the config
 	// belongs to the caller even while the answer is the same for everyone.
@@ -111,7 +121,19 @@ const app = new Hono<App>()
 		const accountId = await authedId(c)
 		if (accountId === null) return unauthorized(c)
 
-		return c.json({})
+		return c.json({
+			Value: {
+				UserConfig: {
+					AssignedCrmType: 0,
+					AssignedPushNotificationService: null,
+					AllowPush: false,
+				},
+				BrazeConfig: null,
+			},
+			Success: true,
+			Error: null,
+			error_id: null,
+		})
 	})
 
 	// The caller's own notification preferences — which categories they have muted, by

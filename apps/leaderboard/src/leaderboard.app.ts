@@ -14,7 +14,6 @@ import {
 	NO_SCORE,
 	UNRANKED,
 } from './leaderboard-db'
-
 import {
 	CheckAndSetStatBody,
 	CheckAndSetStatResponse,
@@ -37,11 +36,19 @@ import type { Board } from './leaderboard-db'
  */
 
 /** A board selector as the client posts it. Every field is optional on the wire — a body
- * that names nothing still gets an answer, it's just an empty one. */
+ * that names nothing still gets an answer, it's just an empty one.
+ *
+ * Two shapes name a board, told apart by which keys are PRESENT (see {@link board}). Up to
+ * 2025 the client sends `RoomId` + `StatChannel`. 20260323 renamed them `PrimaryKey` +
+ * `SecondaryKey`, made both nullable, and added `LeaderboardType` (0 Room, 1 Event), which
+ * says what `PrimaryKey` is the id of. */
 interface BoardBody {
 	PlayerId?: number
 	RoomId?: number
 	StatChannel?: number
+	PrimaryKey?: number | null
+	SecondaryKey?: number | null
+	LeaderboardType?: number
 	FilterType?: number
 	SortAscending?: boolean
 	RankStart?: number
@@ -63,17 +70,48 @@ const enum FilterType {
 	Friends = 1,
 }
 
+/** The 2026 client's `LeaderboardType`: what `PrimaryKey` is the id of. */
+const enum LeaderboardType {
+	Room = 0,
+	Event = 1,
+}
+
+/** Whether a body is the 2026 shape. Decided by key PRESENCE, not value, because the 2026
+ * keys can be null and a 2025 body never carries any of them. */
+const is2026Body = (body: BoardBody) =>
+	'PrimaryKey' in body || 'SecondaryKey' in body || 'LeaderboardType' in body
+
 /**
- * The board a body names: `RoomId` + `StatChannel`, each 0 when absent, seen through
- * `PlayerId`'s friends when `FilterType` is Friends. A friends board with no `PlayerId`
- * has nobody to be friends of, so it falls back to the global one rather than to nothing.
+ * The board a body names, or null when it names none, which every read answers as an empty
+ * board (or an unranked player). Seen through `PlayerId`'s friends when `FilterType` is
+ * Friends. A friends board with no `PlayerId` has nobody to be friends of, so it falls back
+ * to the global one rather than to nothing.
+ *
+ * 2025 body: `RoomId` + `StatChannel`, each 0 when absent, exactly as before.
+ *
+ * 2026 body: `PrimaryKey` + `SecondaryKey`. A null key is UNSCOPED and names no board. It is
+ * not room 0 or channel 0. Only a Room board (`LeaderboardType` 0) reads rows: an Event
+ * board's `PrimaryKey` is an event id, and nothing stores event stats (`CheckAndSetStat`
+ * takes only a room), so it reads empty instead of landing on whichever room shares the id.
  */
-function board(body: BoardBody): Board {
+function board(body: BoardBody): Board | null {
+	let roomId: number
+	let statChannel: number
+	if (is2026Body(body)) {
+		if (int(body.LeaderboardType, LeaderboardType.Room) !== LeaderboardType.Room) return null
+		if (!Number.isInteger(body.PrimaryKey) || !Number.isInteger(body.SecondaryKey)) return null
+		roomId = body.PrimaryKey as number
+		statChannel = body.SecondaryKey as number
+	} else {
+		roomId = int(body.RoomId, 0)
+		statChannel = int(body.StatChannel, 0)
+	}
 	const playerId = int(body.PlayerId, 0)
 	return {
-		roomId: int(body.RoomId, 0),
-		statChannel: int(body.StatChannel, 0),
-		...(int(body.FilterType, 0) === FilterType.Friends && playerId !== 0 && { friendsOf: playerId }),
+		roomId,
+		statChannel,
+		...(int(body.FilterType, 0) === FilterType.Friends &&
+			playerId !== 0 && { friendsOf: playerId }),
 	}
 }
 
@@ -144,9 +182,11 @@ const app = new Hono<App>()
 			const body = await readBody<BoardBody>(c)
 			logger.info('GetNearbyScores', { body })
 
+			const target = board(body)
+			if (target === null) return c.json({ Rows: [] })
 			const rows = await getNearbyScores(
 				c.env.DB,
-				board(body),
+				target,
 				int(body.PlayerId, 0),
 				int(body.WindowSize, MAX_WINDOW),
 				body.SortAscending === true
@@ -190,9 +230,11 @@ const app = new Hono<App>()
 			const body = await readBody<BoardBody>(c)
 			logger.info('GetRanks', { body })
 
+			const target = board(body)
+			if (target === null) return c.json({ Rows: [] })
 			const rows = await getRanks(
 				c.env.DB,
-				board(body),
+				target,
 				int(body.RankStart, 0),
 				int(body.RankEnd, 9),
 				body.SortAscending === true
@@ -242,11 +284,13 @@ const app = new Hono<App>()
 			const body = await readBody<BoardBody>(c)
 			logger.info('GetPlayerRank', { body })
 
+			// Every path answers the full three-key object. 20260323 throws "Response was
+			// empty" on a null or empty body, so there is no 204 here and no null.
 			const playerId = int(body.PlayerId, 0)
-			if (playerId === 0) return c.json({ PlayerId: 0, Score: NO_SCORE, Rank: UNRANKED })
-			return c.json(
-				await getPlayerRank(c.env.DB, board(body), playerId, body.SortAscending === true)
-			)
+			const target = board(body)
+			if (playerId === 0 || target === null)
+				return c.json({ PlayerId: playerId, Score: NO_SCORE, Rank: UNRANKED })
+			return c.json(await getPlayerRank(c.env.DB, target, playerId, body.SortAscending === true))
 		}
 	)
 
@@ -290,6 +334,9 @@ const app = new Hono<App>()
 			const accountId = await validateAndGetAccountId(c.req.raw, await c.env.JWT_SECRET.get())
 			if (accountId === null) return c.body(null, 401)
 
+			// Deliberately its own body, NOT a BoardBody: 20260323 still posts `RoomId` +
+			// `StatChannel` here (byte-identical to 2025) even though the reads moved to
+			// `PrimaryKey`/`SecondaryKey`. Keep the two request models apart.
 			const body = await readBody<{
 				RoomId?: number
 				StatChannel?: number
@@ -298,7 +345,7 @@ const app = new Hono<App>()
 			}>(c)
 			logger.info('CheckAndSetStat', { accountId, body })
 
-			const target = board(body)
+			const target: Board = { roomId: int(body.RoomId, 0), statChannel: int(body.StatChannel, 0) }
 			if (target.roomId !== 0 && typeof body.StatValue === 'number') {
 				const expected = typeof body.CurrentStatValue === 'number' ? body.CurrentStatValue : null
 				const written = await checkAndSetStat(
@@ -342,6 +389,11 @@ app.get(
 						'key is always present — a bare `{}` trips the client’s parser); `GetPlayerRank`',
 						'answers a player with no row a rank of 99999, the sentinel for unranked, with a',
 						'score of 0; and `CheckAndSetStat` answers the bare number `0`.',
+						'',
+						'A board is named two ways: up to 2025 by `RoomId` + `StatChannel`; from 20260323',
+						'by `PrimaryKey` + `SecondaryKey` + `LeaderboardType` (0 Room, 1 Event), told apart',
+						'by which keys are present. A null 2026 key names no board and reads empty.',
+						'`CheckAndSetStat` takes `RoomId` + `StatChannel` from every build.',
 						'',
 						'Only `CheckAndSetStat` needs a token — the stat belongs to whoever is calling.',
 						'Unreadable bodies are answered (empty board / unranked), never rejected.',

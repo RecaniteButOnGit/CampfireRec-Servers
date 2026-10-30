@@ -10,3 +10,9 @@ declare namespace Cloudflare {
 		mainModule: MainModule
 	}
 }
+
+// Tests read the migration as a string and apply it, so the schema has one source.
+declare module '*.sql?raw' {
+	const content: string
+	export default content
+}

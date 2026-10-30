@@ -30,12 +30,28 @@ export const REWARD_STATUS_SCHEMA_DDL: string[] = [
 ]
 
 /**
- * How long a player must wait between rewards of the same type in the same activity. One
- * hour flat, for every type — despite what a name like `FirstActivityOfDay` suggests.
- * Per-type windows would be a map keyed by reward type; there's one window until a reward
- * type needs its own.
+ * How long a player must wait between rewards of the same type in the same activity: one
+ * hour, for every type but `FirstActivityOfDay`, which waits {@link DAILY_REWARD_COOLDOWN_MS}.
  */
 export const REWARD_COOLDOWN_MS = 60 * 60 * 1000
+
+/** `FirstActivityOfDay`'s cooldown: a rolling 24h since the player's last one. */
+export const DAILY_REWARD_COOLDOWN_MS = 24 * 60 * 60 * 1000
+
+/**
+ * The game reward's per-PLAYER daily allowances, each kept in `reward_status` as one row under
+ * its reserved type and the empty context: `grant_count` is the AMOUNT paid in the current
+ * window (tokens, or XP — not a count of claims) and `granted_at` is when that window opened.
+ * The `$` keeps them apart from the client's own type names (`FirstActivityOfDay`,
+ * `PostGameActivity`), which a client-sent type could otherwise forge.
+ */
+export type Allowance = '$tokens' | '$xp'
+
+/**
+ * How long an allowance window lasts: a rolling 24h from the first grant in it, rather than a
+ * calendar day — so no time zone's midnight decides when a player's allowance comes back.
+ */
+export const ALLOWANCE_WINDOW_MS = 24 * 60 * 60 * 1000
 
 /**
  * Claim a reward if the player is due one, returning how many of that type they have now
@@ -61,9 +77,10 @@ export async function claimReward(
 	accountId: number,
 	rewardType: string,
 	giftContext = '',
-	now: Date = new Date()
+	now: Date = new Date(),
+	cooldownMs: number = REWARD_COOLDOWN_MS
 ): Promise<number | null> {
-	const cutoff = new Date(now.getTime() - REWARD_COOLDOWN_MS).toISOString()
+	const cutoff = new Date(now.getTime() - cooldownMs).toISOString()
 	const row = await db
 		.prepare(
 			`INSERT INTO reward_status (account_id, reward_type, gift_context, granted_at, grant_count)
@@ -80,28 +97,42 @@ export async function claimReward(
 }
 
 /**
- * Whether the claim just written by {@link claimReward} is the player's FIRST in
- * `giftContext` — across every reward type, so an activity is "new" once, not once per
- * type it happens to be asked under. Call it right after the claim with the count it
- * returned: it is true when that claim INSERTED its row (`grantCount` 1; a repeat past the
- * cooldown is 2+) and the player's rows in that context are exactly that one.
+ * Add `amount` to the player's daily `allowance` if it fits under `cap`, returning the
+ * window's new total — or `null` when it doesn't fit and nothing was granted.
  *
- * Counting AFTER the claim is what keeps two asks landing together (say
- * `FirstActivityOfDay` and `PostGameActivity` for the same match) from both reading "new":
- * D1 serializes the inserts, so at most the first insert's count is 1 and the second's is
- * 2 — a race can skip the bonus, never pay it twice. The contextless `''` bucket is not an
- * activity and is never new.
+ * A window older than {@link ALLOWANCE_WINDOW_MS} is reset in place (the row's key allows
+ * one per player): `granted_at` moves to now and the total restarts at `amount`. Otherwise the
+ * amount is added to the running total, and `granted_at` is left alone so the window keeps its
+ * start. All grant-or-nothing: a claim that would cross the cap pays nothing rather than the
+ * remainder, so `cap` should be a multiple of `amount`.
+ *
+ * One statement, for the same reason as {@link claimReward}: asks landing together can't both
+ * read a total under the cap and both pay. SQLite evaluates every `SET` against the row as it
+ * was, so both `CASE`s see the old `granted_at`.
  */
-export async function isNewActivity(
+export async function claimAllowance(
 	db: D1Database,
 	accountId: number,
-	giftContext: string,
-	grantCount: number
-): Promise<boolean> {
-	if (giftContext === '' || grantCount !== 1) return false
+	allowance: Allowance,
+	amount: number,
+	cap: number,
+	now: Date = new Date()
+): Promise<number | null> {
+	if (amount > cap) return null
+	const cutoff = new Date(now.getTime() - ALLOWANCE_WINDOW_MS).toISOString()
 	const row = await db
-		.prepare('SELECT COUNT(*) AS n FROM reward_status WHERE account_id = ?1 AND gift_context = ?2')
-		.bind(accountId, giftContext)
-		.first<{ n: number }>()
-	return row?.n === 1
+		.prepare(
+			`INSERT INTO reward_status (account_id, reward_type, gift_context, granted_at, grant_count)
+			 VALUES (?1, ?2, '', ?3, ?4)
+			 ON CONFLICT (account_id, reward_type, gift_context) DO UPDATE SET
+			   granted_at = CASE WHEN reward_status.granted_at <= ?5
+			     THEN excluded.granted_at ELSE reward_status.granted_at END,
+			   grant_count = CASE WHEN reward_status.granted_at <= ?5
+			     THEN ?4 ELSE reward_status.grant_count + ?4 END
+			 WHERE reward_status.granted_at <= ?5 OR reward_status.grant_count + ?4 <= ?6
+			 RETURNING grant_count`
+		)
+		.bind(accountId, allowance, now.toISOString(), amount, cutoff, cap)
+		.first<{ grant_count: number }>()
+	return row?.grant_count ?? null
 }

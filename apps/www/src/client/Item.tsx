@@ -3,6 +3,7 @@ import { useEffect, useState } from 'react'
 import { call, usernamesFor, where } from './api'
 
 import type { CustomAvatarItem } from '../../../api/src/custom-avatar-items-db'
+import type { SavedInvention } from '../../../api/src/inventions-db'
 import type { PublicAccount } from './api'
 
 /**
@@ -23,7 +24,8 @@ import type { PublicAccount } from './api'
  * store says too.
  *
  * Its own file for the reason Stats.tsx and Moderation.tsx are: a whole surface rather
- * than one more section of App.tsx.
+ * than one more section of App.tsx. The invention page (`/d/store/invention/<id>`, the
+ * other store share link) lives here too, at the bottom.
  */
 
 /** The `/d/store/customavataritem/<uuid>` path, or null for any other path. */
@@ -214,10 +216,10 @@ export function ItemPage({
 						<p className="room-hero-by">
 							by{' '}
 							<a
-								href={`/u/${encodeURIComponent(creator.username)}`}
+								href={`/user/${encodeURIComponent(creator.username)}`}
 								onClick={(e) => {
 									e.preventDefault()
-									navigate(`/u/${encodeURIComponent(creator.username)}`)
+									navigate(`/user/${encodeURIComponent(creator.username)}`)
 								}}
 							>
 								{creator.displayName || creator.username}
@@ -265,6 +267,157 @@ export function ItemPage({
 					<dt>Item id</dt>
 					<dd>
 						<code>{item.CustomAvatarItemId}</code>
+					</dd>
+				</dl>
+			</section>
+		</main>
+	)
+}
+
+/** The `/d/store/invention/<id>` path's numeric invention id, or null for any other path. */
+export function inventionIdFromPath(path: string): number | null {
+	const match = /^\/d\/store\/invention\/(\d+)\/?$/i.exec(path)
+	return match ? Number(match[1]) : null
+}
+
+/**
+ * The invention, or null when there's no PUBLISHED invention with that id.
+ *
+ * Read through `api`'s `GET /api/inventions/v2/batch?id=<id>` WITHOUT the session token,
+ * deliberately: auth there only widens the answer to the caller's own unpublished
+ * inventions, and this page is a public link, so it shows what anyone could see. Not
+ * `GET /api/inventions/v1`, which serves an unpublished invention to anyone.
+ */
+async function fetchPublishedInvention(inventionId: number): Promise<SavedInvention | null> {
+	const found = await call<SavedInvention[]>(
+		`${where().api}/api/inventions/v2/batch?id=${inventionId}`
+	)
+	if (!Array.isArray(found)) return null
+	// The route already drops unpublished inventions for an anonymous caller; checked again
+	// so this page can't show one if that ever changes.
+	return found.find((i) => i.InventionId === inventionId && i.IsPublished) ?? null
+}
+
+/**
+ * A published invention's page, at `/d/store/invention/<id>` — the store share link's
+ * shape, like the custom avatar item page above. Public: no sign-in needed.
+ */
+export function InventionPage({
+	inventionId,
+	ready,
+	navigate,
+}: {
+	inventionId: number
+	/** Whether `/api/config` has landed — `where()` has no hostnames before it. */
+	ready: boolean
+	navigate: (to: string) => void
+}) {
+	// undefined = not fetched yet; null = no published invention with this id.
+	const [invention, setInvention] = useState<SavedInvention | null | undefined>(undefined)
+	const [creator, setCreator] = useState<PublicAccount | null>(null)
+	const [error, setError] = useState('')
+
+	useEffect(() => {
+		setInvention(undefined)
+		setCreator(null)
+		setError('')
+		if (!ready) return
+		void fetchPublishedInvention(inventionId)
+			.then((found) => {
+				setInvention(found)
+				if (found)
+					void usernamesFor([found.CreatorPlayerId]).then((names) =>
+						setCreator(names.get(found.CreatorPlayerId) ?? null)
+					)
+			})
+			.catch((e) => setError(e instanceof Error ? e.message : String(e)))
+	}, [inventionId, ready])
+
+	if (error) {
+		return (
+			<main className="shell wide">
+				<p className="error">{error}</p>
+			</main>
+		)
+	}
+	if (invention === undefined) {
+		return (
+			<main className="shell wide">
+				<p className="muted">Loading…</p>
+			</main>
+		)
+	}
+	if (invention === null) {
+		return (
+			<main className="shell wide">
+				<p className="muted">
+					There&apos;s no invention here — it hasn&apos;t been published, or it doesn&apos;t exist.
+				</p>
+			</main>
+		)
+	}
+
+	const price = invention.Price > 0 ? `${invention.Price.toLocaleString()} tokens` : 'Free'
+
+	return (
+		<main className="shell wide">
+			<section className="card room-hero">
+				{invention.ImageName ? (
+					<img
+						className="room-hero-img"
+						src={`${where().img}/${invention.ImageName}?width=512`}
+						alt=""
+					/>
+				) : (
+					<div className="room-hero-img" />
+				)}
+				<div className="room-hero-body">
+					<div className="room-head">
+						<h1 className="room-hero-name">{invention.Name}</h1>
+					</div>
+					{creator && (
+						<p className="room-hero-by">
+							by{' '}
+							<a
+								href={`/user/${encodeURIComponent(creator.username)}`}
+								onClick={(e) => {
+									e.preventDefault()
+									navigate(`/user/${encodeURIComponent(creator.username)}`)
+								}}
+							>
+								{creator.displayName || creator.username}
+							</a>
+						</p>
+					)}
+					<p className="muted room-hero-desc">{invention.Description || 'No description.'}</p>
+					<p className="room-stats">
+						{price}
+						{invention.IsFeatured ? ' · Featured' : ''}
+						{invention.IsCertifiedInvention ? ' · Certified' : ''}
+					</p>
+				</div>
+			</section>
+
+			<section className="card">
+				<h2>About this invention</h2>
+				<dl className="facts">
+					<dt>Price</dt>
+					<dd>{price}</dd>
+					<dt>Downloads</dt>
+					<dd>{invention.NumDownloads.toLocaleString()}</dd>
+					<dt>Cheers</dt>
+					<dd>{invention.CheerCount.toLocaleString()}</dd>
+					<dt>Tags</dt>
+					<dd>
+						{invention.Tags?.length ? invention.Tags.map((t) => `#${t.Tag}`).join(' ') : 'None'}
+					</dd>
+					<dt>Published</dt>
+					<dd>{formatDate(invention.FirstPublishedAt ?? invention.CreatedAt)}</dd>
+					<dt>Updated</dt>
+					<dd>{formatDate(invention.ModifiedAt)}</dd>
+					<dt>Invention id</dt>
+					<dd>
+						<code>{invention.InventionId}</code>
 					</dd>
 				</dl>
 			</section>

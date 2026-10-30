@@ -19,6 +19,7 @@ import {
 	PROGRESSION_SCHEMA_DDL,
 	RECEIVED_GIFT_SCHEMA_DDL,
 	ROOM_SCHEMA_DDL,
+	setPresence,
 	updateAccount,
 } from '@repo/domain'
 import { PlatformType } from '@repo/domain/src/enums'
@@ -42,6 +43,7 @@ import { NotificationType } from '../../../../notify/src/notification-types'
 // SQL, not modules: they are never executed here, only read.
 import catalogStructureSql from '../../../migrations/0015_catalog.sql?raw'
 import catalogIdSql from '../../../migrations/0016_catalog_id.sql?raw'
+import catalogListingSql from '../../../migrations/0028_catalog_listing.sql?raw'
 import skinsJson from '../../../static/db/skins.json'
 // The 2025 store DUMP, the source `runx storefront build` and `runx catalog load` both read.
 import storeDump from '../../../static/db/Watch_EnumValue_3.json'
@@ -380,6 +382,13 @@ function b64url(input: ArrayBuffer | string): string {
 }
 
 /**
+ * A bearer token carrying `rn.plus`. Listing anything for a TOKEN price (a room key, a
+ * token-priced room consumable, a room currency's purchase offer) is a Rec Room Plus perk,
+ * so the room-economy tests stock their shops as a subscriber.
+ */
+const plusBearer = (sub: string) => bearer(sub, undefined, undefined, true)
+
+/**
  * A bearer token for `sub`. `roles` becomes the `role` claim the auth worker stamps from an
  * account's flags — pass `['gameClient', 'developer']` for an elevated account; the default
  * is no claim at all, which reads as no roles.
@@ -593,6 +602,134 @@ describe('econ endpoints', () => {
 			body: JSON.stringify({ OutfitSelections: 'a,,0' }),
 		})
 		expect(res.status).toBe(404)
+	})
+
+	test('room badges grant once from a live circuit and appear on another player’s badge tab', async () => {
+		const seed = await createCustomAvatarItem(env.DB, {
+			customAvatarItemId: crypto.randomUUID(),
+			creatorAccountId: 801,
+			name: 'Room badge',
+			description: '',
+			price: 0,
+			baseAvatarItemId: 1,
+			baseAvatarItemColor: '#fff',
+			accessibility: 1,
+			designFilename: 'badge.png',
+			thumbnailImageFilename: 'badge.png',
+		})
+		const badge = await importCustomAvatarItem(env.DB, {
+			...seed,
+			OutfitType: 1000,
+			CustomBadgeMetadata: { RoomId: 989891 },
+			CurrentSaves: [
+				{
+					CustomAvatarItemSaveId: 1,
+					CustomAvatarItemId: seed.CustomAvatarItemId,
+					UnityAssetId: crypto.randomUUID(),
+					BodyType: 0,
+					OutfitType: 1000,
+					QAState: 0,
+					CreatedAt: seed.CreatedAt,
+					ModifiedAt: seed.ModifiedAt,
+					Description: null,
+					ThumbnailFileName: 'badge.png',
+					AdditionalConfiguration: '{}',
+					UnityAsset: 'badge.png',
+					UnityAssetHash: '',
+					UnityAsset2: null,
+					UnityAsset2Hash: null,
+				},
+			],
+		})
+		const presence = async (accountId: number, roomInstanceId = 891) =>
+			setPresence(env.DB, {
+				accountId,
+				roomInstance: { roomId: 989891, roomInstanceId },
+				statusVisibility: 0,
+				deviceClass: 0,
+				vrMovementMode: 0,
+				platform: 0,
+				appVersion: '20260323.14',
+			})
+		await presence(802)
+		await presence(803)
+		const grant = async (overrides = {}, authenticated = true): Promise<Response> =>
+			exports.default.fetch(`${ORIGIN}/circuitsRoomRewards/grantRoomBadge`, {
+				method: 'POST',
+				headers: {
+					...(authenticated ? await bearer('802') : {}),
+					'Content-Type': 'application/json',
+				},
+				body: JSON.stringify({
+					TargetAccountId: 803,
+					BadgeCustomAvatarItemId: badge.CustomAvatarItemId.toUpperCase(),
+					RoomInstanceId: 891,
+					GrantMessage: 'Well done!',
+					...overrides,
+				}),
+			})
+		const list = async (query = '', authenticated = true): Promise<Response> =>
+			exports.default.fetch(`${ORIGIN}/econ/customAvatarItems/v1/ownedby/803${query}`, {
+				headers: authenticated ? await bearer('802') : {},
+			})
+		expect((await grant({}, false)).status).toBe(401)
+		expect((await list('', false)).status).toBe(401)
+		expect(await (await list('?outfitType=1000')).json()).toEqual({ Results: [], TotalResults: 0 })
+		expect(await (await grant({ RoomInstanceId: 892 })).json()).toMatchObject({ ResponseCode: 2 })
+		await presence(803, 892)
+		expect(await (await grant()).json()).toMatchObject({ ResponseCode: 2 })
+		await presence(803)
+		expect(
+			await (await grant({ BadgeCustomAvatarItemId: crypto.randomUUID() })).json()
+		).toMatchObject({ ResponseCode: 2 })
+		const grants = await Promise.all([grant(), grant()])
+		expect(
+			(await Promise.all(grants.map((r) => r.json() as Promise<{ ResponseCode: number }>)))
+				.map((r) => r.ResponseCode)
+				.sort((a, b) => a - b)
+		).toEqual([0, 1])
+		expect(await (await grant()).json()).toEqual({ ResponseCode: 1, ErrorMessage: null })
+		const gifts = await getPendingGifts(env.DB, 803)
+		expect(gifts).toHaveLength(1)
+		expect(gifts[0]!).toMatchObject({
+			CustomAvatarItemId: badge.CustomAvatarItemId,
+			Message: 'Well done!',
+		})
+		await grantCustomAvatarItem(env.DB, 803, seed.CustomAvatarItemId)
+		const shirt = await createCustomAvatarItem(env.DB, {
+			customAvatarItemId: crypto.randomUUID(),
+			creatorAccountId: 801,
+			name: 'Shirt',
+			description: '',
+			price: 0,
+			baseAvatarItemId: 1,
+			baseAvatarItemColor: '#fff',
+			accessibility: 1,
+			designFilename: 'shirt.png',
+			thumbnailImageFilename: 'shirt.png',
+		})
+		await grantCustomAvatarItem(env.DB, 803, shirt.CustomAvatarItemId)
+		const draft = await importCustomAvatarItem(env.DB, {
+			...badge,
+			CustomAvatarItemId: crypto.randomUUID(),
+			Accessibility: 0,
+		})
+		await grantCustomAvatarItem(env.DB, 803, draft.CustomAvatarItemId)
+		expect(
+			await (await grant({ BadgeCustomAvatarItemId: draft.CustomAvatarItemId })).json()
+		).toMatchObject({ ResponseCode: 2 })
+		expect(await (await list('?outfitType=1000&skip=0&take=1000')).json()).toEqual({
+			Results: [{ ...badge, PurchaseInfo: null }],
+			TotalResults: 1,
+		})
+		expect(await (await list('?outfitType=1000&skip=1&take=1')).json()).toEqual({
+			Results: [],
+			TotalResults: 1,
+		})
+		expect(await (await list('?outfitType=1000&unityAssetTarget=2')).json()).toMatchObject({
+			Results: [{ CurrentSaves: [{ UnityAsset: 'badge.png' }] }],
+			TotalResults: 1,
+		})
 	})
 
 	test('GET /econ/customAvatarItems/v1/owned 401s without a token, lists what the caller bought', async () => {
@@ -1233,7 +1370,7 @@ describe('econ endpoints', () => {
 				'not an object',
 			]
 			for (const bad of badBodies) {
-				const res = await save(bad, await bearer('1'))
+				const res = await save(bad, await plusBearer('1'))
 				expect(res.status).toBe(200)
 				expect(await envOf(res)).toEqual({
 					Value: null,
@@ -1245,7 +1382,7 @@ describe('econ endpoints', () => {
 			expect(await shopOf(2511)).toEqual([])
 
 			// The owner stocks it. `PriceAndCurrency` collapses to the flat pair the read serves.
-			const res = await save(body, await bearer('1'))
+			const res = await save(body, await plusBearer('1'))
 			expect(res.status).toBe(200)
 			const env = await envOf(res)
 			expect(env).toMatchObject({ Success: true, Error: null, error_id: null })
@@ -1281,7 +1418,7 @@ describe('econ endpoints', () => {
 		})
 
 		test('PUT roomConsumable replaces when the body names a listing', async () => {
-			const created = (await envOf(await save({ ...body, Name: 'Before' }, await bearer('1'))))
+			const created = (await envOf(await save({ ...body, Name: 'Before' }, await plusBearer('1'))))
 				.Value!
 
 			// Naming the listing REPLACES it rather than adding a second, and a co-owner may.
@@ -1299,7 +1436,7 @@ describe('econ endpoints', () => {
 							PriceAndCurrency: { Price: 25, CurrencyId: null },
 							MaximumCountPerPurchase: 10,
 						},
-						await bearer('2')
+						await plusBearer('2')
 					)
 				)
 			).Value!
@@ -1326,7 +1463,7 @@ describe('econ endpoints', () => {
 				await envOf(
 					await save(
 						{ RoomConsumableId: created.RoomConsumableId, Name: 'Bare' },
-						await bearer('1')
+						await plusBearer('1')
 					)
 				)
 			).Value!
@@ -1341,11 +1478,12 @@ describe('econ endpoints', () => {
 		})
 
 		test('PUT roomConsumable masks a name players will see, and a room can stock several', async () => {
-			const masked = (await envOf(await save({ ...body, Name: 'shit potion' }, await bearer('1'))))
-				.Value!
+			const masked = (
+				await envOf(await save({ ...body, Name: 'shit potion' }, await plusBearer('1')))
+			).Value!
 			expect(masked.Name).toBe('**** potion')
 
-			await save({ ...body, Name: 'Second' }, await bearer('1'))
+			await save({ ...body, Name: 'Second' }, await plusBearer('1'))
 			const shop = await shopOf(2511)
 			expect(shop.length).toBeGreaterThanOrEqual(2)
 			// Each listing has its own id — two things in a shop are not one thing.
@@ -1364,9 +1502,9 @@ describe('econ endpoints', () => {
 					AwardedAt: string
 				} | null
 			}
-			const potion = (await envOf(await save({ ...body, Name: 'Potion' }, await bearer('1'))))
+			const potion = (await envOf(await save({ ...body, Name: 'Potion' }, await plusBearer('1'))))
 				.Value!
-			const elixir = (await envOf(await save({ ...body, Name: 'Elixir' }, await bearer('1'))))
+			const elixir = (await envOf(await save({ ...body, Name: 'Elixir' }, await plusBearer('1'))))
 				.Value!
 
 			const awardBulk = async (payload: unknown, headers?: Record<string, string>) =>
@@ -1478,6 +1616,371 @@ describe('econ endpoints', () => {
 			}
 		})
 
+		test('PUT roomconsumable/:id/purchase/tokens|currency sells for tokens (paying the owner) or room currency (paying nobody)', async () => {
+			const coin = 'b9f41a7c-32f1-4456-b84f-fdb94b240955'
+			// Room 2511 is account 1's, with 2 as co-owner. One listing in tokens (max 3 a
+			// purchase), one in the room's coin.
+			const tokenItem = (
+				await envOf(
+					await save(
+						{
+							...body,
+							Name: 'Token potion',
+							PriceAndCurrency: { Price: 5, CurrencyId: null },
+							MaximumCountPerPurchase: 3,
+						},
+						await plusBearer('1')
+					)
+				)
+			).Value!
+			const coinItem = (
+				await envOf(await save({ ...body, Name: 'Coin potion' }, await plusBearer('1')))
+			).Value!
+			expect(tokenItem).toMatchObject({ Price: 5, PurchaseCurrencyId: null })
+			expect(coinItem).toMatchObject({ Price: 50, PurchaseCurrencyId: coin })
+
+			const purchase = async (
+				sub: string | null,
+				consumableId: string,
+				price: number,
+				currencyId: string | null,
+				quantity = 1,
+				gift: number | null = null
+			) =>
+				exports.default.fetch(
+					// As the client does: a token price to `/tokens`, a room currency to `/currency`.
+					`${ORIGIN}/api/roomconsumables/v1/roomconsumable/${consumableId}/purchase/` +
+						(currencyId === null ? 'tokens' : 'currency'),
+					{
+						method: 'PUT',
+						headers: {
+							'Content-Type': 'application/json',
+							...(sub === null ? {} : await plusBearer(sub)),
+						},
+						body: JSON.stringify({
+							ConcurrencyCodes: {
+								CurrentConcurrencyCode: null,
+								NewConcurrencyCode: '1ea4a2dd-b643-406d-99b7-bd1b936e678b',
+							},
+							ExpectedPriceAndCurrency: { Price: price, CurrencyId: currencyId },
+							Quantity: quantity,
+							GiftRecipientAccountId: gift,
+						}),
+					}
+				)
+			type InventoryItem = {
+				RoomConsumableId: string
+				AccountId: number
+				Count: number
+				ConcurrencyCode: string | null
+				ModifiedAt: string
+				Consumable: Consumable & { IsGiftable: boolean; Visibility: number }
+			}
+			type Purchase = {
+				BalanceUpdateResult: number
+				CurrencyBalanceResponse: {
+					AccountId: number
+					CurrencyId: string | null
+					Balance: number
+					ModifiedAt: string
+				}
+				OperationResult: {
+					Status: number
+					InventoryItem: InventoryItem | null
+				}
+			}
+			const result = async (res: Response) => {
+				expect(res.status).toBe(200)
+				return (await res.json()) as Purchase
+			}
+			// A refusal: the same shape, nothing given, the buyer's balance as it stands.
+			const refused = (
+				code: number,
+				buyer: number,
+				currencyId: string | null,
+				balance: number
+			) => ({
+				BalanceUpdateResult: code,
+				CurrencyBalanceResponse: {
+					AccountId: buyer,
+					CurrencyId: currencyId,
+					Balance: balance,
+					ModifiedAt: expect.any(String),
+				},
+				OperationResult: { Status: 1, InventoryItem: null },
+			})
+			const setTokens = (accountId: number, amount: number) =>
+				env.DB.prepare(
+					'INSERT OR REPLACE INTO balance (account_id, currency_type, amount) VALUES (?1, 2, ?2)'
+				)
+					.bind(accountId, amount)
+					.run()
+			const tokens = async (accountId: number) =>
+				(
+					await env.DB.prepare(
+						'SELECT amount FROM balance WHERE account_id = ?1 AND currency_type = 2'
+					)
+						.bind(accountId)
+						.first<{ amount: number }>()
+				)?.amount
+			const setCoins = (playerId: number, amount: number) =>
+				env.DB.prepare(
+					'INSERT OR REPLACE INTO room_balance (currency_id, player_id, amount) VALUES (?1, ?2, ?3)'
+				)
+					.bind(coin, playerId, amount)
+					.run()
+			const coins = async (playerId: number) =>
+				(
+					await env.DB.prepare(
+						'SELECT amount FROM room_balance WHERE currency_id = ?1 AND player_id = ?2'
+					)
+						.bind(coin, playerId)
+						.first<{ amount: number }>()
+				)?.amount ?? 0
+			const owned = async (playerId: number, consumableId: string) =>
+				(
+					await env.DB.prepare(
+						'SELECT quantity FROM room_inventory WHERE player_id = ?1 AND consumable_id = ?2'
+					)
+						.bind(playerId, consumableId)
+						.first<{ quantity: number }>()
+				)?.quantity ?? 0
+			const drainFrames = async () =>
+				(
+					env.RECFLARE_NOTIFICATIONS_HUB.getByName('global') as unknown as {
+						drainFrames(): Promise<Array<{ accountId: number; payload: Record<string, unknown> }>>
+					}
+				).drainFrames()
+
+			await setTokens(1, 1000)
+			await setTokens(2, 40)
+			await setTokens(7701, 100)
+			await setTokens(7702, 4)
+			await setCoins(7701, 120)
+			await drainFrames()
+
+			expect((await purchase(null, tokenItem.RoomConsumableId, 5, null)).status).toBe(401)
+			// Only the two purchase paths exist.
+			const other = await exports.default.fetch(
+				`${ORIGIN}/api/roomconsumables/v1/roomconsumable/${tokenItem.RoomConsumableId}/purchase/gems`,
+				{ method: 'PUT', headers: await bearer('7701'), body: '{}' }
+			)
+			expect(other.status).toBe(404)
+
+			// Refusals charge and give nothing, and say why in `BalanceUpdateResult`.
+			const refusals: Array<[Promise<Response>, ReturnType<typeof refused>]> = [
+				[purchase('7701', 'nope', 5, null), refused(4, 7701, null, 100)],
+				[purchase('7701', tokenItem.RoomConsumableId, 5, null, 0), refused(7, 7701, null, 100)],
+				[purchase('7701', tokenItem.RoomConsumableId, 5, null, 4), refused(7, 7701, null, 100)],
+				[purchase('7701', tokenItem.RoomConsumableId, 5, null, 1, -3), refused(8, 7701, null, 100)],
+				[purchase('7701', tokenItem.RoomConsumableId, 0, null), refused(6, 7701, null, 100)],
+				[purchase('7701', tokenItem.RoomConsumableId, 5, coin), refused(6, 7701, null, 100)],
+				[purchase('7701', coinItem.RoomConsumableId, 50, null), refused(6, 7701, coin, 120)],
+				[purchase('7702', tokenItem.RoomConsumableId, 5, null), refused(2, 7702, null, 4)],
+				[purchase('7701', coinItem.RoomConsumableId, 50, coin, 3), refused(2, 7701, coin, 120)],
+			]
+			for (const [res, expected] of refusals) {
+				expect(await result(await res)).toEqual(expected)
+			}
+			expect([await tokens(1), await tokens(7701), await tokens(7702)]).toEqual([1000, 100, 4])
+			expect(await coins(7701)).toBe(120)
+			expect(await owned(7701, tokenItem.RoomConsumableId)).toBe(0)
+			expect(await drainFrames()).toEqual([])
+
+			// Tokens: 3 × 5 leaves the buyer and reaches the room's owner.
+			const sold = await result(await purchase('7701', tokenItem.RoomConsumableId, 5, null, 3))
+			expect(sold).toEqual({
+				BalanceUpdateResult: 0,
+				CurrencyBalanceResponse: {
+					AccountId: 7701,
+					CurrencyId: null,
+					Balance: 85,
+					ModifiedAt: expect.any(String),
+				},
+				OperationResult: {
+					Status: 0,
+					InventoryItem: {
+						RoomConsumableId: tokenItem.RoomConsumableId,
+						AccountId: 7701,
+						Count: 3,
+						ConcurrencyCode: '1ea4a2dd-b643-406d-99b7-bd1b936e678b',
+						ModifiedAt: expect.any(String),
+						// The listing plus two fields, with no picture as '' — not the catalogue's.
+						Consumable: { ...tokenItem, ImageName: '', IsGiftable: false, Visibility: 0 },
+					},
+				},
+			})
+			// Member order as the client was observed receiving it.
+			expect(Object.keys(sold)).toEqual([
+				'BalanceUpdateResult',
+				'CurrencyBalanceResponse',
+				'OperationResult',
+			])
+			expect(Object.keys(sold.OperationResult.InventoryItem!)).toEqual([
+				'RoomConsumableId',
+				'AccountId',
+				'Count',
+				'ConcurrencyCode',
+				'ModifiedAt',
+				'Consumable',
+			])
+			expect([await tokens(1), await tokens(7701)]).toEqual([1015, 85])
+			const frames = await drainFrames()
+			expect(frames.find((f) => f.accountId === 1)?.payload).toMatchObject({
+				Balance: 1015,
+				Platform: -2,
+			})
+			expect(frames.find((f) => f.accountId === 7701)?.payload).toMatchObject({
+				Delta: -15,
+				Balance: 85,
+				Platform: -2,
+			})
+
+			// Room currency: 2 × 50 leaves the buyer's coin and pays nobody.
+			const bought = await result(await purchase('7701', coinItem.RoomConsumableId, 50, coin, 2))
+			expect(bought.CurrencyBalanceResponse).toMatchObject({
+				AccountId: 7701,
+				CurrencyId: coin,
+				Balance: 20,
+			})
+			expect(bought.OperationResult.InventoryItem).toMatchObject({ AccountId: 7701, Count: 2 })
+			expect(await coins(7701)).toBe(20)
+			expect(await coins(1)).toBe(0)
+			expect(await tokens(1)).toBe(1015)
+			expect(await drainFrames()).toEqual([])
+
+			// A gift: the buyer pays, the owner is paid, the recipient owns it.
+			const gift = await result(
+				await purchase('7701', tokenItem.RoomConsumableId, 5, null, 1, 7702)
+			)
+			// The balance is the BUYER's; the item is the RECIPIENT's.
+			expect(gift.CurrencyBalanceResponse).toMatchObject({ AccountId: 7701, Balance: 80 })
+			expect(gift.OperationResult.InventoryItem).toMatchObject({ AccountId: 7702, Count: 1 })
+			expect(await owned(7702, tokenItem.RoomConsumableId)).toBe(1)
+			expect(await owned(7701, tokenItem.RoomConsumableId)).toBe(3)
+			expect([await tokens(1), await tokens(7701), await tokens(7702)]).toEqual([1020, 80, 4])
+			await drainFrames()
+
+			// A co-owner gets it free at the 0 the client asks them, in either currency.
+			const free = await result(await purchase('2', tokenItem.RoomConsumableId, 0, null, 2))
+			expect(free.BalanceUpdateResult).toBe(0)
+			expect(free.OperationResult.InventoryItem).toMatchObject({ AccountId: 2, Count: 2 })
+			const freeCoin = await result(await purchase('2', coinItem.RoomConsumableId, 0, coin))
+			expect(freeCoin.OperationResult.Status).toBe(0)
+			expect([await tokens(1), await tokens(2), await coins(2)]).toEqual([1020, 40, 0])
+			expect(await drainFrames()).toEqual([])
+
+			// `/me` lists what the caller holds of the room, in the shop's order — the same item
+			// the purchase answered with, the stored concurrency code included.
+			const mine = async (sub: string | null, roomId: number | string = 2511) => {
+				const res = await exports.default.fetch(
+					`${ORIGIN}/api/roomconsumables/v1/roomConsumable/room/${roomId}/me`,
+					sub === null ? undefined : { headers: await plusBearer(sub) }
+				)
+				return {
+					status: res.status,
+					items: (await res.json().catch(() => null)) as InventoryItem[],
+				}
+			}
+			expect((await mine(null)).status).toBe(401)
+			const own = await mine('7701')
+			expect(own.status).toBe(200)
+			expect(own.items).toEqual([
+				{
+					RoomConsumableId: tokenItem.RoomConsumableId,
+					AccountId: 7701,
+					Count: 3,
+					ConcurrencyCode: '1ea4a2dd-b643-406d-99b7-bd1b936e678b',
+					ModifiedAt: expect.any(String),
+					Consumable: { ...tokenItem, ImageName: '', IsGiftable: false, Visibility: 0 },
+				},
+				expect.objectContaining({ RoomConsumableId: coinItem.RoomConsumableId, Count: 2 }),
+			])
+			expect((await mine('7702')).items).toEqual([
+				expect.objectContaining({ RoomConsumableId: tokenItem.RoomConsumableId, Count: 1 }),
+			])
+			// Another room, an unknown one, and a nonsense id are all empty.
+			expect((await mine('7701', 99999)).items).toEqual([])
+			expect((await mine('7701', 'nope')).items).toEqual([])
+			// Spent down to zero is absent, not a zero row.
+			await env.DB.prepare('UPDATE room_inventory SET quantity = 0 WHERE player_id = 7702').run()
+			expect((await mine('7702')).items).toEqual([])
+
+			await env.DB.prepare('DELETE FROM room_inventory').run()
+			await env.DB.prepare('DELETE FROM room_balance WHERE currency_id = ?1').bind(coin).run()
+		})
+
+		test('PUT roomConsumable/:id/consume uses up one the caller holds', async () => {
+			const potion = (
+				await envOf(await save({ ...body, Name: 'Drinkable potion' }, await plusBearer('1')))
+			).Value!
+			await env.DB.prepare(
+				'INSERT INTO room_inventory (player_id, consumable_id, quantity) VALUES (7801, ?1, 2)'
+			)
+				.bind(potion.RoomConsumableId)
+				.run()
+
+			const consume = async (sub: string | null, consumableId: string, code: string) =>
+				exports.default.fetch(
+					`${ORIGIN}/api/roomconsumables/v1/roomConsumable/${consumableId}/consume`,
+					{
+						method: 'PUT',
+						headers: {
+							'Content-Type': 'application/json',
+							...(sub === null ? {} : await plusBearer(sub)),
+						},
+						body: JSON.stringify({
+							CurrentConcurrencyCode: '872adb91-b163-4f2c-aa8f-4f5d828078cb',
+							NewConcurrencyCode: code,
+						}),
+					}
+				)
+			const held = async () =>
+				(
+					await env.DB.prepare(
+						'SELECT quantity FROM room_inventory WHERE player_id = 7801 AND consumable_id = ?1'
+					)
+						.bind(potion.RoomConsumableId)
+						.first<{ quantity: number }>()
+				)?.quantity
+
+			expect((await consume(null, potion.RoomConsumableId, 'a')).status).toBe(401)
+
+			const res = await consume('7801', potion.RoomConsumableId, 'code-1')
+			expect(res.status).toBe(200)
+			expect(await res.json()).toEqual({
+				Status: 0,
+				InventoryItem: {
+					RoomConsumableId: potion.RoomConsumableId,
+					AccountId: 7801,
+					Count: 1,
+					ConcurrencyCode: 'code-1',
+					ModifiedAt: expect.any(String),
+					Consumable: { ...potion, ImageName: '', IsGiftable: false, Visibility: 0 },
+				},
+			})
+
+			// The last one answers Count 0; after that there is nothing to use.
+			const last = (await (await consume('7801', potion.RoomConsumableId, 'code-2')).json()) as {
+				Status: number
+				InventoryItem: { Count: number; ConcurrencyCode: string } | null
+			}
+			expect(last).toMatchObject({
+				Status: 0,
+				InventoryItem: { Count: 0, ConcurrencyCode: 'code-2' },
+			})
+			const refusal = { Status: 1, InventoryItem: null }
+			expect(await (await consume('7801', potion.RoomConsumableId, 'code-3')).json()).toEqual(
+				refusal
+			)
+			expect(await held()).toBe(0)
+			// Someone who never had one, and an unknown consumable, are refused too.
+			expect(await (await consume('7802', potion.RoomConsumableId, 'x')).json()).toEqual(refusal)
+			expect(await (await consume('7801', 'nope', 'x')).json()).toEqual(refusal)
+
+			await env.DB.prepare('DELETE FROM room_inventory').run()
+		})
+
 		test('GET roomConsumable/room/:id is public and empty for an unknown room', async () => {
 			expect(await shopOf(99999)).toEqual([])
 			const res = await exports.default.fetch(
@@ -1567,7 +2070,7 @@ describe('econ endpoints', () => {
 				{ ...body, RoomId: 'nope' },
 				{ ...body, Name: '  ' },
 			]) {
-				const res = await create(bad, await bearer('1'))
+				const res = await create(bad, await plusBearer('1'))
 				expect(res.status).toBe(200)
 				expect(await envOf(res)).toEqual({
 					Value: null,
@@ -1580,7 +2083,7 @@ describe('econ endpoints', () => {
 		})
 
 		test('POST createCurrency mints the currency and the list reads it back', async () => {
-			const res = await create(body, await bearer('1'))
+			const res = await create(body, await plusBearer('1'))
 			expect(res.status).toBe(200)
 
 			// Enveloped: the client unwraps it and hands its callers `Value` alone.
@@ -1633,7 +2136,7 @@ describe('econ endpoints', () => {
 		})
 
 		test('POST updateCurrency edits it, gated by the room that minted it', async () => {
-			const made = (await envOf(await create({ ...body, Name: 'Before' }, await bearer('1'))))
+			const made = (await envOf(await create({ ...body, Name: 'Before' }, await plusBearer('1'))))
 				.Value!
 
 			const update = async (fields: Record<string, string>, headers?: Record<string, string>) =>
@@ -1658,7 +2161,7 @@ describe('econ endpoints', () => {
 				{ CurrencyId: made.CurrencyId, Name: '   ' },
 			]
 			for (const bad of badEdits) {
-				const res = await update(bad, await bearer('1'))
+				const res = await update(bad, await plusBearer('1'))
 				expect(res.status).toBe(200)
 				expect(await envOf(res)).toEqual({
 					Value: null,
@@ -1682,7 +2185,7 @@ describe('econ endpoints', () => {
 					Shape: '9',
 					Color: '5',
 				},
-				await bearer('1')
+				await plusBearer('1')
 			)
 			expect(res.status).toBe(200)
 			const updated = (await envOf(res)).Value!
@@ -1718,13 +2221,13 @@ describe('econ endpoints', () => {
 			// And a name is masked on the way in, like it is on create.
 			const masked = await update(
 				{ CurrencyId: made.CurrencyId, Name: 'shit bucks' },
-				await bearer('1')
+				await plusBearer('1')
 			)
 			expect((await envOf(masked)).Value?.Name).toBe('**** bucks')
 		})
 
 		test('POST updateCurrency pushes RoomCurrencyModified to the room and the editor', async () => {
-			const made = (await envOf(await create({ ...body, Name: 'Watched' }, await bearer('1'))))
+			const made = (await envOf(await create({ ...body, Name: 'Watched' }, await plusBearer('1'))))
 				.Value!
 
 			const now = Math.floor(Date.now() / 1000)
@@ -1743,7 +2246,7 @@ describe('econ endpoints', () => {
 				method: 'POST',
 				headers: {
 					'Content-Type': 'application/x-www-form-urlencoded',
-					...(await bearer('1')),
+					...(await plusBearer('1')),
 				},
 				body: new URLSearchParams({ CurrencyId: made.CurrencyId, Name: 'Renamed' }),
 			})
@@ -1768,7 +2271,7 @@ describe('econ endpoints', () => {
 
 		test('POST awardCurrency/bulk credits players, reporting each entry on its own', async () => {
 			const coin = (
-				await envOf(await create({ ...body, Name: 'Payable', Limit: '10' }, await bearer('1')))
+				await envOf(await create({ ...body, Name: 'Payable', Limit: '10' }, await plusBearer('1')))
 			).Value!
 
 			type AwardResult = {
@@ -1819,7 +2322,7 @@ describe('econ endpoints', () => {
 			])
 
 			// The owner awards: the result names the entry and carries what the award did.
-			const res = await award(one, await bearer('1'))
+			const res = await award(one, await plusBearer('1'))
 			expect(res.status).toBe(200)
 			const results = await resultsOf(res)
 			expect(results).toHaveLength(1)
@@ -1867,7 +2370,7 @@ describe('econ endpoints', () => {
 					{ CurrencyId: coin.CurrencyId, RecipientId: 'nope', Amount: 1 },
 					{ CurrencyId: coin.CurrencyId, RecipientId: 205, Amount: 1 },
 				],
-				await bearer('1')
+				await plusBearer('1')
 			)
 			const mixedResults = await resultsOf(mixed)
 			expect(mixedResults.map((r) => r.Success)).toEqual([true, false, false, true])
@@ -1883,11 +2386,38 @@ describe('econ endpoints', () => {
 
 			// A body that is not a list of awards has no entries to report on.
 			for (const bad of [{ CurrencyId: coin.CurrencyId }, 'nope', null]) {
-				const res = await award(bad, await bearer('1'))
+				const res = await award(bad, await plusBearer('1'))
 				expect(res.status).toBe(200)
 				expect(await resultsOf(res)).toEqual([])
 			}
-			expect(await resultsOf(await award([], await bearer('1')))).toEqual([])
+			expect(await resultsOf(await award([], await plusBearer('1')))).toEqual([])
+
+			// getBalance reads back what the awards left, for any player the query names.
+			const balance = async (query: string, headers?: Record<string, string>) =>
+				exports.default.fetch(`${ORIGIN}/api/roomcurrencies/v1/getBalance?${query}`, { headers })
+			expect((await balance(`currencyId=${coin.CurrencyId}&accountId=205`)).status).toBe(401)
+			const read = await balance(`currencyId=${coin.CurrencyId}&accountId=205`, await bearer('999'))
+			expect(read.status).toBe(200)
+			const body205 = (await read.json()) as Record<string, unknown>
+			expect(Object.keys(body205)).toEqual(['AccountId', 'CurrencyId', 'Balance', 'ModifiedAt'])
+			expect(body205).toMatchObject({ AccountId: 205, CurrencyId: coin.CurrencyId, Balance: 6 })
+			expect(Date.parse(body205.ModifiedAt as string)).not.toBeNaN()
+			// Never paid, and an unknown currency, are both a balance of 0.
+			for (const query of [
+				`currencyId=${coin.CurrencyId}&accountId=207`,
+				'currencyId=a3f1e8d2-0000-4000-8000-000000000000&accountId=205',
+			]) {
+				expect(await (await balance(query, await plusBearer('1'))).json()).toMatchObject({
+					Balance: 0,
+				})
+			}
+			for (const query of [
+				`currencyId=${coin.CurrencyId}`,
+				'accountId=205',
+				`currencyId=${coin.CurrencyId}&accountId=x`,
+			]) {
+				expect((await balance(query, await plusBearer('1'))).status).toBe(400)
+			}
 		})
 
 		test('POST awardCurrency/bulk floors at zero and ignores the Limit', async () => {
@@ -1895,7 +2425,7 @@ describe('econ endpoints', () => {
 			// holdings — and nothing tracks a day's awards yet, so it must not bound a balance.
 			// It once did, which left every player of a Limit-3 currency stuck at 3 coins.
 			const capped = (
-				await envOf(await create({ ...body, Name: 'Limited', Limit: '3' }, await bearer('1')))
+				await envOf(await create({ ...body, Name: 'Limited', Limit: '3' }, await plusBearer('1')))
 			).Value!
 			const award = async (currencyId: string, recipientId: number, amount: number) =>
 				(
@@ -1904,7 +2434,7 @@ describe('econ endpoints', () => {
 							method: 'POST',
 							headers: {
 								'Content-Type': 'application/json',
-								...(await bearer('1')),
+								...(await plusBearer('1')),
 							},
 							body: JSON.stringify([
 								{ CurrencyId: currencyId, RecipientId: recipientId, Amount: amount },
@@ -1933,7 +2463,7 @@ describe('econ endpoints', () => {
 
 			// A `Limit` of 0 is no different from any other — it bounds nothing either way.
 			const unlimited = (
-				await envOf(await create({ RoomId: '2511', Name: 'Unlimited' }, await bearer('1')))
+				await envOf(await create({ RoomId: '2511', Name: 'Unlimited' }, await plusBearer('1')))
 			).Value!
 			expect(await landed(unlimited.CurrencyId, 212, 50_000)).toEqual({
 				Balance: 50_000,
@@ -1959,13 +2489,14 @@ describe('econ endpoints', () => {
 					)
 				).json()) as Group[]
 
-			const shopped = (await envOf(await create({ ...body, Name: 'Shopped' }, await bearer('1'))))
-				.Value!
+			const shopped = (
+				await envOf(await create({ ...body, Name: 'Shopped' }, await plusBearer('1')))
+			).Value!
 			const alsoShopped = (
-				await envOf(await create({ ...body, Name: 'AlsoShopped' }, await bearer('1')))
+				await envOf(await create({ ...body, Name: 'AlsoShopped' }, await plusBearer('1')))
 			).Value!
 			const unshopped = (
-				await envOf(await create({ ...body, Name: 'Unshopped' }, await bearer('1')))
+				await envOf(await create({ ...body, Name: 'Unshopped' }, await plusBearer('1')))
 			).Value!
 
 			// Seeded directly, deliberately out of `Order`, to prove the read sorts them.
@@ -2102,7 +2633,7 @@ describe('econ endpoints', () => {
 					method: 'POST',
 					headers: {
 						'Content-Type': 'application/x-www-form-urlencoded',
-						...(sub === null ? {} : await bearer(sub)),
+						...(sub === null ? {} : await plusBearer(sub)),
 					},
 					body: new URLSearchParams(fields),
 				})
@@ -2140,9 +2671,10 @@ describe('econ endpoints', () => {
 			}
 
 			// Two shops in room 2511, so the delete has to find the right one from the id alone.
-			const shopped = (await envOf(await create({ ...body, Name: 'Shopped' }, await bearer('1'))))
-				.Value!
-			const other = (await envOf(await create({ ...body, Name: 'Other' }, await bearer('1'))))
+			const shopped = (
+				await envOf(await create({ ...body, Name: 'Shopped' }, await plusBearer('1')))
+			).Value!
+			const other = (await envOf(await create({ ...body, Name: 'Other' }, await plusBearer('1'))))
 				.Value!
 			const first = await addOffer(shopped.CurrencyId, 'First', 0)
 			const second = await addOffer(shopped.CurrencyId, 'Second', 1)
@@ -2219,7 +2751,7 @@ describe('econ endpoints', () => {
 
 			// Account 1 owns the room but is NOT standing in it — the settings UI opens from
 			// anywhere, so the creator is added to the audience separately.
-			const res = await create({ ...body, Name: 'Broadcast bucks' }, await bearer('1'))
+			const res = await create({ ...body, Name: 'Broadcast bucks' }, await plusBearer('1'))
 			expect(res.status).toBe(200)
 			const created = (await envOf(res)).Value!
 
@@ -2251,7 +2783,7 @@ describe('econ endpoints', () => {
 		})
 
 		test('POST createCurrency masks a name players will see, and defaults the rest', async () => {
-			const res = await create({ RoomId: '2511', Name: 'shit bucks' }, await bearer('1'))
+			const res = await create({ RoomId: '2511', Name: 'shit bucks' }, await plusBearer('1'))
 			expect(res.status).toBe(200)
 			const created = (await envOf(res)).Value!
 			// Masked per character like every other player-typed string (see the gift message
@@ -2266,7 +2798,7 @@ describe('econ endpoints', () => {
 			// long. Neither may be clamped or dropped on the way through.
 			const res = await create(
 				{ RoomId: '2511', Name: 'Uncoloured', Limit: '1000000', Color: '-1' },
-				await bearer('1')
+				await plusBearer('1')
 			)
 			expect(res.status).toBe(200)
 			expect((await envOf(res)).Value).toMatchObject({ Limit: 1000000, Color: -1 })
@@ -2278,7 +2810,7 @@ describe('econ endpoints', () => {
 					method: 'POST',
 					headers: {
 						'Content-Type': 'application/x-www-form-urlencoded',
-						...(sub === null ? {} : await bearer(sub)),
+						...(sub === null ? {} : await plusBearer(sub)),
 					},
 					body: new URLSearchParams(fields),
 				})
@@ -2337,9 +2869,10 @@ describe('econ endpoints', () => {
 			})
 
 			// Two currencies in room 2511 (account 1's), so the offer has to pick the right one.
-			const other = (await envOf(await create({ ...body, Name: 'Other' }, await bearer('1'))))
+			const other = (await envOf(await create({ ...body, Name: 'Other' }, await plusBearer('1'))))
 				.Value!
-			const sold = (await envOf(await create({ ...body, Name: 'Sold' }, await bearer('1')))).Value!
+			const sold = (await envOf(await create({ ...body, Name: 'Sold' }, await plusBearer('1'))))
+				.Value!
 			await addOffer(other.CurrencyId, 444, 1)
 			const offerId = await addOffer(sold.CurrencyId, 444, 555)
 			const freeOfferId = await addOffer(sold.CurrencyId, 5, 0)
@@ -2529,7 +3062,7 @@ describe('econ endpoints', () => {
 				{ ...body, RoomId: 'nope' },
 				{ ...body, Name: '  ' },
 			]) {
-				const res = await create(bad, await bearer('1'))
+				const res = await create(bad, await plusBearer('1'))
 				expect(res.status).toBe(200)
 				expect(await envOf(res)).toEqual({ Status: 1, RoomKey: null })
 			}
@@ -2537,7 +3070,7 @@ describe('econ endpoints', () => {
 		})
 
 		test('POST create lists the key and the room read serves it back', async () => {
-			const res = await create(body, await bearer('1'))
+			const res = await create(body, await plusBearer('1'))
 			expect(res.status).toBe(200)
 			const envelope = await envOf(res)
 			expect(Object.keys(envelope)).toEqual(['Status', 'RoomKey'])
@@ -2581,7 +3114,7 @@ describe('econ endpoints', () => {
 			expect(await keysOf(2511)).toEqual([created])
 
 			// A co-owner may list one too, and the list is oldest first.
-			const second = await keyOf(await create({ ...body, Name: 'second' }, await bearer('2')))
+			const second = await keyOf(await create({ ...body, Name: 'second' }, await plusBearer('2')))
 			expect(second.RoomKeyId).toBeGreaterThan(created.RoomKeyId)
 			expect((await keysOf(2511)).map((k) => k.Name)).toEqual(['my key', 'second'])
 		})
@@ -2602,7 +3135,7 @@ describe('econ endpoints', () => {
 			await putInRoom(321, 1)
 			await drainFrames()
 
-			const created = await keyOf(await create({ ...body, Name: 'pushed' }, await bearer('1')))
+			const created = await keyOf(await create({ ...body, Name: 'pushed' }, await plusBearer('1')))
 			const frames = await drainFrames()
 			expect(frames.map((f) => f.accountId).sort((a, b) => a - b)).toEqual([1, 320])
 			expect(frames.every((f) => f.notificationType === NotificationType.LocalRoomKeyCreated)).toBe(
@@ -2617,7 +3150,7 @@ describe('econ endpoints', () => {
 		})
 
 		test('POST create masks a name players will see, and defaults the rest', async () => {
-			const res = await create({ RoomId: '2511', Name: 'shit key' }, await bearer('1'))
+			const res = await create({ RoomId: '2511', Name: 'shit key' }, await plusBearer('1'))
 			const created = await keyOf(res)
 			expect(created.Name).toBe('**** key')
 			expect(created).toMatchObject({ Description: '', Price: 0, Type: 0 })
@@ -2626,7 +3159,7 @@ describe('econ endpoints', () => {
 				.first<{ key_type: string }>()
 			expect(row?.key_type).toBe('Key')
 			// A negative price is floored at nothing.
-			const free = await keyOf(await create({ ...body, Price: '-5' }, await bearer('1')))
+			const free = await keyOf(await create({ ...body, Price: '-5' }, await plusBearer('1')))
 			expect(free.Price).toBe(0)
 		})
 
@@ -2644,7 +3177,7 @@ describe('econ endpoints', () => {
 					).all<{ room_key_id: number; account_id: number; awarded_at: string }>()
 				).results
 
-			const key = await keyOf(await create({ ...body, Name: 'awarded' }, await bearer('1')))
+			const key = await keyOf(await create({ ...body, Name: 'awarded' }, await plusBearer('1')))
 			const id = key.RoomKeyId
 
 			// Auth-gated.
@@ -2699,7 +3232,7 @@ describe('econ endpoints', () => {
 					body: JSON.stringify(payload),
 				})
 
-			const key = await keyOf(await create({ ...body, Name: 'held' }, await bearer('1')))
+			const key = await keyOf(await create({ ...body, Name: 'held' }, await plusBearer('1')))
 			const id = key.RoomKeyId
 			await post('awardbulk', [{ RoomKeyId: id, AccountId: 42 }], await bearer('42'))
 
@@ -2736,11 +3269,11 @@ describe('econ endpoints', () => {
 		test('POST create refuses the eleventh key in a room', async () => {
 			// MaxKeysPerRoom is 10 (apps/api/static/api-config-v2.json). Fill up to it…
 			while ((await keysOf(2511)).length < 10) {
-				const res = await create({ ...body, Name: 'filler' }, await bearer('1'))
+				const res = await create({ ...body, Name: 'filler' }, await plusBearer('1'))
 				expect((await envOf(res)).Status).toBe(0)
 			}
 			// …and the next is refused, leaving the room at ten.
-			const res = await create({ ...body, Name: 'one too many' }, await bearer('1'))
+			const res = await create({ ...body, Name: 'one too many' }, await plusBearer('1'))
 			expect(res.status).toBe(200)
 			expect(await envOf(res)).toEqual({ Status: 1, RoomKey: null })
 			expect((await keysOf(2511)).length).toBe(10)
@@ -2748,9 +3281,9 @@ describe('econ endpoints', () => {
 		})
 
 		test('POST create refuses a token price over 1000', async () => {
-			const atCap = await create({ ...body, Price: '1000' }, await bearer('1'))
+			const atCap = await create({ ...body, Price: '1000' }, await plusBearer('1'))
 			expect((await envOf(atCap)).Status).toBe(0)
-			const over = await create({ ...body, Price: '1001' }, await bearer('1'))
+			const over = await create({ ...body, Price: '1001' }, await plusBearer('1'))
 			expect(await envOf(over)).toEqual({ Status: 1, RoomKey: null })
 			await env.DB.prepare('DELETE FROM room_key').run()
 		})
@@ -2776,8 +3309,8 @@ describe('econ endpoints', () => {
 					).json()) as { Value: { CurrencyId: string } }
 				).Value.CurrencyId
 
-			const key = await keyOf(await create(body, await bearer('1')))
-			const other = await keyOf(await create({ ...body, Name: 'other' }, await bearer('1')))
+			const key = await keyOf(await create(body, await plusBearer('1')))
+			const other = await keyOf(await create({ ...body, Name: 'other' }, await plusBearer('1')))
 			const id = String(key.RoomKeyId)
 			// The body exactly as the client puts it.
 			const edit = {
@@ -2793,29 +3326,29 @@ describe('econ endpoints', () => {
 			expect((await update(edit, await bearer('42'))).status).toBe(403)
 
 			// In tokens: 1000 passes, 1001 does not. A co-owner may edit.
-			const res = await update(edit, await bearer('2'))
+			const res = await update(edit, await plusBearer('2'))
 			expect(res.status).toBe(200)
 			expect(await envOf(res)).toEqual({
 				Status: 0,
 				RoomKey: { ...key, Name: 'key1', Description: 'testssdfsdfsdf', Price: 1000 },
 			})
-			expect(await envOf(await update({ ...edit, Price: '1001' }, await bearer('1')))).toEqual(
+			expect(await envOf(await update({ ...edit, Price: '1001' }, await plusBearer('1')))).toEqual(
 				refused
 			)
 
 			// In the room's own currency the cap is a billion.
 			const currencyId = await mint('2511', '1')
 			const rich = { ...edit, Price: '1000000000', PurchaseCurrencyId: currencyId }
-			expect((await envOf(await update(rich, await bearer('1')))).RoomKey).toMatchObject({
+			expect((await envOf(await update(rich, await plusBearer('1')))).RoomKey).toMatchObject({
 				Price: 1000000000,
 				PurchaseCurrencyId: currencyId,
 			})
 			expect(
-				await envOf(await update({ ...rich, Price: '1000000001' }, await bearer('1')))
+				await envOf(await update({ ...rich, Price: '1000000001' }, await plusBearer('1')))
 			).toEqual(refused)
 			// Back to tokens with the big price still on it: the token cap applies again.
 			expect(
-				await envOf(await update({ RoomKeyId: id, PurchaseCurrencyId: '' }, await bearer('1')))
+				await envOf(await update({ RoomKeyId: id, PurchaseCurrencyId: '' }, await plusBearer('1')))
 			).toEqual(refused)
 
 			// Refusals: no such key, a blank name, an unknown currency.
@@ -2824,7 +3357,7 @@ describe('econ endpoints', () => {
 				{ ...edit, Name: '  ' },
 				{ ...edit, PurchaseCurrencyId: '46eddc63-e6d4-42cc-bf04-5d879e33ac17' },
 			]) {
-				expect(await envOf(await update(bad, await bearer('1')))).toEqual(refused)
+				expect(await envOf(await update(bad, await plusBearer('1')))).toEqual(refused)
 			}
 
 			// Only the named key moved, and the refused edits left it as the last good one.
@@ -2852,7 +3385,7 @@ describe('econ endpoints', () => {
 						method: 'PUT',
 						headers: {
 							'Content-Type': 'application/x-www-form-urlencoded',
-							...(await bearer('1')),
+							...(await plusBearer('1')),
 						},
 						body: new URLSearchParams(fields),
 					})
@@ -2870,14 +3403,14 @@ describe('econ endpoints', () => {
 						method: 'POST',
 						headers: {
 							'Content-Type': 'application/x-www-form-urlencoded',
-							...(await bearer('1')),
+							...(await plusBearer('1')),
 						},
 						body: new URLSearchParams({ RoomId: '2511', Name: 'coin' }),
 					})
 				).json()) as { Value: { CurrencyId: string } }
 			).Value.CurrencyId
 
-			const key = await keyOf(await create(body, await bearer('1')))
+			const key = await keyOf(await create(body, await plusBearer('1')))
 			const id = String(key.RoomKeyId)
 			expect(key).toMatchObject({ PurchaseCurrencyId: null, ImageName: null })
 
@@ -2926,7 +3459,7 @@ describe('econ endpoints', () => {
 				exports.default.fetch(
 					`${ORIGIN}/api/storefronts/v1/buyRoomKey?RoomKeyId=${roomKeyId}` +
 						(price === undefined ? '' : `&RequestedPrice=${price}`),
-					sub === null ? undefined : { headers: await bearer(sub) }
+					sub === null ? undefined : { headers: await plusBearer(sub) }
 				)
 			const setTokens = (accountId: number, amount: number) =>
 				env.DB.prepare(
@@ -2962,9 +3495,9 @@ describe('econ endpoints', () => {
 			})
 
 			// Room 2511 is account 1's. A 300-token key, and a free one.
-			const key = await keyOf(await create({ ...body, Price: '300' }, await bearer('1')))
+			const key = await keyOf(await create({ ...body, Price: '300' }, await plusBearer('1')))
 			const free = await keyOf(
-				await create({ ...body, Name: 'free', Price: '0' }, await bearer('1'))
+				await create({ ...body, Name: 'free', Price: '0' }, await plusBearer('1'))
 			)
 			await setTokens(1, 1000)
 			await setTokens(7301, 500)
@@ -3028,7 +3561,8 @@ describe('econ endpoints', () => {
 			expect(await (await buy('7301', key.RoomKeyId, 300)).json()).toEqual(refused(3, key, 200))
 			expect([await tokens(1), await tokens(7301)]).toEqual([1300, 200])
 
-			// A free key moves nothing; nor does the owner buying their own room's key.
+			// A free key moves nothing; nor does a room manager buying their own room's key —
+			// the owner at the stored price, or a co-owner at the 0 the client asks them.
 			const gratis = (await (await buy('7302', free.RoomKeyId)).json()) as {
 				RoomKeyResponse: { Status: number }
 				BalanceUpdateResponse: { Balance: number }
@@ -3038,7 +3572,12 @@ describe('econ endpoints', () => {
 			const own = (await (await buy('1', key.RoomKeyId, 300)).json()) as typeof gratis
 			expect(own.RoomKeyResponse.Status).toBe(0)
 			expect(own.BalanceUpdateResponse.Balance).toBe(1300)
-			expect(await holders(key.RoomKeyId)).toEqual([1, 7301])
+			await setTokens(2, 50)
+			const coOwner = (await (await buy('2', key.RoomKeyId, 0)).json()) as typeof gratis
+			expect(coOwner.RoomKeyResponse.Status).toBe(0)
+			expect(coOwner.BalanceUpdateResponse.Balance).toBe(50)
+			expect(await holders(key.RoomKeyId)).toEqual([1, 2, 7301])
+			expect([await tokens(1), await tokens(2)]).toEqual([1300, 50])
 			expect(await drainFrames()).toEqual([])
 
 			// A key priced in a room currency is not sold for tokens.
@@ -3067,7 +3606,7 @@ describe('econ endpoints', () => {
 					method,
 					headers: {
 						'Content-Type': 'application/x-www-form-urlencoded',
-						...(sub === null ? {} : await bearer(sub)),
+						...(sub === null ? {} : await plusBearer(sub)),
 					},
 					body: new URLSearchParams(fields),
 				})
@@ -3136,7 +3675,7 @@ describe('econ endpoints', () => {
 			// A key priced at 1000 of the room's own currency; a second currency; a token key.
 			const coin = await mint('coin')
 			const other = await mint('other')
-			const made = await keyOf(await create(body, await bearer('1')))
+			const made = await keyOf(await create(body, await plusBearer('1')))
 			const key = (
 				await envOf(
 					await form(
@@ -3148,7 +3687,9 @@ describe('econ endpoints', () => {
 				)
 			).RoomKey!
 			expect(key).toMatchObject({ Price: 1000, PurchaseCurrencyId: coin })
-			const tokenKey = await keyOf(await create({ ...body, Name: 'token key' }, await bearer('1')))
+			const tokenKey = await keyOf(
+				await create({ ...body, Name: 'token key' }, await plusBearer('1'))
+			)
 			await give(coin, 7501, 1500)
 			await give(other, 7501, 5000)
 			await give(coin, 7502, 999)
@@ -3206,6 +3747,24 @@ describe('econ endpoints', () => {
 			)
 			expect(await held(coin, 7501)).toBe(500)
 
+			// A non-manager cannot buy it for 0; the room's managers can — the co-owner at the 0
+			// the client asks them, the owner at the stored price — and nothing is subtracted.
+			expect(await (await purchase('7502', key.RoomKeyId, 0, coin)).json()).toEqual(
+				refused(7502, coin, 999)
+			)
+			await give(coin, 2, 10)
+			const coOwner = (await (await purchase('2', key.RoomKeyId, 0, coin)).json()) as {
+				Balance: { Balance: number }
+				RoomKeyResponse: { Status: number }
+			}
+			expect(coOwner.RoomKeyResponse.Status).toBe(0)
+			expect(coOwner.Balance.Balance).toBe(10)
+			const own = (await (await purchase('1', key.RoomKeyId, 1000, coin)).json()) as typeof coOwner
+			expect(own.RoomKeyResponse.Status).toBe(0)
+			expect(own.Balance.Balance).toBe(0)
+			expect(await holders(key.RoomKeyId)).toEqual([1, 2, 7501])
+			expect([await held(coin, 1), await held(coin, 2)]).toEqual([0, 10])
+
 			await env.DB.prepare('DELETE FROM room_key_player').run()
 			await env.DB.prepare('DELETE FROM room_key').run()
 			await env.DB.prepare('DELETE FROM room_balance WHERE currency_id IN (?1, ?2)')
@@ -3217,12 +3776,112 @@ describe('econ endpoints', () => {
 		})
 	})
 
-	test('GET /api/roomconsumables/v1/roomConsumable/room/:id/me returns []', async () => {
-		const res = await exports.default.fetch(
-			`${ORIGIN}/api/roomconsumables/v1/roomConsumable/room/1/me`
-		)
-		expect(res.status).toBe(200)
-		expect(await res.json()).toEqual([])
+	// Selling for TOKENS is a Rec Room Plus perk: a room manager without `rn.plus` may not put
+	// a non-zero token price on a room key, a room consumable or a currency purchase offer.
+	// A room-currency price, or a free listing, is open to every manager. Room 2511 is
+	// account 1's.
+	test('a token price on a room key, consumable or currency offer needs Rec Room Plus', async () => {
+		const send = async (
+			method: string,
+			path: string,
+			body: BodyInit,
+			type: string,
+			plus: boolean
+		) =>
+			exports.default.fetch(`${ORIGIN}${path}`, {
+				method,
+				headers: {
+					'Content-Type': type,
+					...(await (plus ? plusBearer('1') : bearer('1'))),
+				},
+				body,
+			})
+		const formSend = (method: string, path: string, fields: Record<string, string>, plus = false) =>
+			send(method, path, new URLSearchParams(fields), 'application/x-www-form-urlencoded', plus)
+		const jsonSend = (path: string, payload: unknown, plus = false) =>
+			send('PUT', path, JSON.stringify(payload), 'application/json', plus)
+
+		const coin = (
+			(await (
+				await formSend('POST', '/api/roomcurrencies/v1/createCurrency', {
+					RoomId: '2511',
+					Name: 'plus coin',
+				})
+			).json()) as { Value: { CurrencyId: string } }
+		).Value.CurrencyId
+
+		// Room keys: a create is always priced in tokens.
+		const keyPath = '/api/roomkeys/v1/create'
+		const key = { RoomId: '2511', Name: 'gate key', Price: '50' }
+		expect((await formSend('POST', keyPath, key)).status).toBe(403)
+		expect((await formSend('POST', keyPath, { ...key, Price: '0' })).status).toBe(200)
+		const free = (
+			(await (await formSend('POST', keyPath, { ...key, Price: '0' })).json()) as {
+				RoomKey: { RoomKeyId: number }
+			}
+		).RoomKey
+		const update = (fields: Record<string, string>) =>
+			formSend('PUT', '/api/roomkeys/v1/updateAll', {
+				RoomKeyId: String(free.RoomKeyId),
+				...fields,
+			})
+		// An edit to a token price is refused; onto the room's currency it is not.
+		expect((await update({ Price: '50' })).status).toBe(403)
+		expect((await update({ Price: '50', PurchaseCurrencyId: coin })).status).toBe(200)
+		// Taking it back off the currency at that price would make it a token key.
+		expect((await update({ PurchaseCurrencyId: '' })).status).toBe(403)
+		expect((await formSend('POST', keyPath, key, true)).status).toBe(200)
+		// A key CREATED on the room's currency needs no Plus, and is stored on it.
+		const onCoin = await formSend('POST', keyPath, {
+			...key,
+			Type: 'Key',
+			Description: 'coin key',
+			Price: '10',
+			PurchaseCurrencyId: coin,
+		})
+		expect(onCoin.status).toBe(200)
+		expect(
+			((await onCoin.json()) as { RoomKey: { Price: number; PurchaseCurrencyId: string } }).RoomKey
+		).toMatchObject({ Price: 10, PurchaseCurrencyId: coin })
+		// A room currency lifts the token cap, and a currency of another room is refused.
+		expect(
+			(
+				(await (
+					await formSend('POST', keyPath, { ...key, Price: '5000', PurchaseCurrencyId: coin })
+				).json()) as { Status: number }
+			).Status
+		).toBe(0)
+		expect(
+			await (
+				await formSend('POST', keyPath, { ...key, PurchaseCurrencyId: crypto.randomUUID() })
+			).json()
+		).toEqual({ Status: 1, RoomKey: null })
+		await env.DB.prepare('DELETE FROM room_key WHERE room_id = 2511').run()
+
+		// Room consumables: CurrencyId null is a token price.
+		const consumablePath = '/api/roomconsumables/v1/roomConsumable'
+		const listing = (price: number, currencyId: string | null) => ({
+			RoomConsumableId: null,
+			RoomId: 2511,
+			Name: 'gate snack',
+			Description: '',
+			PriceAndCurrency: { Price: price, CurrencyId: currencyId },
+		})
+		expect((await jsonSend(consumablePath, listing(50, null))).status).toBe(403)
+		expect((await jsonSend(consumablePath, listing(50, coin))).status).toBe(200)
+		expect((await jsonSend(consumablePath, listing(0, null))).status).toBe(200)
+		expect((await jsonSend(consumablePath, listing(50, null), true)).status).toBe(200)
+
+		// Currency purchase offers are always paid in tokens.
+		const offerPath = '/api/roomcurrencies/v1/createPurchaseOffer'
+		const offer = { CurrencyId: coin, Name: 'pack', Amount: '5', Price: '50' }
+		expect((await formSend('POST', offerPath, offer)).status).toBe(403)
+		expect((await formSend('POST', offerPath, { ...offer, Price: '0' })).status).toBe(200)
+		expect((await formSend('POST', offerPath, offer, true)).status).toBe(200)
+
+		await env.DB.prepare('DELETE FROM room_key WHERE room_id = 2511').run()
+		await env.DB.prepare('DELETE FROM room_consumable WHERE room_id = 2511').run()
+		await env.DB.prepare('DELETE FROM room_currency WHERE currency_id = ?1').bind(coin).run()
 	})
 
 	test('GET /api/roomcurrencies/v1/getAllBalances returns []', async () => {
@@ -3266,6 +3925,7 @@ describe('econ endpoints', () => {
 			Name: 'VIP Key',
 			Description: '',
 			Price: 250,
+			PurchaseCurrencyId: null,
 		})
 		const consumable = await upsertRoomConsumable(env.DB, null, {
 			RoomId: 93,
@@ -3336,6 +3996,14 @@ describe('econ endpoints', () => {
 		])
 		// Another room's shop is untouched.
 		expect(await shop(92)).toEqual([])
+	})
+
+	test('2026 room-offer purchase counts use the captured result envelope', async () => {
+		const res = await exports.default.fetch(`${ORIGIN}/econ/roomOffer/room/92/purchaseCounts`, {
+			headers: await bearer('42', undefined, '20260323.14'),
+		})
+		expect(res.status).toBe(200)
+		expect(await res.json()).toEqual({ Value: [], Success: true, Error: null, error_id: null })
 	})
 
 	test('POST /api/ugcPurchasables/v1/items/bulk resolves custom avatar items, echoing RoomId', async () => {
@@ -3674,6 +4342,57 @@ describe('econ endpoints', () => {
 		])
 	})
 
+	test('POST /api/storefronts/v1/purchasableitems answers the served listings verbatim', async () => {
+		// One listing of each kind the catalog holds, loaded exactly as `runx catalog load` would.
+		const pick = (pred: (l: StoreListing) => boolean) => storeListings.find(pred)!
+		const wanted = [
+			pick((l) => l.PurchasableItemId === 2594), // an avatar item
+			pick((l) => l.GiftDrop.ConsumableItemDesc !== ''),
+			pick((l) => l.GiftDrop.EquipmentModificationGuid !== ''),
+			pick((l) => (l.GiftDrop.CustomAvatarItemId ?? '') !== ''),
+		]
+		const ids = new Set(wanted.map((l) => l.PurchasableItemId))
+		const rows = buildCatalogLoad(storeListings).rows.filter((r) => ids.has(r.id))
+		expect(rows).toHaveLength(wanted.length)
+		await env.DB.batch(
+			rows.map((row) =>
+				env.DB.prepare(
+					`INSERT OR REPLACE INTO catalog (${CATALOG_INSERT_COLUMNS.join(', ')})
+					 VALUES (${CATALOG_INSERT_COLUMNS.map((_, i) => `?${i + 1}`).join(', ')})`
+				).bind(...row.values.map((v) => v ?? null))
+			)
+		)
+
+		// Request order, unknown ids and repeats dropped, `GiftDropIds` ignored. No token needed.
+		const order = [...wanted].reverse().map((l) => l.PurchasableItemId)
+		const res = await exports.default.fetch(`${ORIGIN}/api/storefronts/v1/purchasableitems`, {
+			method: 'POST',
+			headers: { 'content-type': 'application/json' },
+			body: JSON.stringify({
+				PurchasableItemIds: [order[0], 12_345_678, ...order, order[1]],
+				GiftDropIds: null,
+			}),
+		})
+		expect(res.status).toBe(200)
+		const body = (await res.json()) as StoreListing[]
+		expect(body).toEqual(order.map((id) => storeListings.find((l) => l.PurchasableItemId === id)))
+		expect(body.at(-1)?.GiftDrop.FriendlyName).toBe('Hot Dog Suit (Ketchup)')
+
+		// Null ids answer an empty list; a non-array is a malformed body.
+		const none = await exports.default.fetch(`${ORIGIN}/api/storefronts/v1/purchasableitems`, {
+			method: 'POST',
+			headers: { 'content-type': 'application/json' },
+			body: JSON.stringify({ PurchasableItemIds: null, GiftDropIds: null }),
+		})
+		expect(await none.json()).toEqual([])
+		const bad = await exports.default.fetch(`${ORIGIN}/api/storefronts/v1/purchasableitems`, {
+			method: 'POST',
+			headers: { 'content-type': 'application/json' },
+			body: JSON.stringify({ PurchasableItemIds: 2594 }),
+		})
+		expect(bad.status).toBe(400)
+	})
+
 	test('POST /api/items/purchaseInfos 400s without Ids and 401s without a token', async () => {
 		const bad = await exports.default.fetch(`${ORIGIN}/api/items/purchaseInfos`, {
 			method: 'POST',
@@ -3687,6 +4406,47 @@ describe('econ endpoints', () => {
 			body: JSON.stringify({ Ids: [] }),
 		})
 		expect(anon.status).toBe(401)
+	})
+
+	test('GET /paintball-battle-pass/config serves the stub season', async () => {
+		const res = await exports.default.fetch(`${ORIGIN}/paintball-battle-pass/config`)
+		expect(res.status).toBe(200)
+		const config = (await res.json()) as Record<string, unknown>
+		expect(config).toMatchObject({
+			BattlePassId: 1,
+			Name: 'Season 1',
+			ValidRoomIds: [112],
+			Levels: [{ XpRequired: 100, RewardGiftDropIds: [1] }],
+			EventXP: { '1': 10, '2': 25, '3': 50, '4': 100 },
+			PermanentBoostTokenPrice: 500,
+		})
+	})
+
+	test('POST /api/timedCurrencyGrants/update serves the stub grant', async () => {
+		const res = await exports.default.fetch(`${ORIGIN}/api/timedCurrencyGrants/update`, {
+			method: 'POST',
+		})
+		expect(res.status).toBe(200)
+		expect(await res.json()).toEqual({
+			TimedCurrencyGrantId: 1,
+			Name: 'Daily Tokens',
+			StartTime: '2026-10-01T00:00:00Z',
+			EndTime: '2026-12-01T00:00:00Z',
+			CurrencyType: 0,
+			OfflineRatePerHour: 1,
+			OnlineRatePerHour: 5,
+			ActiveExperiment: null,
+		})
+	})
+
+	test('POST /api/distanceMovedRewardTracks/distance is a stub: answers an empty 200', async () => {
+		const res = await exports.default.fetch(`${ORIGIN}/api/distanceMovedRewardTracks/distance`, {
+			method: 'POST',
+			headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+			body: 'distanceMeters=12.5',
+		})
+		expect(res.status).toBe(200)
+		expect(await res.text()).toBe('')
 	})
 
 	test('GET /econ/roomEconConfig/:roomId echoes the room and disables sorting tabs', async () => {
@@ -3705,12 +4465,61 @@ describe('econ endpoints', () => {
 		expect(bad.status).toBe(400)
 	})
 
+	test('2026 owned built-in consumables include the definition identity flag', async () => {
+		await grantConsumable(env.DB, 9731, 'test-built-in', 3)
+		try {
+			for (const version of ['20260323.14', '20250718.01']) {
+				const res = await exports.default.fetch(`${ORIGIN}/api/consumables/v2/getUnlocked`, {
+					headers: await bearer('9731', undefined, version),
+				})
+				expect(res.status).toBe(200)
+				const [item] = (await res.json()) as Array<Record<string, unknown>>
+				expect(item.Count).toBe(3)
+				if (version === '20260323.14') expect(item.IsRRO).toBe(true)
+				else expect(item).not.toHaveProperty('IsRRO')
+			}
+		} finally {
+			await env.DB.prepare('DELETE FROM consumable WHERE account_id = ?').bind(9731).run()
+		}
+	})
+
+	test('GET /api/consumables/v1/all serves the consumable definitions', async () => {
+		const res = await exports.default.fetch(`${ORIGIN}/api/consumables/v1/all?supportedVersion=2`)
+		expect(res.status).toBe(200)
+		const body = await res.json<Array<Record<string, unknown>>>()
+		expect(body.length).toBeGreaterThan(0)
+		expect(body[0]).toMatchObject({
+			ConsumableItemId: 1,
+			ConsumableItemDesc: 'frOMH6WxDEG1fBqC4_83vg',
+			FriendlyName: 'Black & White Camera Film',
+		})
+		// ConfigurationData is JSON escaped into a string (or null), never a nested object.
+		for (const item of body) {
+			expect(item.ConfigurationData === null || typeof item.ConfigurationData === 'string').toBe(
+				true
+			)
+		}
+	})
+
 	test('GET /api/consumables/v2/getUnlocked 401s without a token, returns []', async () => {
 		const anon = await exports.default.fetch(`${ORIGIN}/api/consumables/v2/getUnlocked`)
 		expect(anon.status).toBe(401)
 		const res = await exports.default.fetch(`${ORIGIN}/api/consumables/v2/getUnlocked`, {
 			headers: await bearer(),
 		})
+		expect(res.status).toBe(200)
+		expect(await res.json()).toEqual([])
+	})
+
+	test('POST /api/consumables/v1/query/bulk is a stub: resolves nothing, answers []', async () => {
+		const res = await exports.default.fetch(
+			`${ORIGIN}/api/consumables/v1/query/bulk?configurationVersion=2`,
+			{
+				method: 'POST',
+				headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+				body: 'descriptors=xfeDIDboPES-AS90CCn2xQ&descriptors=test_bad',
+			}
+		)
 		expect(res.status).toBe(200)
 		expect(await res.json()).toEqual([])
 	})
@@ -3924,7 +4733,7 @@ describe('econ endpoints', () => {
 		expect((await store(await at('not-a-build'))).StoreItems).toHaveLength(sf3.StoreItems.length)
 
 		// Later builds get the 2025 store — bigger, and still storefront 3.
-		for (const version of ['20230616', '20250424.01', '20250718.01']) {
+		for (const version of ['20230616', '20250424.01', '20250718.01', '20260323.14']) {
 			const newer = await store(await at(version))
 			expect(newer.StorefrontType, version).toBe(3)
 			expect(newer.StoreItems.length, version).toBe(sf32025.StoreItems.length)
@@ -4208,7 +5017,7 @@ describe('econ endpoints', () => {
 	})
 
 	test('POST /api/storefronts/v2/buyItem grants a consumable and stacks on re-buy', async () => {
-		// Item 2266 (Supreme Pizza) in storefront 300 is a consumable — its gift-drop
+		// Item 574 (Supreme Pizza) in storefront 300 is a consumable — its gift-drop
 		// carries a ConsumableItemDesc, not an AvatarItemDesc.
 		const consumableDesc = 'wUCIKdJSvEmiQHYMyx4X4w'
 		const buy = async () =>
@@ -4217,7 +5026,7 @@ describe('econ endpoints', () => {
 				headers: { ...(await bearer('25')), 'Content-Type': 'application/json' },
 				body: JSON.stringify({
 					StorefrontType: 300,
-					PurchasableItemId: 2266,
+					PurchasableItemId: 574,
 					CurrencyType: 2,
 					RequestedPrice: 95,
 				}),
@@ -4377,7 +5186,7 @@ describe('econ endpoints', () => {
 		expect(await bal.json()).toEqual([{ CurrencyType: 2, Platform: -2, Balance: 10000 }])
 	})
 
-	// sf300's item 2263 is 95 tokens in `Prices` and 85 in `SubscriberPrices`. A subscriber's
+	// sf300's item 2089 is 95 tokens in `Prices` and 85 in `SubscriberPrices`. A subscriber's
 	// client applies the Plus discount itself, but not to every item, so the server takes any
 	// price in the band [85, 95] from a subscriber and charges what they asked to pay.
 	const buy2263 = async (headers: Record<string, string>, RequestedPrice: number) =>
@@ -4386,7 +5195,7 @@ describe('econ endpoints', () => {
 			headers: { ...headers, 'Content-Type': 'application/json' },
 			body: JSON.stringify({
 				StorefrontType: 300,
-				PurchasableItemId: 2263,
+				PurchasableItemId: 2089,
 				CurrencyType: 2,
 				RequestedPrice,
 				CouponConsumablePlayerMappingId: null,
@@ -4990,6 +5799,46 @@ describe('econ endpoints', () => {
 		})
 		const list = (await items.json()) as Array<{ friendlyName: string }>
 		expect(list[0].friendlyName).toBe(SF3_ITEM.name)
+	})
+
+	test('POST /api/items/bulkpurchase announces a box-less consumable with ConsumableMappingAdded', async () => {
+		// No box means nothing is ever opened to announce the consumable, so the bag announces it
+		// at grant time — without this it didn't show in the client until an inventory refetch.
+		// 2182 is a consumable; three copies stack into one granted row.
+		await drainFrames()
+		const res = await bulkPurchase('951', {
+			BypassGiftPackages: true,
+			PurchaseItemRequests: [line(2182, 100, { DuplicateItemCount: 3 })],
+		})
+		expect(((await res.json()) as BulkBody).Success).toBe(true)
+		const added = (await drainFrames()).filter(
+			(f) => f.notificationType === NotificationType.ConsumableMappingAdded
+		)
+		expect(added).toHaveLength(1)
+		const [frame] = added
+		expect(frame!.accountId).toBe(951)
+		expect(frame!.payload).toMatchObject({
+			// The item's own desc, as the store it was bought from (2023 sf3: Assorted Donuts)
+			// lists it — 2026 applies the frame only for a desc it knows.
+			ConsumableItemDesc: 'ZuvkidodzkuOfGLDnTOFyg',
+			Count: 3,
+			InitialCount: 0,
+			IsActive: false,
+			IsTransferable: false,
+			ActivatedByRoomie: false,
+			// Must equal the definition's (consumables.json: true) or 2026 throws and drops it.
+			IsRRO: true,
+		})
+		expect((frame!.payload as { Id: number }).Id).toBeGreaterThan(0)
+
+		// With a box, the frame waits for the box to be opened: never sent twice for one grant.
+		await drainFrames()
+		await bulkPurchase('951', { PurchaseItemRequests: [line(2182, 100)] })
+		expect(
+			(await drainFrames()).filter(
+				(f) => f.notificationType === NotificationType.ConsumableMappingAdded
+			)
+		).toEqual([])
 	})
 
 	test('POST /api/items/bulkpurchase routes a gifted line to its receiver', async () => {
@@ -5853,14 +6702,14 @@ describe('econ endpoints', () => {
 	})
 
 	test('POST /api/avatar/v2/gifts/consume opens a consumable box (fires ConsumableMappingAdded)', async () => {
-		// Buy a consumable (Supreme Pizza, item 2266 in storefront 300) for account 26 —
+		// Buy a consumable (Supreme Pizza, item 574 in storefront 300) for account 26 —
 		// its gift box carries a ConsumableItemDesc, so opening it notifies the client.
 		const buy = await exports.default.fetch(`${ORIGIN}/api/storefronts/v2/buyItem`, {
 			method: 'POST',
 			headers: { ...(await bearer('26')), 'Content-Type': 'application/json' },
 			body: JSON.stringify({
 				StorefrontType: 300,
-				PurchasableItemId: 2266,
+				PurchasableItemId: 574,
 				CurrencyType: 2,
 				RequestedPrice: 95,
 			}),
@@ -6484,7 +7333,7 @@ describe('econ endpoints', () => {
 		expect(boxes[0]?.AvatarItemDesc).toBe(entry?.AvatarItemDesc)
 	})
 
-	test('POST /api/gamerewards/v1/request claims once an hour per reward type and activity', async () => {
+	test('POST /api/gamerewards/v1/request claims once an hour per reward type and activity — FirstActivityOfDay once a day per player', async () => {
 		const headers = {
 			...(await bearer('80')),
 			'Content-Type': 'application/x-www-form-urlencoded',
@@ -6512,10 +7361,14 @@ describe('econ endpoints', () => {
 		const claimed = await statusOf('FirstActivityOfDay')
 		expect(claimed?.grant_count).toBe(1)
 
-		// Asking again inside the hour claims nothing — and must not push the cooldown out,
-		// or a client that retries in a loop would never become eligible.
+		// Asking again inside the day claims nothing — and must not push the cooldown out,
+		// or a client that retries in a loop would never become eligible. It is the PLAYER's
+		// first activity of the day, so another activity doesn't claim it either, and writes
+		// no row of its own.
 		expect((await request('rewardType=FirstActivityOfDay&Message=again')).status).toBe(200)
+		expect((await request('rewardType=FirstActivityOfDay&giftContext=Soccer')).status).toBe(200)
 		expect(await statusOf('FirstActivityOfDay')).toEqual(claimed)
+		expect(await statusOf('FirstActivityOfDay', 'Soccer')).toBeNull()
 
 		// A different type has its own cooldown — and so does each `giftContext` within a type:
 		// Soccer and Paintball are separate rows that each claim once.
@@ -6547,12 +7400,21 @@ describe('econ endpoints', () => {
 		expect((await request('rewardType=PostGameActivity&Message=again')).status).toBe(200)
 		expect((await statusOf('PostGameActivity'))?.grant_count).toBe(1)
 
-		// Once the hour has passed, the same type claims again.
-		await env.DB.prepare(
-			"UPDATE reward_status SET granted_at = ?1 WHERE account_id = 80 AND reward_type = 'FirstActivityOfDay'"
-		)
-			.bind(new Date(Date.now() - 61 * 60 * 1000).toISOString())
-			.run()
+		// Once the hour has passed, an hourly type claims again — but FirstActivityOfDay waits
+		// out the whole day.
+		const age = (rewardType: string, ms: number) =>
+			env.DB.prepare(
+				'UPDATE reward_status SET granted_at = ?1 WHERE account_id = 80 AND reward_type = ?2'
+			)
+				.bind(new Date(Date.now() - ms).toISOString(), rewardType)
+				.run()
+		await age('PostGameActivity', 61 * 60 * 1000)
+		expect((await request('rewardType=PostGameActivity&giftContext=Soccer')).status).toBe(200)
+		expect((await statusOf('PostGameActivity', 'Soccer'))?.grant_count).toBe(2)
+		await age('FirstActivityOfDay', 61 * 60 * 1000)
+		expect((await request('rewardType=FirstActivityOfDay&Message=later')).status).toBe(200)
+		expect((await statusOf('FirstActivityOfDay'))?.grant_count).toBe(1)
+		await age('FirstActivityOfDay', 25 * 60 * 60 * 1000)
 		expect((await request('rewardType=FirstActivityOfDay&Message=tomorrow')).status).toBe(200)
 		expect((await statusOf('FirstActivityOfDay'))?.grant_count).toBe(2)
 	})
@@ -6568,12 +7430,21 @@ describe('econ endpoints', () => {
 				body,
 			})
 		/** Age the cooldown so the next ask is eligible again. */
-		const passAnHour = () =>
+		const passADay = () =>
 			env.DB.prepare(
 				"UPDATE reward_status SET granted_at = ?1 WHERE account_id = 82 AND reward_type = 'FirstActivityOfDay'"
 			)
-				.bind(new Date(Date.now() - 61 * 60 * 1000).toISOString())
+				.bind(new Date(Date.now() - 25 * 60 * 60 * 1000).toISOString())
 				.run()
+		/** The reward's own boxes — not the token box (GiftContext 51) each claim also pays. */
+		const rewardBoxes = async () => (await giftBoxes('82')).filter((b) => b.GiftContext !== 51)
+		/** Frames bar the token payout's balance update and box. */
+		const rewardFrames = async () =>
+			(await drainFrames()).filter(
+				(f) =>
+					f.notificationType !== NotificationType.StorefrontBalanceUpdate &&
+					(f.payload as { GiftContext?: number }).GiftContext !== 51
+			)
 
 		await drainFrames()
 		expect((await getProgression(env.DB, 82)).XP).toBe(0)
@@ -6581,56 +7452,43 @@ describe('econ endpoints', () => {
 		expect(res.status).toBe(200)
 		expect(await res.json()).toEqual([])
 
-		// 5 XP is deliberately less than the 10 the first level costs, so one action moves the
-		// bar without levelling anyone up.
-		expect(await getProgression(env.DB, 82)).toEqual({ PlayerId: 82, Level: 1, XP: 5 })
+		// 10 XP is exactly what level 1 costs, so a fresh player's first reward is a level-up.
+		expect(await getProgression(env.DB, 82)).toEqual({ PlayerId: 82, Level: 2, XP: 0 })
 
-		// One box: the XP reward itself, carrying the message the client asked to show and no
-		// item — a game reward is not an item.
-		const first = await giftBoxes('82')
-		expect(first).toHaveLength(1)
+		// Two reward boxes: the XP itself, carrying the message the client asked to show and no
+		// item — a game reward is not an item — then the level-up's. (The tokens come in a box
+		// of their own.)
+		const first = await rewardBoxes()
+		expect(first).toHaveLength(2)
 		expect(first[0]).toMatchObject({
-			Xp: 5,
+			Xp: 10,
 			Message: 'First Game of the Day',
 			AvatarItemDesc: '',
 			EquipmentModificationGuid: '',
 			ConsumableItemDesc: '',
 		})
 
-		// The box, then the bar — no level-up box, since no level was crossed.
-		const frames = await drainFrames()
+		// The box, then the bar, then the level-up box.
+		const frames = await rewardFrames()
 		expect(frames.map((f) => f.notificationType)).toEqual([
 			NotificationType.GiftPackageReceivedImmediate,
 			NotificationType.PlayerProgressionLevelUpdate,
+			NotificationType.GiftPackageReceivedImmediate,
 		])
 		expect(frames[0]?.accountId).toBe(82)
 		expect(frames[0]?.payload).toMatchObject({
 			Id: first[0]?.Id,
 			FromPlayerId: 1,
-			Xp: 5,
+			Xp: 10,
 			// GiftContext.GameRewards — the box came from gameplay, not a purchase.
 			GiftContext: 50,
 			Message: 'First Game of the Day',
 		})
-		expect(frames[1]?.payload).toEqual({ PlayerId: 82, Level: 1, XP: 5 })
+		expect(frames[1]?.payload).toEqual({ PlayerId: 82, Level: 2, XP: 0 })
 
-		// An on-cooldown ask pays nothing: no more boxes, no frames, no more XP.
-		expect((await request('rewardType=FirstActivityOfDay&Message=again')).status).toBe(200)
-		expect(await getProgression(env.DB, 82)).toEqual({ PlayerId: 82, Level: 1, XP: 5 })
-		expect(await giftBoxes('82')).toHaveLength(1)
-		expect(await drainFrames()).toEqual([])
-
-		// A SECOND reward completes the 10 XP level 1 costs — two actions per early level, which
-		// is the pacing the smaller grant buys.
-		await passAnHour()
-		expect((await request('rewardType=FirstActivityOfDay&Message=Second')).status).toBe(200)
-		expect(await getProgression(env.DB, 82)).toEqual({ PlayerId: 82, Level: 2, XP: 0 })
-
-		// …and level 2 pays 2-Star Clothing per the published table: an AVATAR ITEM, never an
+		// Level 2 pays 2-Star Clothing per the published table: an AVATAR ITEM, never an
 		// equipment skin, which is what the avatar-only roll is for.
-		const afterLevel2 = await giftBoxes('82')
-		expect(afterLevel2).toHaveLength(3)
-		const clothingBox = afterLevel2[2]
+		const clothingBox = first[1]
 		expect(clothingBox?.Message).toBe('Level 2!')
 		expect(clothingBox?.AvatarItemDesc).not.toBe('')
 		expect(clothingBox?.EquipmentModificationGuid).toBe('')
@@ -6643,18 +7501,18 @@ describe('econ endpoints', () => {
 		// v4 serves the camelCase DTO, unlike the PascalCase records on the gift box.
 		const owned = (await items.json()) as Array<{ avatarItemDesc: string }>
 		expect(owned.map((i) => i.avatarItemDesc)).toContain(clothingBox?.AvatarItemDesc)
-		expect((await drainFrames()).map((f) => f.notificationType)).toEqual([
-			NotificationType.GiftPackageReceivedImmediate,
-			NotificationType.PlayerProgressionLevelUpdate,
-			NotificationType.GiftPackageReceivedImmediate,
-		])
 
-		// Two more rewards reach level 3, which the table pays as a CONSUMABLE rather than
+		// An on-cooldown ask pays nothing: no more boxes, no frames, no more XP.
+		const boxCount = (await giftBoxes('82')).length
+		expect((await request('rewardType=FirstActivityOfDay&Message=again')).status).toBe(200)
+		expect(await getProgression(env.DB, 82)).toEqual({ PlayerId: 82, Level: 2, XP: 0 })
+		expect(await giftBoxes('82')).toHaveLength(boxCount)
+		expect(await drainFrames()).toEqual([])
+
+		// The next reward reaches level 3, which the table pays as a CONSUMABLE rather than
 		// clothing — rolled without a rarity, since the table names none for them.
-		for (const message of ['Third', 'Fourth']) {
-			await passAnHour()
-			expect((await request(`rewardType=FirstActivityOfDay&Message=${message}`)).status).toBe(200)
-		}
+		await passADay()
+		expect((await request('rewardType=FirstActivityOfDay&Message=Second')).status).toBe(200)
 		expect(await getProgression(env.DB, 82)).toEqual({ PlayerId: 82, Level: 3, XP: 0 })
 
 		const afterLevel3 = await giftBoxes('82')
@@ -6689,13 +7547,14 @@ describe('econ endpoints', () => {
 		)
 		expect(goblin.status).toBe(200)
 		expect(await goblin.json()).toEqual([])
-		// Two boxes: the quest reward, and the new-activity token bonus (covered below) that a
-		// first-ever claim in a context also pays.
+		// Three boxes: the quest reward, the PostGameActivity tokens (covered below), and — 10 XP
+		// being level 1's whole cost — the level-2 box.
 		const boxes = await giftBoxes('83')
-		expect(boxes).toHaveLength(2)
+		expect(boxes).toHaveLength(3)
 		const box = boxes[0]
-		expect(box).toMatchObject({ Xp: 5, Message: 'Quest complete', GiftContext: 4003 })
+		expect(box).toMatchObject({ Xp: 10, Message: 'Quest complete', GiftContext: 4003 })
 		expect(boxes[1]).toMatchObject({ GiftContext: 51, Currency: 250 })
+		expect(boxes[2]?.Message).toBe('Level 2!')
 		expect(box?.AvatarItemDesc).not.toBe('')
 		const row = questRewards.Quest_Goblin_S.find((r) => r.AvatarItemDesc === box?.AvatarItemDesc)
 		expect(row).toBeDefined()
@@ -6740,10 +7599,10 @@ describe('econ endpoints', () => {
 		)
 
 		// An activity the table doesn't know pays the plain XP box, as before — the last
-		// GameRewards box, behind Bowling's own new-activity bonus.
+		// GameRewards box, behind Bowling's own tokens.
 		expect((await request('rewardType=PostGameActivity&giftContext=Bowling')).status).toBe(200)
 		const plain = (await giftBoxes('83')).findLast((b) => b.GiftContext === 50)
-		expect(plain).toMatchObject({ Xp: 5, AvatarItemDesc: '', Currency: 0, GiftContext: 50 })
+		expect(plain).toMatchObject({ Xp: 10, AvatarItemDesc: '', Currency: 0, GiftContext: 50 })
 
 		// A reward the player already owns is never drawn again: Dodgeball has three rows, so
 		// three claims hand over all three, and a fourth — nothing left to give — pays the
@@ -6764,7 +7623,7 @@ describe('econ endpoints', () => {
 		expect(handed.toSorted()).toEqual(dodgeball.toSorted())
 	})
 
-	test('the first claim ever in a giftContext pays a one-off 250-token bonus', async () => {
+	test('PostGameActivity/PostQuestActivity pay 250 tokens, up to 1250 per player per 24h', async () => {
 		const request = async (body: string) =>
 			exports.default.fetch(`${ORIGIN}/api/gamerewards/v1/request`, {
 				method: 'POST',
@@ -6776,61 +7635,165 @@ describe('econ endpoints', () => {
 			})
 		const tokens = () =>
 			getBalance(env.DB, 84, CurrencyType.RecCenterTokens, DEFAULT_STARTING_TOKENS)
-		const bonusBoxes = async () => (await giftBoxes('84')).filter((b) => b.GiftContext === 51)
+		const tokenBoxes = async () => (await giftBoxes('84')).filter((b) => b.GiftContext === 51)
+		const allowance = () =>
+			env.DB.prepare(
+				"SELECT granted_at, grant_count FROM reward_status WHERE account_id = 84 AND reward_type = '$tokens'"
+			).first<{ granted_at: string; grant_count: number }>()
 		await drainFrames()
 		const start = await tokens()
 
-		// A contextless ask is not an activity: XP box only, no tokens.
-		expect((await request('rewardType=FirstActivityOfDay&Message=First')).status).toBe(200)
-		expect(await tokens()).toBe(start)
-		expect(await bonusBoxes()).toHaveLength(0)
+		// FirstActivityOfDay pays its 250 OUTSIDE the allowance: no allowance row, and the cap
+		// below is still five claims' worth on top of it.
+		expect((await request('rewardType=FirstActivityOfDay&giftContext=Soccer')).status).toBe(200)
+		expect(await tokens()).toBe(start + 250)
+		expect(await allowance()).toBeNull()
+		await drainFrames()
+		const base = start + 250
 
-		// First time in Soccer: +250, in a box of its own after the reward's, credited to the
+		// PostGameActivity: +250, in a box of its own after the reward's, credited to the
 		// balance and announced as such.
 		expect((await request('rewardType=PostGameActivity&giftContext=Soccer')).status).toBe(200)
-		expect(await tokens()).toBe(start + 250)
-		const bonus = await bonusBoxes()
-		expect(bonus).toHaveLength(1)
-		expect(bonus[0]).toMatchObject({
+		expect(await tokens()).toBe(base + 250)
+		const boxes = (await tokenBoxes()).slice(1)
+		expect(boxes).toHaveLength(1)
+		expect(boxes[0]).toMatchObject({
 			Currency: 250,
 			CurrencyType: CurrencyType.RecCenterTokens,
 			Xp: 0,
 			AvatarItemDesc: '',
-			Message: 'New activity bonus!',
+			Message: 'Activity bonus!',
 		})
-		// The balance frame carries the resulting total, and the bonus box is announced like
-		// any other. (This being the second 5 XP, a level-2 box rides along too.)
+		// The balance frame carries the resulting total, and the token box is announced like
+		// any other.
 		const frames = await drainFrames()
 		expect(
-			frames.find((f) => f.notificationType === NotificationType.StorefrontBalanceUpdate)?.payload
-		).toMatchObject({ CurrencyType: CurrencyType.RecCenterTokens, Balance: start + 250 })
+			frames.findLast((f) => f.notificationType === NotificationType.StorefrontBalanceUpdate)
+				?.payload
+		).toMatchObject({ CurrencyType: CurrencyType.RecCenterTokens, Balance: base + 250 })
 		expect(
 			frames.filter((f) => f.notificationType === NotificationType.GiftPackageReceivedImmediate)
 		).toContainEqual(
 			expect.objectContaining({
-				payload: expect.objectContaining({ Currency: 250, GiftContext: 51, Id: bonus[0]?.Id }),
+				payload: expect.objectContaining({ Currency: 250, GiftContext: 51, Id: boxes[0]?.Id }),
 			})
 		)
+		const opened = (await allowance())?.granted_at
+		expect(await allowance()).toMatchObject({ grant_count: 250 })
 
-		// Soccer under ANOTHER type is the same activity — no second bonus…
-		expect((await request('rewardType=FirstActivityOfDay&giftContext=Soccer')).status).toBe(200)
-		expect(await tokens()).toBe(start + 250)
-		// …and neither is Soccer again once its cooldown has passed.
+		// PostQuestActivity counts the same, and the allowance is the player's, whatever the
+		// activity — a contextless ask included.
+		for (const body of [
+			'rewardType=PostQuestActivity&giftContext=Quest_Goblin_S',
+			'rewardType=PostGameActivity',
+			'rewardType=PostGameActivity&giftContext=Paintball',
+			'rewardType=PostGameActivity&giftContext=Bowling',
+		]) {
+			expect((await request(body)).status).toBe(200)
+		}
+		expect(await tokens()).toBe(base + 1250)
+		// The window keeps its start as the total grows.
+		expect(await allowance()).toEqual({ granted_at: opened, grant_count: 1250 })
+
+		// At the cap: the claim still pays its XP box, but no tokens.
+		const before = (await giftBoxes('84')).length
+		expect((await request('rewardType=PostGameActivity&giftContext=Dodgeball')).status).toBe(200)
+		expect(await tokens()).toBe(base + 1250)
+		expect(await tokenBoxes()).toHaveLength(6)
+		expect((await giftBoxes('84')).length).toBeGreaterThan(before)
+		expect(await allowance()).toMatchObject({ grant_count: 1250 })
+
+		// Once the window is 24h old, the next claim opens a fresh one.
 		await env.DB.prepare(
-			"UPDATE reward_status SET granted_at = ?1 WHERE account_id = 84 AND gift_context = 'Soccer'"
+			"UPDATE reward_status SET granted_at = ?1 WHERE account_id = 84 AND reward_type = '$tokens'"
 		)
-			.bind(new Date(Date.now() - 61 * 60 * 1000).toISOString())
+			.bind(new Date(Date.now() - 25 * 60 * 60 * 1000).toISOString())
 			.run()
-		expect((await request('rewardType=PostGameActivity&giftContext=Soccer')).status).toBe(200)
-		expect(await tokens()).toBe(start + 250)
-		// An on-cooldown ask in a context never claimed pays nothing — it wrote no row.
-		expect((await request('rewardType=PostGameActivity&giftContext=Soccer')).status).toBe(200)
-		expect(await tokens()).toBe(start + 250)
+		expect((await request('rewardType=PostGameActivity&giftContext=Basketball')).status).toBe(200)
+		expect(await tokens()).toBe(base + 1500)
+		const reopened = await allowance()
+		expect(reopened?.grant_count).toBe(250)
+		expect((reopened?.granted_at ?? '') > (opened ?? '')).toBe(true)
+	})
 
-		// A different activity is new again.
+	test('game-reward XP stops at 150 per player per 24h, FirstActivityOfDay aside', async () => {
+		const request = async (body: string) =>
+			exports.default.fetch(`${ORIGIN}/api/gamerewards/v1/request`, {
+				method: 'POST',
+				headers: {
+					...(await bearer('85')),
+					'Content-Type': 'application/x-www-form-urlencoded',
+				},
+				body,
+			})
+		const xp = async () => {
+			const { Level, XP } = await getProgression(env.DB, 85)
+			return { Level, XP }
+		}
+		const allowance = () =>
+			env.DB.prepare(
+				"SELECT granted_at, grant_count FROM reward_status WHERE account_id = 85 AND reward_type = '$xp'"
+			).first<{ granted_at: string; grant_count: number }>()
+		const rewardBoxes = async () =>
+			(await giftBoxes('85')).filter((b) => b.GiftContext !== 51 && !b.Message?.startsWith('Level'))
+
+		// A claim's XP draws on the allowance.
+		expect((await request('rewardType=PostGameActivity&giftContext=Soccer')).status).toBe(200)
+		expect(await allowance()).toMatchObject({ grant_count: 10 })
+		expect(await xp()).toEqual({ Level: 2, XP: 0 })
+
+		// One claim short of the cap: the next pays its 10 and fills it.
+		await env.DB.prepare(
+			"UPDATE reward_status SET grant_count = 140 WHERE account_id = 85 AND reward_type = '$xp'"
+		).run()
 		expect((await request('rewardType=PostGameActivity&giftContext=Paintball')).status).toBe(200)
-		expect(await tokens()).toBe(start + 500)
-		expect(await bonusBoxes()).toHaveLength(2)
+		expect(await allowance()).toMatchObject({ grant_count: 150 })
+		expect(await xp()).toEqual({ Level: 3, XP: 0 })
+		const boxesAtCap = (await rewardBoxes()).length
+		await drainFrames()
+
+		// At the cap: no XP, no progression frame, and — nothing else to carry — no reward box.
+		// The tokens are their own allowance and still pay.
+		const tokensBefore = await getBalance(
+			env.DB,
+			85,
+			CurrencyType.RecCenterTokens,
+			DEFAULT_STARTING_TOKENS
+		)
+		expect((await request('rewardType=PostGameActivity&giftContext=Bowling')).status).toBe(200)
+		expect(await xp()).toEqual({ Level: 3, XP: 0 })
+		expect(await allowance()).toMatchObject({ grant_count: 150 })
+		expect(await rewardBoxes()).toHaveLength(boxesAtCap)
+		expect(
+			await getBalance(env.DB, 85, CurrencyType.RecCenterTokens, DEFAULT_STARTING_TOKENS)
+		).toBe(tokensBefore + 250)
+		expect((await drainFrames()).map((f) => f.notificationType)).not.toContain(
+			NotificationType.PlayerProgressionLevelUpdate
+		)
+
+		// An activity with a prize still hands it over, in a box carrying no XP.
+		expect((await request('rewardType=PostQuestActivity&giftContext=Quest_Goblin_S')).status).toBe(
+			200
+		)
+		const quest = (await rewardBoxes()).at(-1)
+		expect(quest).toMatchObject({ GiftContext: 4003, Xp: 0 })
+		expect(quest?.AvatarItemDesc).not.toBe('')
+		expect(await xp()).toEqual({ Level: 3, XP: 0 })
+
+		// FirstActivityOfDay's XP is a bonus on top of the cap.
+		expect((await request('rewardType=FirstActivityOfDay&giftContext=Soccer')).status).toBe(200)
+		expect(await xp()).toEqual({ Level: 4, XP: 0 })
+		expect(await allowance()).toMatchObject({ grant_count: 150 })
+
+		// Once the window is 24h old, the next claim opens a fresh one.
+		await env.DB.prepare(
+			"UPDATE reward_status SET granted_at = ?1 WHERE account_id = 85 AND reward_type = '$xp'"
+		)
+			.bind(new Date(Date.now() - 25 * 60 * 60 * 1000).toISOString())
+			.run()
+		expect((await request('rewardType=PostGameActivity&giftContext=Basketball')).status).toBe(200)
+		expect(await allowance()).toMatchObject({ grant_count: 10 })
+		expect(await xp()).toEqual({ Level: 4, XP: 10 })
 	})
 
 	test('POST /api/gamerewards/v1/request is 401 without a token, and ignores a typeless ask', async () => {
@@ -6858,10 +7821,77 @@ describe('econ endpoints', () => {
 		expect(rows?.count).toBe(0)
 	})
 
-	test('GET /api/roomkeys/v1/mine returns []', async () => {
-		const res = await exports.default.fetch(`${ORIGIN}/api/roomkeys/v1/mine`)
+	test('GET /api/roomkeys/v1/mine lists the keys the caller holds, across rooms', async () => {
+		const mine = async (sub: string | null) =>
+			exports.default.fetch(
+				`${ORIGIN}/api/roomkeys/v1/mine`,
+				sub === null ? undefined : { headers: await bearer(sub) }
+			)
+		expect((await mine(null)).status).toBe(401)
+		expect(await (await mine('7601')).json()).toEqual([])
+
+		const insert = async (roomId: number, name: string, imageName: string) =>
+			(await env.DB.prepare(
+				`INSERT INTO room_key
+					(replication_id, room_id, key_type, name, description, price, purchase_currency_id, image_name, created_at)
+				 VALUES ('0f8c3a7e-1d42-4b90-9c11-7a6e5d2b8f03', ?1, 'Key', ?2, '', 0, NULL, ?3, '2026-10-14T12:00:00Z')
+				 RETURNING room_key_id`
+			)
+				.bind(roomId, name, imageName)
+				.first<{ room_key_id: number }>())!.room_key_id
+		const a = await insert(12, 'VIP Key', '')
+		const b = await insert(2511, 'Art Key', 'key.png')
+		const notHeld = await insert(12, 'Other', '')
+		for (const [key, account] of [
+			[b, 7601],
+			[a, 7601],
+			[notHeld, 7602],
+		]) {
+			await env.DB.prepare(
+				"INSERT INTO room_key_player (room_key_id, account_id, awarded_at) VALUES (?1, ?2, '')"
+			)
+				.bind(key, account)
+				.run()
+		}
+
+		const res = await mine('7601')
 		expect(res.status).toBe(200)
-		expect(await res.json()).toEqual([])
+		const keys = (await res.json()) as Array<Record<string, unknown>>
+		expect(keys).toEqual([
+			{
+				RoomKeyId: a,
+				ReplicationId: '0f8c3a7e-1d42-4b90-9c11-7a6e5d2b8f03',
+				RoomId: 12,
+				Name: 'VIP Key',
+				Description: '',
+				Price: 0,
+				PurchaseCurrencyId: null,
+				CreatedAt: '2026-10-14T12:00:00Z',
+				ImageName: '',
+				Type: 0,
+				IsGiftable: false,
+				Visibility: 0,
+			},
+			expect.objectContaining({ RoomKeyId: b, RoomId: 2511, ImageName: 'key.png' }),
+		])
+		// Member order as the client was observed receiving it.
+		expect(Object.keys(keys[0]!)).toEqual([
+			'RoomKeyId',
+			'ReplicationId',
+			'RoomId',
+			'Name',
+			'Description',
+			'Price',
+			'PurchaseCurrencyId',
+			'CreatedAt',
+			'ImageName',
+			'Type',
+			'IsGiftable',
+			'Visibility',
+		])
+
+		await env.DB.prepare('DELETE FROM room_key_player').run()
+		await env.DB.prepare('DELETE FROM room_key').run()
 	})
 
 	test('GET /api/subscriptionseasons/v1/seasons/current returns []', async () => {
@@ -7204,7 +8234,7 @@ describe('econ endpoints', () => {
 		expect(await dev.json()).toEqual({})
 
 		// …and it buys nothing at the subscriber price either, so the report and the buy path
-		// agree. 85 is the SubscriberPrices entry for sf300's 2263; 95 is the list price.
+		// agree. 85 is the SubscriberPrices entry for sf300's 2089; 95 is the list price.
 		const discounted = await buy2263(await bearer('9211', ['gameClient', 'developer']), 85)
 		expect(discounted.status).toBe(409)
 	})
@@ -7262,6 +8292,7 @@ describe('econ endpoints', () => {
 			'GET /api/challenge/v2/getCurrent',
 			'GET /api/checklist/v1/current',
 			'GET /api/checklist/v2/current',
+			'GET /api/consumables/v1/all',
 			'GET /api/consumables/v2/getUnlocked',
 			'GET /api/equipment/v2/getUnlocked',
 			'GET /api/gamerewards/v1/pending',
@@ -7278,6 +8309,7 @@ describe('econ endpoints', () => {
 			'GET /api/roomconsumables/v1/roomConsumable/room/{roomId}/me',
 			'GET /api/roomcurrencies/v1/currencies',
 			'GET /api/roomcurrencies/v1/getAllBalances',
+			'GET /api/roomcurrencies/v1/getBalance',
 			'GET /api/roomcurrencies/v1/getPurchaseOffersBatch',
 			'GET /api/roomkeys/v1/mine',
 			'GET /api/roomkeys/v1/room',
@@ -7289,6 +8321,7 @@ describe('econ endpoints', () => {
 			'GET /api/subscriptionseasons/v1/seasons/current',
 			'GET /api/ugcPurchasables/v1/items/room/{roomId}',
 			'GET /econ/customAvatarItems/v1/owned',
+			'GET /econ/customAvatarItems/v1/ownedby/{accountId}',
 			'GET /econ/roomEconConfig/{roomId}',
 			'GET /econ/roomGiftDropShops/room/{roomId}',
 			'GET /econ/roomInventory/room/{roomId}',
@@ -7296,6 +8329,7 @@ describe('econ endpoints', () => {
 			'GET /econ/roomInventoryItemTags/room/{roomId}',
 			'GET /econ/roomOffer/room/{roomId}',
 			'GET /econ/roomOffer/room/{roomId}/purchaseCounts',
+			'GET /paintball-battle-pass/config',
 			'POST /api/CampusCard/v1/UpdateAndGetSubscription',
 			'POST /api/avatar/v1/lockeditems/bulk',
 			'POST /api/avatar/v2/gifts/consume',
@@ -7306,7 +8340,9 @@ describe('econ endpoints', () => {
 			'POST /api/checklist/v1/complete',
 			'POST /api/checklist/v2/complete',
 			'POST /api/consumables/v1/consume',
+			'POST /api/consumables/v1/query/bulk',
 			'POST /api/consumables/v1/updateActive',
+			'POST /api/distanceMovedRewardTracks/distance',
 			'POST /api/equipment/v1/update',
 			'POST /api/gamerewards/v1/request',
 			'POST /api/influencerpartnerprogram/remove',
@@ -7329,11 +8365,16 @@ describe('econ endpoints', () => {
 			'POST /api/roomkeys/v1/create',
 			'POST /api/roomkeys/v1/owns/bulk',
 			'POST /api/storefronts/v1/PurchaseRoomKeyWithCurrency',
+			'POST /api/storefronts/v1/purchasableitems',
 			'POST /api/storefronts/v2/buyItem',
 			'POST /api/storefronts/v3/buyInvention',
+			'POST /api/timedCurrencyGrants/update',
 			'POST /api/ugcPurchasables/v1/items/bulk',
+			'POST /circuitsRoomRewards/grantRoomBadge',
 			'PUT /api/equipment/v1/update',
 			'PUT /api/roomconsumables/v1/roomConsumable',
+			'PUT /api/roomconsumables/v1/roomConsumable/{id}/consume',
+			'PUT /api/roomconsumables/v1/roomconsumable/{id}/purchase/{via}',
 			'PUT /api/roomkeys/v1/updateAll',
 		])
 
@@ -7650,7 +8691,7 @@ describe('catalog', () => {
 		// separate because 0015 was already applied, and an edit there would never re-run — which
 		// is exactly the drift this test exists to catch. `CATALOG_SCHEMA_DDL` declares the end
 		// state in one CREATE, so it is compared against the pair.
-		const migrations = `${catalogStructureSql}\n${catalogIdSql}`
+		const migrations = `${catalogStructureSql}\n${catalogIdSql}\n${catalogListingSql}`
 
 		// Compared on identifiers rather than text, since the two are formatted differently, and
 		// `catalog_id` arrives via ALTER rather than inside the CREATE.
@@ -7661,6 +8702,7 @@ describe('catalog', () => {
 		expect(catalogStructureSql).toContain('item_key TEXT PRIMARY KEY')
 		expect(CATALOG_SCHEMA_DDL[0]).toContain('item_key TEXT PRIMARY KEY')
 		expect(catalogIdSql).toContain('ALTER TABLE catalog ADD COLUMN catalog_id INTEGER')
+		expect(catalogListingSql).toContain('ALTER TABLE catalog ADD COLUMN listing TEXT')
 		for (const index of [
 			'idx_catalog_name',
 			'idx_catalog_prefab',
@@ -7725,13 +8767,27 @@ describe('catalog', () => {
 		)
 		expect(row.values[CATALOG_INSERT_COLUMNS.indexOf('rarity')]).toBe(both.GiftDrop.Rarity)
 
-		// What the store lists that is NOT a catalog item is counted, not loaded: first-party
-		// custom items (the `custom_avatar_item` table's), loot boxes, token bundles — and the
-		// PACKS, a consumable listed again under another number with a count. Every listing is
-		// accounted for: a row, a skipped count, or nothing else.
-		expect(skipped.custom_avatar_item).toBe(
-			storeListings.filter((l) => l.GiftDrop.CustomAvatarItemId).length
+		// First-party custom items load as rows of their own, keyed by guid: the item is
+		// `api`'s `custom_avatar_item` record, but its LISTING has to resolve by number too.
+		expect(kinds.filter((k) => k === 'custom_avatar_item')).toHaveLength(
+			listed((l) => l.GiftDrop.CustomAvatarItemId ?? '')
 		)
+
+		// Every row carries its listing verbatim, so the store's own JSON comes back out.
+		const listingAt = CATALOG_INSERT_COLUMNS.indexOf('listing')
+		const byPurchasableId = new Map(storeListings.map((l) => [l.PurchasableItemId, l]))
+		expect(
+			rows.every(
+				(r) =>
+					r.values[listingAt] === JSON.stringify(byPurchasableId.get(r.id)) &&
+					r.values[listingAt] !== undefined
+			)
+		).toBe(true)
+
+		// What the store lists that is NOT a catalog item is counted, not loaded: loot boxes,
+		// token bundles — and the PACKS, a consumable listed again under another number with a
+		// count. Every listing is accounted for: a row, a skipped count, or nothing else.
+		expect(skipped.custom_avatar_item).toBeUndefined()
 		expect(skipped.query).toBe(storeListings.filter((l) => l.GiftDrop.IsQuery).length)
 		expect(skipped.consumable_pack).toBeGreaterThan(0)
 		expect(
@@ -7788,7 +8844,12 @@ describe('catalog', () => {
 			const drop = byId.get(row.id)?.GiftDrop
 			expect(drop, String(row.id)).toBeDefined()
 			expect(
-				[drop!.AvatarItemDesc, drop!.ConsumableItemDesc, drop!.EquipmentModificationGuid],
+				[
+					drop!.AvatarItemDesc,
+					drop!.ConsumableItemDesc,
+					drop!.EquipmentModificationGuid,
+					drop!.CustomAvatarItemId,
+				],
 				String(row.id)
 			).toContain(row.key)
 		}
@@ -8254,5 +9315,20 @@ describe('discord role gift', () => {
 		expect(await tokens(9323)).toBe(DEFAULT_STARTING_TOKENS + 10000)
 		expect(await getPendingGifts(env.DB, 9321)).toHaveLength(2)
 		expect(await getPendingGifts(env.DB, 9322)).toHaveLength(1)
+	})
+})
+
+test('2026 current subscription season supplies a nonempty disabled-season DTO', async () => {
+	const res = await exports.default.fetch(`${ORIGIN}/api/subscriptionseasons/v1/seasons/current`, {
+		headers: await bearer('42', undefined, '20260323.14'),
+	})
+	expect(res.status).toBe(200)
+	expect(await res.json()).toEqual({
+		SubscriptionSeasonId: '00000000-0000-0000-0000-000000000000',
+		Name: '',
+		ImageName: '',
+		StartAt: '0001-01-01T00:00:00Z',
+		NextSeasonStart: null,
+		Milestones: [],
 	})
 })

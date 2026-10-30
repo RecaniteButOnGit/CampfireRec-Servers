@@ -623,9 +623,9 @@ export async function getMyInventions(
 }
 
 /** A stored record with the client's flat `RRInvention` laid over it — see {@link getMyInventions}. */
-type ListedInvention = Omit<SavedInvention, keyof InventionV9Dto> & InventionV9Dto
+export type ListedInvention = Omit<SavedInvention, keyof InventionV9Dto> & InventionV9Dto
 
-function withClientInvention(invention: SavedInvention): ListedInvention {
+export function withClientInvention(invention: SavedInvention): ListedInvention {
 	return { ...invention, ...toInventionV9(invention) }
 }
 
@@ -1278,10 +1278,11 @@ export async function getInventionsByIds(
 	inventionIds: number[]
 ): Promise<SavedInvention[]> {
 	if (inventionIds.length === 0) return []
-	const placeholders = inventionIds.map((_, i) => `?${i + 1}`).join(', ')
+	// One bound JSON array rather than a placeholder per id: D1 caps a statement at 100
+	// bound variables, and the top-today window or a big collection easily passes that.
 	const { results } = await db
-		.prepare(`SELECT data FROM invention WHERE id IN (${placeholders})`)
-		.bind(...inventionIds)
+		.prepare(`SELECT data FROM invention WHERE id IN (SELECT value FROM json_each(?1))`)
+		.bind(JSON.stringify(inventionIds))
 		.all<InventionRow>()
 
 	const byId = new Map<number, SavedInvention>()

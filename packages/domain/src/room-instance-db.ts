@@ -11,10 +11,13 @@
  * data_blob, allow_new_users, join_disabled) live in the blob but are dropped from
  * the client DTO (`toDto`) — as does `game_version`, which is this server's own
  * addition (migrations/0012_room_instance_version.sql) and keys matchmaking so that
- * only players on the same client build share an instance.
+ * only players on the same client build share an instance. It is stored as a BUILD —
+ * the bare `YYYYMMDD` (`gameBuild`), never the client's `20250718.01` — so point releases
+ * of one build share a session; migrations/0028_room_instance_build.sql stripped the
+ * rows written before that held.
  */
 
-import { countPlayersInInstance, getPlayerIdsByRoomInstance } from './presence-db'
+import { countPlayersInInstance, gameBuild, getPlayerIdsByRoomInstance } from './presence-db'
 
 /** Schema DDL (mirror of migrations/0004_room_instance.sql). */
 export const ROOM_INSTANCE_SCHEMA_DDL: string[] = [
@@ -131,6 +134,10 @@ export interface NewRoomInstance {
 	 * {@link getJoinableInstance}), because two builds in one Photon room disagree about
 	 * how the scene and its objects serialize. Omitted (`''`) means "unknown", which
 	 * matches nothing: rows written before the field existed are never joined into.
+	 *
+	 * Stored as the BUILD (`gameBuild`): a caller may hand over the client's full
+	 * `20250718.01` and the row carries `20250718`, the same key every lookup here
+	 * normalizes its argument to — a `.2` point release of that date joins this session.
 	 */
 	gameVersion?: string
 }
@@ -198,7 +205,7 @@ export async function createRoomInstance(
 		matchmakingPolicy: input.matchmakingPolicy ?? 0,
 		allowNewUsers: input.allowNewUsers ?? true,
 		joinDisabled: input.joinDisabled ?? false,
-		gameVersion: input.gameVersion ?? '',
+		gameVersion: gameBuild(input.gameVersion) ?? '',
 		createdAt: new Date().toISOString(),
 	}
 	await db
@@ -235,7 +242,9 @@ export async function getStoredRoomInstance(
 	// A row written before the build stamp existed has no `gameVersion` at all; it reads
 	// as `''` (the "unknown build" the type promises) rather than as undefined, so a
 	// caller comparing builds doesn't have to know the field is younger than the table.
-	return { ...stored, gameVersion: stored.gameVersion || '' }
+	// Read as a build, like it is written: a row the backfill hasn't reached yet still
+	// compares as its date.
+	return { ...stored, gameVersion: gameBuild(stored.gameVersion) ?? '' }
 }
 
 /**
@@ -468,6 +477,25 @@ export async function deleteEmptyRoomInstances(
 }
 
 /**
+ * Delete EVERY instance of a room, occupied or not — the staff "Clear instances" button
+ * for a room whose sessions are stuck. Presence is left alone: a player still in a
+ * deleted instance keeps their row until it expires or they move, and their next
+ * matchmake lands them in a fresh instance.
+ *
+ * Returns the ids deleted.
+ */
+export async function deleteRoomInstancesByRoom(db: D1Database, roomId: number): Promise<number[]> {
+	const { results } = await db
+		.prepare(
+			`DELETE FROM room_instance WHERE room_id = ?1
+			 RETURNING json_extract(data, '$.roomInstanceId') AS id`
+		)
+		.bind(roomId)
+		.all<{ id: number }>()
+	return results.map((r) => r.id)
+}
+
+/**
  * The oldest joinable public instance of a room (not private, not full, joins
  * enabled, not already in progress, not set to `Ignore`) that is running `gameVersion`,
  * or null when there's none to join. Used by matchmaking to reuse an existing instance
@@ -492,15 +520,25 @@ export async function deleteEmptyRoomInstances(
  * only instance of a room they're already in must skip it and fall through to a
  * fresh instance rather than hand back the same id. A no-op when they're not in this
  * room; instance ids are globally unique.
+ *
+ * `gameVersion` is matched as a BUILD ({@link gameBuild}): `20250718.01` and `20250718.2`
+ * both find the `20250718` session, which is what the rows store.
+ *
+ * `eventId` scopes the search to one player event's sessions, and the default 0 to the
+ * room's ordinary ones — the two never mix. An event matchmake only reuses an instance
+ * stamped with that event, so its guests gather in the event's session rather than
+ * scattering into whatever public instance the room has open; and a plain room matchmake
+ * never lands in an event's session, which for a private event is its guest list's alone.
  */
 export async function getJoinableInstance(
 	db: D1Database,
 	roomId: number,
 	gameVersion: string,
 	subRoomId?: number,
-	excludeInstanceId?: number
+	excludeInstanceId?: number,
+	eventId = 0
 ): Promise<RoomInstanceDto | null> {
-	const binds: Array<number | string> = [roomId, gameVersion]
+	const binds: Array<number | string> = [roomId, gameBuild(gameVersion) ?? '', eventId]
 	const filters: string[] = []
 	if (subRoomId !== undefined) {
 		binds.push(subRoomId)
@@ -513,7 +551,7 @@ export async function getJoinableInstance(
 	const row = await db
 		.prepare(
 			`SELECT data FROM room_instance
-			 WHERE room_id = ?1 AND game_version = ?2
+			 WHERE room_id = ?1 AND game_version = ?2 AND COALESCE(event_id, 0) = ?3
 			   AND is_private = 0 AND is_full = 0 AND join_disabled = 0
 			   AND is_in_progress = 0
 			   AND matchmaking_policy != ${MatchmakingPolicy.Ignore} ${filters.join(' ')}
@@ -555,7 +593,7 @@ export async function getSharedPrivateInstance(
 	excludeInstanceId?: number,
 	now = Math.floor(Date.now() / 1000)
 ): Promise<RoomInstanceDto | null> {
-	const binds: Array<number | string> = [roomId, gameVersion, subRoomId, now]
+	const binds: Array<number | string> = [roomId, gameBuild(gameVersion) ?? '', subRoomId, now]
 	let exclude = ''
 	if (excludeInstanceId !== undefined) {
 		binds.push(excludeInstanceId)
@@ -580,9 +618,10 @@ export async function getSharedPrivateInstance(
 
 /**
  * All instances of a given room — every build's, unless `gameVersion` scopes it to the
- * sessions running one. An instance belongs to a single client build (see
- * {@link getJoinableInstance}), so a caller looking for one to place a player in wants
- * the scoped form; a caller counting or listing what's live wants them all.
+ * sessions running one (matched as a build, like the other lookups). An instance belongs
+ * to a single client build (see {@link getJoinableInstance}), so a caller looking for one
+ * to place a player in wants the scoped form; a caller counting or listing what's live
+ * wants them all.
  */
 export async function getRoomInstancesByRoom(
 	db: D1Database,
@@ -595,7 +634,7 @@ export async function getRoomInstancesByRoom(
 				gameVersion === undefined ? '' : ' AND game_version = ?2'
 			}`
 		)
-		.bind(...(gameVersion === undefined ? [roomId] : [roomId, gameVersion]))
+		.bind(...(gameVersion === undefined ? [roomId] : [roomId, gameBuild(gameVersion) ?? '']))
 		.all<{ data: string }>()
 	return results.map((r) => toDto(parse(r.data)))
 }

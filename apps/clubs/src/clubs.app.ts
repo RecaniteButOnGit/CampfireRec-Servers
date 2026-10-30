@@ -12,6 +12,7 @@ import {
 	createClub,
 	createClubAnnouncement,
 	deleteClub,
+	deleteClubAnnouncement,
 	getClub,
 	getClubAnnouncements,
 	getClubDetails,
@@ -56,6 +57,7 @@ import {
 	ClubMembersEnvelope,
 	ClubSearchResponse,
 	CreateClubRequest,
+	DeleteAnnouncementResponse,
 	EmptyObject,
 	ErrorEnvelope,
 	form,
@@ -640,6 +642,58 @@ const app = new Hono<App>()
 				meta: field('meta'),
 			})
 			return c.json({ error: '', success: true, value: announcementId })
+		}
+	)
+
+	// Delete one of a club's announcements. The club's owner (creator) only. Answers
+	// `{ Success, Error, error_id }` — PascalCase, unlike the rest of this worker.
+	.delete(
+		'/announcements/club/:clubId{[0-9]+}/:announcementId{[0-9]+}',
+		describeRoute({
+			tags: ['Announcements'],
+			summary: 'Delete a club announcement',
+			description: [
+				'The club’s owner (creator) only. Answers `{ Success, Error, error_id }` —',
+				'PascalCase, not the `{ error, success, value }` envelope the rest of this worker uses.',
+			].join(' '),
+			security: AUTHED,
+			parameters: [
+				CLUB_ID_PARAM,
+				{
+					name: 'announcementId',
+					in: 'path',
+					required: true,
+					description: 'The announcement’s id',
+					schema: { type: 'string' },
+				},
+			],
+			responses: {
+				200: json(DeleteAnnouncementResponse, 'Deleted'),
+				401: UNAUTHORIZED_RESPONSE,
+				403: json(DeleteAnnouncementResponse, 'Not the club’s owner'),
+				404: json(DeleteAnnouncementResponse, 'No such club or announcement'),
+			},
+		}),
+		async (c) => {
+			const id = await authedId(c)
+			if (id === null) return c.body(null, 401)
+
+			const clubId = Number.parseInt(c.req.param('clubId'), 10)
+			const announcementId = Number.parseInt(c.req.param('announcementId'), 10)
+			const club = await getClub(c.env.DB, clubId)
+			if (club === null) {
+				return c.json({ Success: false, Error: 'Club not found.', error_id: null }, 404)
+			}
+
+			const membership = await getMembership(c.env.DB, clubId, id)
+			if (membership < ClubMembershipType.Creator) {
+				return c.json({ Success: false, Error: 'Insufficient permissions.', error_id: null }, 403)
+			}
+
+			if (!(await deleteClubAnnouncement(c.env.DB, clubId, announcementId))) {
+				return c.json({ Success: false, Error: 'Announcement not found.', error_id: null }, 404)
+			}
+			return c.json({ Success: true, Error: null, error_id: null })
 		}
 	)
 

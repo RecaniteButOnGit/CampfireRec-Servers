@@ -1267,6 +1267,59 @@ describe('clubs endpoints', () => {
 		expect(missing.status).toBe(404)
 	})
 
+	test('DELETE /announcements/club/:id/:announcementId deletes one, owner only', async () => {
+		const create = await exports.default.fetch(`${ORIGIN}/club/create`, {
+			method: 'POST',
+			headers: { ...(await bearer('9450')), 'Content-Type': 'application/x-www-form-urlencoded' },
+			body: 'name=Retractions',
+		})
+		const clubId = ((await create.json()) as { value: { ClubId: number } }).value.ClubId
+		const postOne = async (title: string): Promise<number> => {
+			const res = await exports.default.fetch(`${ORIGIN}/announcements/club/${clubId}`, {
+				method: 'POST',
+				headers: { ...(await bearer('9450')), 'Content-Type': 'application/x-www-form-urlencoded' },
+				body: `title=${title}`,
+			})
+			return ((await res.json()) as { value: number }).value
+		}
+		const keepId = await postOne('Keep')
+		const dropId = await postOne('Drop')
+		const del = async (path: string, sub: string | null = '9450'): Promise<Response> =>
+			exports.default.fetch(`${ORIGIN}/announcements/club/${path}`, {
+				method: 'DELETE',
+				headers: sub === null ? {} : await bearer(sub),
+			})
+		const ids = async (): Promise<number[]> => {
+			const res = await exports.default.fetch(`${ORIGIN}/announcements/club/${clubId}`)
+			const body = (await res.json()) as {
+				value: { Announcements: Array<{ AnnouncementId: number }> }
+			}
+			return body.value.Announcements.map((a) => a.AnnouncementId)
+		}
+
+		// Signed out is a 401; a non-member is refused; neither touches the board.
+		expect((await del(`${clubId}/${dropId}`, null)).status).toBe(401)
+		const refused = await del(`${clubId}/${dropId}`, '9451')
+		expect(refused.status).toBe(403)
+		expect(await refused.json()).toEqual({
+			Success: false,
+			Error: 'Insufficient permissions.',
+			error_id: null,
+		})
+		expect(await ids()).toEqual([dropId, keepId])
+
+		// The owner deletes it; the other stays.
+		const ok = await del(`${clubId}/${dropId}`)
+		expect(ok.status).toBe(200)
+		expect(await ok.json()).toEqual({ Success: true, Error: null, error_id: null })
+		expect(await ids()).toEqual([keepId])
+
+		// Gone now, so a repeat 404s; so does an unknown club, or an id from another club.
+		expect((await del(`${clubId}/${dropId}`)).status).toBe(404)
+		expect((await del(`99999/${keepId}`)).status).toBe(404)
+		expect(await ids()).toEqual([keepId])
+	})
+
 	test('PUT /club/:id/minlevel sets the join level, co-owner only', async () => {
 		type Details = { error: string; success: boolean; value: { Club: { MinLevel: number } } }
 		const create = await exports.default.fetch(`${ORIGIN}/club/create`, {
@@ -1700,6 +1753,7 @@ describe('clubs endpoints', () => {
 			)
 		)
 		expect([...documented].sort()).toEqual([
+			'DELETE /announcements/club/{clubId}/{announcementId}',
 			'DELETE /club/home/me',
 			'DELETE /club/{clubId}',
 			'DELETE /club/{clubId}/additionalimage/{index}',

@@ -117,6 +117,18 @@ export const CustomAvatarItemsResponse = z.object({
 	TotalResults: z.int(),
 })
 
+export const GrantRoomBadgeRequest = z.object({
+	TargetAccountId: z.int().positive(),
+	BadgeCustomAvatarItemId: z.uuid(),
+	RoomInstanceId: z.int().positive(),
+	GrantMessage: z.string().nullable().optional(),
+})
+
+export const GrantRoomBadgeResponse = z.object({
+	ResponseCode: z.union([z.literal(0), z.literal(1), z.literal(2)]),
+	ErrorMessage: z.string().nullable(),
+})
+
 /**
  * A Rec Room Plus subscription (the client calls it a `CampusCard`). Nothing here sells one,
  * so this is the complimentary subscription reported by a caller whose token carries
@@ -633,6 +645,18 @@ export const ItemPurchaseInfosRequest = z.object({
 	),
 })
 
+/** `POST /api/storefronts/v1/purchasableitems` — store listings by id. */
+export const PurchasableItemsRequest = z.object({
+	PurchasableItemIds: z
+		.array(z.number().int())
+		.nullable()
+		.describe('The listings to resolve, by `PurchasableItemId`'),
+	GiftDropIds: z
+		.array(z.number().int())
+		.nullable()
+		.describe('Sent by the client (observed null); accepted and ignored'),
+})
+
 /** One `Prices[]` entry: what the item costs in one currency, and any sale on top. */
 export const ItemPriceDto = z.object({
 	CurrencyType: z.number().int().describe('2 = RecCenterTokens — what UGC items are priced in'),
@@ -767,6 +791,13 @@ export const RoomKeyDto = z.object({
 	Type: z.int().describe('The key type’s ordinal: 0 `Key`, the only one seen'),
 })
 
+/** A held key as `GET /api/roomkeys/v1/mine` serves it — the room key plus two fields. */
+export const HeldRoomKeyDto = RoomKeyDto.extend({
+	ImageName: z.string().describe('The key’s art; "" when it has none (NOT null, unlike the list)'),
+	IsGiftable: z.boolean().describe('Always false — gifting keys is not modelled'),
+	Visibility: z.int().describe('Always 0 — not modelled'),
+})
+
 /**
  * The envelope `POST /api/roomkeys/v1/create` answers in: `{ Status, RoomKey }`, observed from
  * the live client — NOT the `{ Value, Success, Error, error_id }` the room-currency and
@@ -791,7 +822,13 @@ export const CreateRoomKeyRequest = z.object({
 	Price: z
 		.string()
 		.optional()
-		.describe('What the key costs, in tokens; defaults to 0. At most 1000'),
+		.describe(
+			'What the key costs, in tokens or `PurchaseCurrencyId`; defaults to 0. At most 1000 in tokens, 1000000000 in a room currency'
+		),
+	PurchaseCurrencyId: z
+		.string()
+		.optional()
+		.describe('A `room_currency` id of the key’s own room; absent or blank prices it in tokens'),
 })
 
 /**
@@ -1061,6 +1098,107 @@ export const AwardRoomConsumableResult = z.object({
 export const AwardRoomConsumableResultList = z.array(AwardRoomConsumableResult)
 
 /**
+ * The client's `RoomConsumableInventoryItem` — what a player owns of one consumable. The
+ * element of `GET …/roomConsumable/room/{roomId}/me` and the purchase's `InventoryItem`.
+ */
+export const RoomConsumableInventoryItemDto = z.object({
+	RoomConsumableId: z.string(),
+	AccountId: z.int().describe('Who owns them'),
+	Count: z.int().describe('The RESULTING total owned, never the change'),
+	ConcurrencyCode: z
+		.string()
+		.nullable()
+		.describe('The last `NewConcurrencyCode` written — stored, not checked'),
+	ModifiedAt: z.string().describe('ISO-8601 UTC — the last write'),
+	Consumable: RoomConsumableDto.extend({
+		ImageName: z.string().describe('"" when the listing has no picture (NOT null)'),
+		IsGiftable: z.boolean().describe('Always false — not modelled'),
+		Visibility: z.int().describe('Always 0 — not modelled'),
+	}).describe('The listing — the catalogue element plus two fields'),
+})
+
+/**
+ * `PUT /api/roomconsumables/v1/roomconsumable/{id}/purchase/{tokens|currency}` — the client's
+ * `RoomConsumablePurchaseRequest`, four keys in declaration order (from its formatter). One
+ * route for both kinds of price: `ExpectedPriceAndCurrency.CurrencyId` null is TOKENS.
+ */
+export const PurchaseRoomConsumableRequest = z.object({
+	ConcurrencyCodes: z
+		.object({
+			CurrentConcurrencyCode: z.string().nullable().optional(),
+			NewConcurrencyCode: z.string().nullable().optional(),
+		})
+		.optional()
+		.describe('Accepted and IGNORED — no optimistic concurrency is implemented yet'),
+	ExpectedPriceAndCurrency: z
+		.object({
+			Price: z.int().describe('The UNIT price the client rendered; must equal the listing’s'),
+			CurrencyId: z
+				.string()
+				.nullable()
+				.describe('The listing’s room currency, or null for a listing priced in tokens'),
+		})
+		.describe('What the client showed — refused unless it is the listing’s own'),
+	Quantity: z.int().describe('How many to buy; at least 1, at most `MaximumCountPerPurchase`'),
+	GiftRecipientAccountId: z
+		.int()
+		.nullable()
+		.optional()
+		.describe('Who receives them; null for the buyer. The buyer pays either way'),
+})
+
+/**
+ * The consumable purchase's answer, observed from the live client. The refusal form (`Status`
+ * 1, a null `InventoryItem`) is an assumption — only success has been observed.
+ */
+export const PurchaseRoomConsumableResponse = z.object({
+	BalanceUpdateResult: z
+		.int()
+		.describe(
+			'An UpdateResponse: 0 OK, 2 NotEnoughCredit, 4 NoItemAvailable, ' +
+				'6 RequestedPriceDoesNotMatch, 7 RequestedAmountNotAllowed, 8 PlayerNotEligible'
+		),
+	CurrencyBalanceResponse: z
+		.object({
+			AccountId: z.int().describe('The BUYER — who paid, even for a gift'),
+			CurrencyId: z
+				.string()
+				.nullable()
+				.describe('The room currency paid in; null for a listing priced in tokens'),
+			Balance: z.int().describe('What the buyer holds of it afterwards — the RESULTING total'),
+			ModifiedAt: z.string().describe('ISO-8601 UTC'),
+		})
+		.describe('What the buyer now holds of what they paid in'),
+	OperationResult: z.object({
+		Status: z.int().describe('0 on success; 1 on a refusal. Always sent — omitted reads as 0'),
+		InventoryItem: RoomConsumableInventoryItemDto.nullable().describe(
+			'What the recipient now owns of the consumable; null on a refusal'
+		),
+	}),
+})
+
+/**
+ * `PUT /api/roomconsumables/v1/roomConsumable/{id}/consume` — just the concurrency pair, at the
+ * TOP level (not nested under `ConcurrencyCodes` as the purchase sends it). Uses up one.
+ */
+export const ConsumeRoomConsumableRequest = z.object({
+	CurrentConcurrencyCode: z.string().nullable().optional().describe('Accepted and NOT checked'),
+	NewConcurrencyCode: z
+		.string()
+		.nullable()
+		.optional()
+		.describe('Stored and echoed back as the item’s `ConcurrencyCode`'),
+})
+
+/** The consume's answer: the purchase's `OperationResult`, alone. */
+export const ConsumeRoomConsumableResponse = z.object({
+	Status: z.int().describe('0 on success; 1 on a refusal. Always sent — omitted reads as 0'),
+	InventoryItem: RoomConsumableInventoryItemDto.nullable().describe(
+		'What the caller holds afterwards (`Count` the resulting total, 0 included); null on a refusal'
+	),
+})
+
+/**
  * The envelope the consumable write answers in — the same
  * `{ Value, Success, Error, error_id }` the room-currency writes use.
  */
@@ -1188,6 +1326,17 @@ export const PurchaseRoomCurrencyRequest = z.object({
 })
 
 /**
+ * What a player holds of one room currency, as `GET /api/roomcurrencies/v1/getBalance` answers
+ * it. `ModifiedAt` is the time of the response: `room_balance` keeps no modification time.
+ */
+export const RoomCurrencyBalance = z.object({
+	AccountId: z.int().describe('The player the balance belongs to'),
+	CurrencyId: z.string().describe('The room currency'),
+	Balance: z.int().describe('What the player holds of it; 0 when they have never earned any'),
+	ModifiedAt: z.string().describe('ISO-8601 UTC; the time of the response'),
+})
+
+/**
  * What `POST /api/roomCurrencies/v2/purchase` answers: both balances the purchase moved,
  * inside the `{ Value, Success, Error, error_id }` envelope the room-currency writes use.
  * Each `Balance` is a RESULTING total. Only the success form has been observed; a refusal's
@@ -1297,6 +1446,17 @@ export const BulkPurchaseRequest = z.object({
 export const ConsumeConsumableRequest = z.object({
 	Id: z.int().describe('The consumable row id to spend from'),
 	DeltaCount: z.int().optional().describe('How many to spend; defaults to 1'),
+})
+
+/**
+ * `POST /api/consumables/v1/query/bulk` form body — `descriptors` repeated once per
+ * consumable to look up.
+ */
+export const QueryConsumablesRequest = z.object({
+	descriptors: z
+		.union([z.string(), z.array(z.string())])
+		.optional()
+		.describe('A ConsumableItemDesc; the key repeats for each one asked about'),
 })
 
 /**

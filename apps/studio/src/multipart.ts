@@ -122,7 +122,7 @@ function parseParts(bytes: Uint8Array, boundary: string): FormFields {
  * filename are Files. A later part with the same name replaces an earlier one. A
  * request that is not multipart, or has no boundary, parses as no fields.
  */
-export async function parseMultipart(req: Request): Promise<FormFields> {
+export async function parseMultipart(req: Pick<Request, 'headers' | 'arrayBuffer'>): Promise<FormFields> {
 	const boundary = boundaryOf(req.headers.get('content-type'))
 	if (boundary == null) return {}
 	const bytes = new Uint8Array(await req.arrayBuffer())

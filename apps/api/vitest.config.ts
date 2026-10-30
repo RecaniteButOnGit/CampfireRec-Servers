@@ -2,6 +2,13 @@ import { cloudflareTest } from '@cloudflare/vitest-pool-workers'
 import { defineConfig } from 'vitest/config'
 
 export default defineConfig({
+	test: {
+		// Requests dispatched into the worker (`exports.default.fetch`/`SELF.fetch`) get slower
+		// the more have run before them in the same file — a vitest-pool-workers/workerd issue,
+		// reproducible in every app. The tail of api.test.ts runs ~250ms per request, which
+		// puts some tests past the 5s default under a loaded full-repo run.
+		testTimeout: 30_000,
+	},
 	plugins: [
 		cloudflareTest({
 			wrangler: { configPath: `${__dirname}/wrangler.jsonc` },

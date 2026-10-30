@@ -16,6 +16,7 @@ import {
 	cloneSubRoom,
 	countRoomsByCreator,
 	createNotification,
+	createStudioRoom,
 	createSubRoom,
 	deleteExpiredRoomInvites,
 	deleteRoom,
@@ -47,7 +48,6 @@ import {
 	getRoomsByIds,
 	getSimilarRooms,
 	getStudioUnityAsset,
-	getSubRoom,
 	getSubRoomPermissions,
 	getSubRoomSaveById,
 	getSubRoomSaves,
@@ -73,6 +73,7 @@ import {
 	roomRoles,
 	saveSubRoomData,
 	searchRooms,
+	searchRoomsByName,
 	setPlayerData,
 	setRoomDescription,
 	setRoomImage,
@@ -87,6 +88,7 @@ import {
 	transferRoomOwnership,
 	unbanPlayerFromRoom,
 	updateRoomFields,
+	withConfirmedRoles,
 	writeAuditLog,
 } from '@repo/domain'
 import {
@@ -97,7 +99,7 @@ import {
 	withNotFound,
 	withOnError,
 } from '@repo/hono-helpers'
-import { validateAndGetAccountId, validateAndGetRoles, validateAndGetVersion } from '@repo/jwt'
+import { validateAndGetAccountId, validateAndGetBuild, validateAndGetRoles } from '@repo/jwt'
 
 // The notification-type ids the hub carries (owned by the `notify` worker). Imported
 // as a value — the enum has no runtime dependencies.
@@ -117,6 +119,7 @@ import {
 	CuratedPlaylists,
 	DescriptionRequest,
 	DormRoomId,
+	ExcludeRequest,
 	ExperienceIncrementRequest,
 	ExperienceRequest,
 	FeaturedRoomGroupDto,
@@ -154,6 +157,7 @@ import {
 	RoomBanEnvelope,
 	RoomBanHistoryEnvelope,
 	RoomBansRemovedEnvelope,
+	RoomBoostCount,
 	RoomDto,
 	RoomEnvelope,
 	RoomExperience,
@@ -162,6 +166,7 @@ import {
 	roomIdParam,
 	RoomLookup,
 	RoomPascalEnvelope,
+	RoomRestrictionsEnvelope,
 	RoomResultEnvelope,
 	RoomRoleDto,
 	RoomSaveEnvelope,
@@ -447,8 +452,14 @@ async function handlePhotonAccessToken(c: Context<App>) {
  * lasts only as long as the player is actually there (rows carry an absolute expiry and
  * expired ones don't read back).
  *
- * The presence read only happens for someone who doesn't manage the room, so the owner's
- * and a co-owner's path stays one query.
+ * And so may staff — a token carrying the `developer` / `moderator` role — in any room,
+ * like the other room-admin surfaces here. They are not in the room yet when this is
+ * read: the client asks for the save list BEFORE it matchmakes a private instance (to
+ * resolve which version to load), so there is no presence to grant on, and a developer
+ * who runs none of a room's roles was refused a private instance of it with a 403.
+ *
+ * The presence read only happens for someone who neither manages the room nor is staff,
+ * so the owner's and a co-owner's path stays one query, and staff's stays none.
  */
 async function canReadSaves(
 	c: Context<App>,
@@ -457,6 +468,7 @@ async function canReadSaves(
 	accountId: number
 ): Promise<boolean> {
 	if (canManageRoom(room, accountId)) return true
+	if (await isStaff(c)) return true
 	const instance = (await getPresence<PresenceView>(c.env.DB, accountId))?.roomInstance
 	return instance?.roomId === roomId
 }
@@ -467,16 +479,17 @@ async function authedAccountId(c: Context<App>): Promise<number | null> {
 }
 
 /**
- * The client build this request's token was minted for (`rn.ver`), or null when there's no
- * valid token. The claim is the build the CLIENT posted at login, not this server's
- * GAME_VERSION, so it identifies what the player is actually running.
+ * The client BUILD this request's token was minted for (`rn.ver` as its bare `YYYYMMDD`,
+ * so a `20250718.01` client reads `20250718`), or null when there's no valid token. The
+ * claim is the build the CLIENT posted at login, not this server's GAME_VERSION, so it
+ * identifies what the player is actually running.
  *
  * It is unverified — a client can claim any build — which is fine for the one thing it is
  * used for here: keeping a payload away from a build it breaks. Lying about your version to
  * opt IN to a broken room list only breaks your own client.
  */
 async function authedGameVersion(c: Context<App>): Promise<string | null> {
-	return validateAndGetVersion(c.req.raw, await c.env.JWT_SECRET.get())
+	return validateAndGetBuild(c.req.raw, await c.env.JWT_SECRET.get())
 }
 
 /**
@@ -490,9 +503,11 @@ async function authedGameVersion(c: Context<App>): Promise<string | null> {
  *
  * An allow-list rather than a "this build or newer" comparison, deliberately: the thing
  * being asserted is that a build was CHECKED, and a version string that sorts high (a
- * debug build, say) must not opt itself in. Add a build here once it's been tried.
+ * debug build, say) must not opt itself in. Add a build here once it's been tried — as
+ * the bare date, which is what {@link authedGameVersion} yields; every point release of
+ * it (`20250718.01`, `20250718.2`) is the same build.
  */
-const FEATURED_ROOMS_VERSIONS: ReadonlySet<string> = new Set(['20250718.01'])
+const FEATURED_ROOMS_VERSIONS: ReadonlySet<string> = new Set(['20250718'])
 
 /**
  * Operator-granted elevated roles — the ones the auth worker stamps from an account's
@@ -508,6 +523,15 @@ const STAFF_ROLES: ReadonlySet<string> = new Set(['developer', 'moderator'])
 async function isStaff(c: Context<App>): Promise<boolean> {
 	const roles = await validateAndGetRoles(c.req.raw, await c.env.JWT_SECRET.get())
 	return roles?.some((role) => STAFF_ROLES.has(role)) ?? false
+}
+
+/**
+ * Whether the caller's token carries the `developer` role — the narrower of the two staff
+ * roles, for the actions a moderator may not take (deleting a room that isn't theirs).
+ */
+async function isDeveloper(c: Context<App>): Promise<boolean> {
+	const roles = await validateAndGetRoles(c.req.raw, await c.env.JWT_SECRET.get())
+	return roles?.includes('developer') ?? false
 }
 
 /**
@@ -648,16 +672,14 @@ function parseMaxPlayerCalculationMode(value: unknown): number | undefined {
 	return Object.values(MAX_PLAYER_CALCULATION_MODES).includes(ordinal) ? ordinal : undefined
 }
 
-async function pushRoomUpdate(
-	c: Context<App>,
-	playerId: number,
-	room: Record<string, unknown>
-): Promise<void> {
+async function pushRoomUpdate(c: Context<App>, playerId: number, room: Room): Promise<void> {
 	try {
+		// The pushed room is the client's room, like any served one: pending invites are not
+		// part of its `Roles` (see `serveRoom`).
 		await c.env.RECFLARE_NOTIFICATIONS_HUB.getByName(HUB_INSTANCE).notifyPlayer(
 			playerId,
 			NotificationType.SubscriptionUpdateRoom,
-			room
+			withConfirmedRoles(room)
 		)
 	} catch (err) {
 		logger.error('failed to push RoomUpdate notification', {
@@ -685,7 +707,7 @@ async function pushRoomUpdate(
 async function pushRoomUpdateToRoom(
 	c: Context<App>,
 	roomId: number,
-	room: Record<string, unknown>,
+	room: Room,
 	alsoNotify: number[] = []
 ): Promise<void> {
 	const playerIds = new Set(await getPlayerIdsInRoom(c.env.DB, roomId))
@@ -917,11 +939,15 @@ function toSaveResponse(save: Record<string, unknown>, target: number | null = n
 		unityAssetId: str(save.UnityAssetId),
 		unityAsset: baked?.filename ?? null,
 		unityAssetHash: baked?.hash ?? null,
-		dataBlob: str(save.DataBlob) ?? '',
+		dataBlob: str(save.DataBlob),
 		dataBlobHash: str(save.DataBlobHash),
+		persistenceVersion: num(save.PersistenceVersion) ?? 0,
+		omVersion: num(save.OMVersion) ?? 0,
+		ugcSubVersion: num(save.UgcSubVersion) ?? 0,
 		savedByAccountId: num(save.SavedByAccountId),
-		savedOnPlatform: num(save.SavedOnPlatform) ?? 0,
-		savedOnDeviceClass: num(save.SavedOnDeviceClass) ?? 0,
+		savedOnPlatform: save.SavedOnPlatform === null ? null : (num(save.SavedOnPlatform) ?? 0),
+		savedOnDeviceClass:
+			save.SavedOnDeviceClass === null ? null : (num(save.SavedOnDeviceClass) ?? 0),
 		description: str(save.Description),
 		createdAt: str(save.CreatedAt) ?? '',
 	}
@@ -941,9 +967,15 @@ function pickBakedBundle(
 	target: number | null
 ): { filename: string; hash: string | null } | null {
 	if (!Array.isArray(save.UnitySubAssets)) return null
+	const rootId = typeof save.UnityAssetId === 'string' ? save.UnityAssetId.toLowerCase() : null
 	const rows = save.UnitySubAssets.filter(
 		(item): item is { Target?: unknown; Filename?: unknown; Hash?: unknown } =>
-			typeof item === 'object' && item !== null
+			typeof item === 'object' &&
+			item !== null &&
+			(rootId === null ||
+				('UnityAssetId' in item &&
+					typeof item.UnityAssetId === 'string' &&
+					item.UnityAssetId.toLowerCase() === rootId))
 	)
 	const chosen =
 		target === null
@@ -998,18 +1030,30 @@ function toSaveWithoutUnityAssets(save: Record<string, unknown>) {
 		ReferencedUnityAssetIds: Array.isArray(save.ReferencedUnityAssetIds)
 			? save.ReferencedUnityAssetIds
 			: [],
-		DataBlob: str(save.DataBlob) ?? '',
+		DataBlob: str(save.DataBlob),
 		DataBlobHash: str(save.DataBlobHash),
 		PersistenceVersion: num(save.PersistenceVersion) ?? 0,
 		OMVersion: num(save.OMVersion) ?? 0,
 		SavedByAccountId: num(save.SavedByAccountId),
-		SavedOnPlatform: num(save.SavedOnPlatform) ?? 0,
-		SavedOnDeviceClass: num(save.SavedOnDeviceClass) ?? 0,
+		SavedOnPlatform: save.SavedOnPlatform === null ? null : (num(save.SavedOnPlatform) ?? 0),
+		SavedOnDeviceClass:
+			save.SavedOnDeviceClass === null ? null : (num(save.SavedOnDeviceClass) ?? 0),
 		Description: str(save.Description) ?? '',
 		ModerationState: num(save.ModerationState) ?? 0,
 		CreatedAt: str(save.CreatedAt) ?? '',
 		UgcSubVersion: num(save.UgcSubVersion) ?? 0,
 	}
+}
+
+/** A JSON authoring manifest is not interchangeable with a baked game bundle. */
+function studioSource(
+	save: Record<string, unknown>
+): { Filename: string; Hash: string | null } | null {
+	const value = save.StudioSourceAsset
+	if (typeof value !== 'object' || value === null) return null
+	const source = value as { Filename?: unknown; Hash?: unknown }
+	if (typeof source.Filename !== 'string' || source.Filename === '') return null
+	return { Filename: source.Filename, Hash: typeof source.Hash === 'string' ? source.Hash : null }
 }
 
 /**
@@ -1019,10 +1063,10 @@ function toSaveWithoutUnityAssets(save: Record<string, unknown>) {
  * values were all missing). Two things differ from the list row, both observed against
  * the reference:
  *
- * - Each `UnitySubAssets` entry is `{ UnityAssetId, UnityAsset, UnityAssetHash }` — the
- *   stored `Filename`/`Hash` under the names the client's save-detail decoder reads —
- *   and the save's own main bundle is lifted to top-level `UnityAsset`/`UnityAssetHash`
- *   (the named target's, Windows when none was named; both null for a maker-pen save).
+ * - The save's main bundle is at top-level `UnityAsset`/`UnityAssetHash`. Only other
+ *   bundles belong in `UnitySubAssets`, as `{ UnityAssetId, UnityAsset, UnityAssetHash }`.
+ *   Concrete filenames use the named target, Windows when absent; the main fields
+ *   are null for a maker-pen save.
  * - No `Tags`, and `UnityAssetId` is always present (null when the save carried none).
  *
  * Built key by key like {@link toSaveWithoutUnityAssets}, for the same reason.
@@ -1031,11 +1075,18 @@ function toSaveDetail(save: Record<string, unknown>, target: number | null) {
 	const str = (v: unknown) => (typeof v === 'string' ? v : null)
 	const num = (v: unknown) => (typeof v === 'number' ? v : null)
 	const main = pickBakedBundle(save, target)
+	// The root bundle is loaded separately through UnityAsset. Listing it as a
+	// dependency makes Unity load the same serialized files twice (room error 8714).
+	// A detail response names concrete files, so default to Windows just as `main`
+	// does; it cannot carry both platform builds under the same asset GUID.
+	const rootId = str(save.UnityAssetId)?.toLowerCase()
 	const bundles = (Array.isArray(save.UnitySubAssets) ? save.UnitySubAssets : []).filter(
 		(item): item is Record<string, unknown> =>
 			typeof item === 'object' &&
 			item !== null &&
-			(target === null || (item as { Target?: unknown }).Target === target)
+			(item as { Target?: unknown }).Target === (target ?? 0) &&
+			(typeof (item as { UnityAssetId?: unknown }).UnityAssetId !== 'string' ||
+				(item as { UnityAssetId: string }).UnityAssetId.toLowerCase() !== rootId)
 	)
 	return {
 		UnitySubAssets: bundles.map((row) => ({
@@ -1054,7 +1105,7 @@ function toSaveDetail(save: Record<string, unknown>, target: number | null) {
 		ReferencedUnityAssetIds: Array.isArray(save.ReferencedUnityAssetIds)
 			? save.ReferencedUnityAssetIds
 			: [],
-		DataBlob: str(save.DataBlob) ?? '',
+		DataBlob: str(save.DataBlob),
 		DataBlobHash: str(save.DataBlobHash),
 		PersistenceVersion: num(save.PersistenceVersion) ?? 0,
 		OMVersion: num(save.OMVersion) ?? 0,
@@ -1068,16 +1119,44 @@ function toSaveDetail(save: Record<string, unknown>, target: number | null) {
 	}
 }
 
-/** Client envelope for room mutations: `{ success, error, value }` (lowercase). */
-function roomEnvelope(c: Context<App>, value: unknown, error = '') {
-	return c.json({ success: error === '', error, value })
+/**
+ * A room as the client is shown it. The stored room is served whole EXCEPT for its pending
+ * role invites: a `Roles` entry with `Role` 0 and an `InvitedRole` is an offer the player
+ * has not answered, and served as-is it put the invited player on the room's member list
+ * (and, on the 2025 client, in its co-owner list) before they had accepted anything. The
+ * offer reaches them as a `RoomCoOwnerInvited` message; the entry stays in the STORED room
+ * for the accept to promote, which is why this is applied where the room leaves the worker
+ * and never to a room about to be written back.
+ *
+ * Every room this worker answers — alone, in a list, in the mutation envelope or pushed as
+ * a `RoomUpdate` — goes through this (or {@link serveRooms}).
+ */
+const serveRoom = withConfirmedRoles
+
+/** {@link serveRoom} over a list. */
+const serveRooms = (rooms: Room[]): Room[] => rooms.map(serveRoom)
+
+/** {@link serveRoom} over a `{ Results, TotalResults }` page. */
+const serveRoomPage = <T extends { Results: Room[] }>(page: T): T => ({
+	...page,
+	Results: serveRooms(page.Results),
+})
+
+/**
+ * Client envelope for room mutations: `{ success, error, value }` (lowercase). `value` is
+ * the updated room (served through {@link serveRoom}) or null on a refusal.
+ */
+function roomEnvelope(c: Context<App>, value: Room | null, error = '') {
+	return c.json({ success: error === '', error, value: value && serveRoom(value) })
 }
 
 /**
  * The same envelope for the ban write, whose `value` is the BAN rather than the room —
  * a ban isn't part of the room the client renders, so there is no updated room to send.
  */
-const banEnvelope = roomEnvelope
+function banEnvelope(c: Context<App>, value: unknown, error = '') {
+	return c.json({ success: error === '', error, value })
+}
 
 /**
  * The envelope both leaderboard routes answer: `{ Success, Error, error_id }`, carrying
@@ -1088,6 +1167,27 @@ function leaderboardEnvelope(c: Context<App>, error: string | null = null) {
 	return c.json({ Success: error === null, Error: error, error_id: null })
 }
 
+/**
+ * From this build on, the leaderboard slot writes (`POST`/`DELETE
+ * /rooms/:id/leaderboards/:lid`) go through the client's non-generic send and never read the
+ * body. A `200 { Success: false }` therefore reads as SUCCESS, so a refusal has to be an
+ * HTTP status. Older builds parse the envelope and keep getting it on a 200.
+ */
+const STATUS_ONLY_LEADERBOARD_BUILD = '20260323'
+
+/**
+ * A refusal from a leaderboard slot write: `status` for a build at or past
+ * {@link STATUS_ONLY_LEADERBOARD_BUILD}, a 200 failure envelope for the builds before it.
+ * The same envelope rides along as the body either way. Nothing reads it in 2026, but it
+ * costs nothing and shows up in a capture.
+ */
+async function leaderboardRefusal(c: Context<App>, status: 404, error: string) {
+	const build = await authedGameVersion(c)
+	if (build !== null && build >= STATUS_ONLY_LEADERBOARD_BUILD)
+		return c.json({ Success: false, Error: error, error_id: null }, status)
+	return leaderboardEnvelope(c, error)
+}
+
 /** The same bare envelope for the room progression write (`POST /rooms/:id/experience`). */
 const experienceEnvelope = leaderboardEnvelope
 
@@ -1095,7 +1195,7 @@ const experienceEnvelope = leaderboardEnvelope
 async function ownedRooms(c: Context<App>) {
 	const accountId = await authedAccountId(c)
 	if (accountId === null) return unauthorized(c)
-	return c.json(await getRoomsByCreator(c.env.DB, accountId))
+	return c.json(serveRooms(await getRoomsByCreator(c.env.DB, accountId)))
 }
 
 /**
@@ -1105,12 +1205,17 @@ async function ownedRooms(c: Context<App>) {
 async function ownedRoomsExcludingDorm(c: Context<App>) {
 	const accountId = await authedAccountId(c)
 	if (accountId === null) return unauthorized(c)
-	const rooms = await getRoomsByCreator(c.env.DB, accountId)
-	return c.json(rooms.filter((r) => r.IsDorm !== true))
+	const rooms = (await getContributedRooms(c.env.DB, accountId)).filter((room) =>
+		canManageRoom(room, accountId)
+	)
+	return c.json(serveRooms(rooms.filter((r) => r.IsDorm !== true)))
 }
 
 /** Suggestions `/rooms/autocomplete_search` returns when the client names no `take`. */
 const DEFAULT_SUGGESTION_COUNT = 10
+
+/** Cap on `/rooms/search/name`'s `take`: a type-ahead list, so the seek stays a few rows. */
+const NAME_SEARCH_MAX = 10
 
 const app = new Hono<App>()
 	.use(
@@ -1134,6 +1239,92 @@ const app = new Hono<App>()
 
 	.onError(withOnError())
 	.notFound(withNotFound())
+
+	// Studio loaders resolve asset GUIDs before downloading the published bundles.
+	.use('/unity_assets/baked/bulk', async (c, next) => {
+		// Preserve upstream's public form-based Studio resolver. JSON imports need
+		// the caller's presence/ownership before resolving legacy save metadata.
+		if (c.req.method !== 'POST' || !c.req.header('content-type')?.includes('application/json'))
+			return next()
+		const accountId = await authedAccountId(c)
+		if (accountId === null) return unauthorized(c)
+		let body: Record<string, unknown>
+		try {
+			body = await c.req.json<Record<string, unknown>>()
+		} catch {
+			return c.body(null, 400)
+		}
+		if (!body || typeof body !== 'object' || Array.isArray(body)) return c.body(null, 400)
+		const entries = Object.entries(body)
+		const ids = entries.find(([key]) => /^(unityAssetIds|assetIds|ids)$/i.test(key))?.[1]
+		const target = Number(
+			entries.find(([key]) => /^(unityAssetTarget|assetTarget|target)$/i.test(key))?.[1] ?? 0
+		)
+		const version = Number(
+			entries.find(([key]) => /^(unityAssetVersion|assetVersion|version)$/i.test(key))?.[1] ?? 5
+		)
+		if (
+			!Array.isArray(ids) ||
+			ids.length > 128 ||
+			ids.some(
+				(id) => typeof id !== 'string' || !/^[0-9a-f]{8}(-[0-9a-f]{4}){3}-[0-9a-f]{12}$/i.test(id)
+			)
+		) {
+			return c.body(null, 400)
+		}
+		if (!Number.isInteger(target) || !Number.isInteger(version)) return c.body(null, 400)
+		if (ids.length === 0) return c.json([])
+		const requested = new Set(ids.map((id: string) => id.toLowerCase()))
+		const studio = await getBakedUnityAssets(c.env.DB, [...requested], target, version)
+		if (studio.length === requested.size) return c.json(studio)
+		const instance = (await getPresence<PresenceView>(c.env.DB, accountId))?.roomInstance
+		const { results } = await c.env.DB.prepare(
+			`
+			SELECT saves.data FROM subroom_save saves
+			JOIN subroom subs ON subs.current_save_id = saves.sub_room_data_save_id
+			JOIN room rooms ON rooms.room_id = subs.room_id
+			WHERE (rooms.accessibility = 1 OR rooms.creator_account_id = ?1 OR rooms.room_id = ?2)
+			AND (lower(json_extract(saves.data, '$.UnityAssetId')) IN (SELECT value FROM json_each(?3))
+			OR EXISTS (SELECT 1 FROM json_each(saves.data, '$.UnitySubAssets') asset
+				WHERE lower(json_extract(asset.value, '$.UnityAssetId')) IN (SELECT value FROM json_each(?3)))
+			OR EXISTS (SELECT 1 FROM json_each(saves.data, '$.ReferencedUnityAssets') asset
+				WHERE lower(json_extract(asset.value, '$.UnityAssetId')) IN (SELECT value FROM json_each(?3))))
+		`
+		)
+			.bind(accountId, instance?.roomId ?? -1, JSON.stringify([...requested]))
+			.all<{ data: string }>()
+		const assets = new Map<
+			string,
+			{ UnityAssetId: string; Target: number; Version: number; Filename: string; Hash: string }
+		>()
+		for (const asset of studio) assets.set(asset.UnityAssetId.toLowerCase(), asset)
+		for (const row of results) {
+			const save = JSON.parse(row.data) as Record<string, unknown>
+			const candidates = [
+				save,
+				...(Array.isArray(save.UnitySubAssets) ? save.UnitySubAssets : []),
+				...(Array.isArray(save.ReferencedUnityAssets) ? save.ReferencedUnityAssets : []),
+			]
+			for (const candidate of candidates) {
+				if (!candidate || typeof candidate !== 'object') continue
+				const asset = candidate as Record<string, unknown>
+				const id = typeof asset.UnityAssetId === 'string' ? asset.UnityAssetId.toLowerCase() : ''
+				const filename = asset.UnityAsset
+				if (!requested.has(id) || typeof filename !== 'string') continue
+				const build = /\.(\d+)\.(\d+)\.assetbundle$/.exec(filename)
+				if (!build || Number(build[1]) !== target || Number(build[2]) !== version) continue
+				if (assets.has(id)) continue
+				assets.set(id, {
+					UnityAssetId: id,
+					Target: target,
+					Version: version,
+					Filename: filename,
+					Hash: typeof asset.UnityAssetHash === 'string' ? asset.UnityAssetHash : '',
+				})
+			}
+		}
+		return c.json([...requested].flatMap((id) => (assets.has(id) ? [assets.get(id)!] : [])))
+	})
 
 	.get(
 		'/',
@@ -1239,16 +1430,49 @@ const app = new Hono<App>()
 			if (idParam) {
 				const id = firstId(idParam)
 				const room = id === undefined ? null : await getRoomById(c.env.DB, id)
-				return c.json(room ?? {})
+				return c.json(room ? serveRoom(room) : c.req.query('include') === '525581' ? null : {})
 			}
 			const room = await getRoomByName(c.env.DB, nameParam ?? '')
-			return c.json(room ?? {})
+			return c.json(room ? serveRoom(room) : c.req.query('include') === '525581' ? null : {})
+		}
+	)
+
+	// Studio creates an empty room directly, rather than cloning a game template.
+	.post(
+		'/rooms/create',
+		describeRoute({
+			tags: ['My rooms'],
+			summary: 'Create an empty Studio room',
+			security: AUTHED,
+			requestBody: form(CloneRoomRequest, 'Room name and optional ugcVersion (1 or 2)'),
+			responses: {
+				200: json(RoomDto, 'The private room with its empty Home subroom'),
+				401: UNAUTHORIZED_RESPONSE,
+			},
+		}),
+		async (c) => {
+			const accountId = await authedAccountId(c)
+			if (accountId === null) return unauthorized(c)
+			const body = await c.req.parseBody()
+			const name = typeof body.name === 'string' ? body.name.trim() : ''
+			const invalid = roomNameRejection(name, 'room name')
+			if (name === '' || invalid !== null)
+				return c.json({ error: invalid ?? 'A room name is required.' }, 400)
+			const version = Number(body.ugcVersion ?? 1)
+			if (version !== 1 && version !== 2) return c.json({ error: 'Unsupported UGC version.' }, 400)
+			const maxRooms = intVar(c.env.MAX_ROOMS_PER_ACCOUNT, DEFAULT_MAX_ROOMS_PER_ACCOUNT)
+			if (maxRooms > 0 && (await countRoomsByCreator(c.env.DB, accountId)) >= maxRooms)
+				return c.json({ error: `You can only have ${maxRooms} rooms.` }, 403)
+			const room = await createStudioRoom(c.env.DB, name, accountId, version)
+			if (!room) return c.json({ error: 'A room with that name already exists.' }, 409)
+			return c.json(serveRoom(room))
 		}
 	)
 
 	// Room search: `query` is space/`+`-separated terms — `#tag` matches room tags,
-	// plain terms match the name. Public, non-dorm rooms only. Paginated via
-	// skip/take. Returns `{ Results, TotalResults }`.
+	// plain terms match the name. Public, non-dorm rooms not opted out of search
+	// (`ExcludeFromSearch`) only — `ExcludeFromLists` is the feeds' flag and does not hide
+	// a room here. Paginated via skip/take. Returns `{ Results, TotalResults }`.
 	//
 	// `#community` is the one tag term that isn't a tag lookup: it is the browse chip's
 	// pseudo-tag reaching search, and means rooms a PLAYER made rather than the seeded
@@ -1260,7 +1484,9 @@ const app = new Hono<App>()
 			summary: 'Search rooms',
 			description: [
 				'Full room search. `query` is space- or `+`-separated terms: a `#tag` term matches the',
-				'room’s tags, a plain term matches its name. Public, non-dorm rooms only.',
+				'room’s tags, a plain term matches its name. Public, non-dorm rooms only, and never one',
+				'whose `ExcludeFromSearch` is set; `ExcludeFromLists` hides a room from the feeds, not',
+				'from here.',
 				'`#community` is a pseudo-tag no room carries — it narrows to rooms a player made',
 				'(anything the system Coach account didn’t create), like `/rooms/hot?tag=community`.',
 			].join(' '),
@@ -1277,7 +1503,39 @@ const app = new Hono<App>()
 			const query = c.req.query('query') ?? ''
 			const skip = Number.parseInt(c.req.query('skip') ?? '0', 10) || 0
 			const take = Number.parseInt(c.req.query('take') ?? '30', 10) || 30
-			return c.json(await searchRooms(c.env.DB, query, skip, take))
+			return c.json(serveRoomPage(await searchRooms(c.env.DB, query, skip, take)))
+		}
+	)
+
+	// The website's header search: searchable rooms whose name STARTS with `query`, A–Z,
+	// as a bare array. Not the game's search (`/rooms/search` is a substring match that
+	// reads every searchable room); this is an index seek that reads only the rows it
+	// returns, which is what lets the site ask on every pause in typing. Un-hydrated rooms.
+	.get(
+		'/rooms/search/name',
+		describeRoute({
+			tags: ['Discovery'],
+			summary: 'Prefix-search rooms by name',
+			description: [
+				'Searchable rooms (public, non-dorm, not `ExcludeFromSearch`) whose name begins',
+				'with `query`, case-insensitive, alphabetically — a bare array. An index seek, so',
+				'it reads only the rooms it returns. Rooms are served without subrooms, tags or',
+				'badges. The game’s substring search is `/rooms/search`.',
+			].join(' '),
+			parameters: [
+				stringQuery('query', 'Name prefix'),
+				intQuery('take', `How many rooms to return (default and max ${NAME_SEARCH_MAX})`),
+			],
+			responses: { 200: json(RoomDto.array(), 'The matching rooms, A–Z') },
+		}),
+		async (c) => {
+			const take = Number.parseInt(c.req.query('take') ?? '', 10)
+			const rooms = await searchRoomsByName(
+				c.env.DB,
+				c.req.query('query') ?? '',
+				Number.isNaN(take) ? NAME_SEARCH_MAX : Math.min(take, NAME_SEARCH_MAX)
+			)
+			return c.json(serveRooms(rooms))
 		}
 	)
 
@@ -1286,8 +1544,9 @@ const app = new Hono<App>()
 	//
 	// Every suggestion is something `/rooms/search` will actually find, so submitting one
 	// can't come back empty: they're drawn from room names (what a plain search term
-	// matches) and room tags (what a `#tag` term matches), over the same public, non-dorm
-	// rooms search considers. Tags come back with their `#` for that reason.
+	// matches) and room tags (what a `#tag` term matches), over the same public, non-dorm,
+	// searchable rooms search considers — a room opted out of search is not suggested
+	// either. Tags come back with their `#` for that reason.
 	//
 	// `searchSessionId` is the client's own correlation id for a typing session — it ties
 	// the keystrokes and the eventual search together in the reference's analytics. Nothing
@@ -1299,8 +1558,9 @@ const app = new Hono<App>()
 			summary: 'Search suggestions for the search box',
 			description: [
 				'Type-ahead suggestions as a bare array of strings — not rooms, not an envelope.',
-				'Drawn from room names and room tags over the public, non-dorm rooms `/rooms/search`',
-				'searches, so every suggestion is one that finds something when submitted; a tag',
+				'Drawn from room names and room tags over the public, non-dorm, searchable rooms',
+				'`/rooms/search` searches, so every suggestion is one that finds something when',
+				'submitted and a room opted out of search is never suggested; a tag',
 				'suggestion carries its `#` so it searches by tag. A `query` starting with `#`',
 				'suggests tags only. Matches that START with the query come first, then ones that',
 				'merely contain it, alphabetically within each — the same query always suggests the',
@@ -1360,7 +1620,7 @@ const app = new Hono<App>()
 			const tag = c.req.query('tag') ?? ''
 			const skip = Number.parseInt(c.req.query('skip') ?? '0', 10) || 0
 			const take = Number.parseInt(c.req.query('take') ?? '100', 10) || 100
-			return c.json(await getHotRooms(c.env.DB, tag, skip, take))
+			return c.json(serveRoomPage(await getHotRooms(c.env.DB, tag, skip, take)))
 		}
 	)
 
@@ -1412,7 +1672,7 @@ const app = new Hono<App>()
 		async (c) => {
 			const skip = Number.parseInt(c.req.query('skip') ?? '0', 10) || 0
 			const take = Number.parseInt(c.req.query('take') ?? '100', 10) || 100
-			return c.json(await getTrendingRooms(c.env.DB, skip, take))
+			return c.json(serveRoomPage(await getTrendingRooms(c.env.DB, skip, take)))
 		}
 	)
 
@@ -1434,7 +1694,7 @@ const app = new Hono<App>()
 		async (c) => {
 			const skip = Number.parseInt(c.req.query('skip') ?? '0', 10) || 0
 			const take = Number.parseInt(c.req.query('take') ?? '100', 10) || 100
-			return c.json(await getBaseRooms(c.env.DB, skip, take))
+			return c.json(serveRooms(await getBaseRooms(c.env.DB, skip, take)))
 		}
 	)
 
@@ -1462,7 +1722,7 @@ const app = new Hono<App>()
 		async (c) => {
 			const skip = Number.parseInt(c.req.query('skip') ?? '0', 10) || 0
 			const take = Number.parseInt(c.req.query('take') ?? '100', 10) || 100
-			return c.json(await getRecommendedRooms(c.env.DB, skip, take))
+			return c.json(serveRooms(await getRecommendedRooms(c.env.DB, skip, take)))
 		}
 	)
 
@@ -1491,7 +1751,7 @@ const app = new Hono<App>()
 				'',
 				'Restricted by CLIENT BUILD. Serving this to the 2023 client breaks its other room',
 				'listings (NREs, apparently from the featured-room load corrupting its room cache), so',
-				'only the builds known to render it — `20250718.01` today — get the group; anything',
+				'only the builds known to render it — `20250718` today — get the group; anything',
 				'else gets a 404, the same answer it got while the route was parked. The build is read',
 				'from the token’s `rn.ver` claim, which is why this needs a token at all: nothing in',
 				'the group itself is per-player.',
@@ -1557,13 +1817,15 @@ const app = new Hono<App>()
 				if (ids.length > MAX_BULK_ROOM_IDS) return tooManyIds(c)
 				const rooms = await getRoomsByIds(c.env.DB, ids)
 				return c.json(
-					excludePrivateRooms(c.req.query('excludePrivateRooms'))
-						? rooms.filter((r) => r.Accessibility === 1)
-						: rooms
+					serveRooms(
+						excludePrivateRooms(c.req.query('excludePrivateRooms'))
+							? rooms.filter((r) => r.Accessibility === 1)
+							: rooms
+					)
 				)
 			}
 			const room = await getRoomByName(c.env.DB, nameParam ?? '')
-			return c.json(room ? [room] : [])
+			return c.json(room ? [serveRoom(room)] : [])
 		}
 	)
 
@@ -1615,7 +1877,7 @@ const app = new Hono<App>()
 			const rooms = await getRoomsByIds(c.env.DB, ids)
 
 			const excludePrivate = excludePrivateRooms(field('excludePrivateRooms')[0])
-			return c.json(excludePrivate ? rooms.filter((r) => r.Accessibility === 1) : rooms)
+			return c.json(serveRooms(excludePrivate ? rooms.filter((r) => r.Accessibility === 1) : rooms))
 		}
 	)
 
@@ -1644,9 +1906,9 @@ const app = new Hono<App>()
 		'/rooms/ownedby/me',
 		describeRoute({
 			tags: ['My rooms'],
-			summary: 'Rooms the caller owns (excluding their dorm)',
+			summary: 'Rooms the caller owns or co-owns (excluding their dorm)',
 			description: [
-				'The caller’s own rooms with the dorm filtered out: a dorm is auto-provisioned, not a',
+				'The caller’s created and accepted co-owned rooms with the dorm filtered out: a dorm is auto-provisioned, not a',
 				'room the player made, so it doesn’t belong in the “rooms you own” list. Use',
 				'`createdby/me` for everything the account created. Accessibility is deliberately NOT',
 				'filtered — this is the owner’s own list, so unpublished (Private) rooms appear, unlike',
@@ -1706,7 +1968,7 @@ const app = new Hono<App>()
 		async (c) => {
 			const accountId = await authedAccountId(c)
 			if (accountId === null) return unauthorized(c)
-			return c.json(await getContributedRooms(c.env.DB, accountId))
+			return c.json(serveRooms(await getContributedRooms(c.env.DB, accountId)))
 		}
 	)
 
@@ -1763,7 +2025,11 @@ const app = new Hono<App>()
 			responses: { 200: json(RoomDto.array(), 'That account’s public rooms') },
 		}),
 		async (c) =>
-			c.json(await getPublicRoomsByCreator(c.env.DB, Number.parseInt(c.req.param('accountId'), 10)))
+			c.json(
+				serveRooms(
+					await getPublicRoomsByCreator(c.env.DB, Number.parseInt(c.req.param('accountId'), 10))
+				)
+			)
 	)
 
 	// A player's showcased rooms — the hand-picked rail the client draws on a profile,
@@ -1811,7 +2077,7 @@ const app = new Hono<App>()
 			if (accountId === null) return unauthorized(c)
 			const skip = Number.parseInt(c.req.query('skip') ?? '0', 10) || 0
 			const take = Number.parseInt(c.req.query('take') ?? '100', 10) || 100
-			return c.json(await getFavoritedRooms(c.env.DB, accountId, skip, take))
+			return c.json(serveRooms(await getFavoritedRooms(c.env.DB, accountId, skip, take)))
 		}
 	)
 
@@ -1835,7 +2101,7 @@ const app = new Hono<App>()
 			if (accountId === null) return unauthorized(c)
 			const skip = Number.parseInt(c.req.query('skip') ?? '0', 10) || 0
 			const take = Number.parseInt(c.req.query('take') ?? '100', 10) || 100
-			return c.json(await getVisitedRooms(c.env.DB, accountId, skip, take))
+			return c.json(serveRooms(await getVisitedRooms(c.env.DB, accountId, skip, take)))
 		}
 	)
 
@@ -1881,11 +2147,32 @@ const app = new Hono<App>()
 			const skip = Number.parseInt(c.req.query('skip') ?? '0', 10) || 0
 			const take = Number.parseInt(c.req.query('take') ?? '100', 10) || 100
 			return c.json(
-				own
-					? await getVisitedRooms(c.env.DB, playerId, skip, take)
-					: await getPublicVisitedRooms(c.env.DB, playerId, skip, take)
+				serveRooms(
+					own
+						? await getVisitedRooms(c.env.DB, playerId, skip, take)
+						: await getPublicVisitedRooms(c.env.DB, playerId, skip, take)
+				)
 			)
 		}
+	)
+
+	// How many boosts a player has put on a room. Boosts are not implemented — nothing
+	// grants or spends them, and the room DTO's `BoostCount` is a constant 0 for the same
+	// reason — so this is a stub that answers a bare integer 0 for any room and player,
+	// known or not, rather than leaving the client's request to 404.
+	.get(
+		'/rooms/:roomId{[0-9]+}/boosts/:playerId{[0-9]+}/count',
+		describeRoute({
+			tags: ['Interaction'],
+			summary: 'A player’s boost count on a room',
+			description: [
+				'Stub: boosts are not implemented, so this answers a bare `0` for every room and',
+				'player, whether or not either exists. No envelope — the body is the integer.',
+			].join(' '),
+			parameters: [roomIdParam, playerIdParam],
+			responses: { 200: json(RoomBoostCount, 'The boost count, always 0') },
+		}),
+		(c) => c.json(0)
 	)
 
 	// The current player's interaction state with a room (cheered/favorited/last
@@ -2394,7 +2681,7 @@ const app = new Hono<App>()
 		}
 	)
 
-	// Delete a room. Auth-gated (401); owners and staff (developers/moderators) may delete.
+	// Delete a room. Auth-gated (401); the owner or a developer may delete — not a moderator.
 	// Removes the room record (and per-player interactions with it) and the room's
 	// image object from the shared CDN bucket. Images players *took* in the room are
 	// left alone — they live in the api/img world and outlast the room.
@@ -2404,7 +2691,7 @@ const app = new Hono<App>()
 			tags: ['Room settings'],
 			summary: 'Delete a room',
 			description: [
-				'Owner or staff. Removes the room record, the per-player interactions with it, and the',
+				'Owner or developer (a moderator token is refused). Removes the room record, the per-player interactions with it, and the',
 				'room’s image object from the shared CDN bucket. Photos players TOOK in the room are',
 				'left alone — those live in the api/img world and outlive the room.',
 			].join(' '),
@@ -2429,7 +2716,7 @@ const app = new Hono<App>()
 				})
 			}
 			const isOwner = room.CreatorAccountId === accountId
-			if (!isOwner && !(await isStaff(c))) {
+			if (!isOwner && !(await isDeveloper(c))) {
 				return roomResult(c, {
 					Success: false,
 					ErrorId: 'Rooms.NotOwner',
@@ -2447,7 +2734,7 @@ const app = new Hono<App>()
 				await c.env.CDN_ASSETS.delete(`image/${imageName}`)
 			}
 
-			// A takedown — staff deleting a room that isn't theirs — goes in the audit log; an
+			// A takedown — a developer deleting a room that isn't theirs — goes in the audit log; an
 			// owner deleting their own room is their business and doesn't. The row keeps the
 			// room's identity, since the room itself is gone and nothing else will answer "which
 			// room was that". Written after the fact and caught: a failed insert must not report
@@ -2489,9 +2776,14 @@ const app = new Hono<App>()
 			summary: 'A room’s roles',
 			description: [
 				'Everyone with a role in the room — its creator plus whoever has been granted Host,',
-				'Moderator or CoOwner — as whole `RoomRole` records. This is the same array the',
-				'room DTO serves under `Roles`, on its own endpoint, so it is public exactly like the',
-				'room is: a role list says who runs a room, which the room page already shows.',
+				'Moderator or CoOwner — as whole `RoomRole` records, PLUS every pending invite. It is',
+				'public exactly like the room is: a role list says who runs a room, which the room',
+				'page already shows.',
+				'',
+				'Unlike the room DTO’s `Roles`, this list INCLUDES unanswered co-owner invites (`Role`',
+				'0, the offer on `InvitedRole`): the client reads it to show the players with an',
+				'invite pending. The room DTO leaves those entries out, because there an invited',
+				'player read as a member before they had accepted anything.',
 				'',
 				'A bare array, NOT the `{ success, error, value }` envelope the role WRITE answers. An',
 				'unknown room is an empty list rather than an error — it reads the same as a room',
@@ -3267,14 +3559,22 @@ const app = new Hono<App>()
 				'Answers a bare `{ Success, Error, error_id }` — PascalCase with a lowercase',
 				'`error_id`, like the unprefixed isBanned route, carrying no entity. NOT the room',
 				'mutations’ lowercase `{ success, error, value }`.',
+				'',
+				'From build 20260323 the client never reads the body, so a `200` with `Success: false`',
+				'would read as success: a token for that build or later gets an unknown room as a 404',
+				'instead. Earlier builds still get the 200 failure envelope.',
 			].join('\n'),
 			security: AUTHED,
 			parameters: [roomIdParam, leaderboardIdParam],
 			requestBody: form(LeaderboardRequest, 'The leaderboard configuration'),
 			responses: {
-				200: json(LeaderboardResultEnvelope, 'Stored, or a rejection with `Success: false`'),
+				200: json(
+					LeaderboardResultEnvelope,
+					'Stored, or (before 20260323) a rejection with `Success: false`'
+				),
 				401: UNAUTHORIZED_RESPONSE,
 				403: FORBIDDEN_RESPONSE,
+				404: json(LeaderboardResultEnvelope, 'Unknown room (build 20260323 and later)'),
 			},
 		}),
 		async (c) => {
@@ -3283,7 +3583,7 @@ const app = new Hono<App>()
 
 			const roomId = Number.parseInt(c.req.param('roomId'), 10)
 			const room = await getRoomById(c.env.DB, roomId)
-			if (!room) return leaderboardEnvelope(c, 'This room does not exist!')
+			if (!room) return leaderboardRefusal(c, 404, 'This room does not exist!')
 			// A valid token but not the room's owner/co-owner → 403 (the auth gate above
 			// already returned 401 for a missing/invalid token).
 			if (!canManageRoom(room, accountId)) return c.body(null, 403)
@@ -3324,7 +3624,10 @@ const app = new Hono<App>()
 				'silent success — the caller asked to undo something that was not there. The client',
 				'deletes slots blindly when tearing boards down and tolerates the refusal.',
 				'',
-				'Answers the same bare `{ Success, Error, error_id }` as the leaderboard write.',
+				'Answers the same bare `{ Success, Error, error_id }` as the leaderboard write. An',
+				'unknown room is a 404 for build 20260323 and later, which never read the body. An',
+				'unconfigured slot stays a 200 for them: the slot is already gone, which is what',
+				'they asked for.',
 			].join('\n'),
 			security: AUTHED,
 			parameters: [roomIdParam, leaderboardIdParam],
@@ -3332,6 +3635,7 @@ const app = new Hono<App>()
 				200: json(LeaderboardResultEnvelope, 'Removed, or a rejection with `Success: false`'),
 				401: UNAUTHORIZED_RESPONSE,
 				403: FORBIDDEN_RESPONSE,
+				404: json(LeaderboardResultEnvelope, 'Unknown room (build 20260323 and later)'),
 			},
 		}),
 		async (c) => {
@@ -3340,11 +3644,15 @@ const app = new Hono<App>()
 
 			const roomId = Number.parseInt(c.req.param('roomId'), 10)
 			const room = await getRoomById(c.env.DB, roomId)
-			if (!room) return leaderboardEnvelope(c, 'This room does not exist!')
+			if (!room) return leaderboardRefusal(c, 404, 'This room does not exist!')
 			if (!canManageRoom(room, accountId)) return c.body(null, 403)
 
 			const leaderboardId = Number.parseInt(c.req.param('leaderboardId'), 10)
 			const removed = await deleteRoomLeaderboard(c.env.DB, roomId, leaderboardId)
+			// Deliberately NOT a 404 for 2026: the client tears boards down by deleting every
+			// slot blindly, and an unconfigured slot is already in the state it asked for. The
+			// 2026 client reads this 200 as success, which is the truth. Older builds get the
+			// envelope's refusal, which they tolerate.
 			if (!removed) return leaderboardEnvelope(c, 'This room has no such leaderboard!')
 			return leaderboardEnvelope(c)
 		}
@@ -3504,8 +3812,9 @@ const app = new Hono<App>()
 	// Auth-gated (401) and owner/co-owner-only (403). Body is a form of
 	// `supports*=True|False` fields (see RESTRICTION_FIELDS); only the fields present
 	// are changed. Returns the updated room in the `{ success, error, value }` envelope.
-	.put(
-		'/rooms/:roomId{[0-9]+}/restrictions',
+	.on(
+		'PUT',
+		['/rooms/:roomId{[0-9]+}/restrictions', '/rooms/:roomId{[0-9]+}/v2/restrictions'],
 		describeRoute({
 			tags: ['Room settings'],
 			summary: 'Set a room’s platform/movement support flags',
@@ -3518,7 +3827,10 @@ const app = new Hono<App>()
 			parameters: [roomIdParam],
 			requestBody: form(RestrictionsRequest, 'The flags to change'),
 			responses: {
-				200: json(RoomEnvelope, 'The updated room, or a rejection with `success: false`'),
+				200: json(
+					RoomRestrictionsEnvelope,
+					'The updated room; Studio v2 uses a PascalCase result envelope'
+				),
 				401: UNAUTHORIZED_RESPONSE,
 				403: FORBIDDEN_RESPONSE,
 			},
@@ -3535,7 +3847,7 @@ const app = new Hono<App>()
 			if (!canManageRoom(room, accountId)) return c.body(null, 403)
 
 			const body = (await c.req.parseBody().catch(() => ({}))) as Record<string, unknown>
-			const patch: Record<string, boolean> = {}
+			const patch: Record<string, boolean | number> = {}
 			for (const [key, value] of Object.entries(body)) {
 				const field = RESTRICTION_FIELDS[key.toLowerCase()]
 				if (field !== undefined && typeof value === 'string') {
@@ -3543,8 +3855,20 @@ const app = new Hono<App>()
 				}
 			}
 
+			const ageEntry = Object.entries(body).find(([key]) => key.toLowerCase() === 'agerating')
+			if (ageEntry !== undefined) {
+				const age = ageEntry[1]
+				if (typeof age !== 'string' || !/^[012]$/.test(age)) {
+					if (c.req.path.endsWith('/v2/restrictions'))
+						return c.json({ Success: false, Error: 'Invalid age rating.', Value: null })
+					return roomEnvelope(c, null, 'Invalid age rating.')
+				}
+				patch.AgeRating = Number(age)
+			}
 			const updated = await updateRoomFields(c.env.DB, roomId, room, patch)
 			await pushRoomUpdate(c, accountId, updated)
+			if (c.req.path.endsWith('/v2/restrictions'))
+				return c.json({ Success: true, Error: null, Value: updated })
 			return roomEnvelope(c, updated)
 		}
 	)
@@ -3656,10 +3980,95 @@ const app = new Hono<App>()
 		}
 	)
 
+	// Hide a room from the feeds and from search, or list it again — the staff listing
+	// toggle on the website's room page. NOT a game endpoint: the real service set
+	// `ExcludeFromLists` / `ExcludeFromSearch` from an admin tool, and the client has no
+	// screen for either, so this is recflare's own and is staff-only — the owner has
+	// `Accessibility` for hiding their own room. The two flags are independent in the reads
+	// (see LISTABLE_WHERE / SEARCHABLE_WHERE) but are set TOGETHER here: a room moderation
+	// pulls from the listings is meant to be unfindable, not merely un-browsable.
+	.put(
+		'/rooms/:roomId{[0-9]+}/exclude',
+		describeRoute({
+			tags: ['Custom', 'Room settings'],
+			summary: 'Hide a room from the listings and search (staff)',
+			description: [
+				'Sets `ExcludeFromLists` AND `ExcludeFromSearch` together to the posted `excluded`.',
+				'Staff only — a token carrying the `developer` / `moderator` role; the room’s owner',
+				'is refused (403) like anyone else, since this is a moderation action rather than a',
+				'room setting. The room stays reachable by link and by matchmake; it simply stops',
+				'appearing in the browse feeds, search and autocomplete. Not an endpoint the game',
+				'client calls — the website’s room page uses it. Written to the audit log.',
+			].join(' '),
+			security: AUTHED,
+			parameters: [roomIdParam],
+			requestBody: form(ExcludeRequest, 'Whether the room is hidden'),
+			responses: {
+				200: json(RoomEnvelope, 'The updated room, or a rejection with `success: false`'),
+				401: UNAUTHORIZED_RESPONSE,
+				403: FORBIDDEN_RESPONSE,
+			},
+		}),
+		async (c) => {
+			const accountId = await authedAccountId(c)
+			if (accountId === null) return unauthorized(c)
+			if (!(await isStaff(c))) return c.body(null, 403)
+
+			const body = (await c.req.parseBody().catch(() => ({}))) as Record<string, unknown>
+			const excluded =
+				body.excluded === 'true' || body.excluded === '1'
+					? true
+					: body.excluded === 'false' || body.excluded === '0'
+						? false
+						: null
+			if (excluded === null) {
+				return roomEnvelope(c, null, 'You must provide a valid excluded!')
+			}
+
+			const roomId = Number.parseInt(c.req.param('roomId'), 10)
+			const room = await getRoomById(c.env.DB, roomId)
+			if (!room) return roomEnvelope(c, null, 'This room does not exist!')
+
+			const updated = await updateRoomFields(c.env.DB, roomId, room, {
+				ExcludeFromLists: excluded,
+				ExcludeFromSearch: excluded,
+			})
+
+			// Always a staff action on somebody's room, so always audited — the owner can't
+			// get here. Written after the fact and caught, like the takedown's row: a failed
+			// insert must not report a change that has already happened as refused.
+			try {
+				await writeAuditLog(c.env.DB, {
+					playerId: accountId,
+					action: 'room_exclude',
+					data: {
+						roomId,
+						name: room.Name,
+						creatorAccountId: room.CreatorAccountId,
+						excluded,
+					},
+				})
+			} catch (err) {
+				logger.error('could not write an audit log row', {
+					action: 'room_exclude',
+					playerId: accountId,
+					roomId,
+					error: err instanceof Error ? err.message : String(err),
+				})
+			}
+
+			// The owner's client, if it's open, re-renders the room from this.
+			if (typeof room.CreatorAccountId === 'number') {
+				await pushRoomUpdate(c, room.CreatorAccountId, updated)
+			}
+			return roomEnvelope(c, updated)
+		}
+	)
+
 	// A subroom's saved-data versions — the room-history / "restore a save" list. Every
 	// save is its own `subroom_save` row (nothing is overwritten), so this is real
 	// history, newest first, paged by skip/take. Auth-gated (401), and readable by the
-	// room's creator, a co-owner, or anyone whose presence puts them in the room (see
+	// room's creator, a co-owner, anyone whose presence puts them in the room, or staff (see
 	// `canReadSaves`).
 	.get(
 		'/rooms/:roomId{[0-9]+}/subrooms/:subRoomId{[0-9]+}/saves',
@@ -3675,7 +4084,8 @@ const app = new Hono<App>()
 				'',
 				'The list includes STAGED saves that were never published, so it is not public:',
 				'the room’s creator or a co-owner may read it, and so may anyone standing IN the room',
-				'(their live presence says so). Anyone else is a 403. It is what the client reads to resolve',
+				'(their live presence says so) and anyone whose token carries the `developer` /',
+				'`moderator` role. Anyone else is a 403. It is what the client reads to resolve',
 				'“load the latest or the published version?” on entering a private instance — a',
 				'visitor who cannot read it cannot load what the instance is running.',
 				'',
@@ -3748,8 +4158,9 @@ const app = new Hono<App>()
 				'paged wrapper, with no `{ success, error, value }` envelope around it.',
 				'',
 				'Gated exactly like `…/saves`, and for the same reason: the list includes STAGED',
-				'saves that were never published, so it is the room’s creator, a co-owner, or anyone',
-				'whose live presence puts them in the room, and anyone else is a 403.',
+				'saves that were never published, so it is the room’s creator, a co-owner, anyone',
+				'whose live presence puts them in the room, or staff (a `developer` / `moderator`',
+				'token), and anyone else is a 403.',
 				'',
 				'`TotalResults` and `TotalCount` carry the same number — the client’s paged DTO and',
 				'the reference disagree on the name, so both are emitted.',
@@ -3789,7 +4200,14 @@ const app = new Hono<App>()
 			// `TotalResults` counts the whole history, not the page — that is what the client
 			// pages against.
 			return c.json({
-				Results: page.map(toSaveWithoutUnityAssets),
+				Results: page.map((save) => {
+					const result = toSaveWithoutUnityAssets(save)
+					// Archived game bundles have no editable Unity project. Studio can still
+					// load their Maker Pen data; don't make it fetch a nonexistent source manifest.
+					if (c.req.header('user-agent')?.startsWith('RRStudio') && !studioSource(save))
+						result.UnityAssetId = null
+					return result
+				}),
 				TotalResults: saves.length,
 				TotalCount: saves.length,
 			})
@@ -3817,9 +4235,9 @@ const app = new Hono<App>()
 				'cannot read another’s save by guessing an id: a save that belongs elsewhere is a',
 				'404, same as an unknown one.',
 				'',
-				'Gated like the list it details — the room’s creator, a co-owner, or anyone whose',
-				'presence puts them in the room. A save id resolves whether or not it was ever published, so this',
-				'reads unpublished work.',
+				'Gated like the list it details — the room’s creator, a co-owner, anyone whose',
+				'presence puts them in the room, or staff (a `developer` / `moderator` token). A save id',
+				'resolves whether or not it was ever published, so this reads unpublished work.',
 			].join(' '),
 			security: AUTHED,
 			parameters: [
@@ -3853,28 +4271,36 @@ const app = new Hono<App>()
 			if (!(await canReadSaves(c, room, roomId, accountId))) return c.body(null, 403)
 
 			const save = await getSubRoomSaveById(c.env.DB, subRoomId, saveId)
-			return save ? c.json(toSaveDetail(save, unityAssetTargetQuery(c))) : c.notFound()
+			if (!save) return c.notFound()
+			const target = unityAssetTargetQuery(c)
+			// Imported pre-Studio saves name their main/dependency bundles directly.
+			// Keep upstream's target-aware Studio projection for its built assets.
+			if (
+				typeof save.UnityAsset === 'string' &&
+				!pickBakedBundle(save, target) &&
+				(target === null || target === 0)
+			)
+				return c.json(save)
+			return c.json(toSaveDetail(save, target))
 		}
 	)
 
-	// Metadata for the unity asset on one of this subroom's saves. The editor calls
-	// this after a build; the game reads the same bundles from `CurrentSave` and then
-	// downloads `filename` from the CDN. Bare object, no envelope, no auth — the room
-	// document already names the files.
+	// The authoring manifest on a save. Its JSON source filename is independent of
+	// the baked game bundles; a baked-only archive has no editable source to return.
 	.get(
 		'/rooms/:roomId{[0-9]+}/subrooms/:subRoomId{[0-9]+}/unityasset',
 		describeRoute({
 			tags: ['Subrooms'],
 			summary: 'The unity asset attached to a subroom save',
 			description: [
-				'The baked Windows and Android bundles stored for `unityAssetId`, when that id is',
+				'The editable JSON source manifest and any baked bundles stored for `unityAssetId`, when that id is',
 				'on a save of this subroom. A bare object: `unityAssetId`, `createdByAccountId`,',
 				'`bakedUnityAssets` (one entry per main bundle), plus `filename` and `hash` for the',
-				'Windows bundle. Bytes are `GET /unityasset/{filename}` on the CDN.',
+				'authoring manifest. Source JSON is `GET /roomunityasset/{filename}` on the CDN; baked bundles remain separate.',
 				'',
-				'`target` is 0 for Windows and 2 for Android/Quest. Stripped bundles are stored and',
-				'not listed. An unknown room, subroom, or asset is a 404. No auth: `GET /rooms/{id}`',
-				'already includes the same filenames on `CurrentSave`.',
+				'Stripped bundles are not listed. The published current save is public. Other revisions require the same',
+				'authentication and permissions as save history. Without an asset ID, authorized',
+				'readers receive the latest source; other callers receive only the published source.',
 			].join(' '),
 			parameters: [
 				roomIdParam,
@@ -3883,6 +4309,8 @@ const app = new Hono<App>()
 			],
 			responses: {
 				200: json(UnityAssetWithSourceDto, 'The unity asset and its baked bundles'),
+				401: UNAUTHORIZED_RESPONSE,
+				403: FORBIDDEN_RESPONSE,
 				404: { description: 'No such room, subroom, or asset on that subroom' },
 			},
 		}),
@@ -3890,27 +4318,40 @@ const app = new Hono<App>()
 			const roomId = Number.parseInt(c.req.param('roomId'), 10)
 			const subRoomId = Number.parseInt(c.req.param('subRoomId'), 10)
 			const unityAssetId = c.req.query('unityAssetId') ?? ''
-			if (unityAssetId === '') return c.notFound()
 
-			const sub = await getSubRoom(c.env.DB, roomId, subRoomId)
-			if (!sub) return c.notFound()
-			const saves = await getSubRoomSaves(c.env.DB, subRoomId)
-			const save = saves.find((row) => row.UnityAssetId === unityAssetId)
+			const room = await getRoomById(c.env.DB, roomId)
+			const sub = room && findSubRoom(room, subRoomId)
+			if (!room || !sub) return c.notFound()
+			const current = sub.CurrentSave
+			let save =
+				typeof current === 'object' && current !== null
+					? (current as Record<string, unknown>)
+					: undefined
+			const accountId = await authedAccountId(c)
+			const canReadHistory = accountId !== null && (await canReadSaves(c, room, roomId, accountId))
+			if (canReadHistory) {
+				const saves = await getSubRoomSaves(c.env.DB, subRoomId)
+				save =
+					unityAssetId === ''
+						? saves.find((row) => studioSource(row) !== null)
+						: saves.find((row) => row.UnityAssetId === unityAssetId)
+			} else if (unityAssetId !== '' && save?.UnityAssetId !== unityAssetId) {
+				if (accountId === null) return unauthorized(c)
+				return c.body(null, 403)
+			}
 			if (!save) return c.notFound()
-
-			const asset = await getStudioUnityAsset(c.env.DB, unityAssetId)
-			if (!asset) return c.notFound()
-
-			// Main bundles, Windows first; the Windows one (or the first there is) supplies
-			// the top-level `filename`/`hash`.
-			const mains = bakedUnityAssets(asset.builds)
-			const source = mains.find((build) => build.Target === 0) ?? mains[0]
+			const source = studioSource(save)
 			if (!source) return c.notFound()
+
+			const asset = await getStudioUnityAsset(c.env.DB, String(save.UnityAssetId))
+
+			// Baked bundles are optional until compilation; the source exists before a build.
+			const mains = bakedUnityAssets(asset?.builds ?? [])
 
 			const savedBy = typeof save.SavedByAccountId === 'number' ? save.SavedByAccountId : 0
 			return c.json({
-				unityAssetId: asset.unityAssetId,
-				createdByAccountId: asset.createdByAccountId || savedBy,
+				unityAssetId: String(save.UnityAssetId),
+				createdByAccountId: asset?.createdByAccountId || savedBy,
 				bakedUnityAssets: mains.map((build) => ({
 					unityAssetId: build.UnityAssetId,
 					target: build.Target,
@@ -3986,8 +4427,11 @@ const app = new Hono<App>()
 				RoomData?: { Filename?: string; Hash?: string | null }
 				SubRoomData?: { Filename?: string; Hash?: string | null }
 				UnityAssetId?: string | null
+				UnityAsset?: { Filename?: string; Hash?: string | null }
 				Description?: string
 				PersistenceVersion?: number
+				OMVersion?: number
+				UgcSubVersion?: number
 				InventionUsage?: string
 				AutoPublish?: boolean
 			}
@@ -3999,10 +4443,19 @@ const app = new Hono<App>()
 				roomDataFilename: body.RoomData?.Filename,
 				roomDataHash: typeof body.RoomData?.Hash === 'string' ? body.RoomData.Hash : undefined,
 				unityAssetId: typeof body.UnityAssetId === 'string' ? body.UnityAssetId : undefined,
+				unitySource:
+					typeof body.UnityAsset?.Filename === 'string' && body.UnityAsset.Filename !== ''
+						? {
+								Filename: body.UnityAsset.Filename,
+								Hash: typeof body.UnityAsset.Hash === 'string' ? body.UnityAsset.Hash : null,
+							}
+						: undefined,
 				autoPublish: body.AutoPublish === true,
 				description: typeof body.Description === 'string' ? body.Description : undefined,
 				persistenceVersion:
 					typeof body.PersistenceVersion === 'number' ? body.PersistenceVersion : undefined,
+				omVersion: typeof body.OMVersion === 'number' ? body.OMVersion : undefined,
+				ugcSubVersion: typeof body.UgcSubVersion === 'number' ? body.UgcSubVersion : undefined,
 				inventionUsage: typeof body.InventionUsage === 'string' ? body.InventionUsage : undefined,
 			})
 			if (!result) {
@@ -4016,7 +4469,7 @@ const app = new Hono<App>()
 			return c.json({
 				success: true,
 				error: null,
-				value: { room: result.room, subRoomDataSave: toSaveResponse(result.save) },
+				value: { room: serveRoom(result.room), subRoomDataSave: toSaveResponse(result.save) },
 			})
 		}
 	)
@@ -4318,7 +4771,13 @@ const app = new Hono<App>()
 
 			const permissions = parseRoomPermissions(await c.req.json().catch(() => null))
 			await setSubRoomPermissions(c.env.DB, subRoomId, permissions)
-			return c.json({ Value: room, Success: true, Error: null, error_id: null })
+			const clientBuild = (await authedGameVersion(c)) ?? GAME_VERSION
+			return c.json({
+				Value: serveRoom(roomForClientBuild(room, clientBuild)),
+				Success: true,
+				Error: null,
+				error_id: null,
+			})
 		}
 	)
 
@@ -4578,7 +5037,9 @@ const app = new Hono<App>()
 			const skip = Number.parseInt(c.req.query('skip') ?? '0', 10) || 0
 			const take = Number.parseInt(c.req.query('take') ?? '100', 10) || 100
 			return c.json(
-				await getSimilarRooms(c.env.DB, Number.parseInt(c.req.param('roomId'), 10), skip, take)
+				serveRoomPage(
+					await getSimilarRooms(c.env.DB, Number.parseInt(c.req.param('roomId'), 10), skip, take)
+				)
 			)
 		}
 	)
@@ -4708,9 +5169,13 @@ const app = new Hono<App>()
 			parameters: [roomIdParam],
 			requestBody: form(ExperienceRequest, 'The room’s XP settings'),
 			responses: {
-				200: json(LeaderboardResultEnvelope, 'Stored, or a rejection with `Success: false`'),
+				200: json(
+					LeaderboardResultEnvelope,
+					'Stored, or (before 20260323) a rejection with `Success: false`'
+				),
 				401: UNAUTHORIZED_RESPONSE,
 				403: FORBIDDEN_RESPONSE,
+				404: json(LeaderboardResultEnvelope, 'Unknown room (build 20260323 and later)'),
 			},
 		}),
 		async (c) => {
@@ -4842,7 +5307,9 @@ const app = new Hono<App>()
 			tags: ['Rooms'],
 			summary: 'A room by id',
 			description: [
-				'The room as stored, with its `SubRooms` re-attached. Unlike `GET /rooms?id=`, an',
+				'The room as stored, with its `SubRooms` re-attached and pending role invites left',
+				'out of `Roles` (an unanswered invite is `Role` 0 with the offer on `InvitedRole`; the',
+				'invited player is not a member until they accept). Unlike `GET /rooms?id=`, an',
 				'unknown room here is a 404, not `{}`. A save that has a Rec Room Studio build',
 				'lists its main bundles on `CurrentSave.UnitySubAssets` (`Target` 0 Windows, 2',
 				'Android/Quest, `Filename` downloaded from the CDN at `/unityasset/{filename}`).',
@@ -4865,7 +5332,7 @@ const app = new Hono<App>()
 			const room = await getRoomById(c.env.DB, Number.parseInt(c.req.param('roomId'), 10))
 			if (!room) return c.notFound()
 			filterRoomUnityAssets(room, unityAssetTargetQuery(c))
-			return c.json(roomForClientBuild(room, (await authedGameVersion(c)) ?? GAME_VERSION))
+			return c.json(serveRoom(roomForClientBuild(room, (await authedGameVersion(c)) ?? GAME_VERSION)))
 		}
 	)
 
@@ -5022,6 +5489,16 @@ app.get(
 					].join('\n'),
 				},
 				servers: [{ url: 'https://rooms.recflare.net', description: 'Production' }],
+				tags: [
+					{
+						name: 'Custom',
+						description: [
+							'Endpoints the game client never calls. Everything else here reimplements a',
+							'call the Rec Room client makes; these are recflare’s own additions, used by the',
+							'website (`www`) for things the real service did from an admin tool.',
+						].join(' '),
+					},
+				],
 				components: {
 					securitySchemes: {
 						bearerAuth: {

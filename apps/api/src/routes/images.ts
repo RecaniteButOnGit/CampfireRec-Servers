@@ -20,8 +20,10 @@ import {
 	setImageDescription,
 	SLIDESHOW_LIMIT,
 	SLIDESHOW_MAX_LIMIT,
+	toImagesBulk,
 	toImagesPlayer,
 } from '@repo/domain'
+import { SNIFFED_IMAGE_FORMATS, sniffImage } from '@repo/hono-helpers'
 
 import { authedId, unauthorized } from '../http'
 import {
@@ -33,6 +35,7 @@ import {
 	ErrorResponse,
 	form,
 	idParam,
+	ImagesBulkDto,
 	ImagesPlayerDto,
 	intQuery,
 	json,
@@ -217,12 +220,16 @@ export const imageRoutes = new Hono<App>({ strict: false })
 				'The `imgMeta` multipart field is a JSON `SavedImageMetaDTO` describing the upload; ' +
 				'malformed JSON is tolerated and the image is still stored, just untyped. A ' +
 				'`savedImageType` of 4 (profile thumbnail) additionally becomes the account’s ' +
-				'avatar, persisted on the account row.',
+				'avatar, persisted on the account row.\n\n' +
+				'The file is identified by its bytes, not by the part’s filename or content-type: ' +
+				'it must be a PNG or JPEG, and the stored key’s extension and ' +
+				'content-type come from that signature. Anything else is refused with a 400 — the ' +
+				'`img` worker serves only those two formats, so it would never display.',
 			security: AUTHED,
 			requestBody: form(UploadImageRequest, 'The image file plus its metadata'),
 			responses: {
 				200: json(UploadImageResponse, 'The stored bucket key'),
-				400: json(ErrorResponse, 'No file in the request'),
+				400: json(ErrorResponse, 'No file in the request, or the file is not an image'),
 				401: UNAUTHORIZED_RESPONSE,
 				413: json(ErrorResponse, 'The image exceeds the configured per-file limit'),
 			},
@@ -262,10 +269,12 @@ export const imageRoutes = new Hono<App>({ strict: false })
 			const roomId = num(meta.roomId)
 			const playerEventId = num(meta.playerEventId)
 
-			const valid = ['.png', '.jpg', '.jpeg', '.gif', '.webp', '.bmp']
-			const dot = file.name.lastIndexOf('.')
-			const ext = dot >= 0 ? file.name.slice(dot).toLowerCase() : ''
-			const extension = valid.includes(ext) ? ext : '.jpg'
+			// The part's filename and content-type are the uploader's claims; the `img` worker
+			// serves the object back under whatever type is stored, so both the extension and
+			// the stored type come from the bytes. A body that is not an image is refused.
+			const bytes = new Uint8Array(await file.arrayBuffer())
+			const image = sniffImage(bytes)
+			if (!image) return c.json({ error: `image is not a ${SNIFFED_IMAGE_FORMATS} image` }, 400)
 
 			// Store the upload in the shared image bucket under a random key, foldered by
 			// the image type and then the upload date (e.g. `sharecamera/2026-06-15/`) so
@@ -273,10 +282,8 @@ export const imageRoutes = new Hono<App>({ strict: false })
 			// key (slashes and all), which is the returned ImageName.
 			const typePrefix = (typeFolder[savedImageType] ?? typeFolder[SavedImageType.None]) + '/'
 			const datePrefix = new Date().toISOString().slice(0, 10) + '/'
-			const name = typePrefix + datePrefix + crypto.randomUUID() + extension
-			await c.env.IMAGES.put(name, await file.arrayBuffer(), {
-				httpMetadata: { contentType: file.type || 'image/jpeg' },
-			})
+			const name = typePrefix + datePrefix + crypto.randomUUID() + image.extension
+			await c.env.IMAGES.put(name, bytes, { httpMetadata: { contentType: image.contentType } })
 
 			// A profile thumbnail becomes the account's avatar — persist it on the
 			// account row (a JSON blob in the shared accounts table) so it sticks.
@@ -610,9 +617,9 @@ export const imageRoutes = new Hono<App>({ strict: false })
 	// with what it asked for; an id with no record (or one that isn't public) is simply
 	// absent, which is why this answers 200 with a short list rather than 404ing the lot.
 	//
-	// Serves the RAW `SavedImage`, like `v6` (metadata by filename) and the room feed — NOT
-	// the `ImagesPlayer` projection the player photo LISTS use. Those are a rendered grid,
-	// where the raw record comes up blank; this is a metadata lookup.
+	// Serves the `ImagesBulk` projection: the player lists' `ImagesPlayer` shape
+	// (`SavedImageId`/`SavedImageType`, no `TaggedPlayerIds`) plus a `ClubId`, always null.
+	// NOT the raw `SavedImage` that `v6` and the room feed serve.
 	//
 	// Public-only, as every image read here is: ids are sequential, so honouring whatever
 	// id is named would hand out private photos to anyone who counts.
@@ -625,12 +632,13 @@ export const imageRoutes = new Hono<App>({ strict: false })
 				'The stored `SavedImage` records for the given ids (`?ids=207&ids=106`), as a bare ' +
 				'array in request order. An id with no record, or one that is not public, is absent ' +
 				'from the answer rather than an error — the list can be shorter than the request. ' +
-				'Serves the raw `SavedImage` (as `v6` does), not the `ImagesPlayer` projection the ' +
-				'player photo lists use.',
+				'Serves the `ImagesPlayer` projection (`SavedImageId`/`SavedImageType`, no ' +
+				'`TaggedPlayerIds`) plus a `ClubId` that is always null — not the raw `SavedImage` ' +
+				'that `v6` serves.',
 			parameters: [
 				intQuery('ids', 'Repeatable; each value may also be a comma-separated list of image ids'),
 			],
-			responses: { 200: json(SavedImageDto.array(), 'The matching records, in request order') },
+			responses: { 200: json(ImagesBulkDto.array(), 'The matching records, in request order') },
 		}),
 		async (c) => {
 			const ids =
@@ -639,7 +647,7 @@ export const imageRoutes = new Hono<App>({ strict: false })
 					?.flatMap((raw) => raw.split(','))
 					.map((raw) => Number.parseInt(raw.trim(), 10))
 					.filter((imageId) => !Number.isNaN(imageId)) ?? []
-			return c.json(await getImagesByIds(c.env.DB, ids))
+			return c.json((await getImagesByIds(c.env.DB, ids)).map(toImagesBulk))
 		}
 	)
 
@@ -656,7 +664,7 @@ export const imageRoutes = new Hono<App>({ strict: false })
 			summary: 'Image metadata by filename',
 			description:
 				'An image’s stored `SavedImage` record for a bucket key — the raw record, as ' +
-				'`v6/{id}` and `v5/bulk` serve, with `Description`, `RoomId` and `PlayerEventId` ' +
+				'`v6/{id}` serves, with `Description`, `RoomId` and `PlayerEventId` ' +
 				'null where the row holds null. 404s when the object exists but has no metadata row.',
 			parameters: [stringQuery('name', 'The image name (bucket key); required')],
 			responses: {
@@ -677,7 +685,7 @@ export const imageRoutes = new Hono<App>({ strict: false })
 	//
 	// Serves the RAW 13-key `SavedImage` (`Id`/`Type`, `TaggedPlayerIds`, nulls left null),
 	// which is the type the client decodes this route into — the same record `v6?name=`
-	// serves, and `v5/bulk` a list of. NOT the `ImagesPlayer` projection of the player lists.
+	// serves. NOT the `ImagesPlayer` projection of the player lists.
 	//
 	// Public, or the caller's own: ids are sequential, so anyone else's private photo is a
 	// 404 here, the same as an id that doesn't exist.
@@ -687,7 +695,7 @@ export const imageRoutes = new Hono<App>({ strict: false })
 			tags: ['Images'],
 			summary: 'One image by id',
 			description:
-				'The stored `SavedImage` record for an image id — the raw record, as `v5/bulk` ' +
+				'The stored `SavedImage` record for an image id — the raw record, as `v6?name=` ' +
 				'serves, with `Description`, `RoomId` and `PlayerEventId` null where the row holds ' +
 				'null. A private image is served only to the player who took it; to anyone else ' +
 				'it is a 404, like an unknown id.',

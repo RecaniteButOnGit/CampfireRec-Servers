@@ -19,6 +19,12 @@ declare module 'cloudflare:test' {
 const ORIGIN = 'https://example.com'
 const TEST_SECRET = 'test-signing-key'
 
+it('returns an empty recommendation list when no circuit corpus is installed', async () => {
+	const response = await SELF.fetch(`${ORIGIN}/commonQuery/rrstudio/chiprecommendations`)
+	expect(response.status).toBe(200)
+	expect(await response.json()).toEqual([])
+})
+
 function b64url(input: ArrayBuffer | string): string {
 	const bytes = typeof input === 'string' ? new TextEncoder().encode(input) : new Uint8Array(input)
 	let binary = ''
@@ -113,14 +119,48 @@ it('lists no cloud builds for a room', async () => {
 	expect(await res.json()).toEqual({ results: [], totalResults: 0 })
 })
 
-it('serves a stubbed cloud build rate limit config', async () => {
+it('serves the Studio rate-limit DTO without blocking a first build', async () => {
 	const res = await SELF.fetch('https://example.com/cloud-builds/get-rate-limit-config')
 	expect(res.status).toBe(200)
 	expect(await res.json()).toEqual({
-		maxBuildsPerHour: 100,
-		maxConcurrentBuilds: 10,
-		cooldownSeconds: 0,
+		buildThrottleIntervalHours: 1,
+		warnAfterBuildsPerInterval: 90,
+		maxBuildsPerInterval: 100,
 	})
+})
+
+it('requires authentication for the user build count', async () => {
+	const res = await SELF.fetch('https://example.com/cloud-builds/get-build-count-for-user')
+	expect(res.status).toBe(401)
+})
+
+it('serves the authenticated user build count expected by Studio 2026', async () => {
+	const res = await SELF.fetch('https://example.com/cloud-builds/get-build-count-for-user', {
+		headers: await bearer('11899'),
+	})
+	expect(res.status).toBe(200)
+	const body = await res.json<{
+		success: boolean
+		error: string | null
+		value: {
+			accountId: number
+			startTime: string
+			endTime: string
+			subRoomTotalBuildCount: number
+			subRoomFailedBuildCount: number
+			avatarItemTotalBuildCount: number
+			avatarItemFailedBuildCount: number
+		}
+	}>()
+	expect(body.success).toBe(true)
+	expect(body.error).toBeNull()
+	expect(body.value.accountId).toBe(11899)
+	expect(body.value.subRoomTotalBuildCount).toBe(0)
+	expect(body.value.subRoomFailedBuildCount).toBe(0)
+	expect(body.value.avatarItemTotalBuildCount).toBe(0)
+	expect(body.value.avatarItemFailedBuildCount).toBe(0)
+	expect(Date.parse(body.value.startTime)).not.toBeNaN()
+	expect(Date.parse(body.value.endTime)).not.toBeNaN()
 })
 
 describe('GET /collaboration/owners-in-room', () => {

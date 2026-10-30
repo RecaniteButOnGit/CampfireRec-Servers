@@ -50,9 +50,14 @@ Supported client builds live in `SUPPORTED_GAME_VERSIONS`
 Campfire accepts only `20240621`, Steam depot manifest `5652464073904128818`.
 Full protocol and room compatibility remain under investigation.
 
-Builds are date-stamped (`YYYYMMDD[.NN]`) so they order as plain strings; several
-surfaces gate on "newer than `20230414`" (econ storefront catalog, `api` event tags,
-`rooms` featured rooms) rather than on an explicit list.
+A client reports `YYYYMMDD[.NN]`; the `.NN` is a same-day point release of the same build
+and decides nothing. `gameBuild` strips it, the lists above hold bare dates, every gate
+compares builds (`validateAndGetBuild` in `@repo/jwt` is the token form), and the
+`room_instance` key is stored as the build so `20250718.01` and `20250718.2` share a
+session. The token's `rn.ver` and presence's `appVersion` still echo the client's full
+version. Builds order as plain strings; several surfaces gate on "newer than `20230414`"
+(econ storefront catalog, `api` event tags, `rooms` featured rooms) rather than on an
+explicit list.
 </game-clients>
 
 <code-style>
@@ -97,8 +102,8 @@ inconsistency here without checking the client first.
 - The room save (`rooms`: `POST /subrooms/:sid/data`) is the ONE exception to that shape:
   `value` is `{ room, subRoomDataSave }`, and `error` is NULL rather than `""`. The
   `subRoomDataSave` is camelCase with a different field set from the PascalCase
-  `CurrentSave` embedded in the room (no persistence/OM/UGC versions, no moderation state,
-  no asset arrays; but `unityAsset`/`unityAssetHash`). Don't unify the two projections.
+  `CurrentSave` embedded in the room (no moderation state or asset arrays;
+  version fields are camelCase, alongside `unityAsset`/`unityAssetHash`). Keep the projections distinct.
 - A subroom's saved scene loads from `CurrentSave.DataBlob` (`rooms`: `GET /rooms/:id`),
   NOT the flat `DataBlob` on the subroom — a subroom with no `CurrentSave` silently loads
   nothing. The key must be present (null before the first publish); read it via
@@ -115,17 +120,21 @@ inconsistency here without checking the client first.
   `GET …/saves/:saveId` is the detail behind a list row, under the same gate, and a
   PASCALCASE row like the list serves — NOT the camelCase projection the room save's
   response uses (served that, the client showed a save with every value missing). It
-  differs from the list row only in how it names bundles: each `UnitySubAssets` entry is
-  `{ UnityAssetId, UnityAsset, UnityAssetHash }`, the main bundle is lifted to top-level
+  differs from the list row only in how it names bundles: dependency entries in `UnitySubAssets`
+  are `{ UnityAssetId, UnityAsset, UnityAssetHash }`, the main bundle appears only at top-level
   `UnityAsset`/`UnityAssetHash`, and there is no `Tags`. Three shapes of one save; keep
   them straight.
 - The save reads (`rooms`: `…/saves`, `…/saves/no_unity_assets` and `…/saves/:saveId`) are
-  auth-gated and readable by the room's creator, a CO-OWNER, or anyone whose live `presence`
-  row puts them in that room. They list unpublished staged saves, so they aren't public; but
-  a co-owner opens the save history from the room's settings without being in the room
-  (creator-only showed them the buttons and a list that 403'd), and a visitor resolves which
-  version an instance is running from this list, so managers-only locks them out of loading
-  the room. The presence grant expires with the presence row.
+  auth-gated and readable by the room's creator, a CO-OWNER, anyone whose live `presence`
+  row puts them in that room, or STAFF (a `developer`/`moderator` token). They list
+  unpublished staged saves, so they aren't public; but a co-owner opens the save history from
+  the room's settings without being in the room (creator-only showed them the buttons and a
+  list that 403'd), and a visitor resolves which version an instance is running from this
+  list, so managers-only locks them out of loading the room. The presence grant expires with
+  the presence row. The client reads `…/saves/no_unity_assets` BEFORE it matchmakes a private
+  instance, when the caller has no presence in the room yet, so presence alone cannot let a
+  non-owner create one: a developer creating a private instance of a room they hold no role
+  on was 403'd there until staff were let through.
 - A room save writes ONLY to the subroom and its save row — never to the room. Everything
   the body carries describes that one revision: `Description` is the save comment shown in
   `…/saves`, and `PersistenceVersion`/`InventionUsage` describe the scene just saved (the
@@ -280,6 +289,31 @@ inconsistency here without checking the client first.
   other implementations set it at all, it names the start of a voice-chat timeout. Other
   implementations with timed bans keep their set-time private and serve the remainder on
   every read; `banned_at` here is the staff panel's audit trail, not the client's.
+- `unity_asset` holds two kinds of bundle under one shape: Rec Room Studio builds (UGC, the
+  `studio` worker writes them, filenames `studio/<roomId>/…`) and FIRST-PARTY bundles captured
+  from the official game and loaded by hand (`unity/<roomId>/…`). Only the Studio ones may be
+  folded onto `CurrentSave.UnitySubAssets` (`rooms`: `GET /rooms/:id`, the save reads) —
+  `attachStudioUnityAssets` filters on `isStudioBundleFilename`. The 2025 client resolves a
+  first-party bundle through `POST /unity_assets/baked/bulk` (which serves both kinds); handed
+  it inline in the five-key `{ Target, Version, Filename, Hash }` shape it takes that instead,
+  cannot name the file (its decoder wants `UnityAsset`/`UnityAssetHash`), and the room loads
+  nothing. Every imported first-party room broke when the splice moved from the Studio-only
+  table to `unity_asset`, with every response looking correct.
+- "Forgot password" (`auth`: `POST /account/recoverpassword`) posts only `email`, and the client
+  reads the PascalCase envelope `{ Success, Error, error_id }` — `Error` and `error_id` null on
+  success — not the lowercase `{ success, error }` the password change answers in. The address is
+  all the server gets, so an email is UNIQUE across accounts (`idx_account_email_lower`, enforced
+  by `accounts` `POST /account/me/email`). The recovery finishes on the WEBSITE
+  (`/reset-password`, posting `auth` `POST /account/resetpassword`): the game has no screen for it.
+  Every refusal that would reveal whether an address is on an account, or that a cap was hit
+  (2-minute cooldown, 5 codes/day per account, 10 requests/hour per IP — `rate_limit` table),
+  is answered as `Success: true` and sends nothing.
+- Setting the email (`accounts`: `POST /account/me/email`) STAGES the address and still answers
+  `{ success: true }` — the game reads nothing else — while `/account/me` keeps serving the old
+  one until the emailed codes come back through `…/email/confirm` (website only, `/confirm-email`).
+  Two steps: the CURRENT address approves first (so a stolen session can't move the recovery
+  address), then the NEW address confirms itself (so a typo is never stored); an account with no
+  email gets only the second, and may re-enter a different address at any time.
 - Accessibility is sent as the `RoomAccessibility` enum NAME on
   `rooms` `PUT /rooms/:id/subrooms/:sid/accessibility` (`accessibility=Private`), not the
   ordinal the room-level `/rooms/:id/accessibility` takes. The enum has five members

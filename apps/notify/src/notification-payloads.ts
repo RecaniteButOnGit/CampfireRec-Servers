@@ -178,17 +178,34 @@ export interface RewardBalanceModificationPayload {
 	BalanceInGiftBox: boolean
 }
 
-/** `ConsumableMappingAdded` (70) / `ConsumableMappingRemoved` (71). */
+/**
+ * `ConsumableMappingAdded` (70) / `ConsumableMappingRemoved` (71) — one consumable INSTANCE.
+ *
+ * A superset of two builds. 2026 decodes it as `ConsumableInstanceDTO` (9 keys: `Id` — a
+ * `[DataMember]` rename of `InstanceId` — `ConsumableItemDesc`, `CreatedAt`, `Count`,
+ * `ActiveDurationMinutes`, `IsActive`, `IsTransferable`, `ActivatedByRoomie`, `IsRRO`) and
+ * applies the frame only for a `ConsumableItemDesc` it knows, so send the item's own desc.
+ * `InitialCount` is gone on 2026 but still read by 2025; each decoder drops the keys it
+ * doesn't know, so one payload serves both.
+ */
 export interface ConsumableMappingPayload {
 	Id: number
 	ConsumableItemDesc: string
 	Count: number
+	/** 2025 only; 2026 dropped it. */
 	InitialCount: number
 	/** ISO-8601. */
 	CreatedAt: string
 	ActiveDurationMinutes: number | null
 	IsActive: boolean
 	IsTransferable: boolean
+	/** 2026. */
+	ActivatedByRoomie: boolean
+	/**
+	 * 2026. Must EQUAL the item's definition (`IsRRO` in econ's `static/consumables.json`): the
+	 * client checks it and throws on a mismatch, losing the frame.
+	 */
+	IsRRO: boolean
 }
 
 /** `ModerationKick` (22) and `ModerationUnkick`. Room bans go out as this with `IsBan`. */

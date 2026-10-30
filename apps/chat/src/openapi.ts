@@ -274,6 +274,13 @@ export const PartyChatThread = z.object({
 	ClubId: z.int().nullable().describe('Always null here — this worker serves no club threads'),
 })
 
+/** 2026 reads a thread list; older clients read a thread or an empty object. */
+export const PartyChatReadResponse = z.union([
+	PartyChatThread,
+	z.array(PartyChatThread),
+	z.object({}).strict(),
+])
+
 /**
  * `POST /thread/party` — the client's CreatePartyChat. A bare two-key wrapper, PascalCase
  * like the thread inside it, with no `{ success, error, value }` envelope around it.
@@ -379,6 +386,18 @@ export const FavoriteThreadRequest = z.object({
 	favorite: z
 		.string()
 		.describe('`True`/`False` as the client spells it (`1`/`yes` also count as true)'),
+})
+
+/**
+ * `PUT|POST /thread/:id/favorite` response — the client's `FavoriteChatResponse`, a bare
+ * two-key object with no envelope. Unlike the other thread actions it is NOT a bare
+ * ChatResult integer: the client parses this object either way.
+ */
+export const FavoriteChatResponse = z.object({
+	ChatResult,
+	IsFavorited: z
+		.boolean()
+		.describe('The caller’s favorite flag after the call (false when they aren’t on the thread)'),
 })
 
 // ---- Shared parameters -----------------------------------------------------

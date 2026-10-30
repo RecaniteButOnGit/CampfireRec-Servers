@@ -8,6 +8,8 @@ export default defineConfig({
 			miniflare: {
 				bindings: {
 					ENVIRONMENT: 'VITEST',
+					// Exercise the staged-rollout behavior; production Campfire defaults to none.
+					ROLLOUT_GAME_VERSIONS: '20260323',
 				},
 				// The worker's RECFLARE_NOTIFICATIONS_HUB binding points at the `notify`
 				// worker's DO (script_name: "notify"). That worker isn't part of this

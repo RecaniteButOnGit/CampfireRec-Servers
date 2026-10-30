@@ -273,10 +273,23 @@ beforeAll(async () => {
 			SubRooms: [],
 		} as Record<string, unknown>)
 	}
-	// Non-public and a dorm: neither belongs in a discovery row.
+	// Non-public, a dorm, and a public room OPTED OUT of lists: none belongs in a discovery
+	// row. Room 9 is built to lead every row it is wrongly let into — newest of all, tagged
+	// `quest`, and (in the hot test) occupied — so a feed that forgets `ExcludeFromLists`
+	// fails loudly rather than by luck of ordering.
 	for (const room of [
 		{ RoomId: 5, Name: 'SecretRoom', CreatorAccountId: 500, Accessibility: 0, IsDorm: false },
 		{ RoomId: 6, Name: '@Dorm', CreatorAccountId: 502, Accessibility: 1, IsDorm: true },
+		{
+			RoomId: 9,
+			Name: 'OptedOut',
+			CreatorAccountId: 505,
+			Accessibility: 1,
+			IsDorm: false,
+			ExcludeFromLists: true,
+			CreatedAt: '2026-04-01T00:00:00Z',
+			Tags: [{ Tag: 'quest', Type: 0 }],
+		},
 	]) {
 		await seedRoomWithSubRooms(env.DB, { ...room, SubRooms: [] } as Record<string, unknown>)
 	}
@@ -784,9 +797,12 @@ it('creates the list and adds the item on PUT …/createlistifneeded', async () 
 	// changed — with the id unquoted, as every read of a list serves it.
 	const body = await res.text()
 	expect(body).toMatch(/"ListId":\d+,/)
-	// The SAVE's projection: every key the read serves EXCEPT `Accessibility`, in the read's
-	// order. Compared exactly, not loosely, because the missing key is the point.
-	const { ListId: _id, ...rest } = JSON.parse(body) as Record<string, unknown>
+	// Wrapped in the write envelope, around the SAVE's projection: every key the read serves
+	// EXCEPT `Accessibility`, in the read's order. Compared exactly, not loosely, because the
+	// missing key is the point.
+	const { Value, ...envelope } = JSON.parse(body) as { Value: Record<string, unknown> }
+	expect(envelope).toEqual({ Success: true, Error: null, error_id: null })
+	const { ListId: _id, ...rest } = Value
 	expect(rest).toEqual({
 		CreatorAccountId: 300,
 		Name: '__SavedForLater_Rooms',
@@ -1201,6 +1217,9 @@ it('serves the live hot-room ranking for /algorithmiclists/HotList', async () =>
 	await putInRoom(904, 2)
 	await putInRoom(905, 2)
 	await putInRoom(906, 2)
+	// Room 9 is as busy as the leader and opted out of lists: it must not place.
+	await putInRoom(907, 9)
+	await putInRoom(908, 9)
 
 	const res = await SELF.fetch(`${ORIGIN}/algorithmiclists/HotList?type=1`)
 	expect(res.status).toBe(200)
@@ -1220,9 +1239,11 @@ it('serves the live hot-room ranking for /algorithmiclists/HotList', async () =>
 	// the Coach, whose stock rooms the hot row leaves out — a "Hot" row full of Rec Center
 	// is a row about the server rather than about what players are doing.
 	expect(ids).not.toContain('2')
-	// The private room and the dorm are not in it either.
+	// The private room and the dorm are not in it either, nor the public room whose
+	// `ExcludeFromLists` is set — busy as it is.
 	expect(ids).not.toContain('5')
 	expect(ids).not.toContain('6')
+	expect(ids).not.toContain('9')
 
 	// The row key is matched case-insensitively — it reaches us from a curated page's
 	// ItemIds, whose casing is the reference's.
@@ -1264,7 +1285,7 @@ it('orders /algorithmiclists/new by creation time', async () => {
 })
 
 it.each(['recentlyupdated', 'new'])(
-	'leaves stock, private and dorm rooms out of %s',
+	'leaves stock, private, dorm and list-excluded rooms out of %s',
 	async (list) => {
 		const ids = await rowIds(list)
 		// Room 2 is the Coach's — this server's stock rooms, which a row about what players have
@@ -1273,6 +1294,9 @@ it.each(['recentlyupdated', 'new'])(
 		// Not public, and a dorm.
 		expect(ids).not.toContain('5')
 		expect(ids).not.toContain('6')
+		// Public and player-made, but `ExcludeFromLists` — and the newest room seeded, so it
+		// would head `new` if the flag were ignored.
+		expect(ids).not.toContain('9')
 	}
 )
 
@@ -1338,6 +1362,8 @@ it('answers recentlyvisited empty for a caller with no history and no token', as
 it('serves the rooms tagged `quest` for /algorithmiclists/quests_algoendpoint', async () => {
 	const ids = await rowIds('quests_algoendpoint')
 	// Ordering is the hot feed's (live players, then engagement), so assert membership.
+	// Room 9 carries the tag too and is absent: a category row asks what a room is about,
+	// but `ExcludeFromLists` still keeps it out of every row.
 	expect([...ids].sort()).toEqual(['2', '3'])
 
 	// Room 2 is the COACH's and belongs here all the same. Every quest-tagged room this
@@ -1487,6 +1513,7 @@ it('generates a spec with no dangling $refs', async () => {
 			'/curatedlists',
 			'/curatedlists/bulk',
 			'/curatedlists/{name}/items/{itemId}/createlistifneeded',
+			'/curatedlists/{listId}/items/{itemId}',
 			'/algorithmiclists/{list}',
 			'/contextualfeatures',
 		])
@@ -1494,4 +1521,89 @@ it('generates a spec with no dangling $refs', async () => {
 	// The spec route keeps itself out of its own output.
 	expect(Object.keys(spec.paths)).not.toContain('/openapi.json')
 	expect(JSON.stringify(spec).match(/\$ref/g)).toBeNull()
+})
+
+it('serves the Coach’s `staffpicks` list for /algorithmiclists/staffpicks', async () => {
+	// No list yet: an empty row, not a 404.
+	const empty = await SELF.fetch(`${ORIGIN}/algorithmiclists/staffpicks?type=1`)
+	expect(await empty.json()).toEqual({ Type: 1, Entities: [] })
+
+	// A player's list of the same name must not fill the row — only the Coach's does.
+	await SELF.fetch(`${ORIGIN}/curatedlists/staffpicks/items/9/createlistifneeded`, {
+		method: 'PUT',
+		headers: await bearer('42'),
+		body: new URLSearchParams({ type: '1', accessibility: '1' }),
+	})
+	const now = new Date().toISOString()
+	const { list_id } = (await env.DB.prepare(
+		`INSERT INTO list (creator_account_id, list_type, list_name, accessibility, created_at)
+		 VALUES (1, 1, 'StaffPicks', 1, ?1) RETURNING list_id`
+	)
+		.bind(now)
+		.first<{ list_id: number }>())!
+	for (const id of ['7', '3', '5']) {
+		await env.DB.prepare('INSERT INTO list_item (list_id, item_id) VALUES (?1, ?2)')
+			.bind(list_id, id)
+			.run()
+	}
+
+	const res = await SELF.fetch(`${ORIGIN}/algorithmiclists/StaffPicks?type=1`)
+	expect(res.status).toBe(200)
+	expect(await res.json()).toEqual({
+		Type: 1,
+		Entities: ['7', '3', '5'].map((Id) => ({ Id, Context: null })),
+	})
+})
+
+/** The client's un-save call: DELETE the item from the list by id. */
+async function removeFromList(listId: string, itemId: string, headers: Record<string, string>) {
+	return SELF.fetch(`${ORIGIN}/curatedlists/${listId}/items/${itemId}`, {
+		method: 'DELETE',
+		headers,
+	})
+}
+
+it('removes an item from the caller’s list on DELETE …/items/:itemId', async () => {
+	const headers = await bearer('320')
+	await saveForLater('__SavedForLater_Rooms', '953', headers)
+	const saved = await (await saveForLater('__SavedForLater_Rooms', '2576', headers)).text()
+	const listId = /"ListId":(\d+),/.exec(saved)![1]
+
+	const res = await removeFromList(listId, '2576', headers)
+	expect(res.status).toBe(200)
+	const body = await res.text()
+	expect(body).toMatch(new RegExp(`"ListId":${listId},`))
+	const { Value, ...envelope } = JSON.parse(body) as { Value: Record<string, unknown> }
+	expect(envelope).toEqual({ Success: true, Error: null, error_id: null })
+	const { ListId: _id, ...rest } = Value
+	expect(rest).toEqual({
+		CreatorAccountId: 320,
+		Name: '__SavedForLater_Rooms',
+		Description: null,
+		ImageName: 'DefaultRoomImage.jpg',
+		Type: 1,
+		ItemIds: ['953'],
+		CreatedAt: expect.any(String),
+	})
+
+	// Removing the last item keeps the list; removing an absent one answers it unchanged.
+	await removeFromList(listId, '953', headers)
+	const again = await removeFromList(listId, '953', headers)
+	expect(again.status).toBe(200)
+	expect((await again.json()) as { Value: { ItemIds: string[] } }).toMatchObject({
+		Value: { ItemIds: [] },
+	})
+	expect(await readList(320)).toMatchObject({ ItemIds: [] })
+})
+
+it('refuses to remove from another player’s list, or without a token', async () => {
+	const saved = await (
+		await saveForLater('__SavedForLater_Rooms', '953', await bearer('321'))
+	).text()
+	const listId = /"ListId":(\d+),/.exec(saved)![1]
+
+	expect((await removeFromList(listId, '953', await bearer('322'))).status).toBe(403)
+	expect((await removeFromList(listId, '953', {})).status).toBe(401)
+	expect((await removeFromList('999999', '953', await bearer('321'))).status).toBe(404)
+	expect((await readList(321)).ItemIds).toEqual(['953'])
 })

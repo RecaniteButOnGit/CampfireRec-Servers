@@ -95,6 +95,9 @@ declare module 'cloudflare:test' {
 
 const ORIGIN = 'https://example.com'
 
+/** The PNG signature — the least an upload route accepts as an image. */
+const PNG_BYTES = new Uint8Array([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a])
+
 // `/api/rooms/v1/verifyRole` reads room roles from the shared recflare D1. Set
 // up the schema (matching the rooms worker's migration) + a couple of rooms.
 const TEST_ROOMS = [
@@ -226,11 +229,12 @@ function b64url(input: ArrayBuffer | string): string {
 // off, the token carries none, which is what a plain player's looks like to the
 // role-gated routes. `version` mints the `rn.ver` claim auth stamps from the build the
 // client posted at login; left off, the token carries none, like one issued before the
-// claim existed.
+// claim existed. `plus` mints the `rn.plus` claim auth stamps from `account.hasPlus`.
 async function bearer(
 	sub = '42',
 	roles?: string[],
-	version?: string
+	version?: string,
+	plus?: boolean
 ): Promise<Record<string, string>> {
 	const now = Math.floor(Date.now() / 1000)
 	const signingInput = `${b64url(JSON.stringify({ alg: 'HS256', typ: 'JWT' }))}.${b64url(
@@ -239,6 +243,7 @@ async function bearer(
 			exp: now + 3600,
 			...(roles && { role: roles }),
 			...(version && { 'rn.ver': version }),
+			...(plus && { 'rn.plus': true }),
 		})
 	)}`
 	const key = await crypto.subtle.importKey(
@@ -286,7 +291,7 @@ describe('public endpoints', () => {
 		const res = await exports.default.fetch(`${ORIGIN}/api/config/v1/backtrace`)
 		expect(res.status).toBe(200)
 		const body = (await res.json()) as { ReportBudget: number; VersionRegex: string }
-		expect(body).toMatchObject({ ReportBudget: 125, VersionRegex: '.*' })
+		expect(body).toMatchObject({ ReportBudget: 0, ANRThresholdMs: 0, VersionRegex: '' })
 	})
 
 	test('GET /api/versioncheck/v4 reports current for the matching build', async () => {
@@ -309,6 +314,17 @@ describe('public endpoints', () => {
 			expect(await other.json(), version).toMatchObject({ VersionStatus: 1 })
 		}
 	})
+	test('GET /api/versioncheck/v4 ignores the point release: every .NN of a supported build is current', async () => {
+		// The list holds bare dates; the client reports `YYYYMMDD.NN`, and the `.NN` is a
+		// same-day rebuild of the same build. All of these are the beta build.
+		for (const version of [`${GAME_VERSION}.01`, `${GAME_VERSION}.2`, GAME_VERSION, `${GAME_VERSION}.99`]) {
+			const res = await exports.default.fetch(`${ORIGIN}/api/versioncheck/v4?v=${version}`)
+			expect(await res.json(), version).toMatchObject({ VersionStatus: 0 })
+		}
+		// ...and a point release of a build that ISN'T supported is still not.
+		const res = await exports.default.fetch(`${ORIGIN}/api/versioncheck/v4?v=19990101.01`)
+		expect(await res.json()).toMatchObject({ VersionStatus: 1 })
+	})
 
 	test('GET /api/versioncheck/v4 flags a mismatched build', async () => {
 		const res = await exports.default.fetch(`${ORIGIN}/api/versioncheck/v4?v=19990101`)
@@ -320,9 +336,60 @@ describe('public endpoints', () => {
 		expect(await res.json()).toMatchObject({ VersionStatus: 1 })
 	})
 
-	// The server only supports the June 2024 build. The 2025 catalog contains keys that
-	// the client cannot consume, so every caller receives the known pre-2025 compatibility
-	// catalog while versioncheck rejects unsupported builds.
+	// The list is the operator's SUPPORTED_GAME_VERSIONS var when set, plus every build
+	// under rollout (ROLLOUT_GAME_VERSIONS) — the same lists `auth` gates tokens on, so a
+	// build told to update here is refused there too.
+	test('GET /api/versioncheck/v4 reads the lists from vars', async () => {
+		const status = async (version: string) => {
+			const res = await exports.default.fetch(`${ORIGIN}/api/versioncheck/v4?v=${version}`)
+			return ((await res.json()) as { VersionStatus: number }).VersionStatus
+		}
+		const originals = {
+			SUPPORTED_GAME_VERSIONS: env.SUPPORTED_GAME_VERSIONS,
+			ROLLOUT_GAME_VERSIONS: env.ROLLOUT_GAME_VERSIONS,
+		}
+		try {
+			// Forced upgrade: the 2025 build drops out, every point release of it.
+			env.SUPPORTED_GAME_VERSIONS = `${GAME_VERSION},20260323`
+			env.ROLLOUT_GAME_VERSIONS = '20260323'
+			expect(await status('20250718.01')).toBe(1)
+			expect(await status('20250718')).toBe(1)
+			expect(await status(GAME_VERSION)).toBe(0)
+			expect(await status('20260323.14')).toBe(0)
+			// Alphas not named in the var are gone too: the var replaces the default list.
+			expect(await status('20231207')).toBe(1)
+
+			// A build under rollout is current even when the var omits it: who may sign in on
+			// it is `auth`'s call, and the version check must not send a supporter to update.
+			env.SUPPORTED_GAME_VERSIONS = '20230414'
+			expect(await status('20260323.14')).toBe(0)
+			env.ROLLOUT_GAME_VERSIONS = 'off'
+			expect(await status('20260323.14')).toBe(1)
+			env.ROLLOUT_GAME_VERSIONS = '20250718'
+			expect(await status('20250718.01')).toBe(0)
+
+			// Entries are builds: a copied point release matches, and `off` empties the list.
+			env.ROLLOUT_GAME_VERSIONS = undefined
+			env.SUPPORTED_GAME_VERSIONS = '20250718.01'
+			expect(await status('20250718.2')).toBe(0)
+			expect(await status(GAME_VERSION)).toBe(1)
+			env.SUPPORTED_GAME_VERSIONS = 'off'
+			env.ROLLOUT_GAME_VERSIONS = 'off'
+			for (const version of SUPPORTED_GAME_VERSIONS) expect(await status(version), version).toBe(1)
+
+			// Blank is unset: the default list.
+			env.SUPPORTED_GAME_VERSIONS = ''
+			env.ROLLOUT_GAME_VERSIONS = ''
+			for (const version of SUPPORTED_GAME_VERSIONS) expect(await status(version), version).toBe(0)
+		} finally {
+			env.SUPPORTED_GAME_VERSIONS = originals.SUPPORTED_GAME_VERSIONS
+			env.ROLLOUT_GAME_VERSIONS = originals.ROLLOUT_GAME_VERSIONS
+		}
+	})
+
+	// Two catalogs, picked off the token's `rn.ver`: a build newer than GAME_VERSION gets
+	// the 2025 one. `Avatars.AdvancedFaceCustomizationEnabled` is a key only that catalog
+	// has, so its presence identifies which body was served.
 	const gameConfigKeys = async (version?: string) => {
 		const res = await exports.default.fetch(`${ORIGIN}/api/gameconfigs/v1/all`, {
 			headers: version === undefined ? {} : await bearer('42', undefined, version),
@@ -336,10 +403,21 @@ describe('public endpoints', () => {
 		expect(await gameConfigKeys('20240621')).not.toContain(KEY_2025_ONLY)
 	})
 
-	test('GET /api/gameconfigs/v1/all never sends the 2025 catalog to unsupported builds', async () => {
-		for (const version of ['20250718.01', '20250424.01', '20231207', '20220101']) {
-			expect(await gameConfigKeys(version), version).not.toContain(KEY_2025_ONLY)
+	test('GET /api/gameconfigs/v1/all serves the 2025 catalog to newer builds', async () => {
+		for (const version of ['20250718.01', '20250424.01', '20260323.14']) {
+			expect(await gameConfigKeys(version), version).toContain(KEY_2025_ONLY)
 		}
+	})
+
+	test('GET /api/gameconfigs/v1/all serves the 2023 catalog to the target build', async () => {
+		expect(await gameConfigKeys(GAME_VERSION)).not.toContain(KEY_2025_ONLY)
+		// A same-day point release of the target is the target build: compared as a build,
+		// not as a string that happens to sort after `20230414`.
+		expect(await gameConfigKeys(`${GAME_VERSION}.01`)).not.toContain(KEY_2025_ONLY)
+	})
+
+	test('GET /api/gameconfigs/v1/all serves the 2023 catalog to an older build', async () => {
+		expect(await gameConfigKeys('20220101')).not.toContain(KEY_2025_ONLY)
 	})
 
 	test('GET /api/gameconfigs/v1/all falls back to the 2023 catalog without a token', async () => {
@@ -1728,8 +1806,8 @@ describe('public endpoints', () => {
 				...metadata,
 			})
 		)
-		form.set('thumbnailImage', new File([new Uint8Array([1])], 'f.bin', { type: 'image/png' }))
-		form.set('design', new File([new Uint8Array([2])], 'f.bin', { type: 'image/png' }))
+		form.set('thumbnailImage', new File([PNG_BYTES], 'f.bin', { type: 'image/png' }))
+		form.set('design', new File([PNG_BYTES], 'f.bin', { type: 'image/png' }))
 		const res = await exports.default.fetch(`${ORIGIN}/api/customAvatarItems/v1`, {
 			method: 'POST',
 			headers: await bearer(creator),
@@ -1929,6 +2007,60 @@ describe('public endpoints', () => {
 		expect(((await worn.json()) as { Name: string | null }).Name).toBe(null)
 	})
 
+	test('PUT /outfits/me refuses an aura or body paint without Plus', async () => {
+		const outfit = (auraId: number | null, bodyPaint: string | null, Slot: number) => ({
+			DataVersion: 10,
+			CustomizationSettings: JSON.stringify({
+				AvatarVersion: 10,
+				...(auraId !== null && { AuraData: { Id: auraId } }),
+				...(bodyPaint !== null && { BodyPaint: bodyPaint }),
+			}),
+			Selections: [],
+			Slot,
+		})
+		const put = async (body: unknown, headers: Record<string, string>) =>
+			exports.default.fetch(`${ORIGIN}/outfits/me`, {
+				method: 'PUT',
+				headers: { ...headers, 'content-type': 'application/json' },
+				body: JSON.stringify(body),
+			})
+		const paint = '44d7e2a4-ae8d-4b95-8686-63e0f7d1ef8b'
+
+		// No Plus: an aura, body paint, or both are refused and nothing lands in the slot.
+		const refused = await put(outfit(14, null, 5), await bearer('4444'))
+		expect(refused.status).toBe(403)
+		expect(await refused.json()).toEqual({
+			Success: false,
+			Error: 'Rec Room Plus is required to wear an aura',
+			error_id: null,
+		})
+		const painted = await put(outfit(null, paint, 5), await bearer('4444'))
+		expect(painted.status).toBe(403)
+		expect(((await painted.json()) as { Error: string }).Error).toBe(
+			'Rec Room Plus is required to wear body paint'
+		)
+		const both = await put(outfit(14, paint, 5), await bearer('4444'))
+		expect(((await both.json()) as { Error: string }).Error).toBe(
+			'Rec Room Plus is required to wear an aura or body paint'
+		)
+		const saved = await exports.default.fetch(`${ORIGIN}/outfits/me/saved`, {
+			headers: await bearer('4444'),
+		})
+		expect(((await saved.json()) as { Slot: number }[]).some((o) => o.Slot === 5)).toBe(false)
+
+		// No Plus, neither perk (absent, aura Id 0, empty or all-zero paint): saves as before.
+		expect((await put(outfit(null, null, 0), await bearer('4444'))).status).toBe(200)
+		expect((await put(outfit(0, '', 0), await bearer('4444'))).status).toBe(200)
+		expect(
+			(await put(outfit(0, '00000000-0000-0000-0000-000000000000', 0), await bearer('4444'))).status
+		).toBe(200)
+
+		// Plus: both save.
+		const plus = await put(outfit(14, paint, 5), await bearer('4444', undefined, undefined, true))
+		expect(plus.status).toBe(200)
+		expect(await plus.json()).toEqual({ Success: true, Error: null, error_id: null })
+	})
+
 	test('GET /outfits/me/saved lists every saved slot, ordered by slot', async () => {
 		const anon = await exports.default.fetch(`${ORIGIN}/outfits/me/saved`)
 		expect(anon.status).toBe(401)
@@ -2120,12 +2252,73 @@ describe('public endpoints', () => {
 		expect(res.status).toBe(400)
 	})
 
-	test('GET /api/progressionEvents/active is a bare 0 (no auth)', async () => {
-		// 0 is the "no active event" value; the client reads it as "no event running" and
-		// skips the event UI. A 404 would stall its load instead.
-		const res = await exports.default.fetch(`${ORIGIN}/api/progressionEvents/active`)
+	test('GET /api/players/v1/progression/xpEarnedToday is a bare 0', async () => {
+		// A plain int on the client. It must not fall through to `/progression/:id`, which
+		// would read the path segment as an account id and answer a progression OBJECT.
+		const res = await exports.default.fetch(`${ORIGIN}/api/players/v1/progression/xpEarnedToday`)
 		expect(res.status).toBe(200)
 		expect(await res.json()).toBe(0)
+	})
+
+	test('GET /api/progressionEvents/active is a bare 18 (no auth)', async () => {
+		// A hardcoded stub: the id of an archived event (0 would mean "no active event").
+		// A 404 would stall the client's load instead.
+		const res = await exports.default.fetch(`${ORIGIN}/api/progressionEvents/active`)
+		expect(res.status).toBe(200)
+		expect(await res.json()).toBe(18)
+	})
+
+	test('GET /api/progressionEvents/event/:id serves the archived event verbatim', async () => {
+		const res = await exports.default.fetch(`${ORIGIN}/api/progressionEvents/event/18`)
+		expect(res.status).toBe(200)
+		expect(res.headers.get('content-type')).toContain('application/json')
+		expect(await res.json()).toMatchObject({
+			ProgressionEventId: 18,
+			Name: 'Yetis Challenge',
+			Rewards: [],
+			KeepsakeRoomLists: [],
+			EventLeaderboardId: 18,
+		})
+
+		// A keepsake room's id is 64-bit: it has to reach the client as written, not as the
+		// nearest double (…705361 parses to …705000), so the body is checked as text.
+		const base = await exports.default.fetch(`${ORIGIN}/api/progressionEvents/event/8`)
+		expect(await base.text()).toContain('"RoomId": 8364812036745705361')
+
+		// The archive has gaps, and an id it doesn't hold is a 404.
+		const missing = await exports.default.fetch(`${ORIGIN}/api/progressionEvents/event/4`)
+		expect(missing.status).toBe(404)
+	})
+
+	test('GET /api/progressionEvents/record/:id is an empty record for the caller', async () => {
+		const url = `${ORIGIN}/api/progressionEvents/record/18`
+		expect((await exports.default.fetch(url)).status).toBe(401)
+
+		const res = await exports.default.fetch(url, { headers: await bearer('2') })
+		expect(res.status).toBe(200)
+		expect(await res.json()).toStrictEqual({
+			AccountId: 2,
+			ProgressionEventId: 18,
+			Xp: 0,
+			GameMinutesToday: 0,
+			RewardsCollected: 0,
+			BonusRewardsCollected: 0,
+			XpBoostLastPurchasedAt: null,
+			PremiumRewardsCollected: 0,
+			LimitedRewardCollectionState: 0,
+		})
+
+		// The id is echoed, whichever event is asked for.
+		const other = await exports.default.fetch(`${ORIGIN}/api/progressionEvents/record/7`, {
+			headers: await bearer('2'),
+		})
+		expect(await other.json()).toMatchObject({ ProgressionEventId: 7 })
+	})
+
+	test('GET /api/purchasableXpBoosts/activations is the empty page', async () => {
+		const res = await exports.default.fetch(`${ORIGIN}/api/purchasableXpBoosts/activations`)
+		expect(res.status).toBe(200)
+		expect(await res.json()).toStrictEqual({ Results: [], TotalResults: 0 })
 	})
 
 	test('GET /api/rooms/v1/filters returns an object with filter arrays', async () => {
@@ -2972,13 +3165,35 @@ describe('public endpoints', () => {
 		const publish = async (body: Record<string, unknown>) => {
 			const res = await exports.default.fetch(`${ORIGIN}/api/inventions/v4/publish`, {
 				method: 'POST',
-				headers: { ...(await bearer('5172')), 'Content-Type': 'application/json' },
+				headers: {
+					...(await bearer('5172', undefined, undefined, true)),
+					'Content-Type': 'application/json',
+				},
 				body: JSON.stringify({ InventionId: inventionId, ...body }),
 			})
 			const value = ((await res.json()) as InventionSaveV9Result).Value
 			if (value === null) throw new Error('Value must not be null on a successful publish')
 			return value.Invention
 		}
+
+		// A price is a Rec Room Plus perk: without `rn.plus` the publish is refused in-band and
+		// nothing is published.
+		const unpaid = await exports.default.fetch(`${ORIGIN}/api/inventions/v4/publish`, {
+			method: 'POST',
+			headers: { ...(await bearer('5172')), 'Content-Type': 'application/json' },
+			body: JSON.stringify({
+				InventionId: inventionId,
+				Permission: 80,
+				Accessibility: 1,
+				Price: 250,
+			}),
+		})
+		expect(unpaid.status).toBe(200)
+		expect(await unpaid.json()).toMatchObject({
+			Success: false,
+			Value: null,
+			Error: 'Rec Room Plus is required to sell an invention',
+		})
 
 		const first = await publish({ Permission: 80, Accessibility: 1, Price: 250 })
 		expect(first.Price).toBe(250)
@@ -2996,7 +3211,10 @@ describe('public endpoints', () => {
 		// One over the cap refuses the publish in-band, and the price stands.
 		const over = await exports.default.fetch(`${ORIGIN}/api/inventions/v4/publish`, {
 			method: 'POST',
-			headers: { ...(await bearer('5172')), 'Content-Type': 'application/json' },
+			headers: {
+				...(await bearer('5172', undefined, undefined, true)),
+				'Content-Type': 'application/json',
+			},
 			body: JSON.stringify({ InventionId: inventionId, Price: 1001 }),
 		})
 		expect(over.status).toBe(200)
@@ -3006,6 +3224,14 @@ describe('public endpoints', () => {
 			Error: 'Price must be <= 1000',
 		})
 		expect((await publish({ Price: 1000 })).Price).toBe(1000)
+
+		// A republish without Plus that leaves the price alone (null) is not a sale being set.
+		const keep = await exports.default.fetch(`${ORIGIN}/api/inventions/v4/publish`, {
+			method: 'POST',
+			headers: { ...(await bearer('5172')), 'Content-Type': 'application/json' },
+			body: JSON.stringify({ InventionId: inventionId, Permission: 20, Price: null }),
+		})
+		expect(((await keep.json()) as InventionSaveV9Result).Success).toBe(true)
 
 		// Out of the published catalogue again — see the note in the publish test above.
 		await env.DB.prepare('DELETE FROM invention WHERE id = ?1').bind(inventionId).run()
@@ -3512,9 +3738,9 @@ describe('public endpoints', () => {
 				body: JSON.stringify({ inventionDataFilename: 'a.inv', ...fields }),
 			})
 
-		// A name is 3–24 characters of letters, digits, spaces, dashes and colons.
+		// A name is 3–40 characters of letters, digits, spaces, dashes and colons.
 		expect((await save({ name: 'ab' })).status).toBe(400)
-		expect((await save({ name: 'a'.repeat(25) })).status).toBe(400)
+		expect((await save({ name: 'a'.repeat(41) })).status).toBe(400)
 		expect((await save({ name: 'Rocket!' })).status).toBe(400)
 		expect((await save({ name: 'Café Lamp' })).status).toBe(400)
 		const ok = await save({ name: 'Rocket Sofa-Bed 2' })
@@ -3931,6 +4157,52 @@ describe('public endpoints', () => {
 
 		// No ids at all → an empty list, not an error.
 		expect(await batch('')).toEqual([])
+	})
+
+	test('POST /api/inventions/v2/batch reads the ids from a form body', async () => {
+		const save = await exports.default.fetch(`${ORIGIN}/api/inventions/v6/save`, {
+			method: 'POST',
+			headers: { ...(await bearer('5567')), 'Content-Type': 'application/json' },
+			body: JSON.stringify({ name: 'Batch Form', inventionDataFilename: 'a.inv' }),
+		})
+		const { Invention } = (await save.json()) as InventionSaveResult
+		await exports.default.fetch(
+			`${ORIGIN}/api/inventions/v3/publish?inventionId=${Invention.InventionId}`,
+			{ headers: await bearer('5567') }
+		)
+
+		// Official-game 64-bit ids have no local invention and are dropped.
+		const res = await exports.default.fetch(`${ORIGIN}/api/inventions/v2/batch`, {
+			method: 'POST',
+			headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+			body: `id=4984136863891873049&id=${Invention.InventionId}&id=9181913027670897186`,
+		})
+		expect(res.status).toBe(200)
+		// The 2025 client's flat `RRInvention` keys, laid over the stored record.
+		expect(await res.json()).toMatchObject([
+			{
+				InventionId: Invention.InventionId,
+				UgcVersion: 1,
+				LatestVersionNumber: Invention.CurrentVersionNumber,
+				Accessibility: 1,
+				ForceCannotPublish: false,
+				IsRecRoomApproved: false,
+				DisplayMetadataJson: null,
+			},
+		])
+
+		const empty = await exports.default.fetch(`${ORIGIN}/api/inventions/v2/batch`, {
+			method: 'POST',
+			headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+			body: '',
+		})
+		expect(await empty.json()).toEqual([])
+
+		await exports.default.fetch(`${ORIGIN}/api/inventions/v2/delete`, {
+			method: 'POST',
+			headers: { ...(await bearer('5567')), 'Content-Type': 'application/json' },
+			body: JSON.stringify({ InventionId: Invention.InventionId }),
+		})
 	})
 
 	test('GET /api/inventions/v1/fulllineageowner answers for the whole set of ids', async () => {
@@ -4361,9 +4633,18 @@ describe('public endpoints', () => {
 		// A saved draft is invisible until it's published.
 		expect(await search()).toEqual([])
 
-		const res = await exports.default.fetch(
+		// Pricing is a Rec Room Plus perk: without `rn.plus` the publish is refused, unpublished.
+		const unpaid = await exports.default.fetch(
 			`${ORIGIN}/api/inventions/v3/publish?inventionId=${Invention.InventionId}&permissionLevel=charge&price=250`,
 			{ headers: await bearer('2121') }
+		)
+		expect(unpaid.status).toBe(403)
+		expect(await unpaid.json()).toEqual({ error: 'Rec Room Plus is required to sell an invention' })
+		expect(await search()).toEqual([])
+
+		const res = await exports.default.fetch(
+			`${ORIGIN}/api/inventions/v3/publish?inventionId=${Invention.InventionId}&permissionLevel=charge&price=250`,
+			{ headers: await bearer('2121', undefined, undefined, true) }
 		)
 		expect(res.status).toBe(200)
 		const published = (await res.json()) as InventionSaveResult
@@ -4380,7 +4661,7 @@ describe('public endpoints', () => {
 		// A price over the cap refuses the whole publish, leaving the invention as it was.
 		const over = await exports.default.fetch(
 			`${ORIGIN}/api/inventions/v3/publish?inventionId=${Invention.InventionId}&price=1001`,
-			{ headers: await bearer('2121') }
+			{ headers: await bearer('2121', undefined, undefined, true) }
 		)
 		expect(over.status).toBe(400)
 		expect(await over.json()).toEqual({ error: 'Price must be <= 1000' })
@@ -4426,12 +4707,27 @@ describe('public endpoints', () => {
 			body: JSON.stringify({ name: 'Priced Lamp', inventionDataFilename: 'a.inv' }),
 		})
 		const { Invention } = (await save.json()) as InventionSaveResult
-		const updateprice = async (body: unknown, sub = '1212'): Promise<Response> =>
+		const updateprice = async (body: unknown, sub = '1212', plus = true): Promise<Response> =>
 			exports.default.fetch(`${ORIGIN}/api/inventions/v1/updateprice`, {
 				method: 'POST',
-				headers: { ...(await bearer(sub)), 'Content-Type': 'application/json' },
+				headers: {
+					...(await bearer(sub, undefined, undefined, plus)),
+					'Content-Type': 'application/json',
+				},
 				body: JSON.stringify(body),
 			})
+
+		// A price above 0 is a Rec Room Plus perk; making it free is not.
+		const unpaid = await updateprice(
+			{ InventionId: Invention.InventionId, Price: 500 },
+			'1212',
+			false
+		)
+		expect(unpaid.status).toBe(403)
+		expect(await unpaid.json()).toEqual({ error: 'Rec Room Plus is required to sell an invention' })
+		expect(
+			(await updateprice({ InventionId: Invention.InventionId, Price: 0 }, '1212', false)).status
+		).toBe(200)
 
 		const res = await updateprice({ InventionId: Invention.InventionId, Price: 500 })
 		expect(res.status).toBe(200)
@@ -4734,6 +5030,59 @@ describe('public endpoints', () => {
 		})
 	})
 
+	describe('POST /api/sanitize/v2/isAllowed/bulk', () => {
+		const bulk = async (body: URLSearchParams | FormData, authed = true) =>
+			exports.default.fetch(`${ORIGIN}/api/sanitize/v2/isAllowed/bulk`, {
+				method: 'POST',
+				headers: authed ? await bearer('42') : {},
+				body,
+			})
+
+		test('401s without a token', async () => {
+			expect((await bulk(new URLSearchParams('Values=hello'), false)).status).toBe(401)
+		})
+
+		test('preserves repeated values, order, empty text and duplicates in the Studio envelope', async () => {
+			const body = new URLSearchParams()
+			for (const text of ['MakerRoom', 'fuck this', '', 'Scunthorpe', 'MakerRoom', 'sh1t'])
+				body.append('Values', text)
+			const res = await bulk(body)
+			expect(res.status).toBe(200)
+			expect(await res.json()).toEqual({
+				Success: true,
+				Error: null,
+				Value: { ArePure: [true, false, true, true, true, false] },
+			})
+		})
+
+		test('accepts a single multipart value and an empty batch', async () => {
+			const body = new FormData()
+			body.append('Values', 'a$$hole')
+			expect(await (await bulk(body)).json()).toEqual({
+				Success: true,
+				Error: null,
+				Value: { ArePure: [false] },
+			})
+			expect(await (await bulk(new URLSearchParams())).json()).toEqual({
+				Success: true,
+				Error: null,
+				Value: { ArePure: [] },
+			})
+		})
+
+		test('rejects file values rather than marking them clean', async () => {
+			const body = new FormData()
+			body.append('Values', new Blob(['hello']), 'text.txt')
+			const res = await bulk(body)
+			expect(res.status).toBe(400)
+			expect(await res.json()).toEqual({
+				Success: false,
+				Error: 'Values must be strings.',
+				Value: null,
+			})
+		})
+	})
+
 	describe('POST /api/sanitize/v1/isPure', () => {
 		const isPure = async (Value?: string, authed = true) =>
 			exports.default.fetch(`${ORIGIN}/api/sanitize/v1/isPure`, {
@@ -4841,11 +5190,8 @@ describe('custom avatar items', () => {
 				Accessibility: 0,
 			})
 		)
-		form.set(
-			'thumbnailImage',
-			new File([new Uint8Array([1, 2, 3])], 'file.bin', { type: 'image/png' })
-		)
-		form.set('design', new File([new Uint8Array([4, 5, 6])], 'file.bin', { type: 'image/png' }))
+		form.set('thumbnailImage', new File([PNG_BYTES], 'file.bin', { type: 'image/png' }))
+		form.set('design', new File([PNG_BYTES], 'file.bin', { type: 'image/png' }))
 		const res = await exports.default.fetch(`${ORIGIN}/api/customAvatarItems/v1`, {
 			method: 'POST',
 			headers: await bearer('205'),
@@ -4892,14 +5238,10 @@ describe('custom avatar items', () => {
 
 		// Both uploads landed in the image bucket under those keys.
 		const thumb = await env.IMAGES.get(body.Value.ThumbnailImageFilename as string)
-		expect(new Uint8Array((await thumb!.arrayBuffer()) as ArrayBuffer)).toEqual(
-			new Uint8Array([1, 2, 3])
-		)
+		expect(new Uint8Array((await thumb!.arrayBuffer()) as ArrayBuffer)).toEqual(PNG_BYTES)
 		expect(thumb!.httpMetadata?.contentType).toBe('image/png')
 		const design = await env.IMAGES.get(body.Value.DesignFilename as string)
-		expect(new Uint8Array((await design!.arrayBuffer()) as ArrayBuffer)).toEqual(
-			new Uint8Array([4, 5, 6])
-		)
+		expect(new Uint8Array((await design!.arrayBuffer()) as ArrayBuffer)).toEqual(PNG_BYTES)
 
 		// The row is the record as JSON, with the queried fields generated off it.
 		const row = await env.DB.prepare(
@@ -4929,9 +5271,26 @@ describe('custom avatar items', () => {
 			new Date('2026-08-01T00:00:00Z')
 		)
 		const url = `${ORIGIN}/api/customAvatarItems/v1/${item.CustomAvatarItemId}`
-		const res = await exports.default.fetch(url, {
+		// Pricing is a Rec Room Plus perk: without `rn.plus` the edit is refused, unchanged.
+		const unpaid = await exports.default.fetch(url, {
 			method: 'PUT',
 			headers: { ...(await bearer('205')), 'content-type': 'application/json' },
+			body: JSON.stringify({ Name: null, Description: null, Price: 100, Accessibility: 1 }),
+		})
+		expect(unpaid.status).toBe(403)
+		expect(await unpaid.json()).toMatchObject({
+			Success: false,
+			Value: null,
+			Error: 'Rec Room Plus is required to sell a custom avatar item',
+		})
+		expect((await getCustomAvatarItem(env.DB, item.CustomAvatarItemId))!.Price).toBe(0)
+
+		const res = await exports.default.fetch(url, {
+			method: 'PUT',
+			headers: {
+				...(await bearer('205', undefined, undefined, true)),
+				'content-type': 'application/json',
+			},
 			body: JSON.stringify({ Name: null, Description: null, Price: 100, Accessibility: 1 }),
 		})
 		expect(res.status).toBe(200)
@@ -4982,20 +5341,28 @@ describe('custom avatar items', () => {
 	// player has enforce it — refusing, not clamping, so the creator sees what was set.
 	test('the price is capped at 1000 tokens on create and edit', async () => {
 		expect(MAX_PLAYER_ITEM_PRICE).toBe(1000)
-		const create = async (Price: unknown) => {
+		const create = async (Price: unknown, plus = true) => {
 			const form = new FormData()
 			form.set(
 				'metadata',
 				JSON.stringify({ Name: 'Pricey', BaseAvatarItemId: 1, BaseAvatarItemColor: '#fff', Price })
 			)
-			form.set('thumbnailImage', new File([new Uint8Array([1])], 't.png', { type: 'image/png' }))
-			form.set('design', new File([new Uint8Array([2])], 'd.png', { type: 'image/png' }))
+			form.set('thumbnailImage', new File([PNG_BYTES], 't.png', { type: 'image/png' }))
+			form.set('design', new File([PNG_BYTES], 'd.png', { type: 'image/png' }))
 			return exports.default.fetch(`${ORIGIN}/api/customAvatarItems/v1`, {
 				method: 'POST',
-				headers: await bearer('205'),
+				headers: await bearer('205', undefined, undefined, plus),
 				body: form,
 			})
 		}
+		// A price above 0 is a Rec Room Plus perk; without `rn.plus` the create is refused.
+		const unpaid = await create(100, false)
+		expect(unpaid.status).toBe(403)
+		expect(await unpaid.json()).toMatchObject({
+			Success: false,
+			Value: null,
+			Error: 'Rec Room Plus is required to sell a custom avatar item',
+		})
 		const over = await create(1001)
 		expect(over.status).toBe(400)
 		expect(await over.json()).toMatchObject({
@@ -5005,6 +5372,11 @@ describe('custom avatar items', () => {
 		})
 		expect((await create(-1)).status).toBe(400)
 		expect((await create(10.5)).status).toBe(400)
+		// Below the `minPriceForPublicItem` floor: a price is 0 or at least 100, Plus or not.
+		const cheap = await create(1)
+		expect(cheap.status).toBe(400)
+		expect(await cheap.json()).toMatchObject({ Error: 'Price must be 0 or >= 100' })
+		expect((await create(99)).status).toBe(400)
 		// Nothing was written for the refused ones.
 		expect(
 			await env.DB.prepare(
@@ -5027,20 +5399,35 @@ describe('custom avatar items', () => {
 
 		// The edit is bound the same way, and a refused edit leaves the row as it was.
 		const url = `${ORIGIN}/api/customAvatarItems/v1/${Value.CustomAvatarItemId}`
-		const edit = async (Price: number) =>
+		const edit = async (Price: number, plus = true) =>
 			exports.default.fetch(url, {
 				method: 'PUT',
-				headers: { ...(await bearer('205')), 'content-type': 'application/json' },
+				headers: {
+					...(await bearer('205', undefined, undefined, plus)),
+					'content-type': 'application/json',
+				},
 				body: JSON.stringify({ Name: null, Description: null, Price, Accessibility: null }),
 			})
 		const tooMuch = await edit(1001)
 		expect(tooMuch.status).toBe(400)
 		expect(await tooMuch.json()).toMatchObject({ Success: false, Error: 'Price must be <= 1000' })
 		expect((await edit(-1)).status).toBe(400)
+		expect((await edit(1)).status).toBe(400)
+		expect((await edit(99)).status).toBe(400)
 		expect((await getCustomAvatarItem(env.DB, Value.CustomAvatarItemId))!.Price).toBe(1000)
 		const lowered = await edit(999)
 		expect(lowered.status).toBe(200)
 		expect(((await lowered.json()) as { Value: { Price: number } }).Value.Price).toBe(999)
+
+		// Without Plus a price can't be set, but the item can still be made free.
+		expect((await edit(500, false)).status).toBe(403)
+		const freed = await edit(0, false)
+		expect(freed.status).toBe(200)
+		expect(((await freed.json()) as { Value: { Price: number } }).Value.Price).toBe(0)
+		// And a free item can be created without Plus.
+		expect((await create(0, false)).status).toBe(200)
+		// The floor itself is allowed.
+		expect((await create(100)).status).toBe(200)
 	})
 
 	// The cap arrived after players had already priced shirts. Migration 0032 lowers every
@@ -5128,8 +5515,8 @@ describe('custom avatar items', () => {
 			'metadata',
 			JSON.stringify({ Name: 'Gone', BaseAvatarItemId: 1, BaseAvatarItemColor: '#fff' })
 		)
-		form.set('thumbnailImage', new File([new Uint8Array([1])], 'file.bin', { type: 'image/png' }))
-		form.set('design', new File([new Uint8Array([2])], 'file.bin', { type: 'image/png' }))
+		form.set('thumbnailImage', new File([PNG_BYTES], 'file.bin', { type: 'image/png' }))
+		form.set('design', new File([PNG_BYTES], 'file.bin', { type: 'image/png' }))
 		const created = (await (
 			await exports.default.fetch(`${ORIGIN}/api/customAvatarItems/v1`, {
 				method: 'POST',
@@ -5232,6 +5619,48 @@ describe('custom avatar items', () => {
 		} finally {
 			env.RECFLARE_MAX_API_UPLOAD_BYTES = previous
 		}
+	})
+
+	// Both files are identified by their bytes — the client posts them as `.bin` under
+	// `image/png` — and the `img` worker serves each under its stored type, so a non-image
+	// is refused before either file or the row is written.
+	test('POST refuses a file whose bytes are not an image, writing nothing', async () => {
+		const objectsBefore = (await env.IMAGES.list({ prefix: 'avatar-item/' })).objects.length
+		const upload = async (thumbnail: string | Uint8Array, design: string | Uint8Array) => {
+			const form = new FormData()
+			form.set(
+				'metadata',
+				JSON.stringify({ Name: 'not-image', BaseAvatarItemId: 1, BaseAvatarItemColor: '#fff' })
+			)
+			form.set('thumbnailImage', new File([thumbnail], 'f.bin', { type: 'image/png' }))
+			form.set('design', new File([design], 'f.bin', { type: 'image/png' }))
+			return exports.default.fetch(`${ORIGIN}/api/customAvatarItems/v1`, {
+				method: 'POST',
+				headers: await bearer('205'),
+				body: form,
+			})
+		}
+		const html = '<script>alert(1)</script>'
+
+		const badThumbnail = await upload(html, PNG_BYTES)
+		expect(badThumbnail.status).toBe(400)
+		expect(await badThumbnail.json()).toMatchObject({
+			Success: false,
+			Error: 'thumbnailImage is not a PNG or JPEG image',
+		})
+
+		const badDesign = await upload(PNG_BYTES, html)
+		expect(badDesign.status).toBe(400)
+		expect(await badDesign.json()).toMatchObject({
+			Success: false,
+			Error: 'design is not a PNG or JPEG image',
+		})
+
+		const row = await env.DB.prepare(
+			"SELECT COUNT(*) AS n FROM custom_avatar_item WHERE json_extract(data, '$.Name') = 'not-image'"
+		).first<{ n: number }>()
+		expect(row?.n).toBe(0)
+		expect((await env.IMAGES.list({ prefix: 'avatar-item/' })).objects).toHaveLength(objectsBefore)
 	})
 
 	test('POST 401s without a token', async () => {
@@ -6759,7 +7188,7 @@ describe('rooms', () => {
 
 describe('images', () => {
 	test('POST /api/images/v4/uploadsaved stores the file in R2 and returns its name', async () => {
-		const bytes = new Uint8Array([0x89, 0x50, 0x4e, 0x47, 1, 2, 3, 4])
+		const bytes = new Uint8Array([...PNG_BYTES, 1, 2, 3, 4])
 		const fd = new FormData()
 		fd.append('imgMeta', JSON.stringify({ savedImageType: 1 })) // ShareCamera
 		fd.append('image', new File([bytes], 'avatar.png', { type: 'image/png' }))
@@ -6790,6 +7219,42 @@ describe('images', () => {
 		// `Id`, not `SavedImageId` — v6 serves the raw record, unlike the player lists.
 		expect(typeof meta.Id).toBe('number')
 		expect(meta.CheerCount).toBe(0)
+	})
+
+	// The part's filename and content-type are the uploader's claims, and the `img`
+	// worker serves the object under whatever type is stored — so an HTML body under an
+	// image name would be a page on the image origin. The bytes decide, and only images
+	// get in.
+	test('POST /api/images/v4/uploadsaved refuses a file whose bytes are not an image', async () => {
+		const objectsBefore = (await env.IMAGES.list()).objects.length
+		const fd = new FormData()
+		fd.append('imgMeta', JSON.stringify({ savedImageType: 1 }))
+		fd.append('image', new File(['<script>alert(1)</script>'], 'photo.jpg', { type: 'image/jpeg' }))
+		const res = await exports.default.fetch(`${ORIGIN}/api/images/v4/uploadsaved`, {
+			method: 'POST',
+			headers: await bearer(),
+			body: fd,
+		})
+		expect(res.status).toBe(400)
+		expect(await res.json()).toEqual({ error: 'image is not a PNG or JPEG image' })
+		expect((await env.IMAGES.list()).objects).toHaveLength(objectsBefore)
+	})
+
+	test('POST /api/images/v4/uploadsaved stores the type and extension the bytes say, not the claim', async () => {
+		const fd = new FormData()
+		fd.append('imgMeta', JSON.stringify({ savedImageType: 1 }))
+		// A real PNG posted as a JPEG under an HTML name.
+		fd.append('image', new File([PNG_BYTES], 'photo.html', { type: 'text/html' }))
+		const res = await exports.default.fetch(`${ORIGIN}/api/images/v4/uploadsaved`, {
+			method: 'POST',
+			headers: await bearer(),
+			body: fd,
+		})
+		expect(res.status).toBe(200)
+		const { ImageName } = (await res.json()) as { ImageName: string }
+		expect(ImageName).toMatch(/\.png$/)
+		const stored = await env.IMAGES.get(ImageName)
+		expect(stored?.httpMetadata?.contentType).toBe('image/png')
 	})
 
 	test('GET /api/images/v1/slideshow is public and joins username + room name', async () => {
@@ -6907,32 +7372,48 @@ describe('images', () => {
 
 		// Request order, not id order — the client lines the answers up with what it asked for.
 		const both = await bulk(`?ids=${two.Id}&ids=${one.Id}`)
-		expect(both.map((i) => i.Id)).toEqual([two.Id, one.Id])
-		// The RAW SavedImage: `Id`/`Type`, and TaggedPlayerIds present — not the
-		// SavedImageId/SavedImageType projection the player photo lists serve.
+		expect(both.map((i) => i.SavedImageId)).toEqual([two.Id, one.Id])
+		// The ImagesPlayer projection plus ClubId — not the raw SavedImage (`Id`/`Type`,
+		// `TaggedPlayerIds`).
+		expect(Object.keys(both[0]).sort()).toEqual(
+			[
+				'SavedImageId',
+				'ImageName',
+				'PlayerId',
+				'RoomId',
+				'PlayerEventId',
+				'ClubId',
+				'Description',
+				'Accessibility',
+				'AccessibilityLocked',
+				'SavedImageType',
+				'CreatedAt',
+				'CheerCount',
+				'CommentCount',
+			].sort()
+		)
 		expect(both[0]).toMatchObject({
-			Id: two.Id,
-			Type: two.Type,
+			SavedImageId: two.Id,
+			SavedImageType: two.Type,
 			ImageName: 'bulktwo.jpg',
 			PlayerId: 7102,
-			TaggedPlayerIds: [],
+			ClubId: null,
 		})
 
 		// An unknown id and a non-public one are absent rather than errors or holes, so the
 		// answer can be shorter than the request.
-		expect((await bulk(`?ids=${one.Id}&ids=999999&ids=${hidden.Id}`)).map((i) => i.Id)).toEqual([
-			one.Id,
-		])
+		expect(
+			(await bulk(`?ids=${one.Id}&ids=999999&ids=${hidden.Id}`)).map((i) => i.SavedImageId)
+		).toEqual([one.Id])
 
 		// No ids at all is an empty array.
 		expect(await bulk('')).toEqual([])
 
 		// More ids than D1 will bind in one query (100) — the lookup has to split.
 		const many = [...Array.from({ length: 130 }, (_, i) => 800000 + i), one.Id, two.Id]
-		expect((await bulk(`?${many.map((id) => `ids=${id}`).join('&')}`)).map((i) => i.Id)).toEqual([
-			one.Id,
-			two.Id,
-		])
+		expect(
+			(await bulk(`?${many.map((id) => `ids=${id}`).join('&')}`)).map((i) => i.SavedImageId)
+		).toEqual([one.Id, two.Id])
 	})
 
 	test('POST /api/images/v1/cheer persists, syncs CheerCount, and the bulk lookup reflects it', async () => {
@@ -7253,7 +7734,7 @@ describe('images', () => {
 				accessibility: 2,
 			})
 		)
-		fd.append('image', new File([new Uint8Array([1, 2, 3])], 'pic.png', { type: 'image/png' }))
+		fd.append('image', new File([PNG_BYTES], 'pic.png', { type: 'image/png' }))
 		const res = await exports.default.fetch(`${ORIGIN}/api/images/v4/uploadsaved`, {
 			method: 'POST',
 			headers: await bearer('42'),
@@ -8250,15 +8731,29 @@ describe('messages', () => {
 		expect(inbox[0]).toMatchObject({ Id: frameId, FromPlayerId: 42, Type: 10, Data: '' })
 	})
 
-	test('POST /api/messages/v2/send defaults Type and Data when omitted', async () => {
-		const res = await send({ ToPlayerId: '2' }, await bearer('42'))
+	test('POST /api/messages/v2/send defaults Data when omitted', async () => {
+		const res = await send({ ToPlayerId: '2', Type: '11' }, await bearer('42'))
 		expect(res.status).toBe(200)
 		expect((await pushed())[0]?.data).toMatchObject({
 			FromPlayerId: 42,
 			ToPlayerId: 2,
-			Type: 0,
+			Type: 11,
 			Data: '',
 		})
+	})
+
+	test('POST /api/messages/v2/send refuses a missing or server-only Type, storing nothing', async () => {
+		// 50 PlayerCheer, 100 CoachMessage, 5 VoteToKick, 4 FriendInvite: all minted by the
+		// server from their own routes; a player posting one here would be forging it.
+		for (const type of [undefined, '', 'nope', '0', '4', '5', '50', '100']) {
+			const fields: Record<string, string> = { ToPlayerId: '9630' }
+			if (type !== undefined) fields.Type = type
+			const res = await send(fields, await bearer('42'))
+			expect(res.status).toBe(400)
+			expect(await res.json()).toEqual({ success: false, error: 'Invalid message type' })
+			expect(await pushed()).toEqual([])
+		}
+		expect(await inboxOf('9630')).toEqual([])
 	})
 
 	test('POST /api/messages/v2/send 400s without a recipient, pushing nothing', async () => {
@@ -8269,7 +8764,7 @@ describe('messages', () => {
 	})
 
 	test('POST /api/messages/v2/send is auth-gated', async () => {
-		const res = await send({ ToPlayerId: '2' })
+		const res = await send({ ToPlayerId: '2', Type: '10' })
 		expect(res.status).toBe(401)
 		expect(await pushed()).toEqual([])
 	})
@@ -8286,7 +8781,7 @@ describe('messages', () => {
 
 	test('POST /api/messages/v1/sendMultiple pushes one frame per recipient', async () => {
 		const res = await sendMultiple(
-			{ ToPlayerIds: [205, 206], Type: 20, Data: 'hi' },
+			{ ToPlayerIds: [205, 206], Type: 30, Data: 'hi' },
 			await bearer('42')
 		)
 		expect(res.status).toBe(200)
@@ -8296,8 +8791,8 @@ describe('messages', () => {
 		const sent = await pushed()
 		expect(sent.map((n) => n.playerId)).toEqual([205, 206])
 		expect(sent.map((n) => n.notificationType)).toEqual([MESSAGE_RECEIVED, MESSAGE_RECEIVED])
-		expect(sent[0]?.data).toMatchObject({ FromPlayerId: 42, ToPlayerId: 205, Type: 20, Data: 'hi' })
-		expect(sent[1]?.data).toMatchObject({ FromPlayerId: 42, ToPlayerId: 206, Type: 20, Data: 'hi' })
+		expect(sent[0]?.data).toMatchObject({ FromPlayerId: 42, ToPlayerId: 205, Type: 30, Data: 'hi' })
+		expect(sent[1]?.data).toMatchObject({ FromPlayerId: 42, ToPlayerId: 206, Type: 30, Data: 'hi' })
 
 		// One STORED message each, with ids of their own — not one message shared.
 		const ids = sent.map((n) => n.data.Id)
@@ -8306,17 +8801,34 @@ describe('messages', () => {
 		expect((await inboxOf('206'))[0]).toMatchObject({ Id: ids[1], Data: 'hi' })
 	})
 
-	test('POST /api/messages/v1/sendMultiple defaults Type and Data, and de-duplicates ids', async () => {
-		const res = await sendMultiple({ ToPlayerIds: [205, 205] }, await bearer('42'))
+	test('POST /api/messages/v1/sendMultiple defaults Data, and de-duplicates ids', async () => {
+		const res = await sendMultiple({ ToPlayerIds: [205, 205], Type: 10 }, await bearer('42'))
 		expect(res.status).toBe(200)
 
 		const sent = await pushed()
 		expect(sent).toHaveLength(1)
-		expect(sent[0]?.data).toMatchObject({ FromPlayerId: 42, ToPlayerId: 205, Type: 0, Data: '' })
+		expect(sent[0]?.data).toMatchObject({ FromPlayerId: 42, ToPlayerId: 205, Type: 10, Data: '' })
+	})
+
+	test('POST /api/messages/v1/sendMultiple refuses a missing or server-only Type', async () => {
+		for (const body of [
+			{ ToPlayerIds: [205] },
+			{ ToPlayerIds: [205], Type: 20 },
+			{ ToPlayerIds: [205], Type: 50 },
+		]) {
+			const res = await sendMultiple(body, await bearer('42'))
+			expect(res.status).toBe(400)
+			expect(await res.json()).toEqual({ success: false, error: 'Invalid message type' })
+			expect(await pushed()).toEqual([])
+		}
 	})
 
 	test('POST /api/messages/v1/sendMultiple 400s with no usable recipient, pushing nothing', async () => {
-		for (const body of [{ Type: 20 }, { ToPlayerIds: [] }, { ToPlayerIds: ['nope', 0] }]) {
+		for (const body of [
+			{ Type: 10 },
+			{ ToPlayerIds: [], Type: 10 },
+			{ ToPlayerIds: ['nope', 0], Type: 10 },
+		]) {
 			const res = await sendMultiple(body, await bearer('42'))
 			expect(res.status).toBe(400)
 			expect(await res.json()).toEqual({ success: false, error: 'ToPlayerIds is required' })
@@ -8325,20 +8837,20 @@ describe('messages', () => {
 	})
 
 	test('POST /api/messages/v1/sendMultiple is auth-gated', async () => {
-		const res = await sendMultiple({ ToPlayerIds: [205] })
+		const res = await sendMultiple({ ToPlayerIds: [205], Type: 10 })
 		expect(res.status).toBe(401)
 		expect(await pushed()).toEqual([])
 	})
 
 	test('GET /api/messages/v2/get serves the caller’s inbox, newest first', async () => {
 		// Two messages to 9600, one to somebody else — an inbox is the caller's own.
-		await send({ ToPlayerId: '9600', Data: 'first' }, await bearer('42'))
-		await send({ ToPlayerId: '9600', Data: 'second' }, await bearer('43'))
-		await send({ ToPlayerId: '9601', Data: 'not yours' }, await bearer('42'))
+		await send({ ToPlayerId: '9600', Type: '30', Data: 'first' }, await bearer('42'))
+		await send({ ToPlayerId: '9600', Type: '30', Data: 'second' }, await bearer('43'))
+		await send({ ToPlayerId: '9601', Type: '30', Data: 'not yours' }, await bearer('42'))
 
 		const inbox = await inboxOf('9600')
 		expect(inbox.map((m) => m.Data)).toEqual(['second', 'first'])
-		expect(inbox[0]).toMatchObject({ FromPlayerId: 43, ToPlayerId: 9600, Type: 0 })
+		expect(inbox[0]).toMatchObject({ FromPlayerId: 43, ToPlayerId: 9600, Type: 30 })
 		// Every message carries the full Message model, ids and all.
 		expect(Date.parse(inbox[0].SentTime)).not.toBeNaN()
 		expect(inbox.every((m) => m.Id > 0)).toBe(true)
@@ -8352,9 +8864,9 @@ describe('messages', () => {
 	})
 
 	test('POST /api/messages/v3/delete removes only the caller’s messages', async () => {
-		await send({ ToPlayerId: '9610', Data: 'keep' }, await bearer('42'))
-		await send({ ToPlayerId: '9610', Data: 'drop' }, await bearer('42'))
-		await send({ ToPlayerId: '9611', Data: 'someone else' }, await bearer('42'))
+		await send({ ToPlayerId: '9610', Type: '30', Data: 'keep' }, await bearer('42'))
+		await send({ ToPlayerId: '9610', Type: '30', Data: 'drop' }, await bearer('42'))
+		await send({ ToPlayerId: '9611', Type: '30', Data: 'someone else' }, await bearer('42'))
 
 		const before = await inboxOf('9610')
 		const drop = before.find((m) => m.Data === 'drop')!
@@ -8371,7 +8883,7 @@ describe('messages', () => {
 	})
 
 	test('POST /api/messages/v3/delete takes a bare array, and shrugs off the rest', async () => {
-		await send({ ToPlayerId: '9620', Data: 'bare' }, await bearer('42'))
+		await send({ ToPlayerId: '9620', Type: '30', Data: 'bare' }, await bearer('42'))
 		const message = (await inboxOf('9620'))[0]
 
 		// The client posts a bare array; the documented `{ MessageIds }` object works too.
@@ -10226,9 +10738,13 @@ describe('openapi', () => {
 			'GET /api/playerevents/v1/{eventId}/responses',
 			'GET /api/playerevents/v2/{eventId}',
 			'GET /api/players/v1/playerPhotoTaggingSetting',
+			'GET /api/players/v1/progression/xpEarnedToday',
 			'GET /api/players/v1/progression/{id}',
 			'GET /api/players/v2/progression/bulk',
 			'GET /api/progressionEvents/active',
+			'GET /api/progressionEvents/event/{id}',
+			'GET /api/progressionEvents/record/{id}',
+			'GET /api/purchasableXpBoosts/activations',
 			'GET /api/quickPlay/v1/getandclear',
 			'GET /api/referee/files',
 			'GET /api/relationships/mutualfriends',
@@ -10282,6 +10798,7 @@ describe('openapi', () => {
 			'POST /api/inventions/v1/settags',
 			'POST /api/inventions/v1/update',
 			'POST /api/inventions/v1/updateprice',
+			'POST /api/inventions/v2/batch',
 			'POST /api/inventions/v2/cheer',
 			'POST /api/inventions/v2/delete',
 			'POST /api/inventions/v2/unpublish',
@@ -10318,6 +10835,7 @@ describe('openapi', () => {
 			'POST /api/rooms/v1/verifyRole',
 			'POST /api/sanitize/v1',
 			'POST /api/sanitize/v1/isPure',
+			'POST /api/sanitize/v2/isAllowed/bulk',
 			'POST /api/v1/progression/bulk',
 			'POST /outfits/bulk',
 			'POST /statsigUserProperties',

@@ -75,11 +75,13 @@ const NAME_WORD_BOUNDARIES: Array<[RegExp, string]> = [
 /**
  * Whether `value`, read as a NAME, contains a swear.
  *
- * A username or display name is letters and digits only (`nameRejection`), so it carries
- * no spaces — and the filter matches whole words. Handing one to {@link containsSwears}
- * as-is therefore only refuses a name that IS a swear and nothing else: `Fucker123` and
- * `ShitLord` sail through. So the name is split at the boundaries a player types instead
- * of a space, and the pieces are checked as words.
+ * A username is letters and digits only (`nameRejection`), so it carries no spaces — and
+ * the filter matches whole words. Handing one to {@link containsSwears} as-is therefore
+ * only refuses a name that IS a swear and nothing else: `Fucker123` and `ShitLord` sail
+ * through. So the name is split at the boundaries a player types instead of a space, and
+ * the pieces are checked as words. A display name may carry real spaces and punctuation
+ * (`displayNameRejection`), which the filter already breaks words at; the split still
+ * applies to the runs in between.
  *
  * That keeps the library's trade-off rather than reaching for substring matching, which
  * is the tempting fix and the wrong one: `Scunthorpe`, `assassin`, `Classic`,

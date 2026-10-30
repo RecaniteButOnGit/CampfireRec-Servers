@@ -56,7 +56,8 @@ bun runx admin grant-moderator --username alice --remote
 Sets the account's `hasStudio` flag, which `auth` stamps into the token as the
 `betastudio` role — the claim RecFlare Studio reads as permission to upload. Staff
 normally manage this from the website (`/settings/recroomstudio`); this is the
-operator's way in. Takes effect on the player's next Studio sign-in or refresh.
+operator's way in. Takes effect on the player's next Studio sign-in or refresh. To open
+Studio to a whole Discord role instead, name it in `RECFLARE_STUDIO_ROLLOUT` (`.env`).
 
 ```sh
 bun runx admin grant-studio --username alice
@@ -88,17 +89,41 @@ This command targets the `balance` table, so it runs under `apps/econ`'s wrangle
 with `--local` that is econ's dev D1 state, which needs both `balance` and a migrated
 `account` table in it.
 
+### `catalog load` — reload the item catalog
+
+```sh
+just catalog-load                 # sf3-2025.json → local (merge)
+just catalog-load --remote        # production
+just catalog-load --replace       # also drop rows the file no longer lists
+just catalog-load --dry-run       # build and validate, write nothing
+bun runx catalog check            # validate the store file without touching a database
+```
+
+Fills econ's `catalog` table from `apps/econ/static/storefronts/sf3-2025.json`, the 2025
+store as the game is served it, and nothing else. Re-run it whenever that file changes (after
+`runx storefront build`). Each row's `catalog_id` is its listing's `PurchasableItemId` and its
+`listing` column the listing verbatim, which is what
+`POST /api/storefronts/v1/purchasableitems` serves. Avatar items, consumables, skins and
+first-party custom avatar items all load; loot boxes, token bundles and consumable packs do
+not. A merge leaves rows the file no longer lists in place with no `catalog_id` or `listing`;
+`--replace` deletes them. The inventory does not read this table, so either is safe.
+
 ### `cai-load` — load the first-party custom avatar items
 
 ```sh
-bun runx admin cai-load                      # apps/econ/static/db/2025-1-cai.json → local
+bun runx admin cai-load                      # 2025-1-cai.json + studio87-extras.json → local
 bun runx admin cai-load --remote
-bun runx admin cai-load --file path/to/export.json --dry-run
+bun runx admin cai-load --file path/to/export.json --dry-run   # --file takes one or more
 just cai-load --remote                       # the same, as a recipe
 ```
 
-Loads an export of `CustomAvatarItem` records (a JSON array, a `{ Results }` page, or one
-record) into the `custom_avatar_item` table, each stored as the row's JSON with its
+Loads exports of `CustomAvatarItem` records (each a JSON array, a `{ Results }` page, or one
+record) into the `custom_avatar_item` table. With no `--file` it reads
+`apps/econ/static/db/2025-1-cai.json`, then `studio87-extras.json` — the official-store items
+the 2025 export lacks, fetched from another server's `customAvatarItems/v1/bulk` and priced
+from the storefront dump (an item it lists with no price is free). A later export only ADDS:
+an id an earlier one already holds is skipped, so the extras never overwrite a 2025 item. A
+duplicate within one export is refused. Each record is stored as the row's JSON with its
 `CreatorAccountId` forced to 1, the Coach account, whatever the export said: that is what
 files it as stock content (the storefront tab searches by creator) and what a purchase
 pays. Each save's `ThumbnailFileName` is put under `avatar/`, where this server serves
