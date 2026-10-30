@@ -365,6 +365,33 @@ describe('img endpoints', () => {
 		expect(res.headers.get('content-signature')).toBeNull()
 	})
 
+	it('enables real signing with the Railway string environment variable', async () => {
+		const ctx = createExecutionContext()
+		const res = await app.fetch(
+			new Request(`${ORIGIN}/${R2_KEY}?sig=p1`),
+			{
+				...env,
+				IMG_SIGNING_ENABLED: 'true',
+			},
+			ctx
+		)
+		await waitOnExecutionContext(ctx)
+		const signature = Uint8Array.from(
+			atob(res.headers.get('content-signature')!.split('data=')[1]),
+			(ch) => ch.charCodeAt(0)
+		)
+		const publicKey = await crypto.subtle.importKey(
+			'spki',
+			Uint8Array.from(atob(PUBLIC_SPKI_B64), (ch) => ch.charCodeAt(0)),
+			{ name: 'RSASSA-PKCS1-v1_5', hash: 'SHA-1' },
+			false,
+			['verify']
+		)
+		expect(
+			await crypto.subtle.verify('RSASSA-PKCS1-v1_5', publicKey, signature, await res.arrayBuffer())
+		).toBe(true)
+	})
+
 	it('returns a placeholder signature when IMG_SIGNING_ENABLED is off', async () => {
 		// The deployed default (see wrangler.jsonc). The header must still be there —
 		// the client requires it — but the value is derived from the key, so the body

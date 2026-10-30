@@ -1904,11 +1904,12 @@ describe('rooms endpoints', () => {
 				'$.CloningAllowed', json('true'), '$.Stats.VisitorCount', 42) WHERE room_id = 24`
 		).run()
 		// And every kind of tag: an owner tag flagged as the genre (Type 0), the server's
-		// `rro` (Type 2), and the two system tags the client derives (Type 1).
+		// `rro` (Type 2), and a system tag the client derives (Type 1). The base
+		// template has no limitsv2; cloning it enables the tag on the copy.
 		await env.DB.batch([
 			env.DB.prepare(
 				`INSERT OR REPLACE INTO room_tag (room_id, tag, type, is_primary_genre)
-				 VALUES (24, 'hangout', 0, 1), (24, 'rro', 2, 0), (24, 'beta', 1, 0), (24, 'limitsv2', 1, 0)`
+				 VALUES (24, 'hangout', 0, 1), (24, 'rro', 2, 0), (24, 'beta', 1, 0)`
 			),
 		])
 
@@ -1920,7 +1921,7 @@ describe('rooms endpoints', () => {
 		expect(ok.value!.Name).toBe('MyMakerClone')
 		expect(ok.value!.CreatorAccountId).toBe(801)
 		expect(ok.value!.RoomId).toBeGreaterThan(51)
-		// Only the system tags (Type 1) carry over — the scene needs them to run. The
+		// System tags carry over, and base clones get limitsv2. The
 		// owner's tags, the `base` template tag, the derived `rro` and the genre flag don't.
 		expect(ok.value!.Tags).toEqual([
 			{ Tag: 'beta', Type: 1 },
@@ -1968,6 +1969,18 @@ describe('rooms endpoints', () => {
 		const dup = await post(24, 'MyMakerClone')
 		expect(dup).toMatchObject({ success: false, value: null })
 		expect(dup.error).toMatch(/already exists/i)
+	})
+
+	it('does not add Limits V2 to a base room when its tags are saved', async () => {
+		const res = await SELF.fetch(`${ORIGIN}/rooms/24/tags`, {
+			method: 'PUT',
+			headers: { ...(await bearer('1')), 'Content-Type': 'application/x-www-form-urlencoded' },
+			body: 'autoTag=limitsv2',
+		})
+		expect(res.status).toBe(200)
+		const body = (await res.json()) as { value: { Tags: Array<{ Tag: string }> } }
+		expect(body.value.Tags.some((tag) => tag.Tag === 'base')).toBe(true)
+		expect(body.value.Tags.some((tag) => tag.Tag === 'limitsv2')).toBe(false)
 	})
 
 	it('POST /rooms/:id/clone of a PUBLIC source stays out of the public feeds', async () => {

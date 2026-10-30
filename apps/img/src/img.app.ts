@@ -200,9 +200,9 @@ const SIGNATURE_BYTES = 256
 /**
  * A placeholder `Content-Signature` value derived from the object key.
  *
- * The client requires the header to be PRESENT when it asks for `?sig=p1` — it
- * does not check the value — and a real signature is this worker's dominant CPU
- * cost, so by default we fabricate one. Being a pure function of the key it needs
+ * Some clients verify the value and reject this placeholder. Real signing is this
+ * worker's dominant CPU cost, so by default we fabricate one. Being a pure function
+ * of the key it needs
  * no access to the body, which is the whole point: the response still streams out
  * of R2 instead of being buffered into the isolate to be hashed.
  *
@@ -243,7 +243,7 @@ type Signing = { mode: 'none' } | { mode: 'stub'; value: string } | { mode: 'rsa
 
 function resolveSigning(env: Env, sig: string | undefined, key: string): Signing {
 	if (sig !== 'p1') return { mode: 'none' }
-	if (env.IMG_SIGNING_ENABLED === true) return { mode: 'rsa' }
+	if (env.IMG_SIGNING_ENABLED === true || env.IMG_SIGNING_ENABLED === 'true') return { mode: 'rsa' }
 	return { mode: 'stub', value: stubSignature(key) }
 }
 
@@ -472,8 +472,7 @@ app.get(
 				description: [
 					'`p1` returns a `Content-Signature: key-id=KEY:RSA:p1.rec.net; data=<base64>`',
 					'header. By default `data` is a PLACEHOLDER derived from the object key, not a',
-					'real signature — the client requires the header to be present but does not',
-					'verify it, and signing for real costs the streaming fast path. Set',
+					'real signature — clients that verify it reject the placeholder. Set',
 					'`IMG_SIGNING_ENABLED` for a true RSA-SHA1 signature over the bytes actually',
 					'returned (i.e. the resized body when a transform applies); that also needs an',
 					'`IMG_SIGNING_KEY`, without which the header is omitted entirely.',
@@ -512,9 +511,8 @@ app.get(
 		const key = c.req.param('key')
 		if (key.includes('..')) return c.body(null, 400)
 
-		// `?sig=p1` always answers with a Content-Signature header — the client needs
-		// one to be there — but by default the value is a cheap placeholder derived
-		// from the key rather than a real RSA-SHA1 signature over the body. See
+		// `?sig=p1` normally returns a Content-Signature header. By default it is a
+		// placeholder derived from the key, which verifying clients reject. See
 		// stubSignature(); IMG_SIGNING_ENABLED switches back to real signing.
 		const signing = resolveSigning(c.env, c.req.query('sig'), key)
 		const transform = parseTransform(

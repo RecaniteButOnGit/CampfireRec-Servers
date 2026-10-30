@@ -26,7 +26,7 @@ export type Env = SharedHonoEnv & {
 	 * cheap placeholder derived from the object key, which keeps the response on
 	 * the streaming path. See `stubSignature()` in `img.app.ts`.
 	 */
-	IMG_SIGNING_ENABLED?: boolean
+	IMG_SIGNING_ENABLED?: boolean | string
 }
 
 /** Variables can be extended */

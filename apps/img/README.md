@@ -21,8 +21,9 @@ The bucket is bound in the Worker as `env.IMAGES` (see `wrangler.jsonc`).
 
 ## Response signing
 
-The client requires a `Content-Signature` header to be present when it asks for
-`?sig=p1`, but it never verifies the value. Signing for real is this worker's
+The June 2024 client verifies `Content-Signature` when it asks for `?sig=p1`.
+Placeholder signatures fail verification and prevent images from displaying.
+Signing for real is this worker's
 dominant CPU cost: it has to buffer the whole object into the isolate rather than
 streaming it out of R2, then hash the full body with SHA-1 and run an RSA-2048
 private-key operation — on every request the edge cache misses.
@@ -34,10 +35,9 @@ is structurally indistinguishable to the client's parser and stable for a given
 key. It costs no body access, so untransformed images keep streaming.
 
 Set the var to `true` for genuine RSA-SHA1 signatures over the returned bytes.
-Note this is a **placeholder, not a downgrade of a security control** — nothing
-in the system authenticates images either way. Turn it on before relying on the
-header for integrity. (Resizes buffer regardless — the Photon codec needs the
-whole image.)
+The client must also trust the corresponding public key; enabling signing alone
+does not make an unrelated key valid. (Resizes buffer regardless — the Photon
+codec needs the whole image.)
 
 ### Signing key
 
@@ -49,8 +49,9 @@ in production override it with a real secret:
 wrangler secret put IMG_SIGNING_KEY   # paste base64 PKCS8 DER of the private key
 ```
 
-The matching public key must be published wherever the client looks up
-`KEY:RSA:p1.rec.net` so it can verify responses. Generate a keypair with:
+The client must trust the matching public key for `KEY:RSA:p1.rec.net` so it can
+verify responses. The location of that trust configuration for the June 2024
+client still needs to be confirmed. Generate a keypair with:
 
 ```sh
 node -e "const{generateKeyPairSync}=require('crypto');const{publicKey,privateKey}=generateKeyPairSync('rsa',{modulusLength:2048});console.log('PRIVATE',privateKey.export({type:'pkcs8',format:'der'}).toString('base64'));console.log('PUBLIC',publicKey.export({type:'spki',format:'der'}).toString('base64'))"

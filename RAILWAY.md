@@ -64,9 +64,9 @@ Optional integration and policy variables (exact names accepted by the runtime):
 | CV2 counter                                 | `RRTOKEN`                                                                                                                                                                                                              |
 | CV2 Escapees imports                        | `RRTOKEN`, `CDN_*` bucket credentials; optional `ESCAPEES_API_URL`                                                                                                                                                     |
 | Deployment metadata                         | `SENTRY_RELEASE`                                                                                                                                                                                                       |
-| Client support and staged rollout           | `SUPPORTED_GAME_VERSIONS`, `ROLLOUT_GAME_VERSIONS`, `DISCORD_ROLLOUT_ROLE_IDS`, `TACHYON_ROLLOUT_GAME_VERSIONS`, `TACHYON_HOST_PORT_ROLLOUT`                                                                             |
+| Client support and staged rollout           | `SUPPORTED_GAME_VERSIONS`, `ROLLOUT_GAME_VERSIONS`, `DISCORD_ROLLOUT_ROLE_IDS`, `TACHYON_ROLLOUT_GAME_VERSIONS`, `TACHYON_HOST_PORT_ROLLOUT`                                                                           |
 | Studio cloud builds and distribution        | `CLOUD_BUILD_KEY`, `CLOUD_BUILD_TARGETS`, `CLOUD_BUILD_TEMPLATE_VERSION`, `STUDIO_DISTRIBUTION_MANIFEST`                                                                                                               |
-| Recovery and email change messages           | `RESEND_API_KEY`, `EMAIL_FROM`                                                                                                                                                                                         |
+| Recovery and email change messages          | `RESEND_API_KEY`, `EMAIL_FROM`                                                                                                                                                                                         |
 
 The default client list remains Campfire's June 2024 build, `20240621`. `ROLLOUT_GAME_VERSIONS`
 is empty by default. Railway's email adapter sends via Resend; configure a verified sender
@@ -81,6 +81,10 @@ The discovery service also accepts `EscapeesImport[...]` and `EscapeesImportProg
 The discovery service also accepts `CounterAdd8254TOKEN"<RRTOKEN value>"` and `CounterGet8254TOKEN"<RRTOKEN value>"`. Either command can include `[Anticache:"..."]` before `8254TOKEN`; the value is ignored. They share one persistent SQLite counter and return its updated or current value in the section's `id` and `sourceMetadata`. The counter starts at 0; the discovery migration creates it.
 
 The related feature follows the upstream behavior when an optional integration is absent. In particular, web signup requires Turnstile when enabled, Meta nonce login needs the Meta secret, Discord benefits need their credentials, and image signing uses the existing optional configuration.
+The June 2024 game verifies image signatures. `IMG_SIGNING_ENABLED=true` and a
+private `IMG_SIGNING_KEY` whose public key the client trusts are both necessary;
+the default placeholder signatures do not pass verification. Configuring an
+arbitrary signing key without updating client trust will not fix image loading.
 Web password signup is disabled by default in Recflare's current auth and website code. Set `PASSWORD_SIGNUP=on` alongside the Turnstile keys to offer it on Railway. Platform signup in the game remains available.
 
 For Photon Realtime, configure the Photon Dashboard Custom Authentication URL as `https://auth.<DOMAIN>/photon/authenticate` (for this deployment, `https://auth.campfire.recanite.net/photon/authenticate`). The auth app verifies the token minted by `/player/connection-info` using `JWT_SECRET` and `PHOTON_REALTIME_APP_ID`. A plain GET without a token returns HTTP 200 with Photon `ResultCode: 3`; this is a safe route smoke test.

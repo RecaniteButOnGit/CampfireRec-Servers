@@ -51,13 +51,9 @@
 	"vars": {
 		"ENVIRONMENT": "development", // overridden during deployment
 		"SENTRY_RELEASE": "unknown", // overridden during deployment
-		// Feature flag for REAL `?sig=p1` signing. OFF: the client only needs a
-		// Content-Signature header to EXIST, and never checks it, while signing for
-		// real buffers the whole object into the isolate instead of streaming it from
-		// R2 and pays a SHA-1 over the full body plus an RSA-2048 private-key op on
-		// every edge-cache miss. So the header is filled with a placeholder derived
-		// from the object key (see stubSignature in src/img.app.ts). Flip to true if
-		// anything ever needs to verify it.
+		// The June 2024 client verifies signatures and rejects placeholders. Enable
+		// real signing with a private key matching the public key trusted by the client.
+		// Signing buffers the object and performs an RSA operation on each cache miss.
 		"IMG_SIGNING_ENABLED": false,
 		// RSA-2048 private key (PKCS8 DER, base64) used to sign image responses
 		// requested with ?sig=p1. This is an INSECURE DEV KEY committed for local

@@ -855,7 +855,8 @@ export async function setPlayerData(
  * room's content (scene/subrooms/settings), assigning a fresh RoomId, the given
  * name, and the new owner. The clone keeps only the source's SYSTEM tags (`Type` 1,
  * `RoomTagType.auto` — `beta`, `limitsv2`): the client posts those to describe what the
- * scene needs to run, so a copy of the scene needs them too. Every other tag (the owner's
+ * scene needs to run, so a copy of the scene needs them too. Clones of base rooms also
+ * get `limitsv2`, even though the templates themselves do not carry it. Every other tag (the owner's
  * `Type` 0 tags, the `base` template tag, the server-derived `rro`) is dropped, so the
  * owner tags the clone from scratch. `IsRRO` is cleared so the client doesn't render a
  * virtual "RRO" tag on it, `IsDeveloperOwned`/`CloningAllowed` are cleared, its `Stats`
@@ -896,6 +897,12 @@ export async function cloneRoom(
 	const systemTags: RoomTag[] = sourceTags
 		.filter((t) => t.Type === RoomTagType.auto)
 		.map((t) => ({ Tag: t.Tag, Type: RoomTagType.auto }))
+	if (
+		sourceTags.some((t) => tagKey(t) === 'base') &&
+		!systemTags.some((t) => tagKey(t) === 'limitsv2')
+	) {
+		systemTags.push({ Tag: 'limitsv2', Type: RoomTagType.auto })
+	}
 
 	const cloned: Room = {
 		...source,
@@ -1739,6 +1746,9 @@ export async function applyRoomTagEdit(
 		else next.push({ Tag: edit.primaryGenre, Type: RoomTagType.user, IsPrimaryGenre: true })
 	}
 
+	if (next.some((t) => tagKey(t) === 'base')) {
+		next = next.filter((t) => tagKey(t) !== 'limitsv2')
+	}
 	return storeRoomTags(db, roomId, room, next)
 }
 
@@ -3060,11 +3070,19 @@ export async function markRoomAsRRO(db: D1Database, roomId: number, room: Room):
 		...(['beta', 'limitsv2'] as const).map((tag) =>
 			db
 				.prepare(
-					`INSERT INTO room_tag (room_id, tag, type, is_primary_genre) VALUES (?1, ?2, ?3, 0)
+					`INSERT INTO room_tag (room_id, tag, type, is_primary_genre)
+					 SELECT ?1, ?2, ?3, 0 WHERE ?2 != 'limitsv2' OR NOT EXISTS
+					 (SELECT 1 FROM room_tag WHERE room_id = ?1 AND tag = 'base')
 				 ON CONFLICT (room_id, tag) DO UPDATE SET type = ?3, is_primary_genre = 0`
 				)
 				.bind(roomId, tag, RoomTagType.auto)
 		),
+		db
+			.prepare(
+				`DELETE FROM room_tag WHERE room_id = ?1 AND tag = 'limitsv2'
+			AND EXISTS (SELECT 1 FROM room_tag WHERE room_id = ?1 AND tag = 'base')`
+			)
+			.bind(roomId),
 	])
 	return (await getRoomById(db, roomId))!
 }
