@@ -1347,6 +1347,26 @@ it('lets a developer enable RRO settings and system tags without changing other 
 	expect((await devPost('/api/staff/rooms/8798/rro-tag', 8110, {})).status).toBe(404)
 })
 
+it('does not enable Limits V2 when marking a base room as an RRO', async () => {
+	const roomId = 8797
+	await env.DB.prepare('INSERT INTO room (data) VALUES (?1)')
+		.bind(
+			JSON.stringify({ RoomId: roomId, Name: 'BaseRroTest', IsDorm: false, CreatorAccountId: 8700 })
+		)
+		.run()
+	await setRoomTags(env.DB, roomId, [
+		{ Tag: 'base', Type: 0 },
+		{ Tag: 'limitsv2', Type: 1 },
+	])
+	const response = await devPost(`/api/staff/rooms/${roomId}/rro-tag`, 8110, {})
+	expect(response.status).toBe(200)
+	const room = await response.json<{ Tags: Array<{ Tag: string; Type: number }> }>()
+	expect(room.Tags).toContainEqual({ Tag: 'base', Type: 0 })
+	expect(room.Tags).toContainEqual({ Tag: 'beta', Type: 1 })
+	expect(room.Tags.some((tag) => tag.Tag === 'limitsv2')).toBe(false)
+	expect((await getRoomById(env.DB, roomId))?.Tags).toEqual(room.Tags)
+})
+
 // The reporter is the CALLER, never a body field — that is the record of who raised a
 // hand-written report, and it is why nothing marks these rows as staff-created.
 it('files a minimal report as the acting moderator', async () => {
