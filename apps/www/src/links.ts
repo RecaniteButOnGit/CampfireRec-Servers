@@ -8,16 +8,16 @@
  */
 
 /** The community Discord — the join instructions and the build both live there. */
-export const DISCORD_INVITE = 'https://join.recflare.net'
+export const DISCORD_INVITE = 'https://discord.gg/cBq97XrbZ6'
 
 /** Where the stage's "Download for PC" button goes: the client's release listing. */
-export const DOWNLOAD_URL = 'https://github.com/recflare/client/releases'
+export const DOWNLOAD_URL = DISCORD_INVITE
 
 /** The stage's "Download for Quest" button: the build's listing on the Meta store. */
-export const QUEST_DOWNLOAD_URL = 'https://www.meta.com/s/6tSy6tIxY'
+export const QUEST_DOWNLOAD_URL = DISCORD_INVITE
 
 /** The public source repo, linked from the homepage and footer. */
-export const SOURCE_REPO = 'https://github.com/orgs/recflare/repositories'
+export const SOURCE_REPO = 'https://github.com/RecaniteButOnGit/CampfireRec-Servers'
 
 /** The repo's licence, behind the footer's "MIT licensed". */
 export const LICENSE_URL = `${SOURCE_REPO}/blob/main/LICENSE`
@@ -34,4 +34,4 @@ export const ISSUES_URL = `${SOURCE_REPO}/issues/new`
  * are free and open to anyone in any region — which is what VRC.Privacy.4 asks for. Set
  * it to a real, monitored mailbox and the policy adds it as the preferred contact.
  */
-export const PRIVACY_EMAIL: string = 'privacy@recflare.net'
+export const PRIVACY_EMAIL: string = ''

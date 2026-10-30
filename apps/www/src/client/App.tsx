@@ -38,7 +38,6 @@ import {
 import { DeviceLinkPage } from './DeviceLink'
 import { customAvatarItemIdFromPath, inventionIdFromPath, InventionPage, ItemPage } from './Item'
 import { ModerationPage, PlayerBanStatus } from './Moderation'
-import { PumpleBossFight } from './PumpleBossFight'
 import { StatsPage } from './Stats'
 import { StudioAccessPage } from './StudioAccess'
 
@@ -1010,7 +1009,7 @@ function BenefitsPanel({ account, config }: { account: SelfAccount; config: Site
 			</p>
 			<p className="muted">
 				Claiming as <strong>@{account.username}</strong> (#{account.accountId}). A Discord account
-				can claim on one RecFlare account only.
+				can claim on one Campfire account only.
 			</p>
 
 			{error && <p className="error">{error}</p>}
@@ -1161,7 +1160,7 @@ function ClaimPage({
 				<section className="card">
 					<h2>Sign in first</h2>
 					<p className="muted">
-						Benefits are granted to a RecFlare account, so we need to know which one is yours before
+						Benefits are granted to a Campfire account, so we need to know which one is yours before
 						you verify with Discord. If you were part-way through a claim, start it again from your
 						account page once you’re signed in.
 					</p>
@@ -1209,6 +1208,7 @@ interface PublicRoom {
 	RoomId: number
 	Name: string
 	ImageName: string
+	CreatorAccountId?: number
 	Stats: { VisitCount: number; CheerCount: number; FavoriteCount: number }
 }
 
@@ -1638,6 +1638,7 @@ function PlayerPage({
 	const [rooms, setRooms] = useState<PublicRoom[] | null>(null)
 	const [photos, setPhotos] = useState<PublicPhoto[] | null>(null)
 	const [error, setError] = useState('')
+	const [tab, setTab] = useState<'photos' | 'rooms'>('photos')
 
 	useEffect(() => {
 		// Waits for the config, not the session: this page is public, but every fetch on it
@@ -1688,7 +1689,7 @@ function PlayerPage({
 	const created = new Date(account.createdAt)
 
 	return (
-		<main className="shell wide">
+		<main className="shell wide network-profile-page">
 			<section className="card player-hero">
 				{account.bannerImage && (
 					<img
@@ -1713,44 +1714,64 @@ function PlayerPage({
 				</div>
 			</section>
 
-			<section className="card">
-				<h2>Rooms</h2>
-				{rooms === null ? (
-					<p className="muted">Loading…</p>
-				) : rooms.length === 0 ? (
-					<p className="muted">No public rooms.</p>
-				) : (
-					<ul className="rooms">
-						{rooms.map((room) => (
-							<li className="room" key={room.RoomId}>
-								<Link to={`/rooms/${room.RoomId}`} navigate={navigate} className="room-link">
-									<img
-										className="room-thumb"
-										src={`${where().img}/${room.ImageName}?width=256`}
-										alt=""
-										loading="lazy"
-									/>
-									<div className="room-body">
-										<span className="room-name">^{room.Name}</span>
-										<p className="room-stats">{room.Stats.VisitCount.toLocaleString()} visits</p>
-									</div>
-								</Link>
-							</li>
-						))}
-					</ul>
-				)}
-			</section>
+			<nav className="profile-tabs" aria-label="Profile sections">
+				<button
+					type="button"
+					className={tab === 'photos' ? 'active' : ''}
+					onClick={() => setTab('photos')}
+				>
+					Photos
+				</button>
+				<button
+					type="button"
+					className={tab === 'rooms' ? 'active' : ''}
+					onClick={() => setTab('rooms')}
+				>
+					Rooms
+				</button>
+			</nav>
+			{tab === 'rooms' && (
+				<section className="card profile-section">
+					<h2>Rooms</h2>
+					{rooms === null ? (
+						<p className="muted">Loading…</p>
+					) : rooms.length === 0 ? (
+						<p className="muted">No public rooms.</p>
+					) : (
+						<ul className="rooms">
+							{rooms.map((room) => (
+								<li className="room" key={room.RoomId}>
+									<Link to={`/rooms/${room.RoomId}`} navigate={navigate} className="room-link">
+										<img
+											className="room-thumb"
+											src={`${where().img}/${room.ImageName}?width=256`}
+											alt=""
+											loading="lazy"
+										/>
+										<div className="room-body">
+											<span className="room-name">^{room.Name}</span>
+											<p className="room-stats">{room.Stats.VisitCount.toLocaleString()} visits</p>
+										</div>
+									</Link>
+								</li>
+							))}
+						</ul>
+					)}
+				</section>
+			)}
 
-			<section className="card">
-				<h2>Photos</h2>
-				{photos === null ? (
-					<p className="muted">Loading…</p>
-				) : photos.length === 0 ? (
-					<p className="muted">No public photos.</p>
-				) : (
-					<PhotoGrid photos={photos} />
-				)}
-			</section>
+			{tab === 'photos' && (
+				<section className="card profile-section">
+					<h2>Photos</h2>
+					{photos === null ? (
+						<p className="muted">Loading…</p>
+					) : photos.length === 0 ? (
+						<p className="muted">No public photos.</p>
+					) : (
+						<PhotoGrid photos={photos} />
+					)}
+				</section>
+			)}
 
 			{/* Staff only, and cosmetic: hidden for everyone else, but every endpoint behind it
 			    is gated by `requireStaff`. */}
@@ -2139,393 +2160,6 @@ function StaffPlayerActions({ account, navigate }: { account: PublicAccount; nav
 	)
 }
 
-/** Halloween mode: on through October, off after. `?halloween=1` forces it on for testing. */
-const HALLOWEEN_KEY = 'rf_halloween_off'
-const HALLOWEEN_SPRITES = ['🦇', '👻', '🎃', '🕷️', '🦇', '👻', '🎃', '🦇', '👻', '🎃', '🕷️', '🦇']
-
-const HALLOWEEN_CSS = `
-.rf-halloween { position: fixed; inset: 0; pointer-events: none; z-index: 9998; overflow: hidden;
-	background: radial-gradient(ellipse at center, transparent 55%, rgba(255, 110, 0, 0.14) 100%); }
-.rf-halloween-sprite { position: absolute; top: 0; opacity: 0; animation: rf-drift linear infinite; will-change: transform; }
-.rf-halloween-web { position: absolute; top: 0; font-size: 64px; opacity: 0.45; line-height: 1; }
-@keyframes rf-drift {
-	0% { transform: translate(0, 105vh) rotate(-8deg); opacity: 0; }
-	10% { opacity: 0.85; }
-	50% { transform: translate(40px, 50vh) rotate(8deg); }
-	90% { opacity: 0.85; }
-	100% { transform: translate(-30px, -10vh) rotate(-8deg); opacity: 0; }
-}
-@media (prefers-reduced-motion: reduce) { .rf-halloween-sprite { display: none; } }
-.rf-halloween-toggle { position: fixed; left: 12px; bottom: 12px; z-index: 9999; pointer-events: auto;
-	font-size: 20px; line-height: 1; padding: 6px 8px; border-radius: 999px; cursor: pointer; }
-`
-
-function halloweenActive(): boolean {
-	if (new Date().getMonth() === 9) return true
-	return new URLSearchParams(window.location.search).get('halloween') === '1'
-}
-
-/** The sprite, 23x25 native pixels, drawn at 3x with hard edges. */
-const PUMPKIN_FRAMES = [
-	new URL('./pumple-frames/frame-00.png', import.meta.url).href,
-	new URL('./pumple-frames/frame-01.png', import.meta.url).href,
-	new URL('./pumple-frames/frame-02.png', import.meta.url).href,
-	new URL('./pumple-frames/frame-03.png', import.meta.url).href,
-	new URL('./pumple-frames/frame-04.png', import.meta.url).href,
-	new URL('./pumple-frames/frame-05.png', import.meta.url).href,
-	new URL('./pumple-frames/frame-06.png', import.meta.url).href,
-	new URL('./pumple-frames/frame-07.png', import.meta.url).href,
-]
-const PUMPKIN_W = 150
-const PUMPKIN_H = 150
-const PUMPKIN_LINES = ['boo!', 'hehe', 'hey!', 'spooky!', 'happy halloween!', 'ow!', '🎃']
-
-const PUMPKIN_CSS = `
-.rf-pumpkin { position: absolute; top: 0; left: 0; width: ${PUMPKIN_W}px; height: ${PUMPKIN_H}px; will-change: transform; }
-.rf-pumpkin img {
-        display: block;
-        width: ${PUMPKIN_W}px;
-        height: ${PUMPKIN_H}px;
-        image-rendering: pixelated;
-        transform-origin: 50% 100%;
-}
-/* The animated GIF provides its own walking frames. */
-.rf-pumpkin-bubble { position: absolute; left: 50%; transform: translateX(-50%); margin: 6px 0; padding: 3px 8px;
-	border-radius: 10px; background: #fff3dc; color: #2a1608; font-size: 12px; font-weight: 600;
-	white-space: nowrap; opacity: 0; transition: opacity 0.15s; }
-`
-
-/**
- * A little pumpkin that strolls around the viewport, wanders off to random spots, walks toward the
- * cursor (stopping short of it), wobbles when the pointer is over it, and hops and talks when clicked.
- * It never captures pointer events, so it can't block anything underneath it.
- */
-function LilPumpkin() {
-	const rootRef = useRef<HTMLDivElement>(null)
-	const flipRef = useRef<HTMLDivElement>(null)
-	const spriteRef = useRef<HTMLImageElement>(null)
-	const bubbleRef = useRef<HTMLDivElement>(null)
-
-	useEffect(() => {
-		const root = rootRef.current
-		const flip = flipRef.current
-		const sprite = spriteRef.current
-		const bubble = bubbleRef.current
-		if (!root || !flip || !sprite || !bubble) return
-		if (window.matchMedia('(prefers-reduced-motion: reduce)').matches) {
-			root.style.display = 'none'
-			return
-		}
-
-		const clamp = (v: number, lo: number, hi: number) => Math.max(lo, Math.min(hi, v))
-		const maxX = () => Math.max(0, window.innerWidth - PUMPKIN_W)
-		const maxY = () => Math.max(0, window.innerHeight - PUMPKIN_H)
-
-		let x = clamp(window.innerWidth * 0.3, 0, maxX())
-		let y = maxY()
-		let tx = x
-		let ty = y
-		let facing = 1
-		let pause = 1
-		let jy = 0
-		let vy = 0
-		let walkTime = 0
-		let walkDistance = 0
-		let walkFrame = 0
-		let mouseX = -1
-		let mouseY = -1
-		let mouseAt = -Infinity
-		let speechTimer = 0
-		let last = performance.now()
-		let raf = 0
-		const effectNodes: HTMLElement[] = []
-
-		const spawnBatSwarm = () => {
-			const flash = document.createElement('div')
-			Object.assign(flash.style, {
-				position: 'fixed',
-				inset: '0',
-				background: 'rgba(210, 0, 28, 0.32)',
-				opacity: '1',
-				transition: 'opacity 480ms ease-out',
-				pointerEvents: 'none',
-				zIndex: '100000',
-			})
-			document.body.appendChild(flash)
-			effectNodes.push(flash)
-			requestAnimationFrame(() => {
-				flash.style.opacity = '0'
-			})
-			window.setTimeout(() => {
-				flash.remove()
-				const i = effectNodes.indexOf(flash)
-				if (i !== -1) effectNodes.splice(i, 1)
-			}, 520)
-
-			const cx = x + PUMPKIN_W / 2
-			const cy = y + jy + PUMPKIN_H / 2
-			for (let i = 0; i < 22; i++) {
-				const bat = document.createElement('span')
-				const angle = Math.random() * Math.PI * 2
-				const distance = 100 + Math.random() * 260
-				const dx = Math.cos(angle) * distance
-				const dy = Math.sin(angle) * distance
-				Object.assign(bat.style, {
-					position: 'fixed',
-					left: `${cx}px`,
-					top: `${cy}px`,
-					fontSize: `${20 + Math.random() * 20}px`,
-					lineHeight: '1',
-					pointerEvents: 'none',
-					zIndex: '100001',
-					opacity: '1',
-					transform: 'translate(-50%, -50%) scale(0.4)',
-					transition: 'transform 850ms ease-out, opacity 850ms ease-out',
-					willChange: 'transform, opacity',
-				})
-				bat.textContent = '🦇'
-				document.body.appendChild(bat)
-				effectNodes.push(bat)
-				requestAnimationFrame(() => {
-					bat.style.transform = `translate(calc(-50% + ${dx}px), calc(-50% + ${dy}px)) rotate(${Math.random() * 100 - 50}deg) scale(1.2)`
-					bat.style.opacity = '0'
-				})
-				window.setTimeout(() => {
-					bat.remove()
-					const i = effectNodes.indexOf(bat)
-					if (i !== -1) effectNodes.splice(i, 1)
-				}, 900)
-			}
-		}
-
-		root.style.transform = `translate(${x}px, ${y}px)`
-
-		const say = (line: string) => {
-			const nearTop = y + jy < 36
-			bubble.style.top = nearTop ? '100%' : 'auto'
-			bubble.style.bottom = nearTop ? 'auto' : '100%'
-			bubble.textContent = line
-			bubble.style.opacity = '1'
-			window.clearTimeout(speechTimer)
-			speechTimer = window.setTimeout(() => {
-				bubble.style.opacity = '0'
-			}, 1600)
-		}
-
-		const onMove = (e: MouseEvent) => {
-			mouseX = e.clientX
-			mouseY = e.clientY
-			mouseAt = performance.now()
-		}
-		const onLeave = () => {
-			mouseAt = -Infinity
-		}
-		let rapidClickCount = 0
-		let rapidClickStart = 0
-		const onClick = (e: MouseEvent) => {
-			const top = y + jy
-			const bob = 0
-			const hit =
-				e.clientX >= x - 45 &&
-				e.clientX <= x + PUMPKIN_W + 45 &&
-				e.clientY >= top - bob - 45 &&
-				e.clientY <= top - bob + PUMPKIN_H + 45
-			if (!hit) return
-
-			const now = performance.now()
-			if (now - rapidClickStart > 5000) {
-				rapidClickStart = now
-				rapidClickCount = 0
-			}
-			rapidClickCount++
-			if (rapidClickCount >= 10) {
-				rapidClickCount = 0
-				rapidClickStart = 0
-				window.dispatchEvent(new CustomEvent('rf-pumple-boss'))
-			}
-			spawnBatSwarm()
-			if (jy === 0) vy = -430
-			say(PUMPKIN_LINES[Math.floor(Math.random() * PUMPKIN_LINES.length)])
-		}
-		const onResize = () => {
-			x = clamp(x, 0, maxX())
-			y = clamp(y, 0, maxY())
-			tx = clamp(tx, 0, maxX())
-			ty = clamp(ty, 0, maxY())
-		}
-		window.addEventListener('mousemove', onMove)
-		document.documentElement.addEventListener('mouseleave', onLeave)
-		window.addEventListener('click', onClick)
-		window.addEventListener('resize', onResize)
-
-		const frame = (now: number) => {
-			const dt = Math.min(0.05, (now - last) / 1000)
-			last = now
-			const following = now - mouseAt < 3000
-			let speed = 0
-
-			if (following) {
-				const dx = mouseX - (x + PUMPKIN_W / 2)
-				const dy = mouseY - (y + PUMPKIN_H / 2)
-				const dist = Math.hypot(dx, dy)
-				if (Math.abs(dx) > 4) facing = dx > 0 ? 1 : -1
-				if (dist > 85) {
-					// Walk toward the cursor but stop short, so it never ends up sitting under the pointer.
-					tx = clamp(mouseX - (dx / dist) * 80 - PUMPKIN_W / 2, 0, maxX())
-					ty = clamp(mouseY - (dy / dist) * 80 - PUMPKIN_H / 2, 0, maxY())
-					speed = 310
-				} else {
-					tx = x
-					ty = y
-				}
-				pause = 0.5
-			} else if (pause > 0) {
-				pause -= dt
-				if (pause <= 0) {
-					tx = Math.random() * maxX()
-					ty = Math.random() * maxY()
-				}
-			} else {
-				speed = 145
-			}
-
-			const mx = tx - x
-			const my = ty - y
-			const md = Math.hypot(mx, my)
-			let moving = false
-			if (speed > 0 && md > 2) {
-				const step = Math.min(md, speed * dt)
-				x += (mx / md) * step
-				y += (my / md) * step
-				moving = true
-
-				// Advance the walk cycle according to distance actually traveled.
-				walkDistance += step
-				const nextFrame = Math.floor(walkDistance / 30) % PUMPKIN_FRAMES.length
-				if (nextFrame !== walkFrame) {
-					walkFrame = nextFrame
-					sprite.src = PUMPKIN_FRAMES[walkFrame]
-				}
-
-				if (!following && Math.abs(mx) > 4) facing = mx > 0 ? -1 : 1
-			} else if (speed > 0 && !following) {
-				pause = 1 + Math.random() * 2.5
-			}
-
-			if (jy < 0 || vy < 0) {
-				vy += 1500 * dt
-				jy += vy * dt
-				if (jy >= 0) {
-					jy = 0
-					vy = 0
-				}
-			}
-
-			walkTime += moving ? dt : 0
-			const bob = moving ? Math.abs(Math.sin(walkTime * 12)) * 7 : 0
-			const breath = 1 + Math.sin(now / 400) * 0.03
-			const over =
-				following &&
-				mouseX >= x &&
-				mouseX <= x + PUMPKIN_W &&
-				mouseY >= y + jy &&
-				mouseY <= y + jy + PUMPKIN_H
-			const rot = over ? Math.sin(now / 60) * 7 : 0
-
-			root.classList.toggle('is-walking', moving)
-			root.style.transform = `translate(${x.toFixed(1)}px, ${(y + jy - bob).toFixed(1)}px)`
-			flip.style.transform = `rotate(${rot.toFixed(1)}deg) scale(${facing}, ${breath.toFixed(3)})`
-			raf = requestAnimationFrame(frame)
-		}
-		raf = requestAnimationFrame(frame)
-
-		return () => {
-			cancelAnimationFrame(raf)
-			window.clearTimeout(speechTimer)
-			window.removeEventListener('mousemove', onMove)
-			document.documentElement.removeEventListener('mouseleave', onLeave)
-			window.removeEventListener('click', onClick)
-			window.removeEventListener('resize', onResize)
-		}
-	}, [])
-
-	return (
-		<>
-			<style>{PUMPKIN_CSS}</style>
-			<div className="rf-pumpkin" ref={rootRef}>
-				<div className="rf-pumpkin-bubble" ref={bubbleRef} />
-				<div ref={flipRef} style={{ transformOrigin: '50% 100%' }}>
-					<img ref={spriteRef} src={PUMPKIN_FRAMES[0]} alt="" draggable={false} />
-				</div>
-			</div>
-		</>
-	)
-}
-
-/** Drifting bats, ghosts and pumpkins plus corner cobwebs. Never blocks clicks; the corner button turns it off. */
-function HalloweenOverlay() {
-	const [off, setOff] = useState(() => {
-		try {
-			return localStorage.getItem(HALLOWEEN_KEY) === '1'
-		} catch {
-			return false
-		}
-	})
-	if (!halloweenActive()) return null
-
-	const toggle = () => {
-		const next = !off
-		setOff(next)
-		try {
-			if (next) localStorage.setItem(HALLOWEEN_KEY, '1')
-			else localStorage.removeItem(HALLOWEEN_KEY)
-		} catch {
-			// Storage can be unavailable; the toggle still works for this visit.
-		}
-	}
-
-	return (
-		<>
-			<style>{HALLOWEEN_CSS}</style>
-			{!off && (
-				<div className="rf-halloween" aria-hidden="true">
-					<span className="rf-halloween-web" style={{ left: 0 }}>
-						🕸️
-					</span>
-					<span className="rf-halloween-web" style={{ right: 0, transform: 'scaleX(-1)' }}>
-						🕸️
-					</span>
-					<LilPumpkin />
-					{HALLOWEEN_SPRITES.map((emoji, i) => (
-						<span
-							key={i}
-							className="rf-halloween-sprite"
-							style={{
-								left: `${(i * 37 + 5) % 96}vw`,
-								fontSize: `${22 + (i % 4) * 8}px`,
-								animationDuration: `${14 + (i % 5) * 3}s`,
-								animationDelay: `-${(i * 2.3).toFixed(1)}s`,
-							}}
-						>
-							{emoji}
-						</span>
-					))}
-				</div>
-			)}
-			<button
-				type="button"
-				className="rf-halloween-toggle"
-				onClick={toggle}
-				title={off ? 'Turn Halloween mode on' : 'Turn Halloween mode off'}
-				aria-label={off ? 'Turn Halloween mode on' : 'Turn Halloween mode off'}
-				style={{ opacity: off ? 0.5 : 1 }}
-			>
-				🎃
-			</button>
-		</>
-	)
-}
-
 export function App() {
 	// undefined = still checking the session; null = signed out.
 	const [account, setAccount] = useState<SelfAccount | null | undefined>(undefined)
@@ -2577,7 +2211,9 @@ export function App() {
 
 	return (
 		<>
-			<NavBar account={account} path={path} navigate={navigate} onLogout={logout} />
+			{path !== '/login' && path !== '/signup' && (
+				<NavBar account={account} path={path} navigate={navigate} onLogout={logout} />
+			)}
 			{path === '/login/discord' ? (
 				// Discord's registered redirect for a SIGN-IN (the claim's is `/claim`). Matched
 				// before `/login`, which it would otherwise never reach; a cold load falls through
@@ -2664,14 +2300,14 @@ export function App() {
 				<ImagePage imageId={imageId} config={config} />
 			) : lookupUsername !== null ? (
 				<PlayerPage username={lookupUsername} config={config} navigate={navigate} />
+			) : path === '/rooms' || path === '/rooms/' ? (
+				<RoomDirectory config={config} navigate={navigate} />
 			) : roomId !== null ? (
 				<RoomPage account={account} config={config} roomId={roomId} navigate={navigate} />
 			) : (
 				<HomePage account={account} config={config} navigate={navigate} />
 			)}
-			<SiteFooter />
-			{path !== '/' && <HalloweenOverlay />}
-			{path !== '/' && <PumpleBossFight />}
+			{path !== '/login' && path !== '/signup' && <SiteFooter />}
 		</>
 	)
 }
@@ -2788,6 +2424,7 @@ interface Slide {
 	url: string
 	username: string
 	roomName: string | null
+	profileImage?: string
 }
 
 /**
@@ -2810,13 +2447,18 @@ function useSlideshow(config: SiteConfig | undefined) {
 		void (async () => {
 			const h = where()
 			const d = await call<Feed>(`${h.api}/api/images/v1/slideshow?take=${SLIDESHOW_TAKE}`)
-			setSlides(
-				(d.Images ?? []).map((i) => ({
-					url: `${h.img}/${i.ImageName}`,
-					username: i.Username,
-					roomName: i.RoomName,
-				}))
+			const entries = (d.Images ?? []).map((i) => ({
+				url: `${h.img}/${i.ImageName}`,
+				username: i.Username,
+				roomName: i.RoomName,
+			}))
+			setSlides(entries)
+			const names = [...new Set(entries.map((i) => i.username))]
+			const accounts = await Promise.all(
+				names.map((name) => accountByUsername(name).catch(() => null))
 			)
+			const images = new Map(names.map((name, index) => [name, accounts[index]?.profileImage]))
+			setSlides(entries.map((entry) => ({ ...entry, profileImage: images.get(entry.username) })))
 		})().catch((e) => setError(e instanceof Error ? e.message : String(e)))
 	}, [config])
 
@@ -2870,7 +2512,7 @@ function HomePage({
 							{feed.slides?.[1] && <img src={feed.slides[1].url} alt="" />}
 						</div>
 						<span>
-							Download for PC <b>›</b>
+							Get the game <b>›</b>
 						</span>
 					</a>
 					<a className="promo" href={DISCORD_INVITE} target="_blank" rel="noreferrer">
@@ -2885,9 +2527,11 @@ function HomePage({
 			</section>
 			<nav className="home-shortcuts" aria-label="Explore">
 				<a href="#community">✦ Community</a>
-				<a href="#rooms">⌂ Rooms</a>
+				<Link to="/rooms" navigate={navigate}>
+					⌂ Rooms
+				</Link>
 				<a href={QUEST_DOWNLOAD_URL} target="_blank" rel="noreferrer">
-					↓ Quest
+					↓ Download
 				</a>
 				{offerSignup && (
 					<Link to="/signup" navigate={navigate}>
@@ -2937,7 +2581,11 @@ function HomePage({
 						feed.slides.map((slide, index) => (
 							<article className="feed-post" key={`${slide.url}-${index}`}>
 								<div className="feed-post-header">
-									<span className="feed-avatar">{slide.username.slice(0, 1).toUpperCase()}</span>
+									<img
+										className="feed-avatar"
+										src={`${where().img}/${slide.profileImage || 'DefaultProfileImage.jpg'}?width=128`}
+										alt=""
+									/>
 									<div>
 										<Link to={`/user/${encodeURIComponent(slide.username)}`} navigate={navigate}>
 											@{slide.username}
@@ -2963,11 +2611,80 @@ function HomePage({
 							feature-complete and architected for the cloud.
 						</p>
 						<a href={QUEST_DOWNLOAD_URL} target="_blank" rel="noreferrer">
-							Download for Quest ›
+							Find the download in Discord ›
 						</a>
 					</div>
 				</section>
 			</div>
+		</main>
+	)
+}
+
+/** The public hot-room list, shown in the same card grid as the room directory. */
+function RoomDirectory({
+	config,
+	navigate,
+}: {
+	config: SiteConfig | undefined
+	navigate: Navigate
+}) {
+	const [rooms, setRooms] = useState<PublicRoom[] | null>(null)
+	const [creators, setCreators] = useState<Map<number, PublicAccount>>(new Map())
+	const [error, setError] = useState(false)
+	useEffect(() => {
+		if (!config) return
+		void (async () => {
+			const result = await call<{ Results: PublicRoom[] }>(`${where().rooms}/rooms/hot?take=30`)
+			setRooms(result.Results)
+			setCreators(await usernamesFor(result.Results.map((room) => room.CreatorAccountId ?? 0)))
+		})().catch(() => setError(true))
+	}, [config])
+	return (
+		<main className="directory-page">
+			<h1>Rooms Hot List</h1>
+			{error ? (
+				<p className="muted">Rooms are unavailable right now.</p>
+			) : rooms === null ? (
+				<p className="muted">Loading rooms…</p>
+			) : rooms.length === 0 ? (
+				<p className="muted">No public rooms yet.</p>
+			) : (
+				<div className="directory-grid">
+					{rooms.map((room) => {
+						const creator = creators.get(room.CreatorAccountId ?? 0)
+						return (
+							<Link
+								key={room.RoomId}
+								to={`/rooms/${room.RoomId}`}
+								navigate={navigate}
+								className="directory-card"
+							>
+								<div className="directory-card-header">
+									<img
+										src={`${where().img}/${creator?.profileImage || 'DefaultProfileImage.jpg'}?width=128`}
+										alt=""
+									/>
+									<span>
+										<strong>^{room.Name}</strong>
+										<small>
+											{creator ? `by ${creator.displayName || creator.username}` : 'Room'}
+										</small>
+									</span>
+								</div>
+								<img
+									className="directory-card-image"
+									src={`${where().img}/${room.ImageName}?width=600`}
+									alt=""
+									loading="lazy"
+								/>
+								<div className="directory-card-footer">
+									{room.Stats.VisitCount.toLocaleString()} visits
+								</div>
+							</Link>
+						)
+					})}
+				</div>
+			)}
 		</main>
 	)
 }
@@ -3026,7 +2743,10 @@ function LoginPage({
 	const discordLoginUrl = config?.discordLoginUrl ?? null
 
 	return (
-		<main className="shell">
+		<main className="shell network-login">
+			<Link to="/" navigate={navigate} className="login-brand">
+				Campfire
+			</Link>
 			<section className="card">
 				{siteKey && (
 					<div className="tabs">
@@ -3450,7 +3170,7 @@ function DiscordLoginPage({
 		return (
 			<main className="shell">
 				<section className="card">
-					<h2>Welcome to RecFlare</h2>
+					<h2>Welcome to Campfire</h2>
 					<p>
 						Your account is ready, linked to your Discord. Your username is{' '}
 						<strong>@{created.username}</strong> — you can change it on your account page.
@@ -3604,7 +3324,7 @@ function RoomPage({
 
 	if (owned) {
 		return (
-			<main className="shell wide">
+			<main className="shell wide network-room-page">
 				<p className="backlink">
 					<Link to="/account" navigate={navigate}>
 						← My rooms
@@ -3648,7 +3368,7 @@ function RoomPage({
 			isAdmin())
 
 	return (
-		<main className="shell wide">
+		<main className="shell wide network-room-page">
 			{visible ? (
 				<PublicRoomView
 					room={room}

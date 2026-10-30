@@ -3,7 +3,7 @@ import { useCallback, useEffect, useState } from 'react'
 import { call, isAdmin, useAction } from './api'
 
 /**
- * The page RecFlare Studio opens when an account cannot upload.
+ * The page Campfire Studio opens when an account cannot upload.
  *
  * The editor's dialog links to `/settings/recroomstudio`. Anyone can land here
  * and, once signed in, see whether this account is on the upload list. Staff
@@ -135,7 +135,7 @@ function AccessPage({
 			<section className="card">
 				<p className="muted">
 					{kind === 'studio'
-						? 'Manage permission to upload from RecFlare Studio.'
+						? 'Manage permission to upload from Campfire Studio.'
 						: kind.startsWith('avatar-')
 							? 'Grant this Avatar Studio feature independently. Studio upload access is also required. Roomie equipment still requires developer access.'
 							: 'Screen sharing is disabled by default. Staff can enable it for individual users.'}{' '}
@@ -242,7 +242,7 @@ export function StudioAccessPage(props: {
 }) {
 	return (
 		<main className="shell wide">
-			<h1>RecFlare Studio access</h1>
+			<h1>Campfire Studio access</h1>
 			{(Object.keys(accessLabels) as AccessKind[]).map((kind) => (
 				<AccessPage key={kind} kind={kind} {...props} />
 			))}

@@ -43,7 +43,7 @@ const AUTH_MESSAGES: Record<string, string> = {
 	// The website's Discord sign-in found the Discord user on several accounts — a state the
 	// benefits claim never produces, so this is for an operator to untangle, not the player.
 	'platform identity is linked to more than one account':
-		'That Discord account is linked to more than one RecFlare account. Sign in with your username and password instead.',
+		'That Discord account is linked to more than one Campfire account. Sign in with your username and password instead.',
 	// www minted the assertion a moment ago, so this is a key mismatch between www and auth
 	// (or a clock a minute out), never something the player did.
 	'invalid or expired identity assertion':

@@ -3,7 +3,7 @@ import { useEffect, useState } from 'react'
 import { call, useAction, where } from './api'
 
 /**
- * The page RecFlare Studio opens after `POST /connect/deviceauthorization`.
+ * The page Campfire Studio opens after `POST /connect/deviceauthorization`.
  *
  * Studio shows `verification_uri` (`/device`) and opens `verification_uri_complete`
  * (`/device?user_code=…`) in the browser. The API that created the code stays on
@@ -52,7 +52,7 @@ export function DeviceLinkPage({
 	return (
 		<main className="shell">
 			<section className="card">
-				<h2>Sign in to RecFlare Studio</h2>
+				<h2>Sign in to Campfire Studio</h2>
 				<p className="muted">
 					The editor asked to use <strong>{account.username}</strong>. The code below is the one
 					Studio is showing. Allowing it signs the editor into this account.
