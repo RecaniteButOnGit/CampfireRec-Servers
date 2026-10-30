@@ -17,18 +17,46 @@ export interface RoomArchive {
 	image: File
 	subRooms: ArchiveSubRoom[]
 	audio: ArchiveAudio[]
+	missingSamplerAudio: string[]
 	skippedSubRooms: number
 	strippedRrsSubRooms: number
 }
 
 const MAX_ZIP_BYTES = 2 * 1024 * 1024 * 1024
 const MAX_ENTRY_BYTES = 64 * 1024 * 1024
-// CV2 `.htr.binpb` recordings can make the selected import payload much larger than
-// ordinary room scenes. Keep the filtered payload bounded while allowing large rooms.
+// CV1 and CV2 `.htr.binpb` recordings can make the selected import payload much larger
+// than ordinary room scenes. Keep the filtered payload bounded while allowing large rooms.
 const MAX_EXTRACTED_BYTES = 384 * 1024 * 1024
 const text = new TextDecoder()
 const EXPORTED_AUDIO_ENTRY =
-	/(?:^|\/)(?:CV2Audio\/Node_SampleAudio_|AudioSampler\/PVHolotar_|Holotar\/PVHolotar_)([a-z0-9]{16,64}\.htr)\.binpb$/i
+	/(?:^|\/)(?:CV2Audio\/Node_SampleAudio_|AudioSampler\/(?:PVHolotar_)?|Holotar\/PVHolotar_)(\$?[a-z0-9]{16,64}\.htr)\.binpb$/i
+
+/** CV1 sampler saves keep their recording names inline as `$<id>.htr` references. */
+function collectSamplerAudioReferences(bytes: Uint8Array, into: Set<string>): void {
+	const isAlphaNumeric = (byte: number) =>
+		(byte >= 0x30 && byte <= 0x39) ||
+		(byte >= 0x41 && byte <= 0x5a) ||
+		(byte >= 0x61 && byte <= 0x7a)
+	const lower = (byte: number) => (byte >= 0x41 && byte <= 0x5a ? byte + 0x20 : byte)
+
+	for (let start = 0; start < bytes.length; start++) {
+		if (bytes[start] !== 0x24) continue
+		let end = start + 1
+		while (end < bytes.length && end - start <= 64 && isAlphaNumeric(bytes[end]!)) end++
+		const idLength = end - start - 1
+		if (
+			idLength < 16 ||
+			idLength > 64 ||
+			bytes[end] !== 0x2e ||
+			lower(bytes[end + 1]!) !== 0x68 ||
+			lower(bytes[end + 2]!) !== 0x74 ||
+			lower(bytes[end + 3]!) !== 0x72
+		)
+			continue
+		const id = String.fromCharCode(...bytes.subarray(start + 1, end)).toLowerCase()
+		into.add(`$${id}.htr`)
+	}
+}
 
 function selectedEntry(name: string): boolean {
 	return (
@@ -151,6 +179,15 @@ export async function readRoomArchive(file: File): Promise<RoomArchive> {
 	const image = new File([new Uint8Array(imageBytes)], imagePath.split('/').pop()!, {
 		type: imageType,
 	})
+	const referencedSamplerAudio = new Set<string>()
+	for (const [path, bytes] of entries) {
+		if (
+			path.startsWith(root) &&
+			/(?:^|\/)persisted_room_data\.(?:original\.binpb|binpb|room)$/i.test(path.slice(root.length))
+		) {
+			collectSamplerAudioReferences(bytes, referencedSamplerAudio)
+		}
+	}
 	// The scene stores each sample's original `.htr` blob name. WAV files in the
 	// export are decoded previews; the `.binpb` bytes are what the client fetches.
 	const audioByName = new Map<string, Uint8Array>()
@@ -158,7 +195,17 @@ export async function readRoomArchive(file: File): Promise<RoomArchive> {
 		if (!path.startsWith(root)) continue
 		const match = EXPORTED_AUDIO_ENTRY.exec(path)
 		if (!match) continue
-		const blobName = match[1]!.toLowerCase()
+		let blobName = match[1]!.toLowerCase()
+		// Older exports omit the `$` marker from the AudioSampler filename even though
+		// the scene's blob_name includes it. Keep the stored object name equal to the
+		// reference the client will request.
+		if (
+			!blobName.startsWith('$') &&
+			/(?:^|\/)AudioSampler\//i.test(path) &&
+			referencedSamplerAudio.has(`$${blobName}`)
+		) {
+			blobName = `$${blobName}`
+		}
 		const previous = audioByName.get(blobName)
 		if (
 			previous &&
@@ -173,6 +220,9 @@ export async function readRoomArchive(file: File): Promise<RoomArchive> {
 			type: 'application/octet-stream',
 		}),
 	}))
+	const missingSamplerAudio = [...referencedSamplerAudio].filter(
+		(blobName) => !audioByName.has(blobName)
+	)
 	const subRooms: ArchiveSubRoom[] = []
 	let strippedRrsSubRooms = 0
 	for (const [path, bytes] of entries) {
@@ -233,6 +283,7 @@ export async function readRoomArchive(file: File): Promise<RoomArchive> {
 		image,
 		subRooms,
 		audio,
+		missingSamplerAudio,
 		skippedSubRooms: Math.max(0, listed - subRooms.length),
 		strippedRrsSubRooms,
 	}

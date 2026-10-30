@@ -5268,6 +5268,15 @@ function RoomImport({ navigate }: { navigate: Navigate }) {
 							skipped. {archive.audio.length} sample audio file
 							{archive.audio.length === 1 ? '' : 's'} will be uploaded.
 						</p>
+						{archive.missingSamplerAudio.length > 0 && (
+							<p className="error">
+								The scenes reference {archive.missingSamplerAudio.length} CV1 sampler recording
+								{archive.missingSamplerAudio.length === 1 ? '' : 's'}, but this ZIP has no matching
+								audio data. The room can still be imported, but those samplers will be silent.
+								Missing: {archive.missingSamplerAudio.slice(0, 3).join(', ')}
+								{archive.missingSamplerAudio.length > 3 ? ', …' : ''}
+							</p>
+						)}
 						{archive.strippedRrsSubRooms > 0 && (
 							<p className="muted">
 								RRS asset references will be removed from {archive.strippedRrsSubRooms} subroom

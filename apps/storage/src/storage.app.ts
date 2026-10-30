@@ -436,7 +436,7 @@ const app = new Hono<App>()
 							type: 'object',
 							required: ['BlobName', 'File'],
 							properties: {
-								BlobName: { type: 'string', example: '8s9mgoy07z9cn3btawtolp294.htr' },
+								BlobName: { type: 'string', example: '$278c05a31947497ca8fa6f69c4704cc6.htr' },
 								File: { type: 'string', format: 'binary' },
 							},
 						},
@@ -461,7 +461,7 @@ const app = new Hono<App>()
 			const body = await c.req.parseBody().catch(() => ({}))
 			const blobName = textField(body, 'blobname')
 			const file = Object.values(body).find((value): value is File => value instanceof File)
-			if (!blobName || !/^[a-z0-9]{16,64}\.htr$/.test(blobName) || !file) {
+			if (!blobName || !/^\$?[a-z0-9]{16,64}\.htr$/.test(blobName) || !file) {
 				return c.json({ error: 'Valid BlobName and audio file are required' }, 400)
 			}
 			const limit = maxUploadBytes(c.env.MAX_UPLOAD_BYTES)
