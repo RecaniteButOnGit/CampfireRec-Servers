@@ -2670,8 +2670,8 @@ export function App() {
 				<HomePage account={account} config={config} navigate={navigate} />
 			)}
 			<SiteFooter />
-			<HalloweenOverlay />
-			<PumpleBossFight />
+			{path !== '/' && <HalloweenOverlay />}
+			{path !== '/' && <PumpleBossFight />}
 		</>
 	)
 }
@@ -2716,12 +2716,16 @@ function NavBar({
 	return (
 		<header className="nav">
 			<Link to="/" navigate={navigate} className="brand">
-				RecFlare
+				Campfire
 			</Link>
 			<nav className="nav-links">
 				<a href={DISCORD_INVITE} target="_blank" rel="noreferrer">
 					Discord
 				</a>
+				<a href={SOURCE_REPO} target="_blank" rel="noreferrer">
+					Source
+				</a>
+				{SHOW_SEARCH && <SiteSearch navigate={navigate} />}
 				{account === undefined ? null : account ? (
 					<>
 						{/* Staff only, and cosmetic: the link is hidden for everyone else, but
@@ -2763,7 +2767,9 @@ function NavBar({
 						Sign in
 					</Link>
 				)}
-				{SHOW_SEARCH && <SiteSearch navigate={navigate} />}
+				<a className="nav-download" href={DOWNLOAD_URL} target="_blank" rel="noreferrer">
+					Download
+				</a>
 			</nav>
 		</header>
 	)
@@ -2832,6 +2838,15 @@ function HomePage({
 	navigate: Navigate
 }) {
 	const feed = useSlideshow(config)
+	const [rooms, setRooms] = useState<PublicRoom[] | null>(null)
+	const [roomsError, setRoomsError] = useState(false)
+	useEffect(() => {
+		if (!config) return
+		void (async () => {
+			const result = await call<{ Results: PublicRoom[] }>(`${where().rooms}/rooms/hot?take=5`)
+			setRooms(result.Results)
+		})().catch(() => setRoomsError(true))
+	}, [config])
 
 	// The signup offer only makes sense to a signed-out visitor when the server would
 	// actually take one. `account === undefined` is still-checking, so it shows nothing
@@ -2839,173 +2854,121 @@ function HomePage({
 	const offerSignup = account === null && config?.signupEnabled === true
 
 	return (
-		<main>
-			<Stage slides={feed.slides} offerSignup={offerSignup} navigate={navigate} />
-			<div className="shell home">
-				<About slides={feed.slides} error={feed.error} />
+		<main className="network-home">
+			<section className="promo-strip" aria-label="Explore Campfire">
+				<div className="promo-grid">
+					<a className="promo" href={SOURCE_REPO} target="_blank" rel="noreferrer">
+						<div className="promo-art">
+							{feed.slides?.[0] && <img src={feed.slides[0].url} alt="" />}
+						</div>
+						<span>
+							View the source <b>›</b>
+						</span>
+					</a>
+					<a className="promo" href={DOWNLOAD_URL} target="_blank" rel="noreferrer">
+						<div className="promo-art">
+							{feed.slides?.[1] && <img src={feed.slides[1].url} alt="" />}
+						</div>
+						<span>
+							Download for PC <b>›</b>
+						</span>
+					</a>
+					<a className="promo" href={DISCORD_INVITE} target="_blank" rel="noreferrer">
+						<div className="promo-art">
+							{feed.slides?.[2] && <img src={feed.slides[2].url} alt="" />}
+						</div>
+						<span>
+							Join the Discord <b>›</b>
+						</span>
+					</a>
+				</div>
+			</section>
+			<nav className="home-shortcuts" aria-label="Explore">
+				<a href="#community">✦ Community</a>
+				<a href="#rooms">⌂ Rooms</a>
+				<a href={QUEST_DOWNLOAD_URL} target="_blank" rel="noreferrer">
+					↓ Quest
+				</a>
+				{offerSignup && (
+					<Link to="/signup" navigate={navigate}>
+						Create account
+					</Link>
+				)}
+			</nav>
+			<div className="network-content">
+				<aside className="featured-rooms" id="rooms">
+					<h2>Popular Rooms</h2>
+					{rooms === null ? (
+						<p className="network-empty">
+							{roomsError ? 'Rooms are unavailable right now.' : 'Loading rooms…'}
+						</p>
+					) : rooms.length === 0 ? (
+						<p className="network-empty">No public rooms yet.</p>
+					) : (
+						rooms.map((room) => (
+							<Link
+								key={room.RoomId}
+								to={`/rooms/${room.RoomId}`}
+								navigate={navigate}
+								className="featured-room"
+							>
+								<img src={`${where().img}/${room.ImageName}?width=400`} alt="" loading="lazy" />
+								<span>
+									<strong>^{room.Name}</strong>
+									<small>{room.Stats.VisitCount.toLocaleString()} visits</small>
+								</span>
+							</Link>
+						))
+					)}
+				</aside>
+				<section className="community-feed" id="community">
+					<h1>Take A Look At What’s Happening Right Now</h1>
+					{feed.slides === null ? (
+						<div className="feed-empty">
+							{feed.error
+								? 'Community photos are unavailable right now.'
+								: 'Loading community photos…'}
+						</div>
+					) : feed.slides.length === 0 ? (
+						<div className="feed-empty">
+							No public photos yet. Share a moment in game to see it here.
+						</div>
+					) : (
+						feed.slides.map((slide, index) => (
+							<article className="feed-post" key={`${slide.url}-${index}`}>
+								<div className="feed-post-header">
+									<span className="feed-avatar">{slide.username.slice(0, 1).toUpperCase()}</span>
+									<div>
+										<Link to={`/user/${encodeURIComponent(slide.username)}`} navigate={navigate}>
+											@{slide.username}
+										</Link>
+										<small>{slide.roomName ? `In ${slide.roomName}` : 'Shared a photo'}</small>
+									</div>
+								</div>
+								<img
+									src={slide.url}
+									alt={`Photo taken in game by ${slide.username}`}
+									loading={index ? 'lazy' : 'eager'}
+								/>
+							</article>
+						))
+					)}
+					<div className="network-about">
+						<h2>Play today!</h2>
+						<p>
+							The servers you remember, rebuilt and running — free, open source, and up right now.
+						</p>
+						<p>
+							A free fan project, made by players who missed it. Campfire aims to be
+							feature-complete and architected for the cloud.
+						</p>
+						<a href={QUEST_DOWNLOAD_URL} target="_blank" rel="noreferrer">
+							Download for Quest ›
+						</a>
+					</div>
+				</section>
 			</div>
 		</main>
-	)
-}
-
-/**
- * The hero: the headline and the way in on the left, a rotating in-game photo on the
- * right. The photo is proof, never the payload — when the feed is slow or down the
- * frame holds its space and the left half reads the same, so "Play now!" is reachable
- * either way.
- */
-function Stage({
-	slides,
-	offerSignup,
-	navigate,
-}: {
-	slides: Slide[] | null
-	offerSignup: boolean
-	navigate: Navigate
-}) {
-	const [idx, setIdx] = useState(0)
-	const count = slides?.length ?? 0
-
-	// A timeout keyed on the current slide rather than one long-lived interval: steering
-	// by hand re-arms it, so a photo you just picked gets its full six seconds.
-	useEffect(() => {
-		if (count < 2) return
-		const t = setTimeout(() => setIdx((i) => (i + 1) % count), 6000)
-		return () => clearTimeout(t)
-	}, [count, idx])
-
-	const slide = slides && slides.length > 0 ? slides[idx] : null
-	const step = (by: number) => setIdx((i) => (i + by + count) % count)
-
-	return (
-		<section className="stage">
-			<div className="stage-body">
-				{/* Deliberately doesn't name the game: this is a fan project, so the
-				    trademark stays out of the headline and appears lower down, in
-				    plain nominative use next to the disclaimer. */}
-				<h1 className="stage-title">
-					Play <em>today</em>!
-				</h1>
-				<p className="stage-lede">
-					The servers you remember, rebuilt and running — free, open source, and up right now.
-				</p>
-				<div className="stage-actions">
-					<a className="cta" href={DOWNLOAD_URL} target="_blank" rel="noreferrer">
-						Download for PC
-					</a>
-					<a className="cta" href={QUEST_DOWNLOAD_URL} target="_blank" rel="noreferrer">
-						Download for Quest
-					</a>
-					<a className="cta discord" href={DISCORD_INVITE} target="_blank" rel="noreferrer">
-						Join the Discord
-					</a>
-				</div>
-				{/* A line rather than a fourth button: the download is the point of this page,
-				    and launching the game makes an account by itself — signing up here is the
-				    way in for someone who wants one first. Hidden entirely when signup is
-				    closed, matching /login, which hides its create-account tab the same way. */}
-				{offerSignup && (
-					<p className="stage-alt">
-						New here?{' '}
-						<Link to="/signup" navigate={navigate}>
-							Create an account
-						</Link>
-					</p>
-				)}
-			</div>
-			<div className="stage-show">
-				<div className="stage-frame">
-					{slide && (
-						<img
-							className="stage-photo"
-							key={slide.url}
-							src={slide.url}
-							alt={`Photo taken in game by ${slide.username}`}
-						/>
-					)}
-				</div>
-				{/* Always mounted, so the frame doesn't shift down when the feed lands. */}
-				<div className="stage-foot">
-					{slide && (
-						<span className="credit">
-							Photo by @{slide.username}
-							{slide.roomName && ` in ${slide.roomName}`}
-						</span>
-					)}
-					{/* Arrows and a count, not a dot per photo: a dot each is wide enough to
-					    shove the headline's half of the split off the page, and it would have
-					    to be rebuilt the moment SLIDESHOW_TAKE grows. */}
-					{count > 1 && (
-						<span className="steer">
-							<button onClick={() => step(-1)} aria-label="Previous photo">
-								<Chevron />
-							</button>
-							<span className="count">
-								{idx + 1} / {count}
-							</span>
-							<button onClick={() => step(1)} aria-label="Next photo">
-								<Chevron next />
-							</button>
-						</span>
-					)}
-				</div>
-			</div>
-		</section>
-	)
-}
-
-/** The slideshow's back/forward mark. Decorative — the buttons carry the label. */
-function Chevron({ next }: { next?: boolean }) {
-	return (
-		<svg viewBox="0 0 24 24" width="16" height="16" aria-hidden="true" focusable="false">
-			<path
-				d={next ? 'M9 5l7 7-7 7' : 'M15 5l-7 7 7 7'}
-				fill="none"
-				stroke="currentColor"
-				strokeWidth="2.2"
-				strokeLinecap="round"
-				strokeLinejoin="round"
-			/>
-		</svg>
-	)
-}
-
-/** What RecFlare is, under the fold, for whoever wants it. */
-function About({ slides, error }: { slides: Slide[] | null; error: string }) {
-	// The feed answering is proof the server replied, so the indicator can't claim
-	// the server is up when it isn't.
-	const state = slides !== null ? 'online' : error ? 'down' : 'checking'
-
-	return (
-		<section className="about">
-			<div>
-				<h2 className="about-title">A cloud architected server for the 2023-2026 game clients</h2>
-				<p className="about-lede">
-					A free fan project, made by players who missed it. Aiming to be{' '}
-					<strong>feature-complete</strong> and infinitely scalable —{' '}
-					<strong>architected for the cloud</strong>, no gatekeeping, no basement server.
-				</p>
-			</div>
-			<div className="about-side">
-				<div className="about-links">
-					<a className="cta ghost" href={SOURCE_REPO} target="_blank" rel="noreferrer">
-						View the source
-					</a>
-				</div>
-				<div className="status-block">
-					<p className={`status ${state}`}>
-						<span className="dot" />
-						{state === 'online'
-							? 'Servers are up'
-							: state === 'down'
-								? "Can't reach the servers"
-								: 'Checking…'}
-					</p>
-					{/* Only when it's actually up: when it isn't, people want the status, not the joke. */}
-					{state === 'online' && <p className="status-quip">The cloud never goes down, right?</p>}
-				</div>
-			</div>
-		</section>
 	)
 }
 
