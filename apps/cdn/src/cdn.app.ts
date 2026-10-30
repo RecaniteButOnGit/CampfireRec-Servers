@@ -105,6 +105,7 @@ function videoKey(name: string): string | null {
 	if (!/^[a-zA-Z0-9_-][a-zA-Z0-9_./-]*\.mp4$/i.test(name)) return null
 	if (name.includes('..') || name.includes('//')) return null
 	if (name === 'RR2020.mp4') return 'ytmp4-Rec-Room-2020-Trailer-1080p.mp4'
+	if (name === 'Hallway.mp4') return 'Hallway.mp4'
 	return `video/${name}`
 }
 

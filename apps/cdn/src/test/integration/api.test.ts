@@ -39,6 +39,16 @@ test('serves opaque avatar source manifests and SDK avatar bundle GET/HEAD/range
 })
 
 describe('cdn endpoints', () => {
+	test('serves the uploaded Hallway video from the bucket root', async () => {
+		await env.CDN_ASSETS.put('Hallway.mp4', 'hallway')
+		const response = await exports.default.fetch(`${ORIGIN}/video/Hallway.mp4`, {
+			headers: { Range: 'bytes=0-3' },
+		})
+		expect(response.status).toBe(206)
+		expect(response.headers.get('content-type')).toBe('video/mp4')
+		expect(new TextDecoder().decode(await response.arrayBuffer())).toBe('hall')
+	})
+
 	test('serves RR2020 from the uploaded trailer object', async () => {
 		await env.CDN_ASSETS.put('ytmp4-Rec-Room-2020-Trailer-1080p.mp4', 'trailer')
 		const url = `${ORIGIN}/video/RR2020.mp4`
